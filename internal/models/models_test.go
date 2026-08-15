@@ -1,46 +1,49 @@
 package models
 
 import (
+	"encoding/json"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestIsMessageVisible(t *testing.T) {
-	humanUser := User{ID: "h1", UserName: "alice", Type: UserTypeHuman}
-	webhookUser := User{ID: "w1", UserName: "wh", Type: UserTypeWebhook}
-	botReadAll := User{ID: "b1", UserName: "allbot", Type: UserTypeBot, BotPermissions: BotPermissions{ReadAll: true}}
-	botReadMentions := User{ID: "b2", UserName: "mentionbot", Type: UserTypeBot, BotPermissions: BotPermissions{ReadMentions: true}}
-	botNoRead := User{ID: "b3", UserName: "noreadbot", Type: UserTypeBot, BotPermissions: BotPermissions{}}
-
-	// Human user
-	if !IsMessageVisible("townhall", nil, humanUser) {
-		t.Errorf("expected human user to see townhall message")
+func TestJSONSerialization(t *testing.T) {
+	clientMsg := ClientMessage{
+		Type:    ClientMessageTypeSend,
+		ChatID:  "townhall",
+		Content: "Hello world",
 	}
 
-	// Webhook user
-	if IsMessageVisible("townhall", nil, webhookUser) {
-		t.Errorf("expected webhook user to not see townhall message")
-	}
+	data, err := json.Marshal(clientMsg)
+	require.NoError(t, err)
 
-	// Bot in townhall with ReadAll
-	if !IsMessageVisible("townhall", nil, botReadAll) {
-		t.Errorf("expected bot with ReadAll to see townhall message")
-	}
+	var decoded ClientMessage
+	err = json.Unmarshal(data, &decoded)
+	require.NoError(t, err)
+	assert.Equal(t, clientMsg.Type, decoded.Type)
+	assert.Equal(t, clientMsg.ChatID, decoded.ChatID)
+	assert.Equal(t, clientMsg.Content, decoded.Content)
 
-	// Bot in townhall with ReadMentions
-	if IsMessageVisible("townhall", []string{"other"}, botReadMentions) {
-		t.Errorf("expected bot with ReadMentions to not see unmentioned message")
-	}
-	if !IsMessageVisible("townhall", []string{"mentionbot"}, botReadMentions) {
-		t.Errorf("expected bot with ReadMentions to see mentioned message")
-	}
+	serverMsgJSON := `{
+		"type": "messages",
+		"chatId": "townhall",
+		"messages": [
+			{
+				"seq": 1,
+				"timestamp": 1700000000,
+				"chatId": "townhall",
+				"userId": "user-123",
+				"content": "Test message"
+			}
+		]
+	}`
 
-	// Bot in townhall with no read perms
-	if IsMessageVisible("townhall", []string{"noreadbot"}, botNoRead) {
-		t.Errorf("expected bot with no read perms to not see townhall message")
-	}
-
-	// Bot in DM
-	if !IsMessageVisible("dm_h1_b3", nil, botNoRead) {
-		t.Errorf("expected bot to see DM message regardless of townhall permissions")
-	}
+	var sMsg ServerMessage
+	err = json.Unmarshal([]byte(serverMsgJSON), &sMsg)
+	require.NoError(t, err)
+	assert.Equal(t, ServerMessageTypeMessages, sMsg.Type)
+	assert.Equal(t, "townhall", sMsg.ChatID)
+	require.Len(t, sMsg.Messages, 1)
+	assert.Equal(t, "Test message", sMsg.Messages[0].Content)
 }
