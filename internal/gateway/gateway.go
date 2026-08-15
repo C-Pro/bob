@@ -32,6 +32,8 @@ type Gateway struct {
 	conn                 *websocket.Conn
 	mu                   sync.Mutex
 	running              bool
+	botUserID            string
+	startTime            time.Time
 	systemPromptTownhall string
 	systemPromptDM       string
 }
@@ -41,9 +43,48 @@ func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 	return &Gateway{
 		cfg:                  cfg,
 		llmClient:            llmClient,
+		startTime:            time.Now(),
 		systemPromptTownhall: SystemPromptTownhall,
 		systemPromptDM:       SystemPromptDM,
 	}
+}
+
+// FetchBotUser fetches current bot user metadata from Besedka /api/me.
+func (g *Gateway) FetchBotUser(ctx context.Context) error {
+	reqURL := fmt.Sprintf("%s/api/me", strings.TrimSuffix(g.cfg.BesedkaURL, "/"))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create /api/me request: %w", err)
+	}
+
+	if g.cfg.BesedkaAPIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+g.cfg.BesedkaAPIKey)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to call /api/me: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("/api/me returned status %d", resp.StatusCode)
+	}
+
+	var userInfo struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&userInfo); err != nil {
+		return fmt.Errorf("failed to decode /api/me response: %w", err)
+	}
+
+	g.mu.Lock()
+	g.botUserID = userInfo.ID
+	g.mu.Unlock()
+
+	slog.Info("fetched bot user metadata", "botUserID", userInfo.ID, "botName", userInfo.Name)
+	return nil
 }
 
 var htmlTagRe = regexp.MustCompile(`<[^>]*>`)
@@ -164,7 +205,22 @@ func (g *Gateway) SendMessage(chatID, content string) error {
 
 // ProcessMessage handles a single incoming message from Besedka.
 func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error {
-	// Skip messages with empty content
+	g.mu.Lock()
+	botID := g.botUserID
+	startTime := g.startTime
+	g.mu.Unlock()
+
+	// 1. Ignore messages sent by the bot itself
+	if botID != "" && msg.UserID == botID {
+		return nil
+	}
+
+	// 2. Ignore messages older than bot start time (avoid backfill reprocessing)
+	if msg.Timestamp > 0 && msg.Timestamp < startTime.Unix()-5 {
+		return nil
+	}
+
+	// 3. Skip messages with empty content
 	if strings.TrimSpace(msg.Content) == "" {
 		return nil
 	}
@@ -202,6 +258,11 @@ func (g *Gateway) Start(ctx context.Context) error {
 	g.mu.Lock()
 	g.running = true
 	g.mu.Unlock()
+
+	// Try to fetch bot metadata from /api/me
+	if err := g.FetchBotUser(ctx); err != nil {
+		slog.Warn("could not fetch bot user metadata from /api/me", "error", err)
+	}
 
 	for {
 		select {

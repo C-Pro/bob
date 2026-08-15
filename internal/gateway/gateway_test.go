@@ -183,3 +183,22 @@ func TestGatewayWebSocketIntegration(t *testing.T) {
 		t.Fatal("timed out waiting for bot reply")
 	}
 }
+
+func TestIgnoreSelfMessages(t *testing.T) {
+	cfg := &config.Config{
+		BotHandle: "@bot",
+	}
+	gw := NewGateway(cfg, nil)
+	gw.botUserID = "bot-123"
+
+	// Self-message should be ignored
+	selfMsg := models.Message{
+		UserID:    "bot-123",
+		ChatID:    "dm_user_bot",
+		Content:   "Hello user",
+		Timestamp: time.Now().Unix(),
+	}
+
+	err := gw.ProcessMessage(context.Background(), selfMsg)
+	require.NoError(t, err)
+}

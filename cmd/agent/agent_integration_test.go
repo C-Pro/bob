@@ -35,6 +35,11 @@ func TestAgentIntegrationLoop(t *testing.T) {
 	botReplies := make(chan models.ClientMessage, 10)
 
 	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/me" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"id": "bot-user-id", "name": "bot"})
+			return
+		}
 		conn, err := upgrader.Upgrade(w, r, nil)
 		require.NoError(t, err)
 		defer conn.Close()
