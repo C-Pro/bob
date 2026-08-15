@@ -10,14 +10,14 @@ import (
 
 func TestLoadFromEnvDefaults(t *testing.T) {
 	// Clear relevant env vars
-	os.Unsetenv("BOT_HANDLE")
-	os.Unsetenv("BESEDKA_URL")
-	os.Unsetenv("BESEDKA_API_KEY")
-	os.Unsetenv("GEMINI_API_KEY")
-	os.Unsetenv("GEMINI_MODEL")
-	os.Unsetenv("GEMINI_BASE_URL")
-	os.Unsetenv("TOWNHALL_MAX_PARAGRAPHS")
-	os.Unsetenv("DM_MAX_PARAGRAPHS")
+	_ = os.Unsetenv("BOT_HANDLE")
+	_ = os.Unsetenv("BESEDKA_URL")
+	_ = os.Unsetenv("BESEDKA_API_KEY")
+	_ = os.Unsetenv("GEMINI_API_KEY")
+	_ = os.Unsetenv("GEMINI_MODEL")
+	_ = os.Unsetenv("GEMINI_BASE_URL")
+	_ = os.Unsetenv("TOWNHALL_MAX_PARAGRAPHS")
+	_ = os.Unsetenv("DM_MAX_PARAGRAPHS")
 
 	cfg, err := LoadFromEnv()
 	require.NoError(t, err)

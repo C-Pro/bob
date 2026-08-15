@@ -42,7 +42,7 @@ func TestAgentIntegrationLoop(t *testing.T) {
 		}
 		conn, err := upgrader.Upgrade(w, r, nil)
 		require.NoError(t, err)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 		// Send mock mention message to agent
 		_ = conn.WriteJSON(models.ServerMessage{

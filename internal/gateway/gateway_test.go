@@ -113,7 +113,7 @@ func TestGatewayWebSocketIntegration(t *testing.T) {
 		assert.Equal(t, "Bearer test-besedka-key", r.Header.Get("Authorization"))
 		conn, err := upgrader.Upgrade(w, r, nil)
 		require.NoError(t, err)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 		// Send a test message mentioning @bot
 		testServerMsg := models.ServerMessage{

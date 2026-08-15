@@ -121,7 +121,7 @@ func (c *Client) GenerateResponse(ctx context.Context, systemPrompt, userMessage
 		}
 
 		respBody, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if readErr != nil {
 			lastErr = fmt.Errorf("failed to read response body on attempt %d: %w", attempt+1, readErr)
 			continue
