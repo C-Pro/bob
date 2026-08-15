@@ -20,8 +20,10 @@ type Config struct {
 	DMMaxParagraphs       int
 }
 
-// LoadFromEnv loads configuration from environment variables with sensible defaults.
+// LoadFromEnv loads configuration from environment variables (or .env file) with sensible defaults.
 func LoadFromEnv() (*Config, error) {
+	LoadDotEnv(".env")
+
 	cfg := &Config{
 		BotHandle:             getEnvOrDefault("BOT_HANDLE", "@bot"),
 		BesedkaURL:            getEnvOrDefault("BESEDKA_URL", "http://localhost:8080"),
@@ -78,3 +80,27 @@ func getEnvIntOrDefault(key string, defaultValue int) int {
 	}
 	return defaultValue
 }
+
+// LoadDotEnv parses a simple .env file and populates environment variables that are not yet set.
+func LoadDotEnv(filename string) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return
+	}
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			val := strings.TrimSpace(parts[1])
+			if os.Getenv(key) == "" {
+				_ = os.Setenv(key, val)
+			}
+		}
+	}
+}
+

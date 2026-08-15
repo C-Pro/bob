@@ -46,22 +46,31 @@ func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 	}
 }
 
+var htmlTagRe = regexp.MustCompile(`<[^>]*>`)
+
+// StripHTML removes HTML tags from a string.
+func StripHTML(input string) string {
+	cleaned := htmlTagRe.ReplaceAllString(input, "")
+	return strings.TrimSpace(cleaned)
+}
+
 // IsMentionedOrDM checks if a message should be handled by the bot.
 func IsMentionedOrDM(handle, chatID, content string) (bool, string) {
+	plainText := StripHTML(content)
 	isDM := chatID != "townhall" && (strings.HasPrefix(chatID, "dm_") || chatID != "")
 	cleanHandle := strings.TrimPrefix(handle, "@")
 
 	// Match handle case-insensitively
 	re := regexp.MustCompile(`(?i)@` + regexp.QuoteMeta(cleanHandle) + `[:,]?`)
-	hasMention := re.MatchString(content)
+	hasMention := re.MatchString(plainText)
 
 	if hasMention {
-		prompt := re.ReplaceAllString(content, "")
+		prompt := re.ReplaceAllString(plainText, "")
 		return true, strings.TrimSpace(prompt)
 	}
 
 	if isDM {
-		return true, strings.TrimSpace(content)
+		return true, strings.TrimSpace(plainText)
 	}
 
 	return false, ""
@@ -236,6 +245,9 @@ func (g *Gateway) Start(ctx context.Context) error {
 
 			if serverMsg.Type == models.ServerMessageTypeMessages {
 				for _, m := range serverMsg.Messages {
+					if m.ChatID == "" {
+						m.ChatID = serverMsg.ChatID
+					}
 					go func(msg models.Message) {
 						if err := g.ProcessMessage(ctx, msg); err != nil {
 							slog.Error("error processing message", "chatID", msg.ChatID, "error", err)
