@@ -210,6 +210,15 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 	startTime := g.startTime
 	g.mu.Unlock()
 
+	// Ensure botUserID is populated if missing
+	if botID == "" {
+		if err := g.FetchBotUser(ctx); err == nil {
+			g.mu.Lock()
+			botID = g.botUserID
+			g.mu.Unlock()
+		}
+	}
+
 	// 1. Ignore messages sent by the bot itself
 	if botID != "" && msg.UserID == botID {
 		return nil
@@ -282,6 +291,12 @@ func (g *Gateway) Start(ctx context.Context) error {
 		}
 
 		slog.Info("connected to Besedka websocket gateway")
+
+		if g.botUserID == "" {
+			if err := g.FetchBotUser(ctx); err != nil {
+				slog.Warn("could not fetch bot user metadata from /api/me after WS dial", "error", err)
+			}
+		}
 
 		for {
 			g.mu.Lock()

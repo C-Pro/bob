@@ -111,6 +111,14 @@ func TestGatewayWebSocketIntegration(t *testing.T) {
 
 	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "Bearer test-besedka-key", r.Header.Get("Authorization"))
+		if r.URL.Path == "/api/me" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"id":   "bot-id-123",
+				"name": "bot",
+			})
+			return
+		}
 		conn, err := upgrader.Upgrade(w, r, nil)
 		require.NoError(t, err)
 		defer func() { _ = conn.Close() }()
