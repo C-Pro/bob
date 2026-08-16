@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -86,59 +85,6 @@ func (g *Gateway) FetchBotUser(ctx context.Context) error {
 
 	slog.Info("fetched bot user metadata", "botUserID", userInfo.ID, "botName", userInfo.Name)
 	return nil
-}
-
-// EnsureBotRegistration attempts to auto-register the bot user via Admin API if no API key is configured.
-func (g *Gateway) EnsureBotRegistration(ctx context.Context) {
-	if g.cfg.BesedkaAPIKey != "" {
-		return
-	}
-
-	botName := strings.TrimPrefix(g.cfg.BotHandle, "@")
-
-	u, err := url.Parse(g.cfg.BesedkaURL)
-	if err != nil {
-		return
-	}
-
-	host := u.Hostname()
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	adminURL := fmt.Sprintf("%s://%s:8081/admin/users", u.Scheme, host)
-
-	bodyData, _ := json.Marshal(map[string]any{
-		"username":    botName,
-		"displayName": "Bob Agent",
-		"type":        "bot",
-		"botPermissions": map[string]bool{
-			"readMentions": true,
-			"write":        true,
-		},
-	})
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, adminURL, bytes.NewReader(bodyData))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.SetBasicAuth("admin", "1337chat")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		slog.Debug("could not connect to Admin API for bot registration", "error", err)
-		return
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	var result struct {
-		Success bool   `json:"success"`
-		APIKey  string `json:"apiKey"`
-	}
-	if json.NewDecoder(resp.Body).Decode(&result) == nil && result.APIKey != "" {
-		g.cfg.BesedkaAPIKey = result.APIKey
-		slog.Info("automatically registered bot user via Admin API", "username", botName)
-	}
 }
 
 var htmlTagRe = regexp.MustCompile(`<[^>]*>`)
@@ -312,9 +258,6 @@ func (g *Gateway) Start(ctx context.Context) error {
 	g.mu.Lock()
 	g.running = true
 	g.mu.Unlock()
-
-	// Try to auto-register bot user if API key is missing
-	g.EnsureBotRegistration(ctx)
 
 	// Try to fetch bot metadata from /api/me
 	if err := g.FetchBotUser(ctx); err != nil {
