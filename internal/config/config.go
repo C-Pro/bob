@@ -24,9 +24,14 @@ type Config struct {
 func LoadFromEnv() (*Config, error) {
 	LoadDotEnv(".env")
 
+	defaultBesedkaURL := os.Getenv("BASE_URL")
+	if defaultBesedkaURL == "" {
+		defaultBesedkaURL = "http://127.0.0.1:8080"
+	}
+
 	cfg := &Config{
 		BotHandle:             getEnvOrDefault("BOT_HANDLE", "@bot"),
-		BesedkaURL:            getEnvOrDefault("BESEDKA_URL", "http://127.0.0.1:8080"),
+		BesedkaURL:            getEnvOrDefault("BESEDKA_URL", defaultBesedkaURL),
 		BesedkaAPIKey:         os.Getenv("BESEDKA_API_KEY"),
 		GeminiAPIKey:          os.Getenv("GEMINI_API_KEY"),
 		GeminiModel:           getEnvOrDefault("GEMINI_MODEL", "gemini-3.7-flash"),
