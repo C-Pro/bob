@@ -22,7 +22,7 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	cfg, err := LoadFromEnv()
 	require.NoError(t, err)
 	assert.Equal(t, "@bot", cfg.BotHandle)
-	assert.Equal(t, "http://localhost:8080", cfg.BesedkaURL)
+	assert.Equal(t, "http://127.0.0.1:8080", cfg.BesedkaURL)
 	assert.Equal(t, "gemini-3.7-flash", cfg.GeminiModel)
 	assert.Equal(t, "https://generativelanguage.googleapis.com/v1beta/openai/", cfg.GeminiBaseURL)
 	assert.Equal(t, 2, cfg.TownhallMaxParagraphs)

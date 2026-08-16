@@ -26,7 +26,7 @@ func LoadFromEnv() (*Config, error) {
 
 	cfg := &Config{
 		BotHandle:             getEnvOrDefault("BOT_HANDLE", "@bot"),
-		BesedkaURL:            getEnvOrDefault("BESEDKA_URL", "http://localhost:8080"),
+		BesedkaURL:            getEnvOrDefault("BESEDKA_URL", "http://127.0.0.1:8080"),
 		BesedkaAPIKey:         os.Getenv("BESEDKA_API_KEY"),
 		GeminiAPIKey:          os.Getenv("GEMINI_API_KEY"),
 		GeminiModel:           getEnvOrDefault("GEMINI_MODEL", "gemini-3.7-flash"),
@@ -38,6 +38,11 @@ func LoadFromEnv() (*Config, error) {
 	// Normalize bot handle to ensure it starts with @
 	if !strings.HasPrefix(cfg.BotHandle, "@") {
 		cfg.BotHandle = "@" + cfg.BotHandle
+	}
+
+	// Avoid IPv6 loopback connection reset issues in containerized environments by normalizing localhost to 127.0.0.1
+	if strings.Contains(cfg.BesedkaURL, "localhost") {
+		cfg.BesedkaURL = strings.ReplaceAll(cfg.BesedkaURL, "localhost", "127.0.0.1")
 	}
 
 	// Normalize base URL to ensure trailing slash
