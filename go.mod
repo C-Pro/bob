@@ -1,6 +1,6 @@
 module bob
 
-go 1.24
+go 1.26.5
 
 require (
 	github.com/fasthttp/websocket v1.5.12
