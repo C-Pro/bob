@@ -19,7 +19,7 @@
 
 ## 4. Configuration & State Management
 - **Configuration:** Environment variables (`env` / `os.Getenv`)
-- **State Storage (Phase 1):** In-memory state & message queues (preparing for SQLite / BoltDB in Phase 2)
+- **Context & State Storage:** In-memory thread-safe per-chat ring buffers (`internal/chatcontext`) bounded by `MSG_RING_BUFFER_SIZE` (default 100) with dynamic templated prompt generation (`internal/prompt`) and user metadata caching (`internal/gateway`).
 
 ## 5. Testing & Code Quality
 - **Testing Framework:** Native Go `testing` package, `go test -race -cover`
