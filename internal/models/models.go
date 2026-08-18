@@ -36,7 +36,7 @@ type User struct {
 	AvatarURL   string `json:"avatarUrl,omitempty"`
 }
 
-// GetDisplayName returns the most friendly display name available, falling back to "User" instead of raw UUID.
+// GetDisplayName returns the user's DisplayName or Name, falling back to UserName if empty.
 func (u User) GetDisplayName() string {
 	if u.DisplayName != "" {
 		return u.DisplayName
@@ -47,7 +47,7 @@ func (u User) GetDisplayName() string {
 	if u.UserName != "" {
 		return u.UserName
 	}
-	return "User"
+	return ""
 }
 
 // GetUserName returns the username handle if available.

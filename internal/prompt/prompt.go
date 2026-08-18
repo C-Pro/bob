@@ -37,7 +37,7 @@ type DMPromptData struct {
 // RenderTownhallPrompt builds the system prompt for Townhall conversations.
 func RenderTownhallPrompt(bot models.User, botHandle string, maxParagraphs int) string {
 	botDisplayName := bot.GetDisplayName()
-	if botDisplayName == "" || botDisplayName == bot.ID || botDisplayName == "User" {
+	if botDisplayName == "" || botDisplayName == bot.ID {
 		if bot.GetUserName() != "" {
 			botDisplayName = bot.GetUserName()
 		} else {
@@ -77,7 +77,7 @@ func RenderTownhallPrompt(bot models.User, botHandle string, maxParagraphs int) 
 // RenderDMPrompt builds the system prompt for Direct Message conversations with a specific user.
 func RenderDMPrompt(bot models.User, botHandle string, targetUser models.User, maxParagraphs int) string {
 	botDisplayName := bot.GetDisplayName()
-	if botDisplayName == "" || botDisplayName == bot.ID || botDisplayName == "User" {
+	if botDisplayName == "" || botDisplayName == bot.ID {
 		if bot.GetUserName() != "" {
 			botDisplayName = bot.GetUserName()
 		} else {
@@ -102,7 +102,7 @@ func RenderDMPrompt(bot models.User, botHandle string, targetUser models.User, m
 		if targetUser.GetUserName() != "" {
 			userDisplayName = targetUser.GetUserName()
 		} else {
-			userDisplayName = "User"
+			userDisplayName = "the user"
 		}
 	}
 

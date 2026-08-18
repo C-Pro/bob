@@ -362,7 +362,7 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 
 	// 3. Resolve user display name (with dynamic cache refresh on miss)
 	senderName := g.userCache.GetDisplayName(msg.UserID)
-	if senderName == "User" || senderName == "" {
+	if senderName == "" {
 		if users, err := g.FetchUsers(ctx); err == nil && len(users) > 0 {
 			senderName = g.userCache.GetDisplayName(msg.UserID)
 		}
@@ -393,8 +393,8 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 	var systemPrompt string
 	if isDM {
 		targetUser, ok := g.userCache.Get(msg.UserID)
-		if !ok || targetUser.GetDisplayName() == "User" {
-			targetUser = models.User{ID: msg.UserID, DisplayName: senderName}
+		if !ok || targetUser.GetDisplayName() == "" {
+			targetUser = models.User{ID: msg.UserID, DisplayName: senderName, UserName: senderName}
 		}
 		systemPrompt = prompt.RenderDMPrompt(botUser, g.cfg.BotHandle, targetUser, g.cfg.DMMaxParagraphs)
 	} else {

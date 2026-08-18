@@ -18,10 +18,10 @@ import (
 func TestUserCache(t *testing.T) {
 	cache := NewUserCache()
 
-	// Initial empty check - returns "User" fallback and empty username, never raw UUID
+	// Initial empty check - returns empty fallback for unknown user, never raw UUID
 	_, ok := cache.Get("u1")
 	assert.False(t, ok)
-	assert.Equal(t, "User", cache.GetDisplayName("u1"))
+	assert.Equal(t, "", cache.GetDisplayName("u1"))
 	assert.Equal(t, "", cache.GetUserName("u1"))
 
 	// Set single

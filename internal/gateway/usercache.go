@@ -43,14 +43,14 @@ func (c *UserCache) Get(userID string) (models.User, bool) {
 	return u, ok
 }
 
-// GetDisplayName returns the display name for a given user ID, or falls back to "User" (never raw UUID).
+// GetDisplayName returns the display name for a given user ID, falling back to username or empty string.
 func (c *UserCache) GetDisplayName(userID string) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if u, ok := c.users[userID]; ok {
 		return u.GetDisplayName()
 	}
-	return "User"
+	return ""
 }
 
 // GetUserName returns the username handle for a given user ID, or empty string if unknown.

@@ -49,10 +49,15 @@ func TestRenderDMPrompt(t *testing.T) {
 	assert.Contains(t, prompt, "maximum 5 paragraphs")
 	assert.Contains(t, prompt, "direct message conversation")
 
-	// Fallback user display name should fall back to User, never expose raw UUID user-99
-	userEmpty := models.User{ID: "user-99"}
-	prompt2 := RenderDMPrompt(bot, "@bob_bot", userEmpty, 0)
-	assert.Contains(t, prompt2, "User")
+	// Fallback user display name should fall back to username or "the user", never expose raw UUID user-99
+	userWithUsername := models.User{ID: "user-99", UserName: "alice99"}
+	prompt2 := RenderDMPrompt(bot, "@bob_bot", userWithUsername, 0)
+	assert.Contains(t, prompt2, "alice99")
 	assert.NotContains(t, prompt2, "user-99")
 	assert.Contains(t, prompt2, "maximum 10 paragraphs")
+
+	userEmpty := models.User{ID: "user-99"}
+	prompt3 := RenderDMPrompt(bot, "@bob_bot", userEmpty, 0)
+	assert.Contains(t, prompt3, "the user")
+	assert.NotContains(t, prompt3, "user-99")
 }
