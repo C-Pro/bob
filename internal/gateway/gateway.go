@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -49,12 +50,42 @@ func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 	}
 }
 
-var htmlTagRe = regexp.MustCompile(`<[^>]*>`)
+var (
+	brTagRe        = regexp.MustCompile(`(?i)<br\s*/?>`)
+	blockEndTagRe  = regexp.MustCompile(`(?i)</(p|div|li|tr|h[1-6]|blockquote)>`)
+	htmlTagRe      = regexp.MustCompile(`<[^>]*>`)
+	multiNewlineRe = regexp.MustCompile(`\n{3,}`)
+)
 
-// StripHTML removes HTML tags from a string.
+// ExtractMessageText extracts clean plain text / markdown from a message.
+// It uses RawContent when present, or sanitizes and formats HTML content.
+func ExtractMessageText(msg models.Message) string {
+	if strings.TrimSpace(msg.RawContent) != "" {
+		return strings.TrimSpace(msg.RawContent)
+	}
+	return StripHTML(msg.Content)
+}
+
+// StripHTML converts HTML to clean plaintext with preserved line breaks and unescaped entities.
 func StripHTML(input string) string {
-	cleaned := htmlTagRe.ReplaceAllString(input, "")
-	return strings.TrimSpace(cleaned)
+	if input == "" {
+		return ""
+	}
+	// 1. Replace <br> tags with newlines
+	text := brTagRe.ReplaceAllString(input, "\n")
+	// 2. Replace block closing tags with double newlines
+	text = blockEndTagRe.ReplaceAllString(text, "\n\n")
+	// 3. Strip remaining HTML tags
+	text = htmlTagRe.ReplaceAllString(text, "")
+	// 4. Unescape HTML entities (&amp;, &lt;, &gt;, &quot;, &#39;, etc.)
+	text = html.UnescapeString(text)
+	// 5. Normalize consecutive newlines
+	text = multiNewlineRe.ReplaceAllString(text, "\n\n")
+	return strings.TrimSpace(text)
+}
+
+func normalizeForDedup(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 // IsMentionedOrDM checks if a message should be handled by the bot.
@@ -179,12 +210,15 @@ func (g *Gateway) WarmupContext(ctx context.Context) error {
 		slog.Warn("could not fetch chats list during context warmup", "error", err)
 	}
 
-	chatIDs := make(map[string]bool)
-	chatIDs["townhall"] = true
+	hasTownhall := false
 	for _, c := range chats {
-		if c.ID != "" {
-			chatIDs[c.ID] = true
+		if c.ID == "townhall" {
+			hasTownhall = true
+			break
 		}
+	}
+	if !hasTownhall {
+		chats = append(chats, models.Chat{ID: "townhall"})
 	}
 
 	g.mu.Lock()
@@ -192,18 +226,35 @@ func (g *Gateway) WarmupContext(ctx context.Context) error {
 	botName := g.botUser.GetDisplayName()
 	g.mu.Unlock()
 
-	for chatID := range chatIDs {
-		msgs, err := g.FetchChatMessages(ctx, chatID, g.cfg.MsgRingBufferSize)
-		if err != nil {
-			slog.Debug("could not fetch messages for chat during warmup", "chatID", chatID, "error", err)
+	limit := int64(g.cfg.MsgRingBufferSize)
+	if limit <= 0 {
+		limit = 100
+	}
+
+	for _, chat := range chats {
+		if chat.ID == "" {
 			continue
 		}
 
-		rb := g.contextManager.GetOrCreate(chatID)
+		toSeq := int64(chat.LastSeq)
+		fromSeq := int64(1)
+		if toSeq > 0 {
+			fromSeq = max(1, toSeq-limit+1)
+		} else {
+			toSeq = 1000000
+		}
+
+		msgs, err := g.FetchChatMessages(ctx, chat.ID, fromSeq, toSeq)
+		if err != nil {
+			slog.Debug("could not fetch messages for chat during warmup", "chatID", chat.ID, "error", err)
+			continue
+		}
+
+		rb := g.contextManager.GetOrCreate(chat.ID)
 		rb.Clear()
 
 		for _, m := range msgs {
-			cleanContent := StripHTML(m.Content)
+			cleanContent := ExtractMessageText(m)
 			if cleanContent == "" {
 				continue
 			}
@@ -229,7 +280,7 @@ func (g *Gateway) WarmupContext(ctx context.Context) error {
 		}
 	}
 
-	slog.Info("completed context warmup for active chats", "chatCount", len(chatIDs))
+	slog.Info("completed context warmup for active chats", "chatCount", len(chats))
 	return nil
 }
 
@@ -239,7 +290,7 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 		msg.ChatID = "townhall"
 	}
 
-	cleanContent := StripHTML(msg.Content)
+	cleanContent := ExtractMessageText(msg)
 	if cleanContent == "" {
 		return nil
 	}
@@ -264,7 +315,14 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 	if botID != "" && msg.UserID == botID {
 		entries := g.contextManager.GetOrCreate(msg.ChatID).Entries()
 		// Deduplicate if already appended on outgoing SendMessage
-		if len(entries) == 0 || entries[len(entries)-1].Role != "assistant" || entries[len(entries)-1].Content != cleanContent {
+		isDuplicate := false
+		if len(entries) > 0 {
+			lastEntry := entries[len(entries)-1]
+			if lastEntry.Role == "assistant" && normalizeForDedup(lastEntry.Content) == normalizeForDedup(cleanContent) {
+				isDuplicate = true
+			}
+		}
+		if !isDuplicate {
 			g.contextManager.Push(msg.ChatID, chatcontext.Entry{
 				Role:       "assistant",
 				SenderID:   msg.UserID,
@@ -281,8 +339,13 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 		return nil
 	}
 
-	// 3. Resolve user display name
+	// 3. Resolve user display name (with dynamic cache refresh on miss)
 	senderName := g.userCache.GetDisplayName(msg.UserID)
+	if senderName == "User" || senderName == "" {
+		if users, err := g.FetchUsers(ctx); err == nil && len(users) > 0 {
+			senderName = g.userCache.GetDisplayName(msg.UserID)
+		}
+	}
 
 	// 4. Determine trigger condition
 	shouldProcess, _ := IsMentionedOrDM(g.cfg.BotHandle, msg.ChatID, msg.Content)
@@ -303,8 +366,8 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 	isDM := msg.ChatID != "townhall"
 	var systemPrompt string
 	if isDM {
-		targetUser, _ := g.userCache.Get(msg.UserID)
-		if targetUser.ID == "" {
+		targetUser, ok := g.userCache.Get(msg.UserID)
+		if !ok || targetUser.GetDisplayName() == "User" {
 			targetUser = models.User{ID: msg.UserID, DisplayName: senderName}
 		}
 		systemPrompt = prompt.RenderDMPrompt(botUser, g.cfg.BotHandle, targetUser, g.cfg.DMMaxParagraphs)

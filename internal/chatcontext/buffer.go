@@ -90,8 +90,9 @@ func (rb *RingBuffer) ToLLMMessages() []llm.Message {
 		}
 
 		var content string
-		if role == "user" && strings.TrimSpace(e.SenderName) != "" {
-			content = fmt.Sprintf("%s: %s", strings.TrimSpace(e.SenderName), e.Content)
+		senderName := strings.TrimSpace(e.SenderName)
+		if role == "user" && senderName != "" && senderName != e.SenderID {
+			content = fmt.Sprintf("%s: %s", senderName, e.Content)
 		} else {
 			content = e.Content
 		}

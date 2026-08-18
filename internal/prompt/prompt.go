@@ -37,13 +37,21 @@ type DMPromptData struct {
 // RenderTownhallPrompt builds the system prompt for Townhall conversations.
 func RenderTownhallPrompt(bot models.User, botHandle string, maxParagraphs int) string {
 	botDisplayName := bot.GetDisplayName()
-	if botDisplayName == "" || botDisplayName == bot.ID {
-		botDisplayName = "AI Assistant"
+	if botDisplayName == "" || botDisplayName == bot.ID || botDisplayName == "User" {
+		if bot.GetUserName() != "" {
+			botDisplayName = bot.GetUserName()
+		} else {
+			botDisplayName = "AI Assistant"
+		}
 	}
 
 	handle := botHandle
 	if handle == "" {
-		handle = "@" + bot.GetUserName()
+		if bot.GetUserName() != "" {
+			handle = "@" + bot.GetUserName()
+		} else {
+			handle = "@bot"
+		}
 	}
 	if !strings.HasPrefix(handle, "@") {
 		handle = "@" + handle
@@ -69,21 +77,33 @@ func RenderTownhallPrompt(bot models.User, botHandle string, maxParagraphs int) 
 // RenderDMPrompt builds the system prompt for Direct Message conversations with a specific user.
 func RenderDMPrompt(bot models.User, botHandle string, targetUser models.User, maxParagraphs int) string {
 	botDisplayName := bot.GetDisplayName()
-	if botDisplayName == "" || botDisplayName == bot.ID {
-		botDisplayName = "AI Assistant"
+	if botDisplayName == "" || botDisplayName == bot.ID || botDisplayName == "User" {
+		if bot.GetUserName() != "" {
+			botDisplayName = bot.GetUserName()
+		} else {
+			botDisplayName = "AI Assistant"
+		}
 	}
 
 	handle := botHandle
 	if handle == "" {
-		handle = "@" + bot.GetUserName()
+		if bot.GetUserName() != "" {
+			handle = "@" + bot.GetUserName()
+		} else {
+			handle = "@bot"
+		}
 	}
 	if !strings.HasPrefix(handle, "@") {
 		handle = "@" + handle
 	}
 
 	userDisplayName := targetUser.GetDisplayName()
-	if userDisplayName == "" {
-		userDisplayName = "User"
+	if userDisplayName == "" || userDisplayName == targetUser.ID {
+		if targetUser.GetUserName() != "" {
+			userDisplayName = targetUser.GetUserName()
+		} else {
+			userDisplayName = "User"
+		}
 	}
 
 	if maxParagraphs <= 0 {

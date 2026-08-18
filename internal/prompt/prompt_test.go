@@ -21,11 +21,12 @@ func TestRenderTownhallPrompt(t *testing.T) {
 	assert.Contains(t, prompt, "maximum 3 paragraphs")
 	assert.Contains(t, prompt, "Townhall")
 
-	// Fallback handling
+	// Fallback handling: fallback bot should use AI Assistant (@bot), never expose raw UUID
 	botEmpty := models.User{ID: "bot-2"}
 	prompt2 := RenderTownhallPrompt(botEmpty, "", 0)
 	assert.Contains(t, prompt2, "AI Assistant")
-	assert.Contains(t, prompt2, "@bot-2")
+	assert.Contains(t, prompt2, "@bot")
+	assert.NotContains(t, prompt2, "bot-2")
 	assert.Contains(t, prompt2, "maximum 2 paragraphs")
 }
 
@@ -48,9 +49,10 @@ func TestRenderDMPrompt(t *testing.T) {
 	assert.Contains(t, prompt, "maximum 5 paragraphs")
 	assert.Contains(t, prompt, "direct message conversation")
 
-	// Fallback user display name
+	// Fallback user display name should fall back to User, never expose raw UUID user-99
 	userEmpty := models.User{ID: "user-99"}
 	prompt2 := RenderDMPrompt(bot, "@bob_bot", userEmpty, 0)
-	assert.Contains(t, prompt2, "user-99")
+	assert.Contains(t, prompt2, "User")
+	assert.NotContains(t, prompt2, "user-99")
 	assert.Contains(t, prompt2, "maximum 10 paragraphs")
 }

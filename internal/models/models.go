@@ -36,7 +36,7 @@ type User struct {
 	AvatarURL   string `json:"avatarUrl,omitempty"`
 }
 
-// GetDisplayName returns the most friendly display name available.
+// GetDisplayName returns the most friendly display name available, falling back to "User" instead of raw UUID.
 func (u User) GetDisplayName() string {
 	if u.DisplayName != "" {
 		return u.DisplayName
@@ -47,7 +47,7 @@ func (u User) GetDisplayName() string {
 	if u.UserName != "" {
 		return u.UserName
 	}
-	return u.ID
+	return "User"
 }
 
 // GetUserName returns the username handle if available.
@@ -58,7 +58,7 @@ func (u User) GetUserName() string {
 	if u.Name != "" {
 		return u.Name
 	}
-	return u.ID
+	return ""
 }
 
 // Chat represents a Besedka chat or channel.
@@ -66,6 +66,9 @@ type Chat struct {
 	ID           string   `json:"id"`
 	Name         string   `json:"name,omitempty"`
 	Type         string   `json:"type,omitempty"` // "townhall", "dm", etc.
+	LastSeq      int      `json:"lastSeq,omitempty"`
+	IsDM         bool     `json:"isDm,omitempty"`
+	LastSeenSeq  int64    `json:"lastSeenSeq,omitempty"`
 	UserIDs      []string `json:"userIds,omitempty"`
 	TargetUserID string   `json:"targetUserId,omitempty"`
 }

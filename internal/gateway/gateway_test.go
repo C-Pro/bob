@@ -239,8 +239,14 @@ func TestProcessMessage_SelfMessageHandling(t *testing.T) {
 	assert.Equal(t, "assistant", entries[0].Role)
 	assert.Equal(t, "Hello everyone from bot", entries[0].Content)
 
-	// Duplicate self message should be ignored
-	err = gw.ProcessMessage(context.Background(), selfTownhallMsg)
+	// Duplicate self message in HTML format (e.g. broadcast from server) should be deduplicated
+	echoMsg := models.Message{
+		UserID:    "bot-123",
+		ChatID:    "townhall",
+		Content:   "<p>Hello everyone from bot</p>",
+		Timestamp: time.Now().Unix(),
+	}
+	err = gw.ProcessMessage(context.Background(), echoMsg)
 	require.NoError(t, err)
 	assert.Equal(t, 1, gw.contextManager.GetOrCreate("townhall").Len())
 
@@ -258,6 +264,22 @@ func TestProcessMessage_SelfMessageHandling(t *testing.T) {
 	require.Len(t, dmEntries, 1)
 	assert.Equal(t, "assistant", dmEntries[0].Role)
 	assert.Equal(t, "Hello from bot in DM", dmEntries[0].Content)
+}
+
+func TestExtractMessageText(t *testing.T) {
+	// RawContent priority
+	msg1 := models.Message{
+		Content:    "<p>Paragraph 1</p><p>Paragraph 2</p>",
+		RawContent: "Paragraph 1\n\nParagraph 2",
+	}
+	assert.Equal(t, "Paragraph 1\n\nParagraph 2", ExtractMessageText(msg1))
+
+	// HTML parsing with line breaks and entities
+	msg2 := models.Message{
+		Content: "<p>Hello &amp; welcome!<br>Next line &lt;3</p><p>Second paragraph &#39;test&#39; &quot;quote&quot;.</p>",
+	}
+	expected := "Hello & welcome!\nNext line <3\n\nSecond paragraph 'test' \"quote\"."
+	assert.Equal(t, expected, ExtractMessageText(msg2))
 }
 
 func TestProcessMessage_TownhallContextAccumulation(t *testing.T) {
@@ -435,17 +457,21 @@ func TestWarmupContext(t *testing.T) {
 			})
 		case "/api/chats":
 			_ = json.NewEncoder(w).Encode([]models.Chat{
-				{ID: "townhall"},
-				{ID: "dm_u1"},
+				{ID: "townhall", LastSeq: 2},
+				{ID: "dm_u1", LastSeq: 1},
 			})
 		case "/api/chats/townhall/messages":
+			assert.Equal(t, "1", r.URL.Query().Get("fromSeq"))
+			assert.Equal(t, "2", r.URL.Query().Get("toSeq"))
 			_ = json.NewEncoder(w).Encode([]models.Message{
-				{Seq: 1, ChatID: "townhall", UserID: "u1", Content: "Hello world", Timestamp: 10},
-				{Seq: 2, ChatID: "townhall", UserID: "bot-1", Content: "Hello Alice", Timestamp: 11},
+				{Seq: 1, ChatID: "townhall", UserID: "u1", Content: "<p>Hello world</p>", Timestamp: 10},
+				{Seq: 2, ChatID: "townhall", UserID: "bot-1", Content: "<p>Hello Alice</p>", Timestamp: 11},
 			})
 		case "/api/chats/dm_u1/messages":
+			assert.Equal(t, "1", r.URL.Query().Get("fromSeq"))
+			assert.Equal(t, "1", r.URL.Query().Get("toSeq"))
 			_ = json.NewEncoder(w).Encode([]models.Message{
-				{Seq: 1, ChatID: "dm_u1", UserID: "u1", Content: "DM test", Timestamp: 12},
+				{Seq: 1, ChatID: "dm_u1", UserID: "u1", Content: "<p>DM test</p>", Timestamp: 12},
 			})
 		}
 	}))

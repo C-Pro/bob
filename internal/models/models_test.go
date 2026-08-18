@@ -58,6 +58,6 @@ func TestUserHelpers(t *testing.T) {
 	assert.Equal(t, "Bob", u2.GetUserName())
 
 	u3 := User{ID: "u3"}
-	assert.Equal(t, "u3", u3.GetDisplayName())
-	assert.Equal(t, "u3", u3.GetUserName())
+	assert.Equal(t, "User", u3.GetDisplayName())
+	assert.Equal(t, "", u3.GetUserName())
 }

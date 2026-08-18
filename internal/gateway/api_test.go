@@ -18,11 +18,11 @@ import (
 func TestUserCache(t *testing.T) {
 	cache := NewUserCache()
 
-	// Initial empty check
+	// Initial empty check - returns "User" fallback and empty username, never raw UUID
 	_, ok := cache.Get("u1")
 	assert.False(t, ok)
-	assert.Equal(t, "u1", cache.GetDisplayName("u1"))
-	assert.Equal(t, "u1", cache.GetUserName("u1"))
+	assert.Equal(t, "User", cache.GetDisplayName("u1"))
+	assert.Equal(t, "", cache.GetUserName("u1"))
 
 	// Set single
 	cache.Set(models.User{
@@ -121,8 +121,8 @@ func TestFetchChats(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "/api/chats", r.URL.Path)
 		_ = json.NewEncoder(w).Encode([]models.Chat{
-			{ID: "townhall", Name: "Townhall", Type: "townhall"},
-			{ID: "dm_user1", Name: "DM with User 1", Type: "dm"},
+			{ID: "townhall", Name: "Townhall", Type: "townhall", LastSeq: 15},
+			{ID: "dm_user1", Name: "DM with User 1", Type: "dm", LastSeq: 5},
 		})
 	}))
 	defer server.Close()
@@ -135,13 +135,16 @@ func TestFetchChats(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, chats, 2)
 	assert.Equal(t, "townhall", chats[0].ID)
+	assert.Equal(t, 15, chats[0].LastSeq)
 	assert.Equal(t, "dm_user1", chats[1].ID)
+	assert.Equal(t, 5, chats[1].LastSeq)
 }
 
 func TestFetchChatMessages(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "/api/chats/townhall/messages", r.URL.Path)
-		assert.Equal(t, "10", r.URL.Query().Get("limit"))
+		assert.Equal(t, "1", r.URL.Query().Get("fromSeq"))
+		assert.Equal(t, "10", r.URL.Query().Get("toSeq"))
 		_ = json.NewEncoder(w).Encode([]models.Message{
 			{Seq: 1, ChatID: "townhall", UserID: "u1", Content: "First msg", Timestamp: time.Now().Unix()},
 			{Seq: 2, ChatID: "townhall", UserID: "u2", Content: "Second msg", Timestamp: time.Now().Unix()},
@@ -153,7 +156,7 @@ func TestFetchChatMessages(t *testing.T) {
 	gw := NewGateway(cfg, nil)
 	gw.httpClient = server.Client()
 
-	msgs, err := gw.FetchChatMessages(context.Background(), "townhall", 10)
+	msgs, err := gw.FetchChatMessages(context.Background(), "townhall", 1, 10)
 	require.NoError(t, err)
 	assert.Len(t, msgs, 2)
 	assert.Equal(t, "First msg", msgs[0].Content)

@@ -138,11 +138,18 @@ func (g *Gateway) FetchChats(ctx context.Context) ([]models.Chat, error) {
 }
 
 // FetchChatMessages retrieves historical messages for a chat from Besedka /api/chats/{chat_id}/messages.
-func (g *Gateway) FetchChatMessages(ctx context.Context, chatID string, limit int) ([]models.Message, error) {
-	reqURL := fmt.Sprintf("%s/api/chats/%s/messages", strings.TrimSuffix(g.cfg.BesedkaURL, "/"), chatID)
-	if limit > 0 {
-		reqURL = fmt.Sprintf("%s?limit=%d", reqURL, limit)
+func (g *Gateway) FetchChatMessages(ctx context.Context, chatID string, fromSeq, toSeq int64) ([]models.Message, error) {
+	if fromSeq <= 0 {
+		fromSeq = 1
 	}
+	if toSeq <= 0 {
+		toSeq = 1000000
+	}
+	if fromSeq > toSeq {
+		fromSeq = toSeq
+	}
+
+	reqURL := fmt.Sprintf("%s/api/chats/%s/messages?fromSeq=%d&toSeq=%d", strings.TrimSuffix(g.cfg.BesedkaURL, "/"), chatID, fromSeq, toSeq)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {

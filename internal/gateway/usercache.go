@@ -43,24 +43,24 @@ func (c *UserCache) Get(userID string) (models.User, bool) {
 	return u, ok
 }
 
-// GetDisplayName returns the display name for a given user ID, or fallback to the user ID.
+// GetDisplayName returns the display name for a given user ID, or falls back to "User" (never raw UUID).
 func (c *UserCache) GetDisplayName(userID string) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if u, ok := c.users[userID]; ok {
 		return u.GetDisplayName()
 	}
-	return userID
+	return "User"
 }
 
-// GetUserName returns the username handle for a given user ID, or fallback to the user ID.
+// GetUserName returns the username handle for a given user ID, or empty string if unknown.
 func (c *UserCache) GetUserName(userID string) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if u, ok := c.users[userID]; ok {
 		return u.GetUserName()
 	}
-	return userID
+	return ""
 }
 
 // All returns a slice of all cached users.

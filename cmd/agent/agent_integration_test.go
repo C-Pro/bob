@@ -232,3 +232,118 @@ func TestAgentIntegration_MultiTurnContextFlow(t *testing.T) {
 	assert.Equal(t, "Alice: @bot what do you think?", messages[3].Content)
 }
 
+func TestAgentIntegration_DMContextAndNameResolution(t *testing.T) {
+	var capturedRequests []llm.CompletionRequest
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req llm.CompletionRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		capturedRequests = append(capturedRequests, req)
+
+		resp := llm.CompletionResponse{
+			Choices: []llm.Choice{
+				{Index: 0, Message: llm.Message{Role: "assistant", Content: "Sure, let's talk about fins."}},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer llmServer.Close()
+
+	upgrader := websocket.Upgrader{}
+	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/me" {
+			_ = json.NewEncoder(w).Encode(models.User{ID: "bot-id", UserName: "bob", DisplayName: "Agent Bob"})
+			return
+		}
+		if r.URL.Path == "/api/users" {
+			_ = json.NewEncoder(w).Encode([]models.User{
+				{ID: "user-uuid-1234", UserName: "cpro", DisplayName: "C-Pro"},
+			})
+			return
+		}
+		if r.URL.Path == "/api/chats" {
+			_ = json.NewEncoder(w).Encode([]models.Chat{
+				{ID: "townhall", Type: "townhall", LastSeq: 0},
+				{ID: "dm_bot_user", Type: "dm", LastSeq: 2},
+			})
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/chats/dm_bot_user/messages") {
+			assert.Equal(t, "1", r.URL.Query().Get("fromSeq"))
+			assert.Equal(t, "2", r.URL.Query().Get("toSeq"))
+			_ = json.NewEncoder(w).Encode([]models.Message{
+				{Seq: 1, ChatID: "dm_bot_user", UserID: "user-uuid-1234", Content: "<p>Where to buy freediving fins?</p>", Timestamp: 100},
+				{Seq: 2, ChatID: "dm_bot_user", UserID: "bot-id", Content: "<p>Aquamaster in Kuta</p>", Timestamp: 101},
+			})
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/chats/") && strings.HasSuffix(r.URL.Path, "/messages") {
+			_ = json.NewEncoder(w).Encode([]models.Message{})
+			return
+		}
+
+		conn, err := upgrader.Upgrade(w, r, nil)
+		require.NoError(t, err)
+		defer func() { _ = conn.Close() }()
+
+		for {
+			var clientMsg models.ClientMessage
+			if err := conn.ReadJSON(&clientMsg); err != nil {
+				break
+			}
+		}
+	}))
+	defer besedkaServer.Close()
+
+	cfg := &config.Config{
+		BotHandle:         "@bob",
+		BesedkaURL:        besedkaServer.URL,
+		GeminiBaseURL:     llmServer.URL,
+		DMMaxParagraphs:   10,
+		MsgRingBufferSize: 100,
+	}
+
+	llmClient := llm.NewClient(cfg, llmServer.Client())
+	gw := gateway.NewGateway(cfg, llmClient)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	err := gw.DialWebSocket(ctx)
+	require.NoError(t, err)
+
+	// Warmup should populate DM history with correct fromSeq/toSeq!
+	err = gw.WarmupContext(ctx)
+	require.NoError(t, err)
+
+	// Send next turn in DM
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_bot_user",
+		UserID:    "user-uuid-1234",
+		Content:   "What did we discuss earlier?",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+	require.Len(t, capturedRequests, 1)
+
+	messages := capturedRequests[0].Messages
+	require.Len(t, messages, 4)
+
+	// System prompt must have C-Pro (display name), NOT UUID user-uuid-1234
+	assert.Equal(t, "system", messages[0].Role)
+	assert.Contains(t, messages[0].Content, "C-Pro")
+	assert.NotContains(t, messages[0].Content, "user-uuid-1234")
+
+	// Historical turn 1 from user
+	assert.Equal(t, "user", messages[1].Role)
+	assert.Equal(t, "C-Pro: Where to buy freediving fins?", messages[1].Content)
+
+	// Historical turn 2 from assistant
+	assert.Equal(t, "assistant", messages[2].Role)
+	assert.Equal(t, "Aquamaster in Kuta", messages[2].Content)
+
+	// Turn 3
+	assert.Equal(t, "user", messages[3].Role)
+	assert.Equal(t, "C-Pro: What did we discuss earlier?", messages[3].Content)
+}
+
+
