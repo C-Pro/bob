@@ -13,5 +13,5 @@
 - **Workflow:** [workflow.md](workflow.md)
 
 ## Completed Tracks
-- **Phase 1: Simple Request/Response Agent & Besedka Gateway** (`phase-1-request-response-bot`) - [Plan](tracks/phase-1-request-response-bot/plan.md) | [Spec](tracks/phase-1-request-response-bot/spec.md)
+- **Phase 1: Simple Request/Response Agent & Besedka Gateway** (`phase-1-request-response-bot`) - [Plan](archive/phase-1-request-response-bot_20260818/plan.md) | [Spec](archive/phase-1-request-response-bot_20260818/spec.md)
 - **Track: Simple Context Management** (`simple-context-management_20260818`) - [Plan](archive/simple-context-management_20260818/plan.md) | [Spec](archive/simple-context-management_20260818/spec.md)
