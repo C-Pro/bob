@@ -18,6 +18,7 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	_ = os.Unsetenv("GEMINI_BASE_URL")
 	_ = os.Unsetenv("TOWNHALL_MAX_PARAGRAPHS")
 	_ = os.Unsetenv("DM_MAX_PARAGRAPHS")
+	_ = os.Unsetenv("MSG_RING_BUFFER_SIZE")
 
 	cfg, err := LoadFromEnv()
 	require.NoError(t, err)
@@ -27,6 +28,7 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	assert.Equal(t, "https://generativelanguage.googleapis.com/v1beta/openai/", cfg.GeminiBaseURL)
 	assert.Equal(t, 2, cfg.TownhallMaxParagraphs)
 	assert.Equal(t, 10, cfg.DMMaxParagraphs)
+	assert.Equal(t, 100, cfg.MsgRingBufferSize)
 }
 
 func TestLoadFromEnvCustom(t *testing.T) {
@@ -37,6 +39,7 @@ func TestLoadFromEnvCustom(t *testing.T) {
 	t.Setenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
 	t.Setenv("TOWNHALL_MAX_PARAGRAPHS", "3")
 	t.Setenv("DM_MAX_PARAGRAPHS", "15")
+	t.Setenv("MSG_RING_BUFFER_SIZE", "50")
 
 	cfg, err := LoadFromEnv()
 	require.NoError(t, err)
@@ -47,6 +50,7 @@ func TestLoadFromEnvCustom(t *testing.T) {
 	assert.Equal(t, "https://generativelanguage.googleapis.com/v1beta/openai/", cfg.GeminiBaseURL)
 	assert.Equal(t, 3, cfg.TownhallMaxParagraphs)
 	assert.Equal(t, 15, cfg.DMMaxParagraphs)
+	assert.Equal(t, 50, cfg.MsgRingBufferSize)
 }
 
 func TestConfigValidation(t *testing.T) {
@@ -54,6 +58,7 @@ func TestConfigValidation(t *testing.T) {
 		BesedkaURL:            "http://localhost:8080",
 		TownhallMaxParagraphs: 2,
 		DMMaxParagraphs:       10,
+		MsgRingBufferSize:     100,
 	}
 
 	err := cfg.Validate(true)
@@ -66,4 +71,9 @@ func TestConfigValidation(t *testing.T) {
 	cfg.BesedkaURL = ""
 	err = cfg.Validate(false)
 	assert.ErrorContains(t, err, "BESEDKA_URL cannot be empty")
+
+	cfg.BesedkaURL = "http://localhost:8080"
+	cfg.MsgRingBufferSize = 0
+	err = cfg.Validate(false)
+	assert.ErrorContains(t, err, "invalid MSG_RING_BUFFER_SIZE: 0")
 }

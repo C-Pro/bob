@@ -73,14 +73,8 @@ func NewClient(cfg *config.Config, httpClient *http.Client) *Client {
 	}
 }
 
-// GenerateResponse sends a chat completion request to Gemini API and returns the assistant's reply.
-func (c *Client) GenerateResponse(ctx context.Context, systemPrompt, userMessage string) (string, error) {
-	messages := make([]Message, 0, 2)
-	if systemPrompt != "" {
-		messages = append(messages, Message{Role: "system", Content: systemPrompt})
-	}
-	messages = append(messages, Message{Role: "user", Content: userMessage})
-
+// GenerateChatResponse sends a multi-turn chat completion request to Gemini API and returns the assistant's reply.
+func (c *Client) GenerateChatResponse(ctx context.Context, messages []Message) (string, error) {
 	reqPayload := CompletionRequest{
 		Model:    c.cfg.GeminiModel,
 		Messages: messages,
@@ -153,4 +147,14 @@ func (c *Client) GenerateResponse(ctx context.Context, systemPrompt, userMessage
 	}
 
 	return "", fmt.Errorf("request failed after %d retries; last error: %w", c.maxRetries, lastErr)
+}
+
+// GenerateResponse sends a single-turn chat completion request to Gemini API and returns the assistant's reply.
+func (c *Client) GenerateResponse(ctx context.Context, systemPrompt, userMessage string) (string, error) {
+	messages := make([]Message, 0, 2)
+	if systemPrompt != "" {
+		messages = append(messages, Message{Role: "system", Content: systemPrompt})
+	}
+	messages = append(messages, Message{Role: "user", Content: userMessage})
+	return c.GenerateChatResponse(ctx, messages)
 }

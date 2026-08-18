@@ -103,3 +103,36 @@ func TestGenerateResponseRetryExhausted(t *testing.T) {
 	assert.ErrorContains(t, err, "request failed after 3 retries")
 	assert.Equal(t, int32(4), atomic.LoadInt32(&attempts))
 }
+
+func TestGenerateChatResponseMultiTurn(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req CompletionRequest
+		err := json.NewDecoder(r.Body).Decode(&req)
+		require.NoError(t, err)
+		require.Len(t, req.Messages, 3)
+		assert.Equal(t, "system", req.Messages[0].Role)
+		assert.Equal(t, "user", req.Messages[1].Role)
+		assert.Equal(t, "assistant", req.Messages[2].Role)
+
+		resp := CompletionResponse{
+			Choices: []Choice{{Index: 0, Message: Message{Role: "assistant", Content: "Turn 3 reply"}}},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		GeminiAPIKey:  "test-api-key",
+		GeminiModel:   "gemini-3.7-flash",
+		GeminiBaseURL: server.URL,
+	}
+
+	client := NewClient(cfg, server.Client())
+	reply, err := client.GenerateChatResponse(context.Background(), []Message{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: "u1"},
+		{Role: "assistant", Content: "a1"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "Turn 3 reply", reply)
+}

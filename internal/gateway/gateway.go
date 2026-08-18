@@ -13,78 +13,40 @@ import (
 	"sync"
 	"time"
 
+	"bob/internal/chatcontext"
 	"bob/internal/config"
 	"bob/internal/llm"
 	"bob/internal/models"
+	"bob/internal/prompt"
 
 	"github.com/fasthttp/websocket"
 )
 
-const (
-	SystemPromptTownhall = "You are a concise, professional AI assistant for the Besedka chat application. Answer directly and accurately. Keep your answer brief (maximum 2 paragraphs) without unnecessary conversational filler."
-	SystemPromptDM       = "You are a helpful AI assistant for the Besedka chat application. Answer clearly, accurately, and professionally using markdown formatting."
-)
-
 // Gateway handles Besedka ingress (listening for mentions/messages) and egress (posting AI responses).
 type Gateway struct {
-	cfg                  *config.Config
-	llmClient            *llm.Client
-	conn                 *websocket.Conn
-	mu                   sync.Mutex
-	running              bool
-	botUserID            string
-	startTime            time.Time
-	systemPromptTownhall string
-	systemPromptDM       string
+	cfg            *config.Config
+	llmClient      *llm.Client
+	httpClient     *http.Client
+	conn           *websocket.Conn
+	mu             sync.Mutex
+	running        bool
+	botUser        models.User
+	botUserID      string
+	userCache      *UserCache
+	contextManager *chatcontext.Manager
+	startTime      time.Time
 }
 
 // NewGateway creates a new Besedka Gateway instance.
 func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 	return &Gateway{
-		cfg:                  cfg,
-		llmClient:            llmClient,
-		startTime:            time.Now(),
-		systemPromptTownhall: SystemPromptTownhall,
-		systemPromptDM:       SystemPromptDM,
+		cfg:            cfg,
+		llmClient:      llmClient,
+		httpClient:     &http.Client{Timeout: 10 * time.Second},
+		userCache:      NewUserCache(),
+		contextManager: chatcontext.NewManager(cfg.MsgRingBufferSize),
+		startTime:      time.Now(),
 	}
-}
-
-// FetchBotUser fetches current bot user metadata from Besedka /api/me.
-func (g *Gateway) FetchBotUser(ctx context.Context) error {
-	reqURL := fmt.Sprintf("%s/api/me", strings.TrimSuffix(g.cfg.BesedkaURL, "/"))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create /api/me request: %w", err)
-	}
-
-	if g.cfg.BesedkaAPIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+g.cfg.BesedkaAPIKey)
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to call /api/me: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("/api/me returned status %d", resp.StatusCode)
-	}
-
-	var userInfo struct {
-		ID   string `json:"id"`
-		Name string `json:"name"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&userInfo); err != nil {
-		return fmt.Errorf("failed to decode /api/me response: %w", err)
-	}
-
-	g.mu.Lock()
-	g.botUserID = userInfo.ID
-	g.mu.Unlock()
-
-	slog.Info("fetched bot user metadata", "botUserID", userInfo.ID, "botName", userInfo.Name)
-	return nil
 }
 
 var htmlTagRe = regexp.MustCompile(`<[^>]*>`)
@@ -106,8 +68,8 @@ func IsMentionedOrDM(handle, chatID, content string) (bool, string) {
 	hasMention := re.MatchString(plainText)
 
 	if hasMention {
-		prompt := re.ReplaceAllString(plainText, "")
-		return true, strings.TrimSpace(prompt)
+		promptText := re.ReplaceAllString(plainText, "")
+		return true, strings.TrimSpace(promptText)
 	}
 
 	if isDM {
@@ -127,7 +89,7 @@ func FormatResponse(content string, isDM bool, maxTownhallParas, maxDMParas int)
 		return content
 	}
 
-	// Normalise CRLF
+	// Normalize CRLF
 	normalized := strings.ReplaceAll(content, "\r\n", "\n")
 	paras := strings.Split(normalized, "\n\n")
 
@@ -203,51 +165,165 @@ func (g *Gateway) SendMessage(chatID, content string) error {
 	return conn.WriteJSON(clientMsg)
 }
 
-// ProcessMessage handles a single incoming message from Besedka.
-func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error {
+// WarmupContext pre-populates metadata and chat history without triggering LLM responses.
+func (g *Gateway) WarmupContext(ctx context.Context) error {
+	if _, err := g.FetchBotUser(ctx); err != nil {
+		slog.Warn("could not fetch bot user metadata during context warmup", "error", err)
+	}
+	if _, err := g.FetchUsers(ctx); err != nil {
+		slog.Warn("could not fetch users during context warmup", "error", err)
+	}
+
+	chats, err := g.FetchChats(ctx)
+	if err != nil {
+		slog.Warn("could not fetch chats list during context warmup", "error", err)
+	}
+
+	chatIDs := make(map[string]bool)
+	chatIDs["townhall"] = true
+	for _, c := range chats {
+		if c.ID != "" {
+			chatIDs[c.ID] = true
+		}
+	}
+
 	g.mu.Lock()
 	botID := g.botUserID
+	botName := g.botUser.GetDisplayName()
+	g.mu.Unlock()
+
+	for chatID := range chatIDs {
+		msgs, err := g.FetchChatMessages(ctx, chatID, g.cfg.MsgRingBufferSize)
+		if err != nil {
+			slog.Debug("could not fetch messages for chat during warmup", "chatID", chatID, "error", err)
+			continue
+		}
+
+		rb := g.contextManager.GetOrCreate(chatID)
+		rb.Clear()
+
+		for _, m := range msgs {
+			cleanContent := StripHTML(m.Content)
+			if cleanContent == "" {
+				continue
+			}
+
+			if botID != "" && m.UserID == botID {
+				rb.Push(chatcontext.Entry{
+					Role:       "assistant",
+					SenderID:   m.UserID,
+					SenderName: botName,
+					Content:    cleanContent,
+					Timestamp:  m.Timestamp,
+				})
+			} else {
+				senderName := g.userCache.GetDisplayName(m.UserID)
+				rb.Push(chatcontext.Entry{
+					Role:       "user",
+					SenderID:   m.UserID,
+					SenderName: senderName,
+					Content:    cleanContent,
+					Timestamp:  m.Timestamp,
+				})
+			}
+		}
+	}
+
+	slog.Info("completed context warmup for active chats", "chatCount", len(chatIDs))
+	return nil
+}
+
+// ProcessMessage handles a single incoming message from Besedka.
+func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error {
+	if msg.ChatID == "" {
+		msg.ChatID = "townhall"
+	}
+
+	cleanContent := StripHTML(msg.Content)
+	if cleanContent == "" {
+		return nil
+	}
+
+	g.mu.Lock()
+	botID := g.botUserID
+	botUser := g.botUser
 	startTime := g.startTime
 	g.mu.Unlock()
 
 	// Ensure botUserID is populated if missing
 	if botID == "" {
-		if err := g.FetchBotUser(ctx); err == nil {
+		if u, err := g.FetchBotUser(ctx); err == nil && u != nil {
 			g.mu.Lock()
-			botID = g.botUserID
+			botID = u.ID
+			botUser = *u
 			g.mu.Unlock()
 		}
 	}
 
-	// 1. Ignore messages sent by the bot itself
+	// 1. Handle self-messages from the bot itself (Townhall and DM)
 	if botID != "" && msg.UserID == botID {
-		return nil
+		entries := g.contextManager.GetOrCreate(msg.ChatID).Entries()
+		// Deduplicate if already appended on outgoing SendMessage
+		if len(entries) == 0 || entries[len(entries)-1].Role != "assistant" || entries[len(entries)-1].Content != cleanContent {
+			g.contextManager.Push(msg.ChatID, chatcontext.Entry{
+				Role:       "assistant",
+				SenderID:   msg.UserID,
+				SenderName: botUser.GetDisplayName(),
+				Content:    cleanContent,
+				Timestamp:  msg.Timestamp,
+			})
+		}
+		return nil // Never trigger LLM response for self-messages
 	}
 
-	// 2. Ignore messages older than bot start time (avoid backfill reprocessing)
+	// 2. Ignore messages older than bot start time (avoid backfill reprocessing via WS)
 	if msg.Timestamp > 0 && msg.Timestamp < startTime.Unix()-5 {
 		return nil
 	}
 
-	// 3. Skip messages with empty content
-	if strings.TrimSpace(msg.Content) == "" {
-		return nil
-	}
+	// 3. Resolve user display name
+	senderName := g.userCache.GetDisplayName(msg.UserID)
 
-	shouldProcess, prompt := IsMentionedOrDM(g.cfg.BotHandle, msg.ChatID, msg.Content)
-	if !shouldProcess || prompt == "" {
+	// 4. Determine trigger condition
+	shouldProcess, _ := IsMentionedOrDM(g.cfg.BotHandle, msg.ChatID, msg.Content)
+
+	// 5. Append incoming user message to ring buffer
+	g.contextManager.Push(msg.ChatID, chatcontext.Entry{
+		Role:       "user",
+		SenderID:   msg.UserID,
+		SenderName: senderName,
+		Content:    cleanContent,
+		Timestamp:  msg.Timestamp,
+	})
+
+	if !shouldProcess {
 		return nil
 	}
 
 	isDM := msg.ChatID != "townhall"
-	systemPrompt := g.systemPromptTownhall
+	var systemPrompt string
 	if isDM {
-		systemPrompt = g.systemPromptDM
+		targetUser, _ := g.userCache.Get(msg.UserID)
+		if targetUser.ID == "" {
+			targetUser = models.User{ID: msg.UserID, DisplayName: senderName}
+		}
+		systemPrompt = prompt.RenderDMPrompt(botUser, g.cfg.BotHandle, targetUser, g.cfg.DMMaxParagraphs)
+	} else {
+		systemPrompt = prompt.RenderTownhallPrompt(botUser, g.cfg.BotHandle, g.cfg.TownhallMaxParagraphs)
 	}
 
-	slog.Info("processing bot message request", "chatID", msg.ChatID, "prompt", prompt)
+	slog.Info("processing bot message request", "chatID", msg.ChatID, "sender", senderName)
 
-	reply, err := g.llmClient.GenerateResponse(ctx, systemPrompt, prompt)
+	// 6. Build multi-turn context
+	bufferedMsgs := g.contextManager.GetLLMMessages(msg.ChatID)
+	llmMsgs := make([]llm.Message, 0, len(bufferedMsgs)+1)
+	llmMsgs = append(llmMsgs, llm.Message{
+		Role:    "system",
+		Content: systemPrompt,
+	})
+	llmMsgs = append(llmMsgs, bufferedMsgs...)
+
+	reply, err := g.llmClient.GenerateChatResponse(ctx, llmMsgs)
 	if err != nil {
 		slog.Error("failed to generate LLM response", "error", err)
 		reply = "Sorry, I encountered an issue processing your request. Please try again later."
@@ -259,6 +335,15 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 		return fmt.Errorf("failed to send reply to chat %s: %w", msg.ChatID, err)
 	}
 
+	// 7. Append bot's sent reply to the ring buffer
+	g.contextManager.Push(msg.ChatID, chatcontext.Entry{
+		Role:       "assistant",
+		SenderID:   botID,
+		SenderName: botUser.GetDisplayName(),
+		Content:    formattedReply,
+		Timestamp:  time.Now().Unix(),
+	})
+
 	return nil
 }
 
@@ -268,9 +353,9 @@ func (g *Gateway) Start(ctx context.Context) error {
 	g.running = true
 	g.mu.Unlock()
 
-	// Try to fetch bot metadata from /api/me
-	if err := g.FetchBotUser(ctx); err != nil {
-		slog.Warn("could not fetch bot user metadata from /api/me", "error", err)
+	// Initial context warmup on startup
+	if err := g.WarmupContext(ctx); err != nil {
+		slog.Warn("context warmup encountered issues on startup", "error", err)
 	}
 
 	for {
@@ -291,12 +376,6 @@ func (g *Gateway) Start(ctx context.Context) error {
 		}
 
 		slog.Info("connected to Besedka websocket gateway")
-
-		if g.botUserID == "" {
-			if err := g.FetchBotUser(ctx); err != nil {
-				slog.Warn("could not fetch bot user metadata from /api/me after WS dial", "error", err)
-			}
-		}
 
 		for {
 			g.mu.Lock()

@@ -18,6 +18,7 @@ type Config struct {
 	GeminiBaseURL         string
 	TownhallMaxParagraphs int
 	DMMaxParagraphs       int
+	MsgRingBufferSize     int
 }
 
 // LoadFromEnv loads configuration from environment variables (or .env file) with sensible defaults.
@@ -38,6 +39,7 @@ func LoadFromEnv() (*Config, error) {
 		GeminiBaseURL:         getEnvOrDefault("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"),
 		TownhallMaxParagraphs: getEnvIntOrDefault("TOWNHALL_MAX_PARAGRAPHS", 2),
 		DMMaxParagraphs:       getEnvIntOrDefault("DM_MAX_PARAGRAPHS", 10),
+		MsgRingBufferSize:     getEnvIntOrDefault("MSG_RING_BUFFER_SIZE", 100),
 	}
 
 	// Normalize bot handle to ensure it starts with @
@@ -71,6 +73,9 @@ func (c *Config) Validate(requireGeminiKey bool) error {
 	}
 	if c.DMMaxParagraphs <= 0 {
 		return fmt.Errorf("invalid DM_MAX_PARAGRAPHS: %d", c.DMMaxParagraphs)
+	}
+	if c.MsgRingBufferSize <= 0 {
+		return fmt.Errorf("invalid MSG_RING_BUFFER_SIZE: %d", c.MsgRingBufferSize)
 	}
 	return nil
 }

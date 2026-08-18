@@ -17,5 +17,5 @@
 
 ---
 
-- [ ] **Track: Simple context management**
+- [x] **Track: Simple context management**
 *Link: [./tracks/simple-context-management_20260818/](./tracks/simple-context-management_20260818/)*

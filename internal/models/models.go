@@ -30,9 +30,44 @@ type ServerMessage struct {
 // User represents a user or bot in the system.
 type User struct {
 	ID          string `json:"id"`
-	UserName    string `json:"userName"`
-	DisplayName string `json:"displayName"`
+	UserName    string `json:"userName,omitempty"`
+	Name        string `json:"name,omitempty"`
+	DisplayName string `json:"displayName,omitempty"`
 	AvatarURL   string `json:"avatarUrl,omitempty"`
+}
+
+// GetDisplayName returns the most friendly display name available.
+func (u User) GetDisplayName() string {
+	if u.DisplayName != "" {
+		return u.DisplayName
+	}
+	if u.Name != "" {
+		return u.Name
+	}
+	if u.UserName != "" {
+		return u.UserName
+	}
+	return u.ID
+}
+
+// GetUserName returns the username handle if available.
+func (u User) GetUserName() string {
+	if u.UserName != "" {
+		return u.UserName
+	}
+	if u.Name != "" {
+		return u.Name
+	}
+	return u.ID
+}
+
+// Chat represents a Besedka chat or channel.
+type Chat struct {
+	ID           string   `json:"id"`
+	Name         string   `json:"name,omitempty"`
+	Type         string   `json:"type,omitempty"` // "townhall", "dm", etc.
+	UserIDs      []string `json:"userIds,omitempty"`
+	TargetUserID string   `json:"targetUserId,omitempty"`
 }
 
 type AttachmentType string

@@ -34,6 +34,7 @@ func main() {
 		"geminiBaseURL", cfg.GeminiBaseURL,
 		"townhallMaxParagraphs", cfg.TownhallMaxParagraphs,
 		"dmMaxParagraphs", cfg.DMMaxParagraphs,
+		"msgRingBufferSize", cfg.MsgRingBufferSize,
 	)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

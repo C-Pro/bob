@@ -47,3 +47,17 @@ func TestJSONSerialization(t *testing.T) {
 	require.Len(t, sMsg.Messages, 1)
 	assert.Equal(t, "Test message", sMsg.Messages[0].Content)
 }
+
+func TestUserHelpers(t *testing.T) {
+	u1 := User{ID: "u1", DisplayName: "Alice Smith", UserName: "alice", Name: "Alice"}
+	assert.Equal(t, "Alice Smith", u1.GetDisplayName())
+	assert.Equal(t, "alice", u1.GetUserName())
+
+	u2 := User{ID: "u2", Name: "Bob"}
+	assert.Equal(t, "Bob", u2.GetDisplayName())
+	assert.Equal(t, "Bob", u2.GetUserName())
+
+	u3 := User{ID: "u3"}
+	assert.Equal(t, "u3", u3.GetDisplayName())
+	assert.Equal(t, "u3", u3.GetUserName())
+}
