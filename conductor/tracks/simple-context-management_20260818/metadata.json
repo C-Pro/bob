@@ -1,0 +1,8 @@
+{
+  "track_id": "simple-context-management_20260818",
+  "type": "feature",
+  "status": "new",
+  "created_at": "2026-08-18T07:25:50Z",
+  "updated_at": "2026-08-18T07:25:50Z",
+  "description": "Simple context management with per-chat ring buffer and templated system prompts"
+}
