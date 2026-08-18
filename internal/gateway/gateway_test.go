@@ -501,3 +501,85 @@ func TestWarmupContext(t *testing.T) {
 	assert.Equal(t, "user", dmEntries[0].Role)
 	assert.Equal(t, "Alice", dmEntries[0].SenderName)
 }
+
+func TestProcessMessage_OnDemandBackfill(t *testing.T) {
+	var capturedMessages []llm.Message
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req llm.CompletionRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		capturedMessages = req.Messages
+
+		resp := llm.CompletionResponse{
+			Choices: []llm.Choice{
+				{Index: 0, Message: llm.Message{Role: "assistant", Content: "I recall our previous discussion about fins!"}},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer llmServer.Close()
+
+	upgrader := websocket.Upgrader{}
+	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/chats/dm_user_bot/messages" {
+			assert.Equal(t, "1", r.URL.Query().Get("fromSeq"))
+			assert.Equal(t, "12", r.URL.Query().Get("toSeq"))
+			_ = json.NewEncoder(w).Encode([]models.Message{
+				{Seq: 1, ChatID: "dm_user_bot", UserID: "user-1", Content: "Where to buy fins in Kuta?", Timestamp: 100},
+				{Seq: 2, ChatID: "dm_user_bot", UserID: "bot-1", Content: "Aquamaster on Sunset Road", Timestamp: 101},
+			})
+			return
+		}
+
+		conn, err := upgrader.Upgrade(w, r, nil)
+		require.NoError(t, err)
+		defer func() { _ = conn.Close() }()
+		for {
+			var m models.ClientMessage
+			if err := conn.ReadJSON(&m); err != nil {
+				break
+			}
+		}
+	}))
+	defer besedkaServer.Close()
+
+	cfg := &config.Config{
+		BotHandle:         "@bot",
+		BesedkaURL:        besedkaServer.URL,
+		GeminiBaseURL:     llmServer.URL,
+		DMMaxParagraphs:   10,
+		MsgRingBufferSize: 100,
+	}
+
+	llmClient := llm.NewClient(cfg, llmServer.Client())
+	gw := NewGateway(cfg, llmClient)
+	gw.httpClient = besedkaServer.Client()
+	gw.botUserID = "bot-1"
+	gw.botUser = models.User{ID: "bot-1", DisplayName: "Agent Bob", UserName: "bob"}
+	gw.userCache.Set(models.User{ID: "user-1", DisplayName: "C-Pro", UserName: "cpro"})
+
+	ctx := context.Background()
+	err := gw.DialWebSocket(ctx)
+	require.NoError(t, err)
+
+	// Note: We deliberately DO NOT call WarmupContext to test on-demand backfill!
+	// Message arriving with Seq 13 should trigger on-demand backfill for seq 1..12!
+	err = gw.ProcessMessage(ctx, models.Message{
+		Seq:       13,
+		ChatID:    "dm_user_bot",
+		UserID:    "user-1",
+		Content:   "Do you remember what we talked about?",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, capturedMessages)
+
+	// capturedMessages should contain: System prompt, Seq 1, Seq 2, Seq 13!
+	require.Len(t, capturedMessages, 4)
+	assert.Equal(t, "system", capturedMessages[0].Role)
+	assert.Equal(t, "user", capturedMessages[1].Role)
+	assert.Equal(t, "C-Pro: Where to buy fins in Kuta?", capturedMessages[1].Content)
+	assert.Equal(t, "assistant", capturedMessages[2].Role)
+	assert.Equal(t, "Aquamaster on Sunset Road", capturedMessages[2].Content)
+	assert.Equal(t, "user", capturedMessages[3].Role)
+	assert.Equal(t, "C-Pro: Do you remember what we talked about?", capturedMessages[3].Content)
+}

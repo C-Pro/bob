@@ -196,18 +196,92 @@ func (g *Gateway) SendMessage(chatID, content string) error {
 	return conn.WriteJSON(clientMsg)
 }
 
-// WarmupContext pre-populates metadata and chat history without triggering LLM responses.
-func (g *Gateway) WarmupContext(ctx context.Context) error {
-	if _, err := g.FetchBotUser(ctx); err != nil {
-		slog.Warn("could not fetch bot user metadata during context warmup", "error", err)
-	}
-	if _, err := g.FetchUsers(ctx); err != nil {
-		slog.Warn("could not fetch users during context warmup", "error", err)
+// WarmupChat loads historical messages for a single chat into its ring buffer.
+func (g *Gateway) WarmupChat(ctx context.Context, chatID string, lastSeq int64) {
+	if chatID == "" {
+		return
 	}
 
-	chats, err := g.FetchChats(ctx)
+	g.mu.Lock()
+	botID := g.botUserID
+	botName := g.botUser.GetDisplayName()
+	g.mu.Unlock()
+
+	limit := int64(g.cfg.MsgRingBufferSize)
+	if limit <= 0 {
+		limit = 100
+	}
+
+	toSeq := lastSeq
+	fromSeq := int64(1)
+	if toSeq > 0 {
+		fromSeq = max(1, toSeq-limit+1)
+	} else {
+		toSeq = 1000000
+	}
+
+	msgs, err := g.FetchChatMessages(ctx, chatID, fromSeq, toSeq)
 	if err != nil {
-		slog.Warn("could not fetch chats list during context warmup", "error", err)
+		slog.Debug("could not fetch messages for chat warmup", "chatID", chatID, "error", err)
+		return
+	}
+
+	rb := g.contextManager.GetOrCreate(chatID)
+	rb.Clear()
+
+	for _, m := range msgs {
+		cleanContent := ExtractMessageText(m)
+		if cleanContent == "" {
+			continue
+		}
+
+		if botID != "" && m.UserID == botID {
+			rb.Push(chatcontext.Entry{
+				Role:       "assistant",
+				SenderID:   m.UserID,
+				SenderName: botName,
+				Content:    cleanContent,
+				Timestamp:  m.Timestamp,
+			})
+		} else {
+			senderName := g.userCache.GetDisplayName(m.UserID)
+			rb.Push(chatcontext.Entry{
+				Role:       "user",
+				SenderID:   m.UserID,
+				SenderName: senderName,
+				Content:    cleanContent,
+				Timestamp:  m.Timestamp,
+			})
+		}
+	}
+}
+
+// WarmupContext pre-populates metadata and chat history without triggering LLM responses.
+func (g *Gateway) WarmupContext(ctx context.Context) error {
+	var err error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if _, err = g.FetchBotUser(ctx); err == nil {
+			break
+		}
+		slog.Warn("retrying bot user fetch during warmup", "attempt", attempt, "error", err)
+		time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
+	}
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		if _, err = g.FetchUsers(ctx); err == nil {
+			break
+		}
+		slog.Warn("retrying users fetch during warmup", "attempt", attempt, "error", err)
+		time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
+	}
+
+	var chats []models.Chat
+	for attempt := 1; attempt <= 3; attempt++ {
+		if chats, err = g.FetchChats(ctx); err == nil {
+			break
+		}
+		slog.Warn("retrying chats fetch during warmup", "attempt", attempt, "error", err)
+		time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
 	}
 
 	hasTownhall := false
@@ -221,62 +295,9 @@ func (g *Gateway) WarmupContext(ctx context.Context) error {
 		chats = append(chats, models.Chat{ID: "townhall"})
 	}
 
-	g.mu.Lock()
-	botID := g.botUserID
-	botName := g.botUser.GetDisplayName()
-	g.mu.Unlock()
-
-	limit := int64(g.cfg.MsgRingBufferSize)
-	if limit <= 0 {
-		limit = 100
-	}
-
 	for _, chat := range chats {
-		if chat.ID == "" {
-			continue
-		}
-
-		toSeq := int64(chat.LastSeq)
-		fromSeq := int64(1)
-		if toSeq > 0 {
-			fromSeq = max(1, toSeq-limit+1)
-		} else {
-			toSeq = 1000000
-		}
-
-		msgs, err := g.FetchChatMessages(ctx, chat.ID, fromSeq, toSeq)
-		if err != nil {
-			slog.Debug("could not fetch messages for chat during warmup", "chatID", chat.ID, "error", err)
-			continue
-		}
-
-		rb := g.contextManager.GetOrCreate(chat.ID)
-		rb.Clear()
-
-		for _, m := range msgs {
-			cleanContent := ExtractMessageText(m)
-			if cleanContent == "" {
-				continue
-			}
-
-			if botID != "" && m.UserID == botID {
-				rb.Push(chatcontext.Entry{
-					Role:       "assistant",
-					SenderID:   m.UserID,
-					SenderName: botName,
-					Content:    cleanContent,
-					Timestamp:  m.Timestamp,
-				})
-			} else {
-				senderName := g.userCache.GetDisplayName(m.UserID)
-				rb.Push(chatcontext.Entry{
-					Role:       "user",
-					SenderID:   m.UserID,
-					SenderName: senderName,
-					Content:    cleanContent,
-					Timestamp:  m.Timestamp,
-				})
-			}
+		if chat.ID != "" {
+			g.WarmupChat(ctx, chat.ID, int64(chat.LastSeq))
 		}
 	}
 
@@ -350,8 +371,13 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 	// 4. Determine trigger condition
 	shouldProcess, _ := IsMentionedOrDM(g.cfg.BotHandle, msg.ChatID, msg.Content)
 
-	// 5. Append incoming user message to ring buffer
-	g.contextManager.Push(msg.ChatID, chatcontext.Entry{
+	// 5. Append incoming user message to ring buffer (backfill chat history if buffer was uninitialized)
+	rb := g.contextManager.GetOrCreate(msg.ChatID)
+	if rb.Len() == 0 && msg.Seq > 1 {
+		g.WarmupChat(ctx, msg.ChatID, msg.Seq-1)
+	}
+
+	rb.Push(chatcontext.Entry{
 		Role:       "user",
 		SenderID:   msg.UserID,
 		SenderName: senderName,
@@ -440,6 +466,39 @@ func (g *Gateway) Start(ctx context.Context) error {
 
 		slog.Info("connected to Besedka websocket gateway")
 
+		// Re-run warmup upon establishing connection to ensure caches & histories are fresh
+		go func() {
+			if err := g.WarmupContext(ctx); err != nil {
+				slog.Warn("warmup after websocket connect encountered issues", "error", err)
+			}
+		}()
+
+		// WebSocket Ping Keepalive ticker to prevent 1006 idle timeout
+		pingDone := make(chan struct{})
+		g.mu.Lock()
+		activeConn := g.conn
+		g.mu.Unlock()
+
+		go func(c *websocket.Conn) {
+			ticker := time.NewTicker(20 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-pingDone:
+					return
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					g.mu.Lock()
+					isSame := g.conn == c
+					g.mu.Unlock()
+					if isSame && c != nil {
+						_ = c.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(5*time.Second))
+					}
+				}
+			}
+		}(activeConn)
+
 		for {
 			g.mu.Lock()
 			conn := g.conn
@@ -474,6 +533,8 @@ func (g *Gateway) Start(ctx context.Context) error {
 				}
 			}
 		}
+
+		close(pingDone)
 
 		select {
 		case <-ctx.Done():
