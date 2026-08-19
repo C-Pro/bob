@@ -15,8 +15,4 @@
 ## Completed Tracks
 - **Phase 1: Simple Request/Response Agent & Besedka Gateway** (`phase-1-request-response-bot`) - [Plan](archive/phase-1-request-response-bot_20260818/plan.md) | [Spec](archive/phase-1-request-response-bot_20260818/spec.md)
 - **Track: Simple Context Management** (`simple-context-management_20260818`) - [Plan](archive/simple-context-management_20260818/plan.md) | [Spec](archive/simple-context-management_20260818/spec.md)
-
----
-
-- [x] **Track: "OpenAI API". Instead of using hand-rolled openai protocol, let's refactor to use https://github.com/sashabaranov/go-openai. It will give us out of the box support for tools definitions.**
-*Link: [./tracks/openai-api-refactor_20260819/](./tracks/openai-api-refactor_20260819/)*
+- **Track: OpenAI API Refactor** (`openai-api-refactor_20260819`) - [Plan](archive/openai-api-refactor_20260819/plan.md) | [Spec](archive/openai-api-refactor_20260819/spec.md)
