@@ -18,5 +18,5 @@
 
 ---
 
-- [ ] **Track: "OpenAI API". Instead of using hand-rolled openai protocol, let's refactor to use https://github.com/sashabaranov/go-openai. It will give us out of the box support for tools definitions.**
+- [x] **Track: "OpenAI API". Instead of using hand-rolled openai protocol, let's refactor to use https://github.com/sashabaranov/go-openai. It will give us out of the box support for tools definitions.**
 *Link: [./tracks/openai-api-refactor_20260819/](./tracks/openai-api-refactor_20260819/)*

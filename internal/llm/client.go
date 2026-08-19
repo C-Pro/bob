@@ -1,91 +1,84 @@
 package llm
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"bob/internal/config"
+
+	openai "github.com/sashabaranov/go-openai"
 )
 
-// Message represents a chat completion message role and content.
-type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-// CompletionRequest is the request payload sent to the OpenAI-compatible endpoint.
-type CompletionRequest struct {
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
-}
-
-// Choice represents a completion response choice.
-type Choice struct {
-	Index        int     `json:"index"`
-	Message      Message `json:"message"`
-	FinishReason string  `json:"finish_reason"`
-}
-
-// CompletionResponse is the response structure returned by the endpoint.
-type CompletionResponse struct {
-	ID      string    `json:"id"`
-	Object  string    `json:"object"`
-	Created int64     `json:"created"`
-	Model   string    `json:"model"`
-	Choices []Choice  `json:"choices"`
-	Error   *APIError `json:"error,omitempty"`
-}
-
-// APIError represents an error returned in an OpenAI API response.
-type APIError struct {
-	Message string `json:"message"`
-	Type    string `json:"type"`
-	Code    string `json:"code"`
-}
-
-// Client wraps an HTTP client and configuration for LLM requests.
+// Client wraps the official go-openai client and configuration for LLM requests.
 type Client struct {
 	cfg        *config.Config
-	httpClient *http.Client
+	apiClient  *openai.Client
 	maxRetries int
 	baseDelay  time.Duration
 }
 
-// NewClient creates a new LLM client.
+// NewClient creates a new LLM client configured with standard OpenAI settings.
 func NewClient(cfg *config.Config, httpClient *http.Client) *Client {
-	if httpClient == nil {
-		httpClient = &http.Client{
-			Timeout: 30 * time.Second,
-		}
+	clientConfig := openai.DefaultConfig(cfg.OpenAIAPIKey)
+	if cfg.OpenAIBaseURL != "" {
+		clientConfig.BaseURL = strings.TrimSuffix(cfg.OpenAIBaseURL, "/")
 	}
+	if httpClient != nil {
+		clientConfig.HTTPClient = httpClient
+	}
+
 	return &Client{
 		cfg:        cfg,
-		httpClient: httpClient,
+		apiClient:  openai.NewClientWithConfig(clientConfig),
 		maxRetries: 3,
-		baseDelay:  10 * time.Millisecond, // fast delay for unit tests/retries
+		baseDelay:  10 * time.Millisecond,
 	}
 }
 
-// GenerateChatResponse sends a multi-turn chat completion request to Gemini API and returns the assistant's reply.
-func (c *Client) GenerateChatResponse(ctx context.Context, messages []Message) (string, error) {
-	reqPayload := CompletionRequest{
-		Model:    c.cfg.GeminiModel,
-		Messages: messages,
+// OpenAIClient returns the underlying *openai.Client instance.
+func (c *Client) OpenAIClient() *openai.Client {
+	return c.apiClient
+}
+
+// isRetryableError determines if an error from the OpenAI API is transient.
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
 	}
 
-	bodyBytes, err := json.Marshal(reqPayload)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal completion request: %w", err)
+	var apiErr *openai.APIError
+	if errors.As(err, &apiErr) {
+		if apiErr.HTTPStatusCode >= 500 || apiErr.HTTPStatusCode == http.StatusTooManyRequests {
+			return true
+		}
+		// 4xx errors (except 429) are not retryable
+		return false
 	}
 
-	url := strings.TrimSuffix(c.cfg.GeminiBaseURL, "/") + "/chat/completions"
+	var reqErr *openai.RequestError
+	if errors.As(err, &reqErr) {
+		if reqErr.HTTPStatusCode >= 500 || reqErr.HTTPStatusCode == http.StatusTooManyRequests {
+			return true
+		}
+		return false
+	}
+
+	// Network / transport errors are retryable
+	return true
+}
+
+// CreateChatCompletion sends a chat completion request with optional tool definitions and returns the full response.
+func (c *Client) CreateChatCompletion(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+	if req.Model == "" {
+		req.Model = c.cfg.OpenAIModel
+	}
 
 	var lastErr error
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
@@ -93,68 +86,66 @@ func (c *Client) GenerateChatResponse(ctx context.Context, messages []Message) (
 			delay := c.baseDelay * (1 << (attempt - 1))
 			select {
 			case <-ctx.Done():
-				return "", ctx.Err()
+				return nil, ctx.Err()
 			case <-time.After(delay):
 			}
 		}
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
-		if err != nil {
-			return "", fmt.Errorf("failed to create request: %w", err)
+		resp, err := c.apiClient.CreateChatCompletion(ctx, req)
+		if err == nil {
+			if len(resp.Choices) == 0 {
+				return nil, errors.New("no completion choices returned by API")
+			}
+			return &resp, nil
 		}
 
-		req.Header.Set("Content-Type", "application/json")
-		if c.cfg.GeminiAPIKey != "" {
-			req.Header.Set("Authorization", "Bearer "+c.cfg.GeminiAPIKey)
+		lastErr = err
+		if !isRetryableError(err) {
+			return nil, fmt.Errorf("API error: %w", err)
 		}
-
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			lastErr = fmt.Errorf("network error on attempt %d: %w", attempt+1, err)
-			continue
-		}
-
-		respBody, readErr := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		if readErr != nil {
-			lastErr = fmt.Errorf("failed to read response body on attempt %d: %w", attempt+1, readErr)
-			continue
-		}
-
-		if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests {
-			lastErr = fmt.Errorf("HTTP %d error on attempt %d: %s", resp.StatusCode, attempt+1, string(respBody))
-			continue
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			return "", fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBody))
-		}
-
-		var compResp CompletionResponse
-		if err := json.Unmarshal(respBody, &compResp); err != nil {
-			return "", fmt.Errorf("failed to parse completion response: %w", err)
-		}
-
-		if compResp.Error != nil {
-			return "", fmt.Errorf("API error returned: %s", compResp.Error.Message)
-		}
-
-		if len(compResp.Choices) == 0 {
-			return "", errors.New("no completion choices returned by API")
-		}
-
-		return compResp.Choices[0].Message.Content, nil
 	}
 
-	return "", fmt.Errorf("request failed after %d retries; last error: %w", c.maxRetries, lastErr)
+	return nil, fmt.Errorf("request failed after %d retries; last error: %w", c.maxRetries, lastErr)
 }
 
-// GenerateResponse sends a single-turn chat completion request to Gemini API and returns the assistant's reply.
-func (c *Client) GenerateResponse(ctx context.Context, systemPrompt, userMessage string) (string, error) {
-	messages := make([]Message, 0, 2)
-	if systemPrompt != "" {
-		messages = append(messages, Message{Role: "system", Content: systemPrompt})
+// GenerateChatResponse sends a multi-turn chat completion request and returns the assistant's reply text.
+func (c *Client) GenerateChatResponse(ctx context.Context, messages []openai.ChatCompletionMessage) (string, error) {
+	req := openai.ChatCompletionRequest{
+		Model:    c.cfg.OpenAIModel,
+		Messages: messages,
 	}
-	messages = append(messages, Message{Role: "user", Content: userMessage})
+
+	resp, err := c.CreateChatCompletion(ctx, req)
+	if err != nil {
+		return "", err
+	}
+
+	return resp.Choices[0].Message.Content, nil
+}
+
+// GenerateChatResponseWithTools sends a chat completion request with tools definitions support.
+func (c *Client) GenerateChatResponseWithTools(ctx context.Context, messages []openai.ChatCompletionMessage, tools []openai.Tool) (*openai.ChatCompletionResponse, error) {
+	req := openai.ChatCompletionRequest{
+		Model:    c.cfg.OpenAIModel,
+		Messages: messages,
+		Tools:    tools,
+	}
+
+	return c.CreateChatCompletion(ctx, req)
+}
+
+// GenerateResponse sends a single-turn chat completion request and returns the assistant's reply.
+func (c *Client) GenerateResponse(ctx context.Context, systemPrompt, userMessage string) (string, error) {
+	messages := make([]openai.ChatCompletionMessage, 0, 2)
+	if systemPrompt != "" {
+		messages = append(messages, openai.ChatCompletionMessage{
+			Role:    openai.ChatMessageRoleSystem,
+			Content: systemPrompt,
+		})
+	}
+	messages = append(messages, openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleUser,
+		Content: userMessage,
+	})
 	return c.GenerateChatResponse(ctx, messages)
 }

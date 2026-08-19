@@ -13,9 +13,12 @@ type Config struct {
 	BotHandle             string
 	BesedkaURL            string
 	BesedkaAPIKey         string
-	GeminiAPIKey          string
-	GeminiModel           string
-	GeminiBaseURL         string
+	OpenAIAPIKey          string
+	OpenAIModel           string
+	OpenAIBaseURL         string
+	GeminiAPIKey          string // Deprecated: backward-compatible fallback for OpenAIAPIKey
+	GeminiModel           string // Deprecated: backward-compatible fallback for OpenAIModel
+	GeminiBaseURL         string // Deprecated: backward-compatible fallback for OpenAIBaseURL
 	TownhallMaxParagraphs int
 	DMMaxParagraphs       int
 	MsgRingBufferSize     int
@@ -30,13 +33,20 @@ func LoadFromEnv() (*Config, error) {
 		defaultBesedkaURL = "http://127.0.0.1:8080"
 	}
 
+	apiKey := getEnvOrDefault("OPENAI_API_KEY", os.Getenv("GEMINI_API_KEY"))
+	model := getEnvOrDefault("OPENAI_MODEL", getEnvOrDefault("GEMINI_MODEL", "gemini-3.7-flash"))
+	baseURL := getEnvOrDefault("OPENAI_BASE_URL", getEnvOrDefault("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"))
+
 	cfg := &Config{
 		BotHandle:             getEnvOrDefault("BOT_HANDLE", "@bot"),
 		BesedkaURL:            getEnvOrDefault("BESEDKA_URL", defaultBesedkaURL),
 		BesedkaAPIKey:         os.Getenv("BESEDKA_API_KEY"),
-		GeminiAPIKey:          os.Getenv("GEMINI_API_KEY"),
-		GeminiModel:           getEnvOrDefault("GEMINI_MODEL", "gemini-3.7-flash"),
-		GeminiBaseURL:         getEnvOrDefault("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"),
+		OpenAIAPIKey:          apiKey,
+		OpenAIModel:           model,
+		OpenAIBaseURL:         baseURL,
+		GeminiAPIKey:          apiKey,
+		GeminiModel:           model,
+		GeminiBaseURL:         baseURL,
 		TownhallMaxParagraphs: getEnvIntOrDefault("TOWNHALL_MAX_PARAGRAPHS", 2),
 		DMMaxParagraphs:       getEnvIntOrDefault("DM_MAX_PARAGRAPHS", 10),
 		MsgRingBufferSize:     getEnvIntOrDefault("MSG_RING_BUFFER_SIZE", 100),
@@ -52,18 +62,19 @@ func LoadFromEnv() (*Config, error) {
 		cfg.BesedkaURL = strings.ReplaceAll(cfg.BesedkaURL, "localhost", "127.0.0.1")
 	}
 
-	// Normalize base URL to ensure trailing slash
-	if !strings.HasSuffix(cfg.GeminiBaseURL, "/") {
-		cfg.GeminiBaseURL = cfg.GeminiBaseURL + "/"
+	// Normalize base URLs to ensure trailing slash
+	if cfg.OpenAIBaseURL != "" && !strings.HasSuffix(cfg.OpenAIBaseURL, "/") {
+		cfg.OpenAIBaseURL = cfg.OpenAIBaseURL + "/"
 	}
+	cfg.GeminiBaseURL = cfg.OpenAIBaseURL
 
 	return cfg, nil
 }
 
 // Validate checks required fields for runtime readiness.
-func (c *Config) Validate(requireGeminiKey bool) error {
-	if requireGeminiKey && strings.TrimSpace(c.GeminiAPIKey) == "" {
-		return errors.New("GEMINI_API_KEY is required")
+func (c *Config) Validate(requireAPIKey bool) error {
+	if requireAPIKey && strings.TrimSpace(c.OpenAIAPIKey) == "" && strings.TrimSpace(c.GeminiAPIKey) == "" {
+		return errors.New("OPENAI_API_KEY (or GEMINI_API_KEY) is required")
 	}
 	if strings.TrimSpace(c.BesedkaURL) == "" {
 		return errors.New("BESEDKA_URL cannot be empty")
@@ -118,4 +129,3 @@ func LoadDotEnv(filename string) {
 		}
 	}
 }
-

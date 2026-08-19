@@ -21,6 +21,7 @@ import (
 	"bob/internal/prompt"
 
 	"github.com/fasthttp/websocket"
+	openai "github.com/sashabaranov/go-openai"
 )
 
 // Gateway handles Besedka ingress (listening for mentions/messages) and egress (posting AI responses).
@@ -405,9 +406,9 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 
 	// 6. Build multi-turn context
 	bufferedMsgs := g.contextManager.GetLLMMessages(msg.ChatID)
-	llmMsgs := make([]llm.Message, 0, len(bufferedMsgs)+1)
-	llmMsgs = append(llmMsgs, llm.Message{
-		Role:    "system",
+	llmMsgs := make([]openai.ChatCompletionMessage, 0, len(bufferedMsgs)+1)
+	llmMsgs = append(llmMsgs, openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleSystem,
 		Content: systemPrompt,
 	})
 	llmMsgs = append(llmMsgs, bufferedMsgs...)

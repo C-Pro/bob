@@ -4,6 +4,7 @@ go 1.26.5
 
 require (
 	github.com/fasthttp/websocket v1.5.12
+	github.com/sashabaranov/go-openai v1.42.0
 	github.com/stretchr/testify v1.11.1
 )
 

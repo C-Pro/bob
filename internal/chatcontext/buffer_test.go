@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	openai "github.com/sashabaranov/go-openai"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -50,13 +51,13 @@ func TestRingBuffer_ToLLMMessages(t *testing.T) {
 	msgs := rb.ToLLMMessages()
 	require.Len(t, msgs, 3)
 
-	assert.Equal(t, "user", msgs[0].Role)
+	assert.Equal(t, openai.ChatMessageRoleUser, msgs[0].Role)
 	assert.Equal(t, "Alice: Hello world", msgs[0].Content)
 
-	assert.Equal(t, "assistant", msgs[1].Role)
+	assert.Equal(t, openai.ChatMessageRoleAssistant, msgs[1].Role)
 	assert.Equal(t, "Hi Alice!", msgs[1].Content)
 
-	assert.Equal(t, "user", msgs[2].Role)
+	assert.Equal(t, openai.ChatMessageRoleUser, msgs[2].Role)
 	assert.Equal(t, "No sender name", msgs[2].Content)
 }
 

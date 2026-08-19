@@ -13,6 +13,7 @@ import (
 	"bob/internal/models"
 
 	"github.com/fasthttp/websocket"
+	openai "github.com/sashabaranov/go-openai"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -86,7 +87,7 @@ func TestFormatResponse(t *testing.T) {
 
 	// DM (limit 10)
 	dmRes := FormatResponse(longText, true, 2, 10)
-	assert.Equal(t, longText, dmRes)
+	assert.Equal(t, "Paragraph 1: Introduction.\n\nParagraph 2: Second section.\n\nParagraph 3: Third section.\n\nParagraph 4: Conclusion.", dmRes)
 
 	// Single paragraph
 	shortText := "Single paragraph response."
@@ -96,19 +97,28 @@ func TestFormatResponse(t *testing.T) {
 func TestGatewayWebSocketIntegration(t *testing.T) {
 	// 1. Mock LLM server
 	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req llm.CompletionRequest
+		var req openai.ChatCompletionRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 
 		// Verify multi-turn request structure
 		assert.GreaterOrEqual(t, len(req.Messages), 2)
-		assert.Equal(t, "system", req.Messages[0].Role)
+		assert.Equal(t, openai.ChatMessageRoleSystem, req.Messages[0].Role)
 		assert.Contains(t, req.Messages[0].Content, "Townhall")
 
-		resp := llm.CompletionResponse{
-			Choices: []llm.Choice{
-				{Index: 0, Message: llm.Message{Role: "assistant", Content: "Hello from LLM!\n\nParagraph 2 response."}},
+		resp := openai.ChatCompletionResponse{
+			ID:    "chatcmpl-test",
+			Model: req.Model,
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Index: 0,
+					Message: openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "Hello from LLM!\n\nParagraph 2 response.",
+					},
+				},
 			},
 		}
+		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer llmServer.Close()
@@ -165,9 +175,9 @@ func TestGatewayWebSocketIntegration(t *testing.T) {
 		BotHandle:             "@bot",
 		BesedkaURL:            besedkaServer.URL,
 		BesedkaAPIKey:         "test-besedka-key",
-		GeminiAPIKey:          "test-gemini-key",
-		GeminiModel:           "gemini-3.7-flash",
-		GeminiBaseURL:         llmServer.URL,
+		OpenAIAPIKey:          "test-openai-key",
+		OpenAIModel:           "gemini-3.7-flash",
+		OpenAIBaseURL:         llmServer.URL,
 		TownhallMaxParagraphs: 2,
 		DMMaxParagraphs:       10,
 		MsgRingBufferSize:     100,
@@ -283,17 +293,26 @@ func TestExtractMessageText(t *testing.T) {
 }
 
 func TestProcessMessage_TownhallContextAccumulation(t *testing.T) {
-	var capturedMessages []llm.Message
+	var capturedMessages []openai.ChatCompletionMessage
 	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req llm.CompletionRequest
+		var req openai.ChatCompletionRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		capturedMessages = req.Messages
 
-		resp := llm.CompletionResponse{
-			Choices: []llm.Choice{
-				{Index: 0, Message: llm.Message{Role: "assistant", Content: "I see what you are discussing!"}},
+		resp := openai.ChatCompletionResponse{
+			ID:    "chatcmpl-test",
+			Model: req.Model,
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Index: 0,
+					Message: openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "I see what you are discussing!",
+					},
+				},
 			},
 		}
+		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer llmServer.Close()
@@ -316,7 +335,7 @@ func TestProcessMessage_TownhallContextAccumulation(t *testing.T) {
 	cfg := &config.Config{
 		BotHandle:             "@bot",
 		BesedkaURL:            wsServer.URL,
-		GeminiBaseURL:         llmServer.URL,
+		OpenAIBaseURL:         llmServer.URL,
 		TownhallMaxParagraphs: 2,
 		MsgRingBufferSize:     100,
 	}
@@ -366,31 +385,40 @@ func TestProcessMessage_TownhallContextAccumulation(t *testing.T) {
 
 	// Messages should be: System prompt, Alice msg, Bob msg, Alice @bot msg
 	require.Len(t, capturedMessages, 4)
-	assert.Equal(t, "system", capturedMessages[0].Role)
+	assert.Equal(t, openai.ChatMessageRoleSystem, capturedMessages[0].Role)
 	assert.Contains(t, capturedMessages[0].Content, "Townhall")
 
-	assert.Equal(t, "user", capturedMessages[1].Role)
+	assert.Equal(t, openai.ChatMessageRoleUser, capturedMessages[1].Role)
 	assert.Equal(t, "Alice: Hey Bob, did you check the new deployment?", capturedMessages[1].Content)
 
-	assert.Equal(t, "user", capturedMessages[2].Role)
+	assert.Equal(t, openai.ChatMessageRoleUser, capturedMessages[2].Role)
 	assert.Equal(t, "Bob: Yes, it looks good!", capturedMessages[2].Content)
 
-	assert.Equal(t, "user", capturedMessages[3].Role)
+	assert.Equal(t, openai.ChatMessageRoleUser, capturedMessages[3].Role)
 	assert.Equal(t, "Alice: @bot what are we talking about?", capturedMessages[3].Content)
 }
 
 func TestProcessMessage_DMChat(t *testing.T) {
-	var capturedMessages []llm.Message
+	var capturedMessages []openai.ChatCompletionMessage
 	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req llm.CompletionRequest
+		var req openai.ChatCompletionRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		capturedMessages = req.Messages
 
-		resp := llm.CompletionResponse{
-			Choices: []llm.Choice{
-				{Index: 0, Message: llm.Message{Role: "assistant", Content: "Hello Charlie in DM"}},
+		resp := openai.ChatCompletionResponse{
+			ID:    "chatcmpl-test",
+			Model: req.Model,
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Index: 0,
+					Message: openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "Hello Charlie in DM",
+					},
+				},
 			},
 		}
+		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer llmServer.Close()
@@ -412,7 +440,7 @@ func TestProcessMessage_DMChat(t *testing.T) {
 	cfg := &config.Config{
 		BotHandle:         "@bot",
 		BesedkaURL:        wsServer.URL,
-		GeminiBaseURL:     llmServer.URL,
+		OpenAIBaseURL:     llmServer.URL,
 		DMMaxParagraphs:   10,
 		MsgRingBufferSize: 100,
 	}
@@ -438,11 +466,11 @@ func TestProcessMessage_DMChat(t *testing.T) {
 	require.NotNil(t, capturedMessages)
 
 	// System prompt should contain Charlie Brown
-	assert.Equal(t, "system", capturedMessages[0].Role)
+	assert.Equal(t, openai.ChatMessageRoleSystem, capturedMessages[0].Role)
 	assert.Contains(t, capturedMessages[0].Content, "Charlie Brown")
 	assert.Contains(t, capturedMessages[0].Content, "Bot Assistant")
 
-	assert.Equal(t, "user", capturedMessages[1].Role)
+	assert.Equal(t, openai.ChatMessageRoleUser, capturedMessages[1].Role)
 	assert.Equal(t, "Charlie Brown: Can you help me with a Go question?", capturedMessages[1].Content)
 }
 
@@ -503,17 +531,26 @@ func TestWarmupContext(t *testing.T) {
 }
 
 func TestProcessMessage_OnDemandBackfill(t *testing.T) {
-	var capturedMessages []llm.Message
+	var capturedMessages []openai.ChatCompletionMessage
 	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req llm.CompletionRequest
+		var req openai.ChatCompletionRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		capturedMessages = req.Messages
 
-		resp := llm.CompletionResponse{
-			Choices: []llm.Choice{
-				{Index: 0, Message: llm.Message{Role: "assistant", Content: "I recall our previous discussion about fins!"}},
+		resp := openai.ChatCompletionResponse{
+			ID:    "chatcmpl-test",
+			Model: req.Model,
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Index: 0,
+					Message: openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "I recall our previous discussion about fins!",
+					},
+				},
 			},
 		}
+		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer llmServer.Close()
@@ -545,7 +582,7 @@ func TestProcessMessage_OnDemandBackfill(t *testing.T) {
 	cfg := &config.Config{
 		BotHandle:         "@bot",
 		BesedkaURL:        besedkaServer.URL,
-		GeminiBaseURL:     llmServer.URL,
+		OpenAIBaseURL:     llmServer.URL,
 		DMMaxParagraphs:   10,
 		MsgRingBufferSize: 100,
 	}
@@ -575,11 +612,11 @@ func TestProcessMessage_OnDemandBackfill(t *testing.T) {
 
 	// capturedMessages should contain: System prompt, Seq 1, Seq 2, Seq 13!
 	require.Len(t, capturedMessages, 4)
-	assert.Equal(t, "system", capturedMessages[0].Role)
-	assert.Equal(t, "user", capturedMessages[1].Role)
+	assert.Equal(t, openai.ChatMessageRoleSystem, capturedMessages[0].Role)
+	assert.Equal(t, openai.ChatMessageRoleUser, capturedMessages[1].Role)
 	assert.Equal(t, "C-Pro: Where to buy fins in Kuta?", capturedMessages[1].Content)
-	assert.Equal(t, "assistant", capturedMessages[2].Role)
+	assert.Equal(t, openai.ChatMessageRoleAssistant, capturedMessages[2].Role)
 	assert.Equal(t, "Aquamaster on Sunset Road", capturedMessages[2].Content)
-	assert.Equal(t, "user", capturedMessages[3].Role)
+	assert.Equal(t, openai.ChatMessageRoleUser, capturedMessages[3].Role)
 	assert.Equal(t, "C-Pro: Do you remember what we talked about?", capturedMessages[3].Content)
 }

@@ -15,16 +15,23 @@ import (
 	"bob/internal/models"
 
 	"github.com/fasthttp/websocket"
+	openai "github.com/sashabaranov/go-openai"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestAgentIntegrationLoop(t *testing.T) {
-	// Mock Gemini OpenAI completion server
+	// Mock OpenAI completion server
 	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		resp := llm.CompletionResponse{
-			Choices: []llm.Choice{
-				{Index: 0, Message: llm.Message{Role: "assistant", Content: "I am ready to help!"}},
+		resp := openai.ChatCompletionResponse{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Index: 0,
+					Message: openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "I am ready to help!",
+					},
+				},
 			},
 		}
 		_ = json.NewEncoder(w).Encode(resp)
@@ -95,9 +102,9 @@ func TestAgentIntegrationLoop(t *testing.T) {
 		BotHandle:             "@bot",
 		BesedkaURL:            besedkaServer.URL,
 		BesedkaAPIKey:         "test-key",
-		GeminiAPIKey:          "test-gemini-key",
-		GeminiModel:           "gemini-3.7-flash",
-		GeminiBaseURL:         llmServer.URL,
+		OpenAIAPIKey:          "test-openai-key",
+		OpenAIModel:           "gemini-3.7-flash",
+		OpenAIBaseURL:         llmServer.URL,
 		TownhallMaxParagraphs: 2,
 		DMMaxParagraphs:       10,
 	}
@@ -123,15 +130,21 @@ func TestAgentIntegrationLoop(t *testing.T) {
 }
 
 func TestAgentIntegration_MultiTurnContextFlow(t *testing.T) {
-	var capturedRequests []llm.CompletionRequest
+	var capturedRequests []openai.ChatCompletionRequest
 	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req llm.CompletionRequest
+		var req openai.ChatCompletionRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		capturedRequests = append(capturedRequests, req)
 
-		resp := llm.CompletionResponse{
-			Choices: []llm.Choice{
-				{Index: 0, Message: llm.Message{Role: "assistant", Content: "Multi-turn reply"}},
+		resp := openai.ChatCompletionResponse{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Index: 0,
+					Message: openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "Multi-turn reply",
+					},
+				},
 			},
 		}
 		_ = json.NewEncoder(w).Encode(resp)
@@ -184,7 +197,7 @@ func TestAgentIntegration_MultiTurnContextFlow(t *testing.T) {
 	cfg := &config.Config{
 		BotHandle:             "@bot",
 		BesedkaURL:            besedkaServer.URL,
-		GeminiBaseURL:         llmServer.URL,
+		OpenAIBaseURL:         llmServer.URL,
 		TownhallMaxParagraphs: 2,
 		DMMaxParagraphs:       10,
 		MsgRingBufferSize:     100,
@@ -225,7 +238,7 @@ func TestAgentIntegration_MultiTurnContextFlow(t *testing.T) {
 	// Context includes: System Prompt, Historical Alice msg from warmup, Bob msg, Alice @bot msg
 	messages := capturedRequests[0].Messages
 	require.Len(t, messages, 4)
-	assert.Equal(t, "system", messages[0].Role)
+	assert.Equal(t, openai.ChatMessageRoleSystem, messages[0].Role)
 	assert.Contains(t, messages[0].Content, "AI Bot")
 	assert.Equal(t, "Alice: Initial historical message", messages[1].Content)
 	assert.Equal(t, "Bob: Should we deploy to prod today?", messages[2].Content)
@@ -233,15 +246,21 @@ func TestAgentIntegration_MultiTurnContextFlow(t *testing.T) {
 }
 
 func TestAgentIntegration_DMContextAndNameResolution(t *testing.T) {
-	var capturedRequests []llm.CompletionRequest
+	var capturedRequests []openai.ChatCompletionRequest
 	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req llm.CompletionRequest
+		var req openai.ChatCompletionRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		capturedRequests = append(capturedRequests, req)
 
-		resp := llm.CompletionResponse{
-			Choices: []llm.Choice{
-				{Index: 0, Message: llm.Message{Role: "assistant", Content: "Sure, let's talk about fins."}},
+		resp := openai.ChatCompletionResponse{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Index: 0,
+					Message: openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "Sure, let's talk about fins.",
+					},
+				},
 			},
 		}
 		_ = json.NewEncoder(w).Encode(resp)
@@ -297,7 +316,7 @@ func TestAgentIntegration_DMContextAndNameResolution(t *testing.T) {
 	cfg := &config.Config{
 		BotHandle:         "@bob",
 		BesedkaURL:        besedkaServer.URL,
-		GeminiBaseURL:     llmServer.URL,
+		OpenAIBaseURL:     llmServer.URL,
 		DMMaxParagraphs:   10,
 		MsgRingBufferSize: 100,
 	}
@@ -329,21 +348,19 @@ func TestAgentIntegration_DMContextAndNameResolution(t *testing.T) {
 	require.Len(t, messages, 4)
 
 	// System prompt must have C-Pro (display name), NOT UUID user-uuid-1234
-	assert.Equal(t, "system", messages[0].Role)
+	assert.Equal(t, openai.ChatMessageRoleSystem, messages[0].Role)
 	assert.Contains(t, messages[0].Content, "C-Pro")
 	assert.NotContains(t, messages[0].Content, "user-uuid-1234")
 
 	// Historical turn 1 from user
-	assert.Equal(t, "user", messages[1].Role)
+	assert.Equal(t, openai.ChatMessageRoleUser, messages[1].Role)
 	assert.Equal(t, "C-Pro: Where to buy freediving fins?", messages[1].Content)
 
 	// Historical turn 2 from assistant
-	assert.Equal(t, "assistant", messages[2].Role)
+	assert.Equal(t, openai.ChatMessageRoleAssistant, messages[2].Role)
 	assert.Equal(t, "Aquamaster in Kuta", messages[2].Content)
 
 	// Turn 3
-	assert.Equal(t, "user", messages[3].Role)
+	assert.Equal(t, openai.ChatMessageRoleUser, messages[3].Role)
 	assert.Equal(t, "C-Pro: What did we discuss earlier?", messages[3].Content)
 }
-
-

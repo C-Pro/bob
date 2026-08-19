@@ -5,7 +5,7 @@ import (
 	"strings"
 	"sync"
 
-	"bob/internal/llm"
+	openai "github.com/sashabaranov/go-openai"
 )
 
 // Entry represents a single turn in a chat conversation.
@@ -76,28 +76,32 @@ func (rb *RingBuffer) Clear() {
 	rb.entries = make([]Entry, 0, rb.capacity)
 }
 
-// ToLLMMessages converts the buffered entries into OpenAI-compatible llm.Message objects.
+// ToLLMMessages converts the buffered entries into openai.ChatCompletionMessage objects.
 // User messages are formatted with "<SenderName>: <Content>" if SenderName is present.
-func (rb *RingBuffer) ToLLMMessages() []llm.Message {
+func (rb *RingBuffer) ToLLMMessages() []openai.ChatCompletionMessage {
 	rb.mu.RLock()
 	defer rb.mu.RUnlock()
 
-	msgs := make([]llm.Message, 0, len(rb.entries))
+	msgs := make([]openai.ChatCompletionMessage, 0, len(rb.entries))
 	for _, e := range rb.entries {
 		role := e.Role
-		if role == "" {
-			role = "user"
+		if role == "" || role == "user" {
+			role = openai.ChatMessageRoleUser
+		} else if role == "assistant" {
+			role = openai.ChatMessageRoleAssistant
+		} else if role == "system" {
+			role = openai.ChatMessageRoleSystem
 		}
 
 		var content string
 		senderName := strings.TrimSpace(e.SenderName)
-		if role == "user" && senderName != "" && senderName != e.SenderID {
+		if role == openai.ChatMessageRoleUser && senderName != "" && senderName != e.SenderID {
 			content = fmt.Sprintf("%s: %s", senderName, e.Content)
 		} else {
 			content = e.Content
 		}
 
-		msgs = append(msgs, llm.Message{
+		msgs = append(msgs, openai.ChatCompletionMessage{
 			Role:    role,
 			Content: content,
 		})
@@ -150,7 +154,7 @@ func (m *Manager) Push(chatID string, entry Entry) {
 }
 
 // GetLLMMessages returns the formatted LLM messages for the specified chatID.
-func (m *Manager) GetLLMMessages(chatID string) []llm.Message {
+func (m *Manager) GetLLMMessages(chatID string) []openai.ChatCompletionMessage {
 	rb := m.GetOrCreate(chatID)
 	return rb.ToLLMMessages()
 }
