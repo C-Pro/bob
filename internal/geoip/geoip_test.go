@@ -285,7 +285,7 @@ func TestClient_FetchLocation_FailoverAndRoundRobin(t *testing.T) {
 		{Name: "p3", URL: s3.URL, Parser: ParseIPInfo},
 	}
 
-	// Use deterministic rand seed where p1, p2, p3 order is tried
+	// Use deterministic rand seed where p1, p2, p3 order is tested
 	r := rand.New(rand.NewSource(42))
 	client := NewClient(
 		&http.Client{Timeout: 2 * time.Second},

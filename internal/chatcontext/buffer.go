@@ -85,11 +85,12 @@ func (rb *RingBuffer) ToLLMMessages() []openai.ChatCompletionMessage {
 	msgs := make([]openai.ChatCompletionMessage, 0, len(rb.entries))
 	for _, e := range rb.entries {
 		role := e.Role
-		if role == "" || role == "user" {
+		switch role {
+		case "", "user":
 			role = openai.ChatMessageRoleUser
-		} else if role == "assistant" {
+		case "assistant":
 			role = openai.ChatMessageRoleAssistant
-		} else if role == "system" {
+		case "system":
 			role = openai.ChatMessageRoleSystem
 		}
 

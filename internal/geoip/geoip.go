@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand"
+	"math/rand" //nolint:gosec // nosemgrep: go.lang.security.audit.crypto.math_random.math-random-used
 	"net/http"
 	"strconv"
 	"strings"
@@ -177,7 +177,7 @@ func NewClient(httpClient *http.Client, opts ...Option) *Client {
 		httpClient:  httpClient,
 		providers:   DefaultProviders(),
 		maxAttempts: 3,
-		randSource:  rand.New(rand.NewSource(time.Now().UnixNano())),
+		randSource:  rand.New(rand.NewSource(time.Now().UnixNano())), //nolint:gosec // nosemgrep: go.lang.security.audit.crypto.math_random.math-random-used
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -240,7 +240,7 @@ func (c *Client) queryProvider(ctx context.Context, p Provider) (*models.Locatio
 	if err != nil {
 		return nil, fmt.Errorf("http request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("received non-200 status code: %d", resp.StatusCode)
