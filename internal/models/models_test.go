@@ -48,6 +48,30 @@ func TestJSONSerialization(t *testing.T) {
 	assert.Equal(t, "Test message", sMsg.Messages[0].Content)
 }
 
+func TestLocationJSONSerialization(t *testing.T) {
+	locMsg := ClientMessage{
+		Type: ClientMessageTypeLocation,
+		Location: &Location{
+			Lat: 37.7749,
+			Lng: -122.4194,
+		},
+	}
+
+	data, err := json.Marshal(locMsg)
+	require.NoError(t, err)
+
+	expectedJSON := `{"type":"location","location":{"lat":37.7749,"lng":-122.4194}}`
+	assert.JSONEq(t, expectedJSON, string(data))
+
+	var decoded ClientMessage
+	err = json.Unmarshal(data, &decoded)
+	require.NoError(t, err)
+	assert.Equal(t, ClientMessageTypeLocation, decoded.Type)
+	require.NotNil(t, decoded.Location)
+	assert.Equal(t, 37.7749, decoded.Location.Lat)
+	assert.Equal(t, -122.4194, decoded.Location.Lng)
+}
+
 func TestUserHelpers(t *testing.T) {
 	u1 := User{ID: "u1", DisplayName: "Alice Smith", UserName: "alice", Name: "Alice"}
 	assert.Equal(t, "Alice Smith", u1.GetDisplayName())

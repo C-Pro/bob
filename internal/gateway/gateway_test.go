@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -620,3 +621,221 @@ func TestProcessMessage_OnDemandBackfill(t *testing.T) {
 	assert.Equal(t, openai.ChatMessageRoleUser, capturedMessages[3].Role)
 	assert.Equal(t, "C-Pro: Do you remember what we talked about?", capturedMessages[3].Content)
 }
+
+func TestSendLocation(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	receivedMsgs := make(chan models.ClientMessage, 10)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		require.NoError(t, err)
+		defer func() { _ = conn.Close() }()
+
+		for {
+			var msg models.ClientMessage
+			if err := conn.ReadJSON(&msg); err != nil {
+				break
+			}
+			receivedMsgs <- msg
+		}
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		BesedkaURL: server.URL,
+	}
+	gw := NewGateway(cfg, nil)
+
+	// Sending before connection should fail
+	err := gw.SendLocation(&models.Location{Lat: 10, Lng: 20})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "not established")
+
+	// Sending nil location should error
+	err = gw.SendLocation(nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "location is nil")
+
+	// Dial WebSocket
+	err = gw.DialWebSocket(context.Background())
+	require.NoError(t, err)
+	defer gw.Stop()
+
+	// Send valid location
+	targetLoc := &models.Location{
+		Lat: 37.7749,
+		Lng: -122.4194,
+	}
+	err = gw.SendLocation(targetLoc)
+	require.NoError(t, err)
+
+	select {
+	case msg := <-receivedMsgs:
+		assert.Equal(t, models.ClientMessageTypeLocation, msg.Type)
+		require.NotNil(t, msg.Location)
+		assert.Equal(t, 37.7749, msg.Location.Lat)
+		assert.Equal(t, -122.4194, msg.Location.Lng)
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for location message")
+	}
+}
+
+func TestGateway_LocationFrameReporting_InitialAndPeriodic(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	receivedFrames := make(chan models.ClientMessage, 10)
+
+	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/me" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(models.User{ID: "bot-1", UserName: "bot"})
+			return
+		}
+		if r.URL.Path == "/api/users" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.User{})
+			return
+		}
+		if r.URL.Path == "/api/chats" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.Chat{})
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/chats/") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.Message{})
+			return
+		}
+
+		if r.URL.Path == "/api/chat" {
+			conn, err := upgrader.Upgrade(w, r, nil)
+			require.NoError(t, err)
+			defer func() { _ = conn.Close() }()
+
+			for {
+				var msg models.ClientMessage
+				if err := conn.ReadJSON(&msg); err != nil {
+					break
+				}
+				receivedFrames <- msg
+			}
+		}
+	}))
+	defer besedkaServer.Close()
+
+	cfg := &config.Config{
+		BesedkaURL: besedkaServer.URL,
+	}
+	gw := NewGateway(cfg, nil)
+	gw.httpClient = besedkaServer.Client()
+
+	loc := &models.Location{
+		Lat: -8.4095,
+		Lng: 115.1889,
+	}
+	gw.SetLocation(loc)
+	assert.Equal(t, loc, gw.Location())
+
+	// Set short delay and interval for rapid testing
+	gw.SetInitialLocationDelay(20 * time.Millisecond)
+	gw.SetLocationInterval(60 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		_ = gw.Start(ctx)
+	}()
+
+	// 1. Initial location frame soon after connect
+	select {
+	case frame := <-receivedFrames:
+		assert.Equal(t, models.ClientMessageTypeLocation, frame.Type)
+		require.NotNil(t, frame.Location)
+		assert.Equal(t, -8.4095, frame.Location.Lat)
+		assert.Equal(t, 115.1889, frame.Location.Lng)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for initial location frame")
+	}
+
+	// 2. Subsequent periodic location frame
+	select {
+	case frame := <-receivedFrames:
+		assert.Equal(t, models.ClientMessageTypeLocation, frame.Type)
+		require.NotNil(t, frame.Location)
+		assert.Equal(t, -8.4095, frame.Location.Lat)
+		assert.Equal(t, 115.1889, frame.Location.Lng)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for periodic location frame")
+	}
+
+	gw.Stop()
+}
+
+func TestGateway_LocationFrameReporting_NilLocation(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	receivedFrames := make(chan models.ClientMessage, 10)
+
+	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/me" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(models.User{ID: "bot-1", UserName: "bot"})
+			return
+		}
+		if r.URL.Path == "/api/users" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.User{})
+			return
+		}
+		if r.URL.Path == "/api/chats" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.Chat{})
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/chats/") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.Message{})
+			return
+		}
+
+		if r.URL.Path == "/api/chat" {
+			conn, err := upgrader.Upgrade(w, r, nil)
+			require.NoError(t, err)
+			defer func() { _ = conn.Close() }()
+
+			for {
+				var msg models.ClientMessage
+				if err := conn.ReadJSON(&msg); err != nil {
+					break
+				}
+				receivedFrames <- msg
+			}
+		}
+	}))
+	defer besedkaServer.Close()
+
+	cfg := &config.Config{
+		BesedkaURL: besedkaServer.URL,
+	}
+	gw := NewGateway(cfg, nil)
+	gw.httpClient = besedkaServer.Client()
+	gw.SetLocation(nil)
+	gw.SetInitialLocationDelay(20 * time.Millisecond)
+	gw.SetLocationInterval(50 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	go func() {
+		_ = gw.Start(ctx)
+	}()
+
+	select {
+	case frame := <-receivedFrames:
+		t.Fatalf("unexpected frame received when location is nil: %+v", frame)
+	case <-time.After(150 * time.Millisecond):
+		// Expected: no frames sent
+	}
+
+	gw.Stop()
+}
+

@@ -11,12 +11,19 @@ type Message struct {
 	Attachments []Attachment `json:"attachments,omitempty"`
 }
 
+// Location represents geographical coordinates.
+type Location struct {
+	Lat float64 `json:"lat"`
+	Lng float64 `json:"lng"`
+}
+
 // ClientMessage represents a message sent from the bot to the Besedka server.
 type ClientMessage struct {
 	Type        ClientMessageType `json:"type"`
 	ChatID      string            `json:"chatId,omitempty"`
 	Content     string            `json:"content,omitempty"`
 	Attachments []Attachment      `json:"attachments,omitempty"`
+	Location    *Location         `json:"location,omitempty"`
 }
 
 // ServerMessage represents an incoming event frame from the Besedka server.
@@ -90,7 +97,8 @@ type Attachment struct {
 type ClientMessageType string
 
 const (
-	ClientMessageTypeSend ClientMessageType = "send"
+	ClientMessageTypeSend     ClientMessageType = "send"
+	ClientMessageTypeLocation ClientMessageType = "location"
 )
 
 type ServerMessageType string

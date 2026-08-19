@@ -26,28 +26,33 @@ import (
 
 // Gateway handles Besedka ingress (listening for mentions/messages) and egress (posting AI responses).
 type Gateway struct {
-	cfg            *config.Config
-	llmClient      *llm.Client
-	httpClient     *http.Client
-	conn           *websocket.Conn
-	mu             sync.Mutex
-	running        bool
-	botUser        models.User
-	botUserID      string
-	userCache      *UserCache
-	contextManager *chatcontext.Manager
-	startTime      time.Time
+	cfg                  *config.Config
+	llmClient            *llm.Client
+	httpClient           *http.Client
+	conn                 *websocket.Conn
+	mu                   sync.Mutex
+	running              bool
+	botUser              models.User
+	botUserID            string
+	userCache            *UserCache
+	contextManager       *chatcontext.Manager
+	startTime            time.Time
+	location             *models.Location
+	locationInterval     time.Duration
+	initialLocationDelay time.Duration
 }
 
 // NewGateway creates a new Besedka Gateway instance.
 func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 	return &Gateway{
-		cfg:            cfg,
-		llmClient:      llmClient,
-		httpClient:     &http.Client{Timeout: 10 * time.Second},
-		userCache:      NewUserCache(),
-		contextManager: chatcontext.NewManager(cfg.MsgRingBufferSize),
-		startTime:      time.Now(),
+		cfg:                  cfg,
+		llmClient:            llmClient,
+		httpClient:           &http.Client{Timeout: 10 * time.Second},
+		userCache:            NewUserCache(),
+		contextManager:       chatcontext.NewManager(cfg.MsgRingBufferSize),
+		startTime:            time.Now(),
+		locationInterval:     9 * time.Minute,
+		initialLocationDelay: 1 * time.Second,
 	}
 }
 
@@ -190,6 +195,58 @@ func (g *Gateway) SendMessage(chatID, content string) error {
 		Type:    models.ClientMessageTypeSend,
 		ChatID:  chatID,
 		Content: content,
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return conn.WriteJSON(clientMsg)
+}
+
+// SetLocation sets the server location for periodic location reporting.
+func (g *Gateway) SetLocation(loc *models.Location) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.location = loc
+}
+
+// Location returns the current server location configured on the gateway.
+func (g *Gateway) Location() *models.Location {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.location
+}
+
+// SetLocationInterval sets the interval for periodic location updates.
+func (g *Gateway) SetLocationInterval(d time.Duration) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.locationInterval = d
+}
+
+// SetInitialLocationDelay sets the delay before sending the first location frame after connect.
+func (g *Gateway) SetInitialLocationDelay(d time.Duration) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.initialLocationDelay = d
+}
+
+// SendLocation sends a location update frame to Besedka.
+func (g *Gateway) SendLocation(loc *models.Location) error {
+	if loc == nil {
+		return errors.New("location is nil")
+	}
+
+	g.mu.Lock()
+	conn := g.conn
+	g.mu.Unlock()
+
+	if conn == nil {
+		return errors.New("websocket connection is not established")
+	}
+
+	clientMsg := models.ClientMessage{
+		Type:     models.ClientMessageTypeLocation,
+		Location: loc,
 	}
 
 	g.mu.Lock()
@@ -478,6 +535,15 @@ func (g *Gateway) Start(ctx context.Context) error {
 		pingDone := make(chan struct{})
 		g.mu.Lock()
 		activeConn := g.conn
+		loc := g.location
+		locInterval := g.locationInterval
+		if locInterval <= 0 {
+			locInterval = 9 * time.Minute
+		}
+		initDelay := g.initialLocationDelay
+		if initDelay <= 0 {
+			initDelay = 1 * time.Second
+		}
 		g.mu.Unlock()
 
 		go func(c *websocket.Conn) {
@@ -499,6 +565,43 @@ func (g *Gateway) Start(ctx context.Context) error {
 				}
 			}
 		}(activeConn)
+
+		// Periodic server location update loop (initial update soon after connect, then every 9m)
+		locationDone := make(chan struct{})
+		if loc != nil {
+			go func(targetLoc *models.Location, interval, delay time.Duration) {
+				select {
+				case <-locationDone:
+					return
+				case <-ctx.Done():
+					return
+				case <-time.After(delay):
+					if err := g.SendLocation(targetLoc); err != nil {
+						slog.Warn("failed to send initial server location frame", "error", err)
+					} else {
+						slog.Info("sent initial server location frame", "lat", targetLoc.Lat, "lng", targetLoc.Lng)
+					}
+				}
+
+				ticker := time.NewTicker(interval)
+				defer ticker.Stop()
+
+				for {
+					select {
+					case <-locationDone:
+						return
+					case <-ctx.Done():
+						return
+					case <-ticker.C:
+						if err := g.SendLocation(targetLoc); err != nil {
+							slog.Warn("failed to send periodic server location frame", "error", err)
+						} else {
+							slog.Debug("sent periodic server location frame", "lat", targetLoc.Lat, "lng", targetLoc.Lng)
+						}
+					}
+				}
+			}(loc, locInterval, initDelay)
+		}
 
 		for {
 			g.mu.Lock()
@@ -535,6 +638,7 @@ func (g *Gateway) Start(ctx context.Context) error {
 			}
 		}
 
+		close(locationDone)
 		close(pingDone)
 
 		select {

@@ -11,6 +11,7 @@ import (
 
 	"bob/internal/config"
 	"bob/internal/gateway"
+	"bob/internal/geoip"
 	"bob/internal/llm"
 	"bob/internal/models"
 
@@ -363,4 +364,99 @@ func TestAgentIntegration_DMContextAndNameResolution(t *testing.T) {
 	// Turn 3
 	assert.Equal(t, openai.ChatMessageRoleUser, messages[3].Role)
 	assert.Equal(t, "C-Pro: What did we discuss earlier?", messages[3].Content)
+}
+
+func TestAgentIntegration_StartupLocationReporting(t *testing.T) {
+	// 1. Mock GEOIP Server
+	geoServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "success",
+			"lat":    -8.4095,
+			"lon":    115.1889,
+		})
+	}))
+	defer geoServer.Close()
+
+	// 2. Mock Besedka WebSocket Server
+	upgrader := websocket.Upgrader{}
+	receivedFrames := make(chan models.ClientMessage, 10)
+
+	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/me" {
+			_ = json.NewEncoder(w).Encode(models.User{ID: "bot-id", UserName: "bob", DisplayName: "Agent Bob"})
+			return
+		}
+		if r.URL.Path == "/api/users" {
+			_ = json.NewEncoder(w).Encode([]models.User{})
+			return
+		}
+		if r.URL.Path == "/api/chats" {
+			_ = json.NewEncoder(w).Encode([]models.Chat{})
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/chats/") {
+			_ = json.NewEncoder(w).Encode([]models.Message{})
+			return
+		}
+
+		if r.URL.Path == "/api/chat" {
+			conn, err := upgrader.Upgrade(w, r, nil)
+			require.NoError(t, err)
+			defer func() { _ = conn.Close() }()
+
+			for {
+				var msg models.ClientMessage
+				if err := conn.ReadJSON(&msg); err != nil {
+					break
+				}
+				receivedFrames <- msg
+			}
+		}
+	}))
+	defer besedkaServer.Close()
+
+	// 3. Initialize GEOIP and Gateway
+	geoClient := geoip.NewClient(
+		geoServer.Client(),
+		geoip.WithProviders([]geoip.Provider{
+			{Name: "mock-ip-api", URL: geoServer.URL, Parser: geoip.ParseIPAPI},
+		}),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	loc, err := geoClient.FetchLocation(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, loc)
+	assert.Equal(t, -8.4095, loc.Lat)
+	assert.Equal(t, 115.1889, loc.Lng)
+
+	cfg := &config.Config{
+		BotHandle:  "@bob",
+		BesedkaURL: besedkaServer.URL,
+	}
+
+	gw := gateway.NewGateway(cfg, nil)
+	gw.SetLocation(loc)
+	gw.SetInitialLocationDelay(20 * time.Millisecond)
+	gw.SetLocationInterval(50 * time.Millisecond)
+
+	go func() {
+		_ = gw.Start(ctx)
+	}()
+
+	// 4. Verify initial location WS frame arrives soon after initial connection
+	select {
+	case frame := <-receivedFrames:
+		assert.Equal(t, models.ClientMessageTypeLocation, frame.Type)
+		require.NotNil(t, frame.Location)
+		assert.Equal(t, -8.4095, frame.Location.Lat)
+		assert.Equal(t, 115.1889, frame.Location.Lng)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for initial location frame in integration test")
+	}
+
+	gw.Stop()
 }

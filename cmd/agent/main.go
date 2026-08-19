@@ -7,9 +7,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"bob/internal/config"
 	"bob/internal/gateway"
+	"bob/internal/geoip"
 	"bob/internal/llm"
 )
 
@@ -40,9 +42,21 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	httpClient := &http.Client{}
+	httpClient := &http.Client{Timeout: 15 * time.Second}
+
+	// Query server GEOIP location on startup (random round-robin across providers, up to 3 attempts)
+	loc, err := geoip.FetchLocation(ctx, httpClient)
+	if err != nil {
+		slog.Warn("could not determine server location via GEOIP", "error", err)
+	} else if loc != nil {
+		slog.Info("server location determined via GEOIP", "lat", loc.Lat, "lng", loc.Lng)
+	}
+
 	llmClient := llm.NewClient(cfg, httpClient)
 	gw := gateway.NewGateway(cfg, llmClient)
+	if loc != nil {
+		gw.SetLocation(loc)
+	}
 
 	go func() {
 		<-ctx.Done()
