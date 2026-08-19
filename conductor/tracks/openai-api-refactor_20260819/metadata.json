@@ -1,0 +1,8 @@
+{
+  "track_id": "openai-api-refactor_20260819",
+  "type": "refactor",
+  "status": "new",
+  "created_at": "2026-08-19T11:04:23Z",
+  "updated_at": "2026-08-19T11:04:23Z",
+  "description": "\"OpenAI API\". Instead of using hand-rolled openai protocol, let's refactor to use https://github.com/sashabaranov/go-openai. It will give us out of the box support for tools definitions."
+}
