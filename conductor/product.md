@@ -11,7 +11,7 @@ Self-improving general use AI agent for Besedka chat. Phase 1 delivers a request
 ## Key Features & Capabilities (Phase 1)
 - **Besedka Ingress Gateway (Go):** Listens to Besedka API / WebSocket events for incoming chat messages.
 - **Configurable Mention Filter:** Detects direct mentions based on a configurable handle (e.g., `@bot`, defaulting via `BOT_HANDLE` env var) in Townhall and direct messages.
-- **OpenAI-Compatible LLM Client (Go):** Routes structured requests to Google Gemini OpenAI-compatible REST endpoint (`https://generativelanguage.googleapis.com/v1beta/openai/`) using `gemini-3.7-flash` by default (configurable via `GEMINI_MODEL`, `GEMINI_API_KEY`, and `BASE_URL`).
+- **OpenAI-Compatible LLM Client (Go):** Modernized client based on `github.com/sashabaranov/go-openai` with built-in support for tool definitions. Configurable via standard `OPENAI_API_KEY`, `OPENAI_MODEL`, and `OPENAI_BASE_URL` with backward compatibility for legacy `GEMINI_*` env vars.
 - **Besedka Egress Response:** Posts generated text back to the originating Besedka chat via REST/WebSocket API.
 - **Multi-Turn Context Management:** Per-chat in-memory ring buffers maintaining up to $N$ recent message turns (default 100, configurable via `MSG_RING_BUFFER_SIZE`), with startup context warmup and dynamic templated system prompts reflecting bot/user identity and channel guidelines.
 - **Local-First Testing & Harness:** Complete local test setup allowing manual browser testing against a local Besedka instance before any cloud deployment.

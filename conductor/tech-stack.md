@@ -12,9 +12,10 @@
 
 ## 3. LLM Provider & Inference API
 - **Endpoint Protocol:** OpenAI-compatible REST API (`/v1/chat/completions`)
+- **Client Library:** `github.com/sashabaranov/go-openai` (built-in support for tool/function definitions)
 - **Primary Provider Target (Phase 1):** Google Gemini OpenAI-compatible REST API (`https://generativelanguage.googleapis.com/v1beta/openai/`)
-- **Default Model:** `gemini-3.7-flash` (configurable via `GEMINI_MODEL`)
-- **Configurability:** Environment variables for `GEMINI_API_KEY`, `GEMINI_MODEL`, `BASE_URL`
+- **Default Model:** `gemini-3.7-flash` (configurable via `OPENAI_MODEL` / `GEMINI_MODEL`)
+- **Configurability:** Standard OpenAI environment variables (`OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_BASE_URL`) with backward-compatible fallback for `GEMINI_*` env vars.
 - **Future Readiness:** Compatible with local open-weights inference servers (vLLM / SGLang) running local models in future phases.
 
 ## 4. Configuration & State Management
