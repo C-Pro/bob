@@ -16,9 +16,6 @@
 - **Phase 1: Simple Request/Response Agent & Besedka Gateway** (`phase-1-request-response-bot`) - [Plan](archive/phase-1-request-response-bot_20260818/plan.md) | [Spec](archive/phase-1-request-response-bot_20260818/spec.md)
 - **Track: Simple Context Management** (`simple-context-management_20260818`) - [Plan](archive/simple-context-management_20260818/plan.md) | [Spec](archive/simple-context-management_20260818/spec.md)
 - **Track: OpenAI API Refactor** (`openai-api-refactor_20260819`) - [Plan](archive/openai-api-refactor_20260819/plan.md) | [Spec](archive/openai-api-refactor_20260819/spec.md)
+- **Track: Search tool (Tavily API support)** (`search-tool_20260823`) - [Plan](archive/search-tool_20260823/plan.md) | [Spec](archive/search-tool_20260823/spec.md)
 
----
-
-- [x] **Track: Search tool (Tavily API support)**
-*Link: [./tracks/search-tool_20260823/](./tracks/search-tool_20260823/)*
 
