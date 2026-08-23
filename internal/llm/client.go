@@ -1,11 +1,16 @@
 package llm
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"bob/internal/config"
@@ -21,15 +26,230 @@ type Client struct {
 	baseDelay  time.Duration
 }
 
+// geminiTransport preserves thought_signatures and extra_content metadata required by Google Gemini models during multi-turn tool calling.
+type geminiTransport struct {
+	base       http.RoundTripper
+	mu         sync.RWMutex
+	signatures map[string]string
+}
+
+func newGeminiTransport(base http.RoundTripper) *geminiTransport {
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return &geminiTransport{
+		base:       base,
+		signatures: make(map[string]string),
+	}
+}
+
+func (g *geminiTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Body != nil && strings.HasSuffix(req.URL.Path, "/chat/completions") {
+		bodyBytes, err := io.ReadAll(req.Body)
+		_ = req.Body.Close()
+		if err == nil {
+			var bodyMap map[string]interface{}
+			if err := json.Unmarshal(bodyBytes, &bodyMap); err == nil {
+				if g.injectThoughtSignatures(bodyMap) {
+					if newBytes, err := json.Marshal(bodyMap); err == nil {
+						bodyBytes = newBytes
+					}
+				}
+			}
+			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			req.ContentLength = int64(len(bodyBytes))
+			req.Header.Set("Content-Length", strconv.Itoa(len(bodyBytes)))
+		}
+	}
+
+	resp, err := g.base.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.Body != nil && resp.StatusCode == http.StatusOK && strings.HasSuffix(req.URL.Path, "/chat/completions") {
+		respBytes, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err == nil {
+			g.extractThoughtSignatures(respBytes)
+			resp.Body = io.NopCloser(bytes.NewReader(respBytes))
+		}
+	}
+
+	return resp, nil
+}
+
+func (g *geminiTransport) extractThoughtSignatures(data []byte) {
+	var respMap map[string]interface{}
+	if err := json.Unmarshal(data, &respMap); err != nil {
+		return
+	}
+
+	choices, ok := respMap["choices"].([]interface{})
+	if !ok {
+		return
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	for _, choiceVal := range choices {
+		choice, ok := choiceVal.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		msg, ok := choice["message"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		var msgSig string
+		if sig, ok := msg["thought_signature"].(string); ok && sig != "" {
+			msgSig = sig
+		}
+		if extra, ok := msg["extra_content"].(map[string]interface{}); ok {
+			if google, ok := extra["google"].(map[string]interface{}); ok {
+				if sig, ok := google["thought_signature"].(string); ok && sig != "" {
+					msgSig = sig
+				}
+			}
+		}
+
+		toolCalls, ok := msg["tool_calls"].([]interface{})
+		if !ok {
+			continue
+		}
+
+		for _, tcVal := range toolCalls {
+			tc, ok := tcVal.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			tcID, _ := tc["id"].(string)
+			fn, _ := tc["function"].(map[string]interface{})
+			fnName, _ := fn["name"].(string)
+
+			tcSig := msgSig
+			if sig, ok := tc["thought_signature"].(string); ok && sig != "" {
+				tcSig = sig
+			}
+			if extra, ok := tc["extra_content"].(map[string]interface{}); ok {
+				if google, ok := extra["google"].(map[string]interface{}); ok {
+					if sig, ok := google["thought_signature"].(string); ok && sig != "" {
+						tcSig = sig
+					}
+				}
+			}
+
+			if tcSig != "" {
+				if tcID != "" {
+					g.signatures[tcID] = tcSig
+				}
+				if fnName != "" {
+					g.signatures[fnName] = tcSig
+				}
+			}
+		}
+	}
+}
+
+func (g *geminiTransport) injectThoughtSignatures(bodyMap map[string]interface{}) bool {
+	messages, ok := bodyMap["messages"].([]interface{})
+	if !ok {
+		return false
+	}
+
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	modified := false
+	for _, msgVal := range messages {
+		msg, ok := msgVal.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		role, _ := msg["role"].(string)
+		if role != "assistant" {
+			continue
+		}
+
+		toolCalls, ok := msg["tool_calls"].([]interface{})
+		if !ok || len(toolCalls) == 0 {
+			continue
+		}
+
+		var lastSig string
+		for _, tcVal := range toolCalls {
+			tc, ok := tcVal.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			tcID, _ := tc["id"].(string)
+			fn, _ := tc["function"].(map[string]interface{})
+			fnName, _ := fn["name"].(string)
+
+			if _, hasSig := tc["thought_signature"]; hasSig {
+				continue
+			}
+
+			sig := g.signatures[tcID]
+			if sig == "" {
+				sig = g.signatures[fnName]
+			}
+			if sig == "" {
+				sig = "skip_thought_signature_validator"
+			}
+
+			tc["thought_signature"] = sig
+			tc["extra_content"] = map[string]interface{}{
+				"google": map[string]interface{}{
+					"thought_signature": sig,
+				},
+			}
+			lastSig = sig
+			modified = true
+		}
+
+		if lastSig != "" {
+			if _, hasExtra := msg["extra_content"]; !hasExtra {
+				msg["extra_content"] = map[string]interface{}{
+					"google": map[string]interface{}{
+						"thought_signature": lastSig,
+					},
+				}
+				modified = true
+			}
+		}
+	}
+
+	return modified
+}
+
 // NewClient creates a new LLM client configured with standard OpenAI settings.
 func NewClient(cfg *config.Config, httpClient *http.Client) *Client {
 	clientConfig := openai.DefaultConfig(cfg.OpenAIAPIKey)
 	if cfg.OpenAIBaseURL != "" {
 		clientConfig.BaseURL = strings.TrimSuffix(cfg.OpenAIBaseURL, "/")
 	}
+
+	var baseTransport http.RoundTripper
+	clientTimeout := 30 * time.Second
 	if httpClient != nil {
-		clientConfig.HTTPClient = httpClient
+		baseTransport = httpClient.Transport
+		if httpClient.Timeout > 0 {
+			clientTimeout = httpClient.Timeout
+		}
 	}
+	if baseTransport == nil {
+		baseTransport = http.DefaultTransport
+	}
+
+	geminiWrappedClient := &http.Client{
+		Transport: newGeminiTransport(baseTransport),
+		Timeout:   clientTimeout,
+	}
+	clientConfig.HTTPClient = geminiWrappedClient
 
 	return &Client{
 		cfg:        cfg,

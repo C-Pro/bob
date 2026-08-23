@@ -392,3 +392,112 @@ func TestGenerateChatResponseWithToolLoop_MaxIterationsExceeded(t *testing.T) {
 	assert.Contains(t, err.Error(), "tool execution loop exceeded max iterations (2)")
 }
 
+func TestGenerateChatResponseWithToolLoop_GeminiThoughtSignaturePreservation(t *testing.T) {
+	var turn int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		currentTurn := atomic.AddInt32(&turn, 1)
+		w.Header().Set("Content-Type", "application/json")
+
+		if currentTurn == 1 {
+			// Turn 1: Return tool call with Gemini thought_signature in JSON
+			rawResp := `{
+				"id": "chatcmpl-gemini",
+				"choices": [
+					{
+						"index": 0,
+						"message": {
+							"role": "assistant",
+							"tool_calls": [
+								{
+									"id": "call_gemini_search",
+									"type": "function",
+									"function": {
+										"name": "web_search",
+										"arguments": "{\"query\":\"lombok fire\"}"
+									},
+									"thought_signature": "gemini_thought_sig_secret_xyz"
+								}
+							],
+							"extra_content": {
+								"google": {
+									"thought_signature": "gemini_thought_sig_secret_xyz"
+								}
+							}
+						}
+					}
+				]
+			}`
+			_, _ = w.Write([]byte(rawResp))
+			return
+		}
+
+		// Turn 2: Verify outgoing JSON contains thought_signature
+		var bodyMap map[string]interface{}
+		err := json.NewDecoder(r.Body).Decode(&bodyMap)
+		require.NoError(t, err)
+
+		messages, ok := bodyMap["messages"].([]interface{})
+		require.True(t, ok)
+		require.GreaterOrEqual(t, len(messages), 3)
+
+		// Find assistant message with tool calls
+		var foundThoughtSig bool
+		for _, mVal := range messages {
+			m, ok := mVal.(map[string]interface{})
+			if !ok || m["role"] != "assistant" {
+				continue
+			}
+			toolCalls, ok := m["tool_calls"].([]interface{})
+			if !ok || len(toolCalls) == 0 {
+				continue
+			}
+			tc := toolCalls[0].(map[string]interface{})
+			if tc["thought_signature"] == "gemini_thought_sig_secret_xyz" {
+				foundThoughtSig = true
+			}
+		}
+		assert.True(t, foundThoughtSig, "expected thought_signature to be re-injected into outgoing request")
+
+		finalResp := openai.ChatCompletionResponse{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Index: 0,
+					Message: openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "Here is the information about the fire in Lombok.",
+					},
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(finalResp)
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		OpenAIAPIKey:  "test-key",
+		OpenAIModel:   "gemini-3.7-flash",
+		OpenAIBaseURL: server.URL,
+	}
+
+	client := NewClient(cfg, server.Client())
+	executor := &mockToolExecutor{
+		executeFunc: func(ctx context.Context, name, argsJSON string) (string, error) {
+			return `{"results":[{"title":"Lombok Fire","content":"Details about the fire..."}]}`, nil
+		},
+	}
+
+	reply, err := client.GenerateChatResponseWithToolLoop(
+		context.Background(),
+		[]openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleUser, Content: "What happened with the fire in Lombok?"}},
+		[]openai.Tool{{Type: openai.ToolTypeFunction, Function: &openai.FunctionDefinition{Name: "web_search"}}},
+		executor,
+		5,
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, "Here is the information about the fire in Lombok.", reply)
+	assert.Equal(t, int32(2), atomic.LoadInt32(&turn))
+}
+
+
