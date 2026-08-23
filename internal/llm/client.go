@@ -435,6 +435,23 @@ func (c *Client) GenerateChatResponseWithToolLoop(
 		}
 	}
 
-	return "", fmt.Errorf("tool execution loop exceeded max iterations (%d)", maxIterations)
+	// Graceful synthesis step: when maxIterations is reached, request a final completion with tools disabled
+	currentMessages = append(currentMessages, openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleUser,
+		Content: "You have reached the tool execution limit. Please synthesize and provide the best possible response based on all information gathered so far without calling any more tools.",
+	})
+
+	finalReq := openai.ChatCompletionRequest{
+		Model:    c.cfg.OpenAIModel,
+		Messages: currentMessages,
+		Tools:    nil,
+	}
+
+	finalResp, err := c.CreateChatCompletion(ctx, finalReq)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate final synthesis response after tool iterations: %w", err)
+	}
+
+	return finalResp.Choices[0].Message.Content, nil
 }
 

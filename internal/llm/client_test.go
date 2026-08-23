@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -340,29 +341,56 @@ func TestGenerateChatResponseWithToolLoop_Success(t *testing.T) {
 	assert.Equal(t, int32(2), atomic.LoadInt32(&callCount))
 }
 
-func TestGenerateChatResponseWithToolLoop_MaxIterationsExceeded(t *testing.T) {
+func TestGenerateChatResponseWithToolLoop_GracefulSynthesisOnMaxIterations(t *testing.T) {
+	var callCount int32
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		resp := openai.ChatCompletionResponse{
-			Choices: []openai.ChatCompletionChoice{
-				{
-					Index: 0,
-					Message: openai.ChatCompletionMessage{
-						Role: openai.ChatMessageRoleAssistant,
-						ToolCalls: []openai.ToolCall{
-							{
-								ID:   "call_loop",
-								Type: openai.ToolTypeFunction,
-								Function: openai.FunctionCall{
-									Name:      "web_search",
-									Arguments: `{"query":"loop"}`,
+		currentCall := atomic.AddInt32(&callCount, 1)
+		w.Header().Set("Content-Type", "application/json")
+
+		if currentCall <= 2 {
+			// Turns 1 and 2: Model requests tool calls
+			resp := openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Index: 0,
+						Message: openai.ChatCompletionMessage{
+							Role: openai.ChatMessageRoleAssistant,
+							ToolCalls: []openai.ToolCall{
+								{
+									ID:   fmt.Sprintf("call_%d", currentCall),
+									Type: openai.ToolTypeFunction,
+									Function: openai.FunctionCall{
+										Name:      "web_search",
+										Arguments: `{"query":"ongoing search"}`,
+									},
 								},
 							},
 						},
 					},
 				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		// Turn 3: Final graceful synthesis turn (tools should be nil/empty)
+		var bodyMap map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&bodyMap)
+		tools := bodyMap["tools"]
+		assert.Nil(t, tools, "final synthesis call should have tools disabled")
+
+		resp := openai.ChatCompletionResponse{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Index: 0,
+					Message: openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "Synthesized summary after reaching tool iteration limit.",
+					},
+				},
 			},
 		}
-		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer server.Close()
@@ -376,20 +404,21 @@ func TestGenerateChatResponseWithToolLoop_MaxIterationsExceeded(t *testing.T) {
 	client := NewClient(cfg, server.Client())
 	executor := &mockToolExecutor{
 		executeFunc: func(ctx context.Context, name, argsJSON string) (string, error) {
-			return `{"results": []}`, nil
+			return `{"results": [{"title": "Search Result", "content": "Some info"}]}`, nil
 		},
 	}
 
-	_, err := client.GenerateChatResponseWithToolLoop(
+	reply, err := client.GenerateChatResponseWithToolLoop(
 		context.Background(),
-		[]openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleUser, Content: "Loop test"}},
-		nil,
+		[]openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleUser, Content: "Find details"}},
+		[]openai.Tool{{Type: openai.ToolTypeFunction, Function: &openai.FunctionDefinition{Name: "web_search"}}},
 		executor,
 		2,
 	)
 
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "tool execution loop exceeded max iterations (2)")
+	require.NoError(t, err)
+	assert.Equal(t, "Synthesized summary after reaching tool iteration limit.", reply)
+	assert.Equal(t, int32(3), atomic.LoadInt32(&callCount))
 }
 
 func TestGenerateChatResponseWithToolLoop_GeminiThoughtSignaturePreservation(t *testing.T) {
