@@ -74,6 +74,7 @@ func TestExecuteWebSearchSuccess(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "golang news", resultObj["query"])
 	assert.Equal(t, "Go 1.26 is the latest version.", resultObj["answer"])
+	assert.Contains(t, resultObj["instruction"], "markdown links [Title](URL)")
 	resultsArr, ok := resultObj["results"].([]interface{})
 	require.True(t, ok)
 	require.Len(t, resultsArr, 1)

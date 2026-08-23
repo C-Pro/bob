@@ -53,7 +53,7 @@ func (r *Registry) initToolDefinitions() {
 			Type: openai.ToolTypeFunction,
 			Function: &openai.FunctionDefinition{
 				Name:        "web_search",
-				Description: "Search the live web for current information, news, documentation, and facts using Tavily search.",
+				Description: "Search the live web for current information, news, documentation, and facts using Tavily search. When using results from this tool in your response, always cite sources and include the original markdown links [Title](URL) provided in the search results.",
 				Parameters:  webSearchSchema,
 			},
 		},
@@ -109,7 +109,14 @@ func (r *Registry) executeWebSearch(ctx context.Context, argsJSON string) (strin
 		return "", fmt.Errorf("search error: %w", err)
 	}
 
-	respBytes, err := json.Marshal(resp)
+	payload := map[string]interface{}{
+		"query":       resp.Query,
+		"answer":      resp.Answer,
+		"results":     resp.Results,
+		"instruction": "When presenting these search findings to the user, cite your sources with original markdown links [Title](URL) from the results.",
+	}
+
+	respBytes, err := json.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("failed to format search response: %w", err)
 	}
