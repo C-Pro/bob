@@ -32,3 +32,7 @@
 - **Deployment Platform:** GCP Spot VM (co-located on the same Spot VM instances as Besedka)
 - **Container Registry:** GCP Artifact Registry (`asia-southeast2-docker.pkg.dev`)
 - **CI/CD Orchestration:** GitHub Actions (`pipeline.yml` with `workflow_dispatch`, `push` to `main` for test VM, and `v*` tag triggers for prod VM)
+
+## 7. Tools & External Integrations
+- **Web Search API:** Tavily REST API (`POST /search`) with native Go HTTP client, exponential retry backoff, and OpenAI function calling integration.
+
