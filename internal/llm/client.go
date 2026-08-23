@@ -149,3 +149,72 @@ func (c *Client) GenerateResponse(ctx context.Context, systemPrompt, userMessage
 	})
 	return c.GenerateChatResponse(ctx, messages)
 }
+
+// ToolExecutor defines an interface for executing function/tool calls returned by the LLM.
+type ToolExecutor interface {
+	Execute(ctx context.Context, name string, argsJSON string) (string, error)
+}
+
+// GenerateChatResponseWithToolLoop sends chat completion requests iteratively, executing any requested tool calls until a final text response is returned.
+func (c *Client) GenerateChatResponseWithToolLoop(
+	ctx context.Context,
+	messages []openai.ChatCompletionMessage,
+	tools []openai.Tool,
+	executor ToolExecutor,
+	maxIterations int,
+) (string, error) {
+	if maxIterations <= 0 {
+		maxIterations = 5
+	}
+
+	currentMessages := make([]openai.ChatCompletionMessage, len(messages))
+	copy(currentMessages, messages)
+
+	for iter := 0; iter < maxIterations; iter++ {
+		req := openai.ChatCompletionRequest{
+			Model:    c.cfg.OpenAIModel,
+			Messages: currentMessages,
+			Tools:    tools,
+		}
+
+		resp, err := c.CreateChatCompletion(ctx, req)
+		if err != nil {
+			return "", err
+		}
+
+		choice := resp.Choices[0]
+		assistantMsg := choice.Message
+
+		// If no tool calls were requested, return the assistant's content
+		if len(assistantMsg.ToolCalls) == 0 {
+			return assistantMsg.Content, nil
+		}
+
+		// Append assistant message with tool calls to conversation history
+		currentMessages = append(currentMessages, assistantMsg)
+
+		// Execute each tool call and append the result as a tool role message
+		for _, toolCall := range assistantMsg.ToolCalls {
+			var toolResult string
+			if executor == nil {
+				toolResult = `{"error": "tool execution is not configured"}`
+			} else {
+				res, execErr := executor.Execute(ctx, toolCall.Function.Name, toolCall.Function.Arguments)
+				if execErr != nil {
+					toolResult = fmt.Sprintf(`{"error": %q}`, execErr.Error())
+				} else {
+					toolResult = res
+				}
+			}
+
+			currentMessages = append(currentMessages, openai.ChatCompletionMessage{
+				Role:       openai.ChatMessageRoleTool,
+				Content:    toolResult,
+				ToolCallID: toolCall.ID,
+			})
+		}
+	}
+
+	return "", fmt.Errorf("tool execution loop exceeded max iterations (%d)", maxIterations)
+}
+

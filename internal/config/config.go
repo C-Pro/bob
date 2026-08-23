@@ -22,6 +22,8 @@ type Config struct {
 	TownhallMaxParagraphs int
 	DMMaxParagraphs       int
 	MsgRingBufferSize     int
+	TavilyAPIKey          string
+	TavilyBaseURL         string
 }
 
 // LoadFromEnv loads configuration from environment variables (or .env file) with sensible defaults.
@@ -36,6 +38,7 @@ func LoadFromEnv() (*Config, error) {
 	apiKey := getEnvOrDefault("OPENAI_API_KEY", os.Getenv("GEMINI_API_KEY"))
 	model := getEnvOrDefault("OPENAI_MODEL", getEnvOrDefault("GEMINI_MODEL", "gemini-3.7-flash"))
 	baseURL := getEnvOrDefault("OPENAI_BASE_URL", getEnvOrDefault("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"))
+	tavilyBaseURL := strings.TrimSuffix(getEnvOrDefault("TAVILY_BASE_URL", "https://api.tavily.com"), "/")
 
 	cfg := &Config{
 		BotHandle:             getEnvOrDefault("BOT_HANDLE", "@bot"),
@@ -47,6 +50,8 @@ func LoadFromEnv() (*Config, error) {
 		GeminiAPIKey:          apiKey,
 		GeminiModel:           model,
 		GeminiBaseURL:         baseURL,
+		TavilyAPIKey:          getEnvOrDefault("TAVILY_API_KEY", ""),
+		TavilyBaseURL:         tavilyBaseURL,
 		TownhallMaxParagraphs: getEnvIntOrDefault("TOWNHALL_MAX_PARAGRAPHS", 2),
 		DMMaxParagraphs:       getEnvIntOrDefault("DM_MAX_PARAGRAPHS", 10),
 		MsgRingBufferSize:     getEnvIntOrDefault("MSG_RING_BUFFER_SIZE", 100),

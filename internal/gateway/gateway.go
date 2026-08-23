@@ -19,6 +19,8 @@ import (
 	"bob/internal/llm"
 	"bob/internal/models"
 	"bob/internal/prompt"
+	"bob/internal/tools"
+	"bob/internal/tools/tavily"
 
 	"github.com/fasthttp/websocket"
 	openai "github.com/sashabaranov/go-openai"
@@ -29,6 +31,7 @@ type Gateway struct {
 	cfg                  *config.Config
 	llmClient            *llm.Client
 	httpClient           *http.Client
+	toolsRegistry        *tools.Registry
 	conn                 *websocket.Conn
 	mu                   sync.Mutex
 	running              bool
@@ -44,16 +47,31 @@ type Gateway struct {
 
 // NewGateway creates a new Besedka Gateway instance.
 func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+	var toolsRegistry *tools.Registry
+	if cfg.TavilyAPIKey != "" {
+		tavilyClient := tavily.NewClient(cfg.TavilyAPIKey, cfg.TavilyBaseURL, httpClient)
+		toolsRegistry = tools.NewRegistry(tavilyClient)
+	}
+
 	return &Gateway{
 		cfg:                  cfg,
 		llmClient:            llmClient,
-		httpClient:           &http.Client{Timeout: 10 * time.Second},
+		httpClient:           httpClient,
+		toolsRegistry:        toolsRegistry,
 		userCache:            NewUserCache(),
 		contextManager:       chatcontext.NewManager(cfg.MsgRingBufferSize),
 		startTime:            time.Now(),
 		locationInterval:     9 * time.Minute,
 		initialLocationDelay: 1 * time.Second,
 	}
+}
+
+// SetToolsRegistry sets the tool registry for the gateway.
+func (g *Gateway) SetToolsRegistry(r *tools.Registry) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.toolsRegistry = r
 }
 
 var (
@@ -470,7 +488,23 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 	})
 	llmMsgs = append(llmMsgs, bufferedMsgs...)
 
-	reply, err := g.llmClient.GenerateChatResponse(ctx, llmMsgs)
+	g.mu.Lock()
+	toolsRegistry := g.toolsRegistry
+	g.mu.Unlock()
+
+	var reply string
+	var err error
+	if toolsRegistry != nil && len(toolsRegistry.ToolDefinitions()) > 0 {
+		reply, err = g.llmClient.GenerateChatResponseWithToolLoop(
+			ctx,
+			llmMsgs,
+			toolsRegistry.ToolDefinitions(),
+			toolsRegistry,
+			5,
+		)
+	} else {
+		reply, err = g.llmClient.GenerateChatResponse(ctx, llmMsgs)
+	}
 	if err != nil {
 		slog.Error("failed to generate LLM response", "error", err)
 		reply = "Sorry, I encountered an issue processing your request. Please try again later."

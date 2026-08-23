@@ -236,3 +236,159 @@ func TestGenerateChatResponseWithTools(t *testing.T) {
 	assert.Equal(t, "get_weather", resp.Choices[0].Message.ToolCalls[0].Function.Name)
 	assert.Equal(t, `{"location":"Tokyo"}`, resp.Choices[0].Message.ToolCalls[0].Function.Arguments)
 }
+
+type mockToolExecutor struct {
+	executeFunc func(ctx context.Context, name, argsJSON string) (string, error)
+}
+
+func (m *mockToolExecutor) Execute(ctx context.Context, name, argsJSON string) (string, error) {
+	return m.executeFunc(ctx, name, argsJSON)
+}
+
+func TestGenerateChatResponseWithToolLoop_Success(t *testing.T) {
+	var callCount int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req openai.ChatCompletionRequest
+		err := json.NewDecoder(r.Body).Decode(&req)
+		require.NoError(t, err)
+
+		count := atomic.AddInt32(&callCount, 1)
+		w.Header().Set("Content-Type", "application/json")
+
+		if count == 1 {
+			// First turn: LLM calls web_search
+			resp := openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Index: 0,
+						Message: openai.ChatCompletionMessage{
+							Role: openai.ChatMessageRoleAssistant,
+							ToolCalls: []openai.ToolCall{
+								{
+									ID:   "call_search_1",
+									Type: openai.ToolTypeFunction,
+									Function: openai.FunctionCall{
+										Name:      "web_search",
+										Arguments: `{"query":"golang 1.26"}`,
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		// Second turn: Verify tool response message is included in request
+		require.GreaterOrEqual(t, len(req.Messages), 3)
+		lastMsg := req.Messages[len(req.Messages)-1]
+		assert.Equal(t, openai.ChatMessageRoleTool, lastMsg.Role)
+		assert.Equal(t, "call_search_1", lastMsg.ToolCallID)
+		assert.Contains(t, lastMsg.Content, "Go 1.26 release notes")
+
+		resp := openai.ChatCompletionResponse{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Index: 0,
+					Message: openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "Go 1.26 has been released with many improvements.",
+					},
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		OpenAIAPIKey:  "test-key",
+		OpenAIModel:   "gpt-4o-mini",
+		OpenAIBaseURL: server.URL,
+	}
+
+	client := NewClient(cfg, server.Client())
+	tools := []openai.Tool{
+		{
+			Type: openai.ToolTypeFunction,
+			Function: &openai.FunctionDefinition{
+				Name: "web_search",
+			},
+		},
+	}
+
+	executor := &mockToolExecutor{
+		executeFunc: func(ctx context.Context, name, argsJSON string) (string, error) {
+			assert.Equal(t, "web_search", name)
+			return `{"results": [{"title": "Go 1.26", "content": "Go 1.26 release notes"}]}`, nil
+		},
+	}
+
+	reply, err := client.GenerateChatResponseWithToolLoop(
+		context.Background(),
+		[]openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleUser, Content: "What is in Go 1.26?"}},
+		tools,
+		executor,
+		5,
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, "Go 1.26 has been released with many improvements.", reply)
+	assert.Equal(t, int32(2), atomic.LoadInt32(&callCount))
+}
+
+func TestGenerateChatResponseWithToolLoop_MaxIterationsExceeded(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := openai.ChatCompletionResponse{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Index: 0,
+					Message: openai.ChatCompletionMessage{
+						Role: openai.ChatMessageRoleAssistant,
+						ToolCalls: []openai.ToolCall{
+							{
+								ID:   "call_loop",
+								Type: openai.ToolTypeFunction,
+								Function: openai.FunctionCall{
+									Name:      "web_search",
+									Arguments: `{"query":"loop"}`,
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		OpenAIAPIKey:  "test-key",
+		OpenAIModel:   "gpt-4o-mini",
+		OpenAIBaseURL: server.URL,
+	}
+
+	client := NewClient(cfg, server.Client())
+	executor := &mockToolExecutor{
+		executeFunc: func(ctx context.Context, name, argsJSON string) (string, error) {
+			return `{"results": []}`, nil
+		},
+	}
+
+	_, err := client.GenerateChatResponseWithToolLoop(
+		context.Background(),
+		[]openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleUser, Content: "Loop test"}},
+		nil,
+		executor,
+		2,
+	)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "tool execution loop exceeded max iterations (2)")
+}
+

@@ -34,6 +34,7 @@ func main() {
 		"besedkaURL", cfg.BesedkaURL,
 		"openAIModel", cfg.OpenAIModel,
 		"openAIBaseURL", cfg.OpenAIBaseURL,
+		"webSearchEnabled", cfg.TavilyAPIKey != "",
 		"townhallMaxParagraphs", cfg.TownhallMaxParagraphs,
 		"dmMaxParagraphs", cfg.DMMaxParagraphs,
 		"msgRingBufferSize", cfg.MsgRingBufferSize,

@@ -6,12 +6,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"bob/internal/config"
 	"bob/internal/llm"
 	"bob/internal/models"
+	"bob/internal/tools/tavily"
 
 	"github.com/fasthttp/websocket"
 	openai "github.com/sashabaranov/go-openai"
@@ -838,4 +840,176 @@ func TestGateway_LocationFrameReporting_NilLocation(t *testing.T) {
 
 	gw.Stop()
 }
+
+func TestProcessMessageWithWebSearchTool(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	sentMessages := make(chan models.ClientMessage, 10)
+
+	// 1. Mock Besedka server
+	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/me" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(models.User{ID: "bot-id", UserName: "bot", DisplayName: "BotAssistant"})
+			return
+		}
+		if r.URL.Path == "/api/users" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.User{
+				{ID: "user-1", UserName: "alice", DisplayName: "Alice"},
+			})
+			return
+		}
+		if r.URL.Path == "/api/chats" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.Chat{})
+			return
+		}
+		if r.URL.Path == "/api/chat" {
+			conn, err := upgrader.Upgrade(w, r, nil)
+			require.NoError(t, err)
+			defer func() { _ = conn.Close() }()
+
+			for {
+				var msg models.ClientMessage
+				if err := conn.ReadJSON(&msg); err != nil {
+					break
+				}
+				sentMessages <- msg
+			}
+		}
+	}))
+	defer besedkaServer.Close()
+
+	// 2. Mock Tavily Search Server
+	tavilyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/search", r.URL.Path)
+		resp := tavily.SearchResponse{
+			Query:  "golang 1.26 features",
+			Answer: "Go 1.26 adds enhanced tool calling support.",
+			Results: []tavily.SearchResult{
+				{
+					Title:   "Go 1.26 Release",
+					URL:     "https://go.dev/blog/go1.26",
+					Content: "Go 1.26 improves compiler and runtime performance.",
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer tavilyServer.Close()
+
+	// 3. Mock OpenAI LLM Server
+	var llmCallCount int32
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := atomic.AddInt32(&llmCallCount, 1)
+		w.Header().Set("Content-Type", "application/json")
+
+		if count == 1 {
+			var req openai.ChatCompletionRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			require.NotEmpty(t, req.Tools)
+			assert.Equal(t, "web_search", req.Tools[0].Function.Name)
+
+			// LLM decides to call web_search
+			resp := openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Index: 0,
+						Message: openai.ChatCompletionMessage{
+							Role: openai.ChatMessageRoleAssistant,
+							ToolCalls: []openai.ToolCall{
+								{
+									ID:   "call_tavily_1",
+									Type: openai.ToolTypeFunction,
+									Function: openai.FunctionCall{
+										Name:      "web_search",
+										Arguments: `{"query":"golang 1.26 features"}`,
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		// Second turn: returns final text
+		resp := openai.ChatCompletionResponse{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Index: 0,
+					Message: openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "Go 1.26 adds enhanced tool calling support.",
+					},
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer llmServer.Close()
+
+	cfg := &config.Config{
+		BotHandle:             "@bot",
+		BesedkaURL:            besedkaServer.URL,
+		OpenAIAPIKey:          "test-key",
+		OpenAIModel:           "gpt-4o-mini",
+		OpenAIBaseURL:         llmServer.URL,
+		TavilyAPIKey:          "tavily-test-key",
+		TavilyBaseURL:         tavilyServer.URL,
+		TownhallMaxParagraphs: 2,
+		DMMaxParagraphs:       10,
+		MsgRingBufferSize:     10,
+	}
+
+	llmClient := llm.NewClient(cfg, llmServer.Client())
+	gw := NewGateway(cfg, llmClient)
+	gw.httpClient = besedkaServer.Client()
+
+	// Connect websocket
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := gw.DialWebSocket(ctx)
+	require.NoError(t, err)
+
+	// Pre-fetch bot user metadata
+	_, err = gw.FetchBotUser(ctx)
+	require.NoError(t, err)
+
+	incomingMsg := models.Message{
+		Seq:       1,
+		ChatID:    "townhall",
+		UserID:    "user-1",
+		Content:   "@bot what are the golang 1.26 features?",
+		Timestamp: time.Now().Unix(),
+	}
+
+	err = gw.ProcessMessage(ctx, incomingMsg)
+	require.NoError(t, err)
+
+	// Verify reply sent to Besedka
+	select {
+	case reply := <-sentMessages:
+		assert.Equal(t, models.ClientMessageTypeSend, reply.Type)
+		assert.Equal(t, "townhall", reply.ChatID)
+		assert.Equal(t, "Go 1.26 adds enhanced tool calling support.", reply.Content)
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for bot response")
+	}
+
+	// Verify ring buffer contains user turn and final assistant turn
+	entries := gw.contextManager.GetOrCreate("townhall").Entries()
+	require.Len(t, entries, 2)
+	assert.Equal(t, "user", entries[0].Role)
+	assert.Equal(t, "@bot what are the golang 1.26 features?", entries[0].Content)
+	assert.Equal(t, "assistant", entries[1].Role)
+	assert.Equal(t, "Go 1.26 adds enhanced tool calling support.", entries[1].Content)
+
+	gw.Stop()
+}
+
 

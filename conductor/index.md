@@ -19,6 +19,6 @@
 
 ---
 
-- [ ] **Track: Search tool (Tavily API support)**
+- [x] **Track: Search tool (Tavily API support)**
 *Link: [./tracks/search-tool_20260823/](./tracks/search-tool_20260823/)*
 
