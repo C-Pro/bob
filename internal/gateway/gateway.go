@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,10 +10,12 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"bob/internal/chatcontext"
 	"bob/internal/config"
@@ -110,6 +113,111 @@ func StripHTML(input string) string {
 
 func normalizeForDedup(s string) string {
 	return strings.Join(strings.Fields(s), " ")
+}
+
+var textExtensions = map[string]bool{
+	".txt":  true,
+	".md":   true,
+	".json": true,
+	".yaml": true,
+	".yml":  true,
+	".go":   true,
+	".py":   true,
+	".js":   true,
+	".ts":   true,
+	".jsx":  true,
+	".tsx":  true,
+	".html": true,
+	".css":  true,
+	".scss": true,
+	".sh":   true,
+	".bash": true,
+	".csv":  true,
+	".sql":  true,
+	".xml":  true,
+	".toml": true,
+	".rs":   true,
+	".c":    true,
+	".cpp":  true,
+	".h":    true,
+	".hpp":  true,
+	".java": true,
+	".env":  true,
+	".log":  true,
+	".conf": true,
+	".ini":  true,
+}
+
+func isTextMimeOrExt(name, mimeType string) bool {
+	mime := strings.ToLower(strings.TrimSpace(mimeType))
+	if strings.HasPrefix(mime, "text/") ||
+		mime == "application/json" ||
+		mime == "application/xml" ||
+		mime == "application/x-yaml" ||
+		mime == "application/yaml" ||
+		mime == "application/javascript" ||
+		mime == "application/x-javascript" ||
+		mime == "application/typescript" {
+		return true
+	}
+
+	ext := strings.ToLower(filepath.Ext(name))
+	return textExtensions[ext]
+}
+
+func (g *Gateway) processAttachments(ctx context.Context, attachments []models.Attachment) (string, []chatcontext.ImageAttachment) {
+	if len(attachments) == 0 {
+		return "", nil
+	}
+
+	var extraText strings.Builder
+	var images []chatcontext.ImageAttachment
+
+	for _, att := range attachments {
+		attName := strings.TrimSpace(att.Name)
+		if attName == "" {
+			attName = "attachment"
+		}
+
+		isImg := att.Type == models.AttachmentTypeImage || strings.HasPrefix(strings.ToLower(att.MimeType), "image/")
+		if isImg {
+			data, mime, err := g.FetchImageThumbnail(ctx, att.FileID)
+			if err != nil {
+				slog.Warn("failed to fetch image thumbnail", "fileID", att.FileID, "error", err)
+				fmt.Fprintf(&extraText, "\n\n[Attachment: %s (failed to download)]", attName)
+				continue
+			}
+			encoded := base64.StdEncoding.EncodeToString(data)
+			images = append(images, chatcontext.ImageAttachment{
+				URL: fmt.Sprintf("data:%s;base64,%s", mime, encoded),
+			})
+			continue
+		}
+
+		if isTextMimeOrExt(att.Name, att.MimeType) {
+			data, _, err := g.FetchFileContent(ctx, att.FileID, 16384)
+			if err != nil {
+				slog.Warn("failed to fetch file attachment", "fileID", att.FileID, "error", err)
+				fmt.Fprintf(&extraText, "\n\n[Attachment: %s (failed to download)]", attName)
+				continue
+			}
+			if utf8.Valid(data) {
+				fmt.Fprintf(&extraText, "\n\n[Attachment %s]:\n```\n%s\n```", attName, string(data))
+			} else {
+				fmt.Fprintf(&extraText, "\n\n[Attachment: %s (binary content not displayed)]", attName)
+			}
+			continue
+		}
+
+		// Other binary file
+		mimeStr := att.MimeType
+		if mimeStr == "" {
+			mimeStr = "binary file"
+		}
+		fmt.Fprintf(&extraText, "\n\n[Attachment: %s (%s, not displayed)]", attName, mimeStr)
+	}
+
+	return extraText.String(), images
 }
 
 // IsMentionedOrDM checks if a message should be handled by the bot.
@@ -307,7 +415,9 @@ func (g *Gateway) WarmupChat(ctx context.Context, chatID string, lastSeq int64) 
 
 	for _, m := range msgs {
 		cleanContent := ExtractMessageText(m)
-		if cleanContent == "" {
+		extraText, images := g.processAttachments(ctx, m.Attachments)
+		fullContent := strings.TrimSpace(cleanContent + extraText)
+		if fullContent == "" && len(images) == 0 {
 			continue
 		}
 
@@ -316,7 +426,8 @@ func (g *Gateway) WarmupChat(ctx context.Context, chatID string, lastSeq int64) 
 				Role:       "assistant",
 				SenderID:   m.UserID,
 				SenderName: botName,
-				Content:    cleanContent,
+				Content:    fullContent,
+				Images:     images,
 				Timestamp:  m.Timestamp,
 			})
 		} else {
@@ -325,7 +436,8 @@ func (g *Gateway) WarmupChat(ctx context.Context, chatID string, lastSeq int64) 
 				Role:       "user",
 				SenderID:   m.UserID,
 				SenderName: senderName,
-				Content:    cleanContent,
+				Content:    fullContent,
+				Images:     images,
 				Timestamp:  m.Timestamp,
 			})
 		}
@@ -388,7 +500,13 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 	}
 
 	cleanContent := ExtractMessageText(msg)
-	if cleanContent == "" {
+	if cleanContent == "" && len(msg.Attachments) == 0 {
+		return nil
+	}
+
+	extraText, images := g.processAttachments(ctx, msg.Attachments)
+	fullContent := strings.TrimSpace(cleanContent + extraText)
+	if fullContent == "" && len(images) == 0 {
 		return nil
 	}
 
@@ -415,7 +533,7 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 		isDuplicate := false
 		if len(entries) > 0 {
 			lastEntry := entries[len(entries)-1]
-			if lastEntry.Role == "assistant" && normalizeForDedup(lastEntry.Content) == normalizeForDedup(cleanContent) {
+			if lastEntry.Role == "assistant" && normalizeForDedup(lastEntry.Content) == normalizeForDedup(fullContent) {
 				isDuplicate = true
 			}
 		}
@@ -424,7 +542,8 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 				Role:       "assistant",
 				SenderID:   msg.UserID,
 				SenderName: botUser.GetDisplayName(),
-				Content:    cleanContent,
+				Content:    fullContent,
+				Images:     images,
 				Timestamp:  msg.Timestamp,
 			})
 		}
@@ -457,7 +576,8 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 		Role:       "user",
 		SenderID:   msg.UserID,
 		SenderName: senderName,
-		Content:    cleanContent,
+		Content:    fullContent,
+		Images:     images,
 		Timestamp:  msg.Timestamp,
 	})
 

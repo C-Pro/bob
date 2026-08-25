@@ -5,7 +5,8 @@ Bob is an AI agent for the [Besedka](https://github.com/c-pro/besedka) self-host
 ## Features
 
 - **WebSocket ingress** with automatic reconnect and ping keepalive
-- **Multi-turn context** — per-chat in-memory ring buffers with historical backfill
+- **Multi-turn context & chunked eviction** — per-chat in-memory ring buffers with historical backfill and stepped batch eviction (pruning 1/3 of the buffer on overflow) to keep the prompt prefix static and maximize LLM prefix caching
+- **Multimodal image & file attachments** — automatic ingestion and base64 encoding of image thumbnails via OpenAI `image_url` payloads, plus inlined markdown code blocks for text-based code/config attachments
 - **Live web search** via [Tavily](https://tavily.com/) (when `TAVILY_API_KEY` is set)
 - **Web page fetch & extraction** with readability parsing and dynamic rendering fallback
 - **GEOIP location reporting** — round-robin across public providers

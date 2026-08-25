@@ -1158,5 +1158,331 @@ func TestProcessMessage_WebFetchToolIntegration(t *testing.T) {
 	gw.Stop()
 }
 
+func TestProcessMessage_ImageAttachment(t *testing.T) {
+	fakeImageBytes := []byte("fake-png-binary-data")
+	fakeImageB64 := "ZmFrZS1wbmctYmluYXJ5LWRhdGE="
+
+	var receivedMultiContent []openai.ChatMessagePart
+	var receivedRole string
+
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req openai.ChatCompletionRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+
+		// Check the user message
+		for _, msg := range req.Messages {
+			if msg.Role == openai.ChatMessageRoleUser && len(msg.MultiContent) > 0 {
+				receivedRole = msg.Role
+				receivedMultiContent = msg.MultiContent
+			}
+		}
+
+		resp := openai.ChatCompletionResponse{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Message: openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "I analyzed the image.",
+					},
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer llmServer.Close()
+
+	sentMessages := make(chan models.ClientMessage, 10)
+	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/images/img-123") {
+			assert.Equal(t, "1", r.URL.Query().Get("thumb"))
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(fakeImageBytes)
+			return
+		}
+		if r.URL.Path == "/api/me" {
+			_ = json.NewEncoder(w).Encode(models.User{ID: "bot-1", DisplayName: "Bob", UserName: "bot"})
+			return
+		}
+		if r.URL.Path == "/api/users" {
+			_ = json.NewEncoder(w).Encode([]models.User{{ID: "u1", DisplayName: "Alice"}})
+			return
+		}
+		if r.URL.Path == "/api/chats" {
+			_ = json.NewEncoder(w).Encode([]models.Chat{{ID: "townhall", LastSeq: 0}})
+			return
+		}
+		if r.URL.Path == "/api/chat" {
+			upgrader := websocket.Upgrader{}
+			c, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer func() { _ = c.Close() }()
+			for {
+				var cm models.ClientMessage
+				if err := c.ReadJSON(&cm); err != nil {
+					return
+				}
+				sentMessages <- cm
+			}
+		}
+	}))
+	defer besedkaServer.Close()
+
+	cfg := &config.Config{
+		BesedkaURL:            besedkaServer.URL,
+		BesedkaAPIKey:         "test-key",
+		OpenAIAPIKey:          "test-key",
+		OpenAIBaseURL:         llmServer.URL,
+		OpenAIModel:           "test-model",
+		BotHandle:             "@bot",
+		TownhallMaxParagraphs: 2,
+		DMMaxParagraphs:       10,
+		MsgRingBufferSize:     10,
+	}
+
+	llmClient := llm.NewClient(cfg, llmServer.Client())
+	gw := NewGateway(cfg, llmClient)
+	gw.httpClient = besedkaServer.Client()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	require.NoError(t, gw.DialWebSocket(ctx))
+	_, err := gw.FetchBotUser(ctx)
+	require.NoError(t, err)
+
+	incomingMsg := models.Message{
+		Seq:       1,
+		ChatID:    "townhall",
+		UserID:    "u1",
+		Content:   "@bot what is in this picture?",
+		Timestamp: time.Now().Unix(),
+		Attachments: []models.Attachment{
+			{
+				Type:     models.AttachmentTypeImage,
+				Name:     "photo.png",
+				MimeType: "image/png",
+				FileID:   "img-123",
+			},
+		},
+	}
+
+	err = gw.ProcessMessage(ctx, incomingMsg)
+	require.NoError(t, err)
+
+	select {
+	case reply := <-sentMessages:
+		assert.Equal(t, "townhall", reply.ChatID)
+		assert.Equal(t, "I analyzed the image.", reply.Content)
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for bot reply")
+	}
+
+	// Verify LLM received multimodal content
+	assert.Equal(t, openai.ChatMessageRoleUser, receivedRole)
+	require.Len(t, receivedMultiContent, 2)
+	assert.Equal(t, openai.ChatMessagePartTypeText, receivedMultiContent[0].Type)
+	assert.Equal(t, "Alice: @bot what is in this picture?", receivedMultiContent[0].Text)
+	assert.Equal(t, openai.ChatMessagePartTypeImageURL, receivedMultiContent[1].Type)
+	assert.Equal(t, "data:image/png;base64,"+fakeImageB64, receivedMultiContent[1].ImageURL.URL)
+
+	// Verify ring buffer entry
+	entries := gw.contextManager.GetOrCreate("townhall").Entries()
+	require.Len(t, entries, 2) // user + assistant
+	assert.Len(t, entries[0].Images, 1)
+	assert.Equal(t, "data:image/png;base64,"+fakeImageB64, entries[0].Images[0].URL)
+
+	gw.Stop()
+}
+
+func TestProcessMessage_TextAndBinaryAttachments(t *testing.T) {
+	sentMessages := make(chan models.ClientMessage, 10)
+	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/files/f-text" {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("config_key=val123"))
+			return
+		}
+		if r.URL.Path == "/api/files/f-error" {
+			http.Error(w, "server error", http.StatusInternalServerError)
+			return
+		}
+		if r.URL.Path == "/api/me" {
+			_ = json.NewEncoder(w).Encode(models.User{ID: "bot-1", DisplayName: "Bob", UserName: "bot"})
+			return
+		}
+		if r.URL.Path == "/api/users" {
+			_ = json.NewEncoder(w).Encode([]models.User{{ID: "u1", DisplayName: "Alice"}})
+			return
+		}
+		if r.URL.Path == "/api/chat" {
+			upgrader := websocket.Upgrader{}
+			c, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer func() { _ = c.Close() }()
+			for {
+				var cm models.ClientMessage
+				if err := c.ReadJSON(&cm); err != nil {
+					return
+				}
+				sentMessages <- cm
+			}
+		}
+	}))
+	defer besedkaServer.Close()
+
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req openai.ChatCompletionRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		resp := openai.ChatCompletionResponse{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Message: openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "Config parsed successfully.",
+					},
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer llmServer.Close()
+
+	cfg := &config.Config{
+		BesedkaURL:            besedkaServer.URL,
+		BesedkaAPIKey:         "test-key",
+		OpenAIAPIKey:          "test-key",
+		OpenAIBaseURL:         llmServer.URL,
+		OpenAIModel:           "test-model",
+		BotHandle:             "@bot",
+		TownhallMaxParagraphs: 2,
+		DMMaxParagraphs:       10,
+		MsgRingBufferSize:     10,
+	}
+
+	llmClient := llm.NewClient(cfg, llmServer.Client())
+	gw := NewGateway(cfg, llmClient)
+	gw.httpClient = besedkaServer.Client()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	require.NoError(t, gw.DialWebSocket(ctx))
+	_, err := gw.FetchBotUser(ctx)
+	require.NoError(t, err)
+
+	incomingMsg := models.Message{
+		Seq:       1,
+		ChatID:    "dm_user1",
+		UserID:    "u1",
+		Content:   "Please check these files",
+		Timestamp: time.Now().Unix(),
+		Attachments: []models.Attachment{
+			{
+				Type:     models.AttachmentTypeFile,
+				Name:     "settings.conf",
+				MimeType: "text/plain",
+				FileID:   "f-text",
+			},
+			{
+				Type:     models.AttachmentTypeFile,
+				Name:     "data.zip",
+				MimeType: "application/zip",
+				FileID:   "f-bin",
+			},
+			{
+				Type:     models.AttachmentTypeFile,
+				Name:     "missing.txt",
+				MimeType: "text/plain",
+				FileID:   "f-error",
+			},
+		},
+	}
+
+	err = gw.ProcessMessage(ctx, incomingMsg)
+	require.NoError(t, err)
+
+	select {
+	case reply := <-sentMessages:
+		assert.Equal(t, "dm_user1", reply.ChatID)
+		assert.Equal(t, "Config parsed successfully.", reply.Content)
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for bot reply")
+	}
+
+	entries := gw.contextManager.GetOrCreate("dm_user1").Entries()
+	require.Len(t, entries, 2)
+	assert.Contains(t, entries[0].Content, "[Attachment settings.conf]:\n```\nconfig_key=val123\n```")
+	assert.Contains(t, entries[0].Content, "[Attachment: data.zip (application/zip, not displayed)]")
+	assert.Contains(t, entries[0].Content, "[Attachment: missing.txt (failed to download)]")
+
+	gw.Stop()
+}
+
+func TestWarmupChat_WithAttachments(t *testing.T) {
+	fakeImageBytes := []byte("thumb-bytes")
+	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/images/img-warmup") {
+			w.Header().Set("Content-Type", "image/jpeg")
+			_, _ = w.Write(fakeImageBytes)
+			return
+		}
+		if r.URL.Path == "/api/files/f-warmup" {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("historical log line"))
+			return
+		}
+		if r.URL.Path == "/api/chats/townhall/messages" {
+			_ = json.NewEncoder(w).Encode([]models.Message{
+				{
+					Seq:       1,
+					ChatID:    "townhall",
+					UserID:    "u1",
+					Content:   "First with image",
+					Timestamp: 100,
+					Attachments: []models.Attachment{
+						{Type: models.AttachmentTypeImage, Name: "shot.jpg", MimeType: "image/jpeg", FileID: "img-warmup"},
+					},
+				},
+				{
+					Seq:       2,
+					ChatID:    "townhall",
+					UserID:    "u2",
+					Content:   "Second with log",
+					Timestamp: 101,
+					Attachments: []models.Attachment{
+						{Type: models.AttachmentTypeFile, Name: "app.log", MimeType: "text/plain", FileID: "f-warmup"},
+					},
+				},
+			})
+			return
+		}
+	}))
+	defer besedkaServer.Close()
+
+	cfg := &config.Config{
+		BesedkaURL:        besedkaServer.URL,
+		MsgRingBufferSize: 10,
+	}
+	gw := NewGateway(cfg, nil)
+	gw.httpClient = besedkaServer.Client()
+
+	gw.WarmupChat(context.Background(), "townhall", 2)
+
+	entries := gw.contextManager.GetOrCreate("townhall").Entries()
+	require.Len(t, entries, 2)
+
+	assert.Contains(t, entries[0].Content, "First with image")
+	require.Len(t, entries[0].Images, 1)
+	assert.Equal(t, "data:image/jpeg;base64,dGh1bWItYnl0ZXM=", entries[0].Images[0].URL)
+
+	assert.Contains(t, entries[1].Content, "Second with log")
+	assert.Contains(t, entries[1].Content, "[Attachment app.log]:\n```\nhistorical log line\n```")
+}
+
+
 
 
