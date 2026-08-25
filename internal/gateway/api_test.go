@@ -162,3 +162,64 @@ func TestFetchChatMessages(t *testing.T) {
 	assert.Equal(t, "First msg", msgs[0].Content)
 	assert.Equal(t, "Second msg", msgs[1].Content)
 }
+
+func TestFetchImageThumbnail(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/images/img-123", r.URL.Path)
+		assert.Equal(t, "1", r.URL.Query().Get("thumb"))
+		assert.Equal(t, "Bearer secret-token", r.Header.Get("Authorization"))
+
+		w.Header().Set("Content-Type", "image/png; charset=utf-8")
+		_, _ = w.Write([]byte("fake-png-data"))
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		BesedkaURL:    server.URL,
+		BesedkaAPIKey: "secret-token",
+	}
+	gw := NewGateway(cfg, nil)
+	gw.httpClient = server.Client()
+
+	data, mime, err := gw.FetchImageThumbnail(context.Background(), "img-123")
+	require.NoError(t, err)
+	assert.Equal(t, []byte("fake-png-data"), data)
+	assert.Equal(t, "image/png", mime)
+
+	// Error path: empty fileID
+	_, _, err = gw.FetchImageThumbnail(context.Background(), "")
+	assert.Error(t, err)
+}
+
+func TestFetchFileContent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/files/file-456", r.URL.Path)
+		assert.Equal(t, "Bearer secret-token", r.Header.Get("Authorization"))
+
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("hello world config file content"))
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		BesedkaURL:    server.URL,
+		BesedkaAPIKey: "secret-token",
+	}
+	gw := NewGateway(cfg, nil)
+	gw.httpClient = server.Client()
+
+	data, mime, err := gw.FetchFileContent(context.Background(), "file-456", 100)
+	require.NoError(t, err)
+	assert.Equal(t, "hello world config file content", string(data))
+	assert.Equal(t, "text/plain", mime)
+
+	// Truncation test
+	dataTrunc, _, err := gw.FetchFileContent(context.Background(), "file-456", 5)
+	require.NoError(t, err)
+	assert.Equal(t, "hello", string(dataTrunc))
+
+	// Error path: empty fileID
+	_, _, err = gw.FetchFileContent(context.Background(), "", 100)
+	assert.Error(t, err)
+}
+

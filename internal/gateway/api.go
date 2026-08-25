@@ -3,7 +3,9 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -190,3 +192,96 @@ func (g *Gateway) FetchChatMessages(ctx context.Context, chatID string, fromSeq,
 
 	return messages, nil
 }
+
+// FetchImageThumbnail downloads an image thumbnail from Besedka /api/images/{file_id}?thumb=1.
+func (g *Gateway) FetchImageThumbnail(ctx context.Context, fileID string) ([]byte, string, error) {
+	if strings.TrimSpace(fileID) == "" {
+		return nil, "", errors.New("empty fileID")
+	}
+
+	reqURL := fmt.Sprintf("%s/api/images/%s?thumb=1", strings.TrimSuffix(g.cfg.BesedkaURL, "/"), fileID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to create image request: %w", err)
+	}
+
+	if g.cfg.BesedkaAPIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+g.cfg.BesedkaAPIKey)
+	}
+
+	resp, err := g.httpClient.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to fetch image %s: %w", fileID, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("/api/images/%s returned status %d", fileID, resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to read image body: %w", err)
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "image/jpeg"
+	}
+	if idx := strings.Index(contentType, ";"); idx != -1 {
+		contentType = strings.TrimSpace(contentType[:idx])
+	}
+
+	return data, contentType, nil
+}
+
+// FetchFileContent downloads text file content from Besedka /api/files/{file_id} up to maxBytes.
+func (g *Gateway) FetchFileContent(ctx context.Context, fileID string, maxBytes int64) ([]byte, string, error) {
+	if strings.TrimSpace(fileID) == "" {
+		return nil, "", errors.New("empty fileID")
+	}
+	if maxBytes <= 0 {
+		maxBytes = 16384 // 16KB default
+	}
+
+	reqURL := fmt.Sprintf("%s/api/files/%s", strings.TrimSuffix(g.cfg.BesedkaURL, "/"), fileID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to create file request: %w", err)
+	}
+
+	if g.cfg.BesedkaAPIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+g.cfg.BesedkaAPIKey)
+	}
+
+	resp, err := g.httpClient.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to fetch file %s: %w", fileID, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("/api/files/%s returned status %d", fileID, resp.StatusCode)
+	}
+
+	limitReader := io.LimitReader(resp.Body, maxBytes+1)
+	data, err := io.ReadAll(limitReader)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to read file body: %w", err)
+	}
+
+	if int64(len(data)) > maxBytes {
+		data = data[:maxBytes]
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "text/plain"
+	}
+	if idx := strings.Index(contentType, ";"); idx != -1 {
+		contentType = strings.TrimSpace(contentType[:idx])
+	}
+
+	return data, contentType, nil
+}
+

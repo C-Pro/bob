@@ -12,11 +12,15 @@
 - **Code Style Guides:** [code_styleguides/go.md](code_styleguides/go.md)
 - **Workflow:** [workflow.md](workflow.md)
 
+## Active Tracks
+- [~] **Track: Images & Attachments in Context** (`images-in-context_20260825`) - [Plan](tracks/images-in-context_20260825/plan.md) | [Spec](tracks/images-in-context_20260825/spec.md)
+
 ## Completed Tracks
 - **Phase 1: Simple Request/Response Agent & Besedka Gateway** (`phase-1-request-response-bot`) - [Plan](archive/phase-1-request-response-bot_20260818/plan.md) | [Spec](archive/phase-1-request-response-bot_20260818/spec.md)
 - **Track: Simple Context Management** (`simple-context-management_20260818`) - [Plan](archive/simple-context-management_20260818/plan.md) | [Spec](archive/simple-context-management_20260818/spec.md)
 - **Track: OpenAI API Refactor** (`openai-api-refactor_20260819`) - [Plan](archive/openai-api-refactor_20260819/plan.md) | [Spec](archive/openai-api-refactor_20260819/spec.md)
 - **Track: Search tool (Tavily API support)** (`search-tool_20260823`) - [Plan](archive/search-tool_20260823/plan.md) | [Spec](archive/search-tool_20260823/spec.md)
 - **Track: Web Page Fetch Tool Support (`web_fetch`)** (`web-fetch-tool_20260825`) - [Plan](archive/web-fetch-tool_20260825/plan.md) | [Spec](archive/web-fetch-tool_20260825/spec.md)
+
 
 
