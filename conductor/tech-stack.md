@@ -35,4 +35,5 @@
 
 ## 7. Tools & External Integrations
 - **Web Search API:** Tavily REST API (`POST /search`) with native Go HTTP client, exponential retry backoff, and OpenAI function calling integration.
+- **Web Extraction & Readability:** `github.com/go-shiori/go-readability` for HTML DOM extraction and content sanitization; Tavily Extract REST API (`POST /extract`) for dynamic client-rendered SPA fallback.
 

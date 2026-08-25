@@ -16,6 +16,7 @@ Self-improving general use AI agent for Besedka chat. Phase 1 delivers a request
 - **Multi-Turn Context Management:** Per-chat in-memory ring buffers maintaining up to $N$ recent message turns (default 100, configurable via `MSG_RING_BUFFER_SIZE`), with startup context warmup and dynamic templated system prompts reflecting bot/user identity and channel guidelines.
 - **Local-First Testing & Harness:** Complete local test setup allowing manual browser testing against a local Besedka instance before any cloud deployment.
 - **Live Web Search Tool:** Multi-turn tool execution loop (`internal/tools`) enabling real-time web search capabilities via Tavily REST API when `TAVILY_API_KEY` is configured.
+- **Web Page Fetch & Extraction Tool:** Direct URL retrieval and content extraction tool (`web_fetch`) with HTML readability parsing (`go-readability`), 16KB output limit, heuristic fallback detection, and Tavily Extract dynamic rendering support across `auto`, `raw`, and `extract` modes.
 
 ## Deployment & CI/CD Strategy
 - **Co-located Spot VM Deployment:** Bot containers/processes deploy on the **same GCP Spot VMs** as the Besedka instances (test bot co-located with test Besedka, prod bot co-located with prod Besedka).
