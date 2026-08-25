@@ -28,7 +28,7 @@ Bob is an autonomous AI agent service designed for the [Besedka](https://github.
 ## Default operation mode
 - Implement changes in separate steps, try to keep steps small while keeping the tests green. Skipping tests for the sake of keeping build green is not a good option. Prefer finish the step with failing test and mentioning this to the user if e.g. fixing everything in one step will make the step/commit too big.
 - When step is completed ask user for review. Don't commit or push unless explicitly given permission to work autonomously.
-- When explicitly asked to work on the task autonomously or working in goal/autoresearch mode, make sure you are working in a separate branch. You can commit with --no-gpg-sign.
+- When explicitly asked to work on the task autonomously or working in goal/autoresearch mode, make sure you are working in a separate branch. When working autonomously you can commit with --no-gpg-sign.
 
 ## Running the Agent Locally
 
