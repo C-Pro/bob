@@ -219,7 +219,7 @@ func TestParseIPInfo(t *testing.T) {
 
 func TestClient_FetchLocation_Success(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "Besedka-Bot/1.0 (https://besedka.ai)", r.Header.Get("User-Agent"))
+		assert.Equal(t, "Besedka-Bot/1.0", r.Header.Get("User-Agent"))
 		assert.Equal(t, "application/json", r.Header.Get("Accept"))
 
 		w.Header().Set("Content-Type", "application/json")

@@ -9,7 +9,7 @@ import (
 )
 
 // DefaultUserAgent is the standard User-Agent header used for outgoing HTTP requests.
-const DefaultUserAgent = "Besedka-Bot/1.0 (https://besedka.ai)"
+const DefaultUserAgent = "Besedka-Bot/1.0"
 
 // Config holds runtime configuration settings for the agent.
 type Config struct {

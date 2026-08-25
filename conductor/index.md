@@ -17,10 +17,6 @@
 - **Track: Simple Context Management** (`simple-context-management_20260818`) - [Plan](archive/simple-context-management_20260818/plan.md) | [Spec](archive/simple-context-management_20260818/spec.md)
 - **Track: OpenAI API Refactor** (`openai-api-refactor_20260819`) - [Plan](archive/openai-api-refactor_20260819/plan.md) | [Spec](archive/openai-api-refactor_20260819/spec.md)
 - **Track: Search tool (Tavily API support)** (`search-tool_20260823`) - [Plan](archive/search-tool_20260823/plan.md) | [Spec](archive/search-tool_20260823/spec.md)
-
----
-
-- [x] **Track: Web Page Fetch Tool Support (`web_fetch`)**
-*Link: [./tracks/web-fetch-tool_20260825/](./tracks/web-fetch-tool_20260825/)*
+- **Track: Web Page Fetch Tool Support (`web_fetch`)** (`web-fetch-tool_20260825`) - [Plan](archive/web-fetch-tool_20260825/plan.md) | [Spec](archive/web-fetch-tool_20260825/spec.md)
 
 
