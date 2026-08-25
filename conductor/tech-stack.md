@@ -11,7 +11,7 @@
 - **API Authentication:** HTTP Authorization Bearer token header (`Authorization: Bearer <API_KEY>`) / session tokens for user/bot actions
 
 ## 3. LLM Provider & Inference API
-- **Endpoint Protocol:** OpenAI-compatible REST API (`/v1/chat/completions`)
+- **Endpoint Protocol:** OpenAI-compatible REST API (`/v1/chat/completions`) with multimodal image support (`MultiContent` / `ChatMessagePartTypeImageURL`)
 - **Client Library:** `github.com/sashabaranov/go-openai` (built-in support for tool/function definitions)
 - **Primary Provider Target (Phase 1):** Google Gemini OpenAI-compatible REST API (`https://generativelanguage.googleapis.com/v1beta/openai/`)
 - **Default Model:** `gemini-3.7-flash` (configurable via `OPENAI_MODEL` / `GEMINI_MODEL`)
@@ -20,7 +20,7 @@
 
 ## 4. Configuration & State Management
 - **Configuration:** Environment variables (`env` / `os.Getenv`)
-- **Context & State Storage:** In-memory thread-safe per-chat ring buffers (`internal/chatcontext`) bounded by `MSG_RING_BUFFER_SIZE` (default 100) with dynamic templated prompt generation (`internal/prompt`) and user metadata caching (`internal/gateway`).
+- **Context & State Storage:** In-memory thread-safe per-chat ring buffers (`internal/chatcontext`) bounded by `MSG_RING_BUFFER_SIZE` (default 100) with chunked stepped eviction ($1/3$ capacity batch pruning) to maximize LLM prompt prefix caching, dynamic templated prompt generation (`internal/prompt`), and user metadata caching (`internal/gateway`).
 
 ## 5. Testing & Code Quality
 - **Testing Framework:** Native Go `testing` package, `go test -race -cover`
