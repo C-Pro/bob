@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"bob/internal/config"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -14,7 +16,7 @@ import (
 func TestFetchSuccess(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "GET", r.Method)
-		assert.Contains(t, r.Header.Get("User-Agent"), "Mozilla")
+		assert.Equal(t, config.DefaultUserAgent, r.Header.Get("User-Agent"))
 
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte("<html><head><title>Test Page</title></head><body><p>Hello world!</p></body></html>"))

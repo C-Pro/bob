@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"bob/internal/config"
 )
 
 // Client is a lightweight HTTP client for the Tavily Search API.
@@ -106,6 +108,7 @@ func (c *Client) Search(ctx context.Context, req SearchRequest) (*SearchResponse
 
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+		httpReq.Header.Set("User-Agent", config.DefaultUserAgent)
 
 		resp, err := c.httpClient.Do(httpReq)
 		if err != nil {
@@ -187,6 +190,7 @@ func (c *Client) Extract(ctx context.Context, urls ...string) (*ExtractResponse,
 
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+		httpReq.Header.Set("User-Agent", config.DefaultUserAgent)
 
 		resp, err := c.httpClient.Do(httpReq)
 		if err != nil {

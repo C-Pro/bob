@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"bob/internal/config"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -19,6 +21,7 @@ func TestSearchSuccess(t *testing.T) {
 		assert.Equal(t, "/search", r.URL.Path)
 		assert.Equal(t, "Bearer test-api-key", r.Header.Get("Authorization"))
 		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
+		assert.Equal(t, config.DefaultUserAgent, r.Header.Get("User-Agent"))
 
 		var req SearchRequest
 		err := json.NewDecoder(r.Body).Decode(&req)
@@ -177,6 +180,7 @@ func TestExtractSuccess(t *testing.T) {
 		assert.Equal(t, "/extract", r.URL.Path)
 		assert.Equal(t, "Bearer test-api-key", r.Header.Get("Authorization"))
 		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
+		assert.Equal(t, config.DefaultUserAgent, r.Header.Get("User-Agent"))
 
 		var req ExtractRequest
 		err := json.NewDecoder(r.Body).Decode(&req)

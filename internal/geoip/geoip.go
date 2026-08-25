@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"bob/internal/config"
 	"bob/internal/models"
 )
 
@@ -233,7 +234,7 @@ func (c *Client) queryProvider(ctx context.Context, p Provider) (*models.Locatio
 	}
 
 	// Standard User-Agent header (prevents 403 Forbidden on providers like ipapi.co)
-	req.Header.Set("User-Agent", "Besedka-Bot/1.0 (https://besedka.ai)")
+	req.Header.Set("User-Agent", config.DefaultUserAgent)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.httpClient.Do(req)

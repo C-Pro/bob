@@ -8,6 +8,9 @@ import (
 	"strings"
 )
 
+// DefaultUserAgent is the standard User-Agent header used for outgoing HTTP requests.
+const DefaultUserAgent = "Besedka-Bot/1.0 (https://besedka.ai)"
+
 // Config holds runtime configuration settings for the agent.
 type Config struct {
 	BotHandle             string
