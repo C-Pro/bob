@@ -139,3 +139,85 @@ func (c *Client) Search(ctx context.Context, req SearchRequest) (*SearchResponse
 
 	return nil, fmt.Errorf("tavily API request failed after %d retries; last error: %w", c.maxRetries, lastErr)
 }
+
+// Extract executes a URL content extraction request against the Tavily API (/extract).
+func (c *Client) Extract(ctx context.Context, urls ...string) (*ExtractResponse, error) {
+	if strings.TrimSpace(c.apiKey) == "" {
+		return nil, errors.New("tavily API key is required")
+	}
+
+	var validURLs []string
+	for _, u := range urls {
+		trimmed := strings.TrimSpace(u)
+		if trimmed != "" {
+			validURLs = append(validURLs, trimmed)
+		}
+	}
+	if len(validURLs) == 0 {
+		return nil, errors.New("urls cannot be empty")
+	}
+
+	req := ExtractRequest{
+		APIKey: c.apiKey,
+		URLs:   validURLs,
+	}
+
+	bodyBytes, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode extract request: %w", err)
+	}
+
+	extractURL := c.baseURL + "/extract"
+
+	var lastErr error
+	for attempt := 0; attempt <= c.maxRetries; attempt++ {
+		if attempt > 0 {
+			delay := c.baseDelay * (1 << (attempt - 1))
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, extractURL, bytes.NewReader(bodyBytes))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create http request: %w", err)
+		}
+
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+		resp, err := c.httpClient.Do(httpReq)
+		if err != nil {
+			if errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return nil, ctx.Err()
+			}
+			lastErr = err
+			continue
+		}
+
+		respBody, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			lastErr = fmt.Errorf("failed to read response body: %w", readErr)
+			continue
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			var extractResp ExtractResponse
+			if err := json.Unmarshal(respBody, &extractResp); err != nil {
+				return nil, fmt.Errorf("failed to decode extract response: %w", err)
+			}
+			return &extractResp, nil
+		}
+
+		lastErr = fmt.Errorf("tavily API returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		if !isRetryableStatus(resp.StatusCode) {
+			return nil, lastErr
+		}
+	}
+
+	return nil, fmt.Errorf("tavily API request failed after %d retries; last error: %w", c.maxRetries, lastErr)
+}
+

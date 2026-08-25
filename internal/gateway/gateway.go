@@ -48,11 +48,11 @@ type Gateway struct {
 // NewGateway creates a new Besedka Gateway instance.
 func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 	httpClient := &http.Client{Timeout: 10 * time.Second}
-	var toolsRegistry *tools.Registry
+	var tavilyClient *tavily.Client
 	if cfg.TavilyAPIKey != "" {
-		tavilyClient := tavily.NewClient(cfg.TavilyAPIKey, cfg.TavilyBaseURL, httpClient)
-		toolsRegistry = tools.NewRegistry(tavilyClient)
+		tavilyClient = tavily.NewClient(cfg.TavilyAPIKey, cfg.TavilyBaseURL, httpClient)
 	}
+	toolsRegistry := tools.NewRegistry(tavilyClient)
 
 	return &Gateway{
 		cfg:                  cfg,

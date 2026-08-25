@@ -170,3 +170,105 @@ func TestSearchContextCancellation(t *testing.T) {
 	_, err := client.Search(ctx, SearchRequest{Query: "timeout query"})
 	require.Error(t, err)
 }
+
+func TestExtractSuccess(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "POST", r.Method)
+		assert.Equal(t, "/extract", r.URL.Path)
+		assert.Equal(t, "Bearer test-api-key", r.Header.Get("Authorization"))
+		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
+
+		var req ExtractRequest
+		err := json.NewDecoder(r.Body).Decode(&req)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"https://example.com/page"}, req.URLs)
+
+		resp := ExtractResponse{
+			Results: []ExtractResult{
+				{
+					URL:        "https://example.com/page",
+					RawContent: "# Example Page\nThis is extracted content.",
+				},
+			},
+			ResponseTime: 0.15,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer ts.Close()
+
+	client := NewClient("test-api-key", ts.URL, ts.Client())
+	resp, err := client.Extract(context.Background(), "https://example.com/page")
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Len(t, resp.Results, 1)
+	assert.Equal(t, "https://example.com/page", resp.Results[0].URL)
+	assert.Equal(t, "# Example Page\nThis is extracted content.", resp.Results[0].RawContent)
+}
+
+func TestExtractValidation(t *testing.T) {
+	client := NewClient("", "https://api.tavily.com", nil)
+
+	// Missing API key
+	_, err := client.Extract(context.Background(), "https://example.com")
+	assert.ErrorContains(t, err, "tavily API key is required")
+
+	// Empty URLs
+	client = NewClient("some-key", "https://api.tavily.com", nil)
+	_, err = client.Extract(context.Background(), "   ", "")
+	assert.ErrorContains(t, err, "urls cannot be empty")
+}
+
+func TestExtractRetryOn5xxAnd429(t *testing.T) {
+	var attempts int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		curr := atomic.AddInt32(&attempts, 1)
+		if curr == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error": "rate limit"}`))
+			return
+		}
+		if curr == 2 {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"error": "bad gateway"}`))
+			return
+		}
+
+		resp := ExtractResponse{
+			Results: []ExtractResult{
+				{URL: "https://example.com", RawContent: "Extracted after retries"},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer ts.Close()
+
+	client := NewClient("test-api-key", ts.URL, ts.Client())
+	client.baseDelay = 1 * time.Millisecond
+
+	resp, err := client.Extract(context.Background(), "https://example.com")
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, int32(3), atomic.LoadInt32(&attempts))
+	require.Len(t, resp.Results, 1)
+	assert.Equal(t, "Extracted after retries", resp.Results[0].RawContent)
+}
+
+func TestExtractFailureAfterRetries(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error": "service unavailable"}`))
+	}))
+	defer ts.Close()
+
+	client := NewClient("test-api-key", ts.URL, ts.Client())
+	client.baseDelay = 1 * time.Millisecond
+	client.maxRetries = 2
+
+	_, err := client.Extract(context.Background(), "https://example.com")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "tavily API request failed after 2 retries")
+}
+

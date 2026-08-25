@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html>
+<head><title>RFC 9999: Structured Context Framing Protocol</title></head>
+<body>
+<div class="rfc-body">
+<h1>RFC 9999: Structured Context Framing Protocol</h1>
+<p><strong>Status of this Memo:</strong> This document specifies an Internet Standards Track protocol for structured context exchange between autonomous agents and conversational gateways.</p>
+<h2>1. Introduction</h2>
+<p>Real-time conversational agents require reliable context encapsulation to maintain multi-turn coherence across heterogeneous transport layers. This specification defines the frame boundaries, header formatting, and serialization invariants necessary for bidirectional agent streaming.</p>
+<h2>2. Frame Structure</h2>
+<p>Each message frame MUST begin with a 4-byte magic delimiter followed by a 16-bit payload length descriptor. Payloads exceeding the maximum negotiated transmission unit (MTU) MUST be partitioned into sequential chunk frames with monotonic sequence numbering.</p>
+</div>
+</body>
+</html>

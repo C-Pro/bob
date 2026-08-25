@@ -25,3 +25,30 @@ type SearchResponse struct {
 	Results      []SearchResult `json:"results"`
 	ResponseTime float64        `json:"response_time,omitempty"`
 }
+
+// ExtractRequest defines parameters sent to the Tavily Extract API (/extract).
+type ExtractRequest struct {
+	APIKey string   `json:"api_key,omitempty"`
+	URLs   []string `json:"urls"`
+}
+
+// ExtractResult represents an individual extraction item from Tavily Extract.
+type ExtractResult struct {
+	URL        string   `json:"url"`
+	RawContent string   `json:"raw_content"`
+	Images     []string `json:"images,omitempty"`
+}
+
+// ExtractFailedResult represents a failed URL in Tavily Extract.
+type ExtractFailedResult struct {
+	URL   string `json:"url"`
+	Error string `json:"error"`
+}
+
+// ExtractResponse represents the response payload from the Tavily Extract API.
+type ExtractResponse struct {
+	Results       []ExtractResult       `json:"results"`
+	FailedResults []ExtractFailedResult `json:"failed_results,omitempty"`
+	ResponseTime  float64               `json:"response_time,omitempty"`
+}
+

@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html>
+<head><title>Getting Started with Distributed KV Stores</title></head>
+<body>
+<div class="docs-content">
+<h1>Getting Started with Distributed KV Stores</h1>
+<p>This guide walks you through setting up a three-node distributed key-value store cluster using Raft consensus for strong consistency guarantees.</p>
+<h2>Prerequisites</h2>
+<p>Before proceeding, ensure you have Go 1.22 or higher installed, along with Docker and Docker Compose for running local multi-node topologies. Verify network connectivity on ports 8000 through 8003.</p>
+<h2>Cluster Bootstrap</h2>
+<p>Initialize the first cluster leader by providing the discovery configuration file. Once the leader begins broadcasting heartbeats, start nodes two and three in join mode specifying the leader seed address. The cluster will reach quorum within seconds.</p>
+</div>
+</body>
+</html>

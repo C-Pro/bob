@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1011,5 +1012,151 @@ func TestProcessMessageWithWebSearchTool(t *testing.T) {
 
 	gw.Stop()
 }
+
+func TestProcessMessage_WebFetchToolIntegration(t *testing.T) {
+	// 1. Mock Target Website
+	targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		html := `<!DOCTYPE html><html><head><title>Go 1.26 Release Notes</title></head><body><article><h1>Go 1.26 Release Notes</h1><p>Go 1.26 includes major improvements to compiler optimization and tool call integration.</p></article></body></html>`
+		_, _ = w.Write([]byte(html))
+	}))
+	defer targetServer.Close()
+
+	// 2. Mock Besedka Server
+	upgrader := websocket.Upgrader{}
+	sentMessages := make(chan models.ClientMessage, 10)
+	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/me":
+			_ = json.NewEncoder(w).Encode(models.User{
+				ID:          "bot-1",
+				DisplayName: "Bob",
+				UserName:    "bot",
+			})
+		case "/api/users":
+			_ = json.NewEncoder(w).Encode([]models.User{
+				{ID: "bot-1", DisplayName: "Bob", UserName: "bot"},
+				{ID: "user-1", DisplayName: "Alice", UserName: "alice"},
+			})
+		case "/api/chats":
+			_ = json.NewEncoder(w).Encode([]models.Chat{
+				{ID: "townhall", Name: "Townhall"},
+			})
+		case "/api/chats/townhall/messages":
+			_ = json.NewEncoder(w).Encode([]models.Message{})
+		case "/api/chat":
+			conn, err := upgrader.Upgrade(w, r, nil)
+			require.NoError(t, err)
+			defer func() { _ = conn.Close() }()
+			for {
+				var msg models.ClientMessage
+				if err := conn.ReadJSON(&msg); err != nil {
+					break
+				}
+				sentMessages <- msg
+			}
+		}
+	}))
+	defer besedkaServer.Close()
+
+	// 3. Mock OpenAI LLM Server
+	var llmCallCount int32
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := atomic.AddInt32(&llmCallCount, 1)
+		w.Header().Set("Content-Type", "application/json")
+
+		if count == 1 {
+			var req openai.ChatCompletionRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			require.NotEmpty(t, req.Tools)
+
+			// LLM decides to call web_fetch
+			resp := openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Index: 0,
+						Message: openai.ChatCompletionMessage{
+							Role: openai.ChatMessageRoleAssistant,
+							ToolCalls: []openai.ToolCall{
+								{
+									ID:   "call_fetch_1",
+									Type: openai.ToolTypeFunction,
+									Function: openai.FunctionCall{
+										Name:      "web_fetch",
+										Arguments: fmt.Sprintf(`{"url":%q,"mode":"auto"}`, targetServer.URL),
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		// Second turn: returns final text
+		resp := openai.ChatCompletionResponse{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Index: 0,
+					Message: openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "According to the release notes, Go 1.26 includes major compiler improvements.",
+					},
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer llmServer.Close()
+
+	cfg := &config.Config{
+		BotHandle:             "@bot",
+		BesedkaURL:            besedkaServer.URL,
+		OpenAIAPIKey:          "test-key",
+		OpenAIModel:           "gemini-3.7-flash",
+		OpenAIBaseURL:         llmServer.URL,
+		TownhallMaxParagraphs: 2,
+		DMMaxParagraphs:       10,
+		MsgRingBufferSize:     10,
+	}
+
+	llmClient := llm.NewClient(cfg, llmServer.Client())
+	gw := NewGateway(cfg, llmClient)
+	gw.httpClient = besedkaServer.Client()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := gw.DialWebSocket(ctx)
+	require.NoError(t, err)
+
+	_, err = gw.FetchBotUser(ctx)
+	require.NoError(t, err)
+
+	incomingMsg := models.Message{
+		Seq:       1,
+		ChatID:    "townhall",
+		UserID:    "user-1",
+		Content:   fmt.Sprintf("@bot fetch %s for me", targetServer.URL),
+		Timestamp: time.Now().Unix(),
+	}
+
+	err = gw.ProcessMessage(ctx, incomingMsg)
+	require.NoError(t, err)
+
+	select {
+	case reply := <-sentMessages:
+		assert.Equal(t, models.ClientMessageTypeSend, reply.Type)
+		assert.Equal(t, "townhall", reply.ChatID)
+		assert.Equal(t, "According to the release notes, Go 1.26 includes major compiler improvements.", reply.Content)
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for bot response")
+	}
+
+	gw.Stop()
+}
+
 
 

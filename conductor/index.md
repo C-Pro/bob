@@ -20,7 +20,7 @@
 
 ---
 
-- [ ] **Track: Web Page Fetch Tool Support (`web_fetch`)**
+- [x] **Track: Web Page Fetch Tool Support (`web_fetch`)**
 *Link: [./tracks/web-fetch-tool_20260825/](./tracks/web-fetch-tool_20260825/)*
 
 

@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html>
+<head><title>Understanding Memory Allocation in Go</title></head>
+<body>
+<article class="post">
+<h1>Understanding Memory Allocation in Go</h1>
+<div class="byline">By Jane Doe | Published on August 10, 2026</div>
+<p>When developing high-throughput services in Go, understanding how memory is allocated between the stack and heap is critical for performance tuning and minimizing garbage collection overhead.</p>
+<p>The Go compiler performs escape analysis during compilation to determine whether a variable's lifetime exceeds the scope of its enclosing function. If a variable escapes, it is allocated on the heap; otherwise, it remains on the fast, automatically reclaimed stack.</p>
+<p>You can inspect escape analysis decisions using the <code>-gcflags="-m"</code> compiler flag. Reducing heap allocations through struct pooling (using <code>sync.Pool</code>) and passing values by copy when appropriate can yield dramatic improvements in latency and CPU utilization.</p>
+</article>
+</body>
+</html>
