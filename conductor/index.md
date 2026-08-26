@@ -18,5 +18,7 @@
 - **Track: OpenAI API Refactor** (`openai-api-refactor_20260819`) - [Plan](archive/openai-api-refactor_20260819/plan.md) | [Spec](archive/openai-api-refactor_20260819/spec.md)
 - **Track: Search tool (Tavily API support)** (`search-tool_20260823`) - [Plan](archive/search-tool_20260823/plan.md) | [Spec](archive/search-tool_20260823/spec.md)
 - **Track: Web Page Fetch Tool Support (`web_fetch`)** (`web-fetch-tool_20260825`) - [Plan](archive/web-fetch-tool_20260825/plan.md) | [Spec](archive/web-fetch-tool_20260825/spec.md)
+- **Track: Images & Attachments in Context** (`images-in-context_20260825`) - [Plan](archive/images-in-context_20260825/plan.md) | [Spec](archive/images-in-context_20260825/spec.md)
+
 
 

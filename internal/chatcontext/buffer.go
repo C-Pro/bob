@@ -8,13 +8,19 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 )
 
+// ImageAttachment represents an image attached to a chat entry as a data URL.
+type ImageAttachment struct {
+	URL string `json:"url"` // data URL e.g. "data:image/jpeg;base64,..."
+}
+
 // Entry represents a single turn in a chat conversation.
 type Entry struct {
-	Role       string `json:"role"`       // "user" or "assistant"
-	SenderID   string `json:"senderId"`   // user/bot ID
-	SenderName string `json:"senderName"` // display name or username
-	Content    string `json:"content"`    // message text content
-	Timestamp  int64  `json:"timestamp"`  // unix timestamp
+	Role       string            `json:"role"`             // "user" or "assistant"
+	SenderID   string            `json:"senderId"`         // user/bot ID
+	SenderName string            `json:"senderName"`       // display name or username
+	Content    string            `json:"content"`          // message text content
+	Images     []ImageAttachment `json:"images,omitempty"` // image attachments
+	Timestamp  int64             `json:"timestamp"`        // unix timestamp
 }
 
 // RingBuffer is a thread-safe circular buffer holding up to `capacity` entries.
@@ -35,15 +41,20 @@ func NewRingBuffer(capacity int) *RingBuffer {
 	}
 }
 
-// Push adds an entry to the ring buffer, evicting the oldest entry if capacity is exceeded.
+// Push adds an entry to the ring buffer. When capacity is exceeded, it evicts
+// a chunk of the oldest messages (1/3 of capacity) at once to keep the conversation
+// prefix stable and maximize LLM prefix caching.
 func (rb *RingBuffer) Push(entry Entry) {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
 	rb.entries = append(rb.entries, entry)
 	if len(rb.entries) > rb.capacity {
-		// Retain only the latest capacity items
-		rb.entries = rb.entries[len(rb.entries)-rb.capacity:]
+		evictCount := rb.capacity / 3
+		if evictCount < 1 {
+			evictCount = 1
+		}
+		rb.entries = rb.entries[evictCount:]
 	}
 }
 
@@ -102,10 +113,33 @@ func (rb *RingBuffer) ToLLMMessages() []openai.ChatCompletionMessage {
 			content = e.Content
 		}
 
-		msgs = append(msgs, openai.ChatCompletionMessage{
-			Role:    role,
-			Content: content,
-		})
+		if len(e.Images) > 0 {
+			parts := make([]openai.ChatMessagePart, 0, 1+len(e.Images))
+			if content != "" {
+				parts = append(parts, openai.ChatMessagePart{
+					Type: openai.ChatMessagePartTypeText,
+					Text: content,
+				})
+			}
+			for _, img := range e.Images {
+				parts = append(parts, openai.ChatMessagePart{
+					Type: openai.ChatMessagePartTypeImageURL,
+					ImageURL: &openai.ChatMessageImageURL{
+						URL:    img.URL,
+						Detail: openai.ImageURLDetailAuto,
+					},
+				})
+			}
+			msgs = append(msgs, openai.ChatCompletionMessage{
+				Role:         role,
+				MultiContent: parts,
+			})
+		} else {
+			msgs = append(msgs, openai.ChatCompletionMessage{
+				Role:    role,
+				Content: content,
+			})
+		}
 	}
 	return msgs
 }
