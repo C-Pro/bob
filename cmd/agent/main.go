@@ -13,7 +13,10 @@ import (
 	"bob/internal/gateway"
 	"bob/internal/geoip"
 	"bob/internal/llm"
+	"bob/internal/store"
 )
+
+const mainDBFname = "bob.db"
 
 func main() {
 	slog.Info("starting Besedka AI Agent service")
@@ -38,10 +41,31 @@ func main() {
 		"townhallMaxParagraphs", cfg.TownhallMaxParagraphs,
 		"dmMaxParagraphs", cfg.DMMaxParagraphs,
 		"msgRingBufferSize", cfg.MsgRingBufferSize,
+		"dataDir", cfg.DataDir,
+		"dbPath", cfg.DBPath(mainDBFname),
 	)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	// Initialize SQLite database storage
+	st, err := store.OpenOrCreate(cfg.DBPath(mainDBFname))
+	if err != nil {
+		slog.Error("failed to initialize SQLite database", "error", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if err := st.Close(); err != nil {
+			slog.Error("error closing SQLite database", "error", err)
+		}
+	}()
+
+	schemaVer, err := st.GetSchemaVersion(ctx)
+	if err != nil {
+		slog.Error("failed to query database schema version", "error", err)
+		os.Exit(1)
+	}
+	slog.Info("database storage initialized", "path", cfg.DBPath(mainDBFname), "schemaVersion", schemaVer)
 
 	httpClient := &http.Client{Timeout: 15 * time.Second}
 

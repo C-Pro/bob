@@ -1,0 +1,14 @@
+begin;
+
+-- START migration code
+
+-- END migration code
+
+update schema_version
+  set is_current = 0
+  where is_current = 1;
+
+insert into schema_version(version, description, is_current)
+  values({{.Version}}, '{{.Description}}', 1);
+
+end;
