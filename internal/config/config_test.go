@@ -24,6 +24,7 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	_ = os.Unsetenv("MSG_RING_BUFFER_SIZE")
 	_ = os.Unsetenv("TAVILY_API_KEY")
 	_ = os.Unsetenv("TAVILY_BASE_URL")
+	_ = os.Unsetenv("DATA_DIR")
 
 	cfg, err := LoadFromEnv()
 	require.NoError(t, err)
@@ -36,6 +37,8 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	assert.Equal(t, 2, cfg.TownhallMaxParagraphs)
 	assert.Equal(t, 10, cfg.DMMaxParagraphs)
 	assert.Equal(t, 100, cfg.MsgRingBufferSize)
+	assert.Equal(t, "./data", cfg.DataDir)
+	assert.Equal(t, "data/bob.db", cfg.DBPath("bob.db"))
 }
 
 func TestLoadFromEnvStandardOpenAI(t *testing.T) {
@@ -53,6 +56,7 @@ func TestLoadFromEnvStandardOpenAI(t *testing.T) {
 	t.Setenv("MSG_RING_BUFFER_SIZE", "50")
 	t.Setenv("TAVILY_API_KEY", "tvly-test-key-12345")
 	t.Setenv("TAVILY_BASE_URL", "https://custom.tavily.api/v1")
+	t.Setenv("DATA_DIR", "/var/lib/bob")
 
 	cfg, err := LoadFromEnv()
 	require.NoError(t, err)
@@ -66,6 +70,8 @@ func TestLoadFromEnvStandardOpenAI(t *testing.T) {
 	assert.Equal(t, 3, cfg.TownhallMaxParagraphs)
 	assert.Equal(t, 15, cfg.DMMaxParagraphs)
 	assert.Equal(t, 50, cfg.MsgRingBufferSize)
+	assert.Equal(t, "/var/lib/bob", cfg.DataDir)
+	assert.Equal(t, "/var/lib/bob/custom.db", cfg.DBPath("custom.db"))
 }
 
 func TestLoadFromEnvGeminiFallback(t *testing.T) {

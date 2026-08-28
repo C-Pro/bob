@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -27,6 +28,7 @@ type Config struct {
 	MsgRingBufferSize     int
 	TavilyAPIKey          string
 	TavilyBaseURL         string
+	DataDir               string
 }
 
 // LoadFromEnv loads configuration from environment variables (or .env file) with sensible defaults.
@@ -58,6 +60,7 @@ func LoadFromEnv() (*Config, error) {
 		TownhallMaxParagraphs: getEnvIntOrDefault("TOWNHALL_MAX_PARAGRAPHS", 2),
 		DMMaxParagraphs:       getEnvIntOrDefault("DM_MAX_PARAGRAPHS", 10),
 		MsgRingBufferSize:     getEnvIntOrDefault("MSG_RING_BUFFER_SIZE", 100),
+		DataDir:               getEnvOrDefault("DATA_DIR", "./data"),
 	}
 
 	// Normalize bot handle to ensure it starts with @
@@ -77,6 +80,11 @@ func LoadFromEnv() (*Config, error) {
 	cfg.GeminiBaseURL = cfg.OpenAIBaseURL
 
 	return cfg, nil
+}
+
+// DBPath returns the joined path to a SQLite database file inside DataDir.
+func (c *Config) DBPath(filename string) string {
+	return filepath.Join(c.DataDir, filename)
 }
 
 // Validate checks required fields for runtime readiness.

@@ -21,6 +21,7 @@
 ## 4. Configuration & State Management
 - **Configuration:** Environment variables (`env` / `os.Getenv`)
 - **Context & State Storage:** In-memory thread-safe per-chat ring buffers (`internal/chatcontext`) bounded by `MSG_RING_BUFFER_SIZE` (default 100) with chunked stepped eviction ($1/3$ capacity batch pruning) to maximize LLM prompt prefix caching, dynamic templated prompt generation (`internal/prompt`), and user metadata caching (`internal/gateway`).
+- **Database & Persistent Storage:** SQLite via pure Go `modernc.org/sqlite` (no CGO) in `internal/store`, supporting configurable `DATA_DIR`, automated schema initialization (`schema.tmpl`), single-step version migrations (`migrate.tmpl`), and automated git tagging (`db-release-N`).
 
 ## 5. Testing & Code Quality
 - **Testing Framework:** Native Go `testing` package, `go test -race -cover`
