@@ -9,6 +9,7 @@ Bob is an AI agent for the [Besedka](https://github.com/c-pro/besedka) self-host
 - **Multimodal image & file attachments** — automatic ingestion and base64 encoding of image thumbnails via OpenAI `image_url` payloads, plus inlined markdown code blocks for text-based code/config attachments
 - **Live web search** via [Tavily](https://tavily.com/) (when `TAVILY_API_KEY` is set)
 - **Web page fetch & extraction** with readability parsing and dynamic rendering fallback
+- **SQLite storage & schema migrations** — pure Go embedded SQLite database with automatic single-step version migrations
 - **GEOIP location reporting** — round-robin across public providers
 - **OpenAI-compatible LLM client** with exponential retry backoff and tool/function calling
 
@@ -19,6 +20,7 @@ Bob is an AI agent for the [Besedka](https://github.com/c-pro/besedka) self-host
 - Go 1.24+
 - A running [Besedka](https://github.com/c-pro/besedka) server
 - An API key for an OpenAI-compatible LLM provider
+- A writable directory on the host/container filesystem for SQLite database files (`./data` by default)
 
 ### Configuration
 
@@ -36,6 +38,7 @@ BOT_HANDLE=@botname
 Optional:
 
 ```sh
+DATA_DIR=./data                           # directory for SQLite databases (must be writable)
 TAVILY_API_KEY=<your-tavily-key>          # enables web search tool
 MSG_RING_BUFFER_SIZE=100                  # context window size per chat
 TOWNHALL_MAX_PARAGRAPHS=2                 # response length limit in Townhall
@@ -52,8 +55,10 @@ go run ./cmd/agent
 
 ```sh
 docker build -t bob:latest .
-docker run --env-file .env bob:latest
+docker run --env-file .env -v $(pwd)/data:/data bob:latest
 ```
+
+> **Note on Storage Permissions:** Bob requires a writable data directory (configured via `DATA_DIR`, defaulting to `./data`, or `/data` inside the container). When mounting a volume in containerized environments, ensure the mount point is writable by `appuser` (UID `10001`).
 
 ## Development
 
@@ -77,6 +82,7 @@ internal/
   llm/              — OpenAI-compatible LLM client
   models/           — shared data types
   prompt/           — system prompt rendering
+  store/            — SQLite database storage & single-step migrations
   tools/            — tool registry, Tavily search, web fetch
 ```
 
