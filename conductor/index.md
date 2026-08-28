@@ -21,4 +21,7 @@
 - **Track: Images & Attachments in Context** (`images-in-context_20260825`) - [Plan](archive/images-in-context_20260825/plan.md) | [Spec](archive/images-in-context_20260825/spec.md)
 
 
+---
 
+- [ ] **Track: SQLite Database Scaffolding & Single-Step Migration**
+*Link: [./tracks/sqlite-db_20260828/](./tracks/sqlite-db_20260828/)*
