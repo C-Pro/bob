@@ -20,7 +20,7 @@ Bob is an autonomous AI agent service designed for the [Besedka](https://github.
 
 ## Rules
 
-- **Always run `make check` before finishing any task** to ensure that `lint-go` (`golangci-lint`), `test-go` (`go test -race`), `semgrep`, and `osv-scanner` all pass cleanly with 0 errors.
+- **Always run `make check` before finishing any code-related task** to ensure that `lint-go` (`golangci-lint`), `test-go` (`go test -race`), `semgrep`, and `osv-scanner` all pass cleanly with 0 errors. No need to run `make check` when changes are strictly confined to documentation or Conductor plans/specs.
 - When implementing a new feature or fixing a bug, always write thorough unit and integration tests (`go test -race ./...`).
 - When adding or changing dependencies, always run `go mod tidy` and `go mod vendor` to keep the vendor directory up to date.
 - Validate configuration changes against `internal/config`.
