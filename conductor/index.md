@@ -21,3 +21,7 @@
 - **Track: Images & Attachments in Context** (`images-in-context_20260825`) - [Plan](archive/images-in-context_20260825/plan.md) | [Spec](archive/images-in-context_20260825/spec.md)
 - **Track: SQLite Database Scaffolding & Single-Step Migration** (`sqlite-db_20260828`) - [Plan](archive/sqlite-db_20260828/plan.md) | [Spec](archive/sqlite-db_20260828/spec.md)
 
+---
+
+- [ ] **Track: sqvect Long-Term Memory & Isolated RAG**
+*Link: [./tracks/sqvect_20260828/](./tracks/sqvect_20260828/)*
