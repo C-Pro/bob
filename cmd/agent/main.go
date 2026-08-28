@@ -13,6 +13,7 @@ import (
 	"bob/internal/gateway"
 	"bob/internal/geoip"
 	"bob/internal/llm"
+	"bob/internal/store"
 )
 
 func main() {
@@ -38,10 +39,31 @@ func main() {
 		"townhallMaxParagraphs", cfg.TownhallMaxParagraphs,
 		"dmMaxParagraphs", cfg.DMMaxParagraphs,
 		"msgRingBufferSize", cfg.MsgRingBufferSize,
+		"dataDir", cfg.DataDir,
+		"dbPath", cfg.DBPath("bob.db"),
 	)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	// Initialize SQLite database storage
+	st, err := store.OpenOrCreate(cfg.DBPath("bob.db"))
+	if err != nil {
+		slog.Error("failed to initialize SQLite database", "error", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if err := st.Close(); err != nil {
+			slog.Error("error closing SQLite database", "error", err)
+		}
+	}()
+
+	schemaVer, err := st.GetSchemaVersion(ctx)
+	if err != nil {
+		slog.Error("failed to query database schema version", "error", err)
+		os.Exit(1)
+	}
+	slog.Info("database storage initialized", "path", cfg.DBPath("bob.db"), "schemaVersion", schemaVer)
 
 	httpClient := &http.Client{Timeout: 15 * time.Second}
 

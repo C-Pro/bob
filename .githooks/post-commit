@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Check if internal/store/version.go was changed in the latest commit
+if git diff-tree --no-commit-id --name-only -r HEAD | grep -q '^internal/store/version\.go$'; then
+    # Extract version integer from version.go struct initialization e.g. {1, "..."}
+    VERSION=$(sed -nE 's/.*\{([0-9]+),.*/\1/p' internal/store/version.go | tr -d '[:space:]')
+
+    if [ -n "$VERSION" ]; then
+        TAG_NAME="db-release-${VERSION}"
+        if ! git rev-parse "${TAG_NAME}" >/dev/null 2>&1; then
+            git tag "${TAG_NAME}" HEAD
+            echo "[githooks/post-commit] Tagged commit with ${TAG_NAME}"
+        fi
+    fi
+fi

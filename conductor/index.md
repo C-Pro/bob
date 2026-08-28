@@ -23,5 +23,5 @@
 
 ---
 
-- [ ] **Track: SQLite Database Scaffolding & Single-Step Migration**
+- [x] **Track: SQLite Database Scaffolding & Single-Step Migration**
 *Link: [./tracks/sqlite-db_20260828/](./tracks/sqlite-db_20260828/)*
