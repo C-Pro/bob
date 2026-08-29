@@ -11,8 +11,10 @@ import (
 	"testing"
 	"time"
 
+	"bob/internal/chatcontext"
 	"bob/internal/config"
 	"bob/internal/llm"
+	"bob/internal/memory"
 	"bob/internal/models"
 	"bob/internal/tools/tavily"
 
@@ -1482,6 +1484,321 @@ func TestWarmupChat_WithAttachments(t *testing.T) {
 	assert.Contains(t, entries[1].Content, "Second with log")
 	assert.Contains(t, entries[1].Content, "[Attachment app.log]:\n```\nhistorical log line\n```")
 }
+
+func TestGateway_EvictionToMemoryIndexing(t *testing.T) {
+	tempDir := t.TempDir()
+
+	cfg := &config.Config{
+		DataDir:           tempDir,
+		MsgRingBufferSize: 3,
+	}
+
+	gw := NewGateway(cfg, nil)
+	defer gw.Stop()
+
+	// Push 4 messages to ring buffer (capacity 3 -> triggers eviction of msg 1)
+	ctx := context.Background()
+	now := time.Now().Unix()
+
+	gw.contextManager.Push("townhall", chatcontext.Entry{
+		Seq:        10,
+		Role:       "user",
+		SenderName: "Alice",
+		Content:    "Super secret project alpha details in townhall.",
+		Timestamp:  now,
+	})
+	gw.contextManager.Push("townhall", chatcontext.Entry{
+		Seq:        11,
+		Role:       "assistant",
+		SenderName: "Bob",
+		Content:    "Acknowledged alpha.",
+		Timestamp:  now + 1,
+	})
+	gw.contextManager.Push("townhall", chatcontext.Entry{
+		Seq:        12,
+		Role:       "user",
+		SenderName: "Charlie",
+		Content:    "Alpha is progressing well.",
+		Timestamp:  now + 2,
+	})
+
+	// 4th push triggers eviction of 1 entry (Msg 10)
+	gw.contextManager.Push("townhall", chatcontext.Entry{
+		Seq:        13,
+		Role:       "assistant",
+		SenderName: "Bob",
+		Content:    "Alpha update 4.",
+		Timestamp:  now + 3,
+	})
+
+	// Allow async goroutine to complete
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify watermark was updated
+	wm, err := gw.MemoryManager().GetWatermark(ctx, "townhall", false)
+	require.NoError(t, err)
+	assert.Equal(t, int64(10), wm)
+
+	// Verify message is searchable in memory store
+	hits, err := gw.MemoryManager().Search(ctx, "secret", "townhall", false, 5)
+	require.NoError(t, err)
+	require.NotEmpty(t, hits)
+	assert.Contains(t, hits[0].Content, "Super secret project alpha")
+}
+
+func TestGateway_StartupSequenceCatchup(t *testing.T) {
+	tempDir := t.TempDir()
+
+	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/me" {
+			_ = json.NewEncoder(w).Encode(models.User{ID: "bot_1", Name: "BobBot", DisplayName: "Bob"})
+			return
+		}
+		if r.URL.Path == "/api/users" {
+			_ = json.NewEncoder(w).Encode([]models.User{
+				{ID: "u1", Name: "Alice", DisplayName: "Alice User"},
+			})
+			return
+		}
+		if r.URL.Path == "/api/chats" {
+			_ = json.NewEncoder(w).Encode([]models.Chat{
+				{ID: "townhall", LastSeq: 3},
+				{ID: "dm_user1", LastSeq: 2, IsDM: true},
+			})
+			return
+		}
+		if r.URL.Path == "/api/chats/townhall/messages" {
+			_ = json.NewEncoder(w).Encode([]models.Message{
+				{Seq: 1, ChatID: "townhall", UserID: "u1", Content: "Catchup message 1", Timestamp: 100},
+				{Seq: 2, ChatID: "townhall", UserID: "bot_1", Content: "Catchup message 2", Timestamp: 101},
+				{Seq: 3, ChatID: "townhall", UserID: "u1", Content: "Catchup message 3", Timestamp: 102},
+			})
+			return
+		}
+		if r.URL.Path == "/api/chats/dm_user1/messages" {
+			_ = json.NewEncoder(w).Encode([]models.Message{
+				{Seq: 1, ChatID: "dm_user1", UserID: "u1", Content: "Private DM catchup 1", Timestamp: 200},
+				{Seq: 2, ChatID: "dm_user1", UserID: "bot_1", Content: "Private DM catchup 2", Timestamp: 201},
+			})
+			return
+		}
+	}))
+	defer besedkaServer.Close()
+
+	cfg := &config.Config{
+		BesedkaURL:        besedkaServer.URL,
+		DataDir:           tempDir,
+		MsgRingBufferSize: 10,
+	}
+
+	gw := NewGateway(cfg, nil)
+	gw.httpClient = besedkaServer.Client()
+	defer gw.Stop()
+
+	ctx := context.Background()
+
+	// Perform context warmup (includes catch-up)
+	err := gw.WarmupContext(ctx)
+	require.NoError(t, err)
+
+	// Verify townhall watermark is 3
+	thWM, err := gw.MemoryManager().GetWatermark(ctx, "townhall", false)
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), thWM)
+
+	// Verify DM watermark is 2
+	dmWM, err := gw.MemoryManager().GetWatermark(ctx, "dm_user1", true)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), dmWM)
+
+	// Verify townhall search finds historical messages
+	thHits, err := gw.MemoryManager().Search(ctx, "Catchup", "townhall", false, 5)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, len(thHits), 1)
+
+	// Verify DM search finds DM historical messages
+	dmHits, err := gw.MemoryManager().Search(ctx, "Private", "dm_user1", true, 5)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, len(dmHits), 1)
+	assert.Equal(t, "[Direct Message]", dmHits[0].Source)
+}
+
+func TestProcessMessageWithRecallMemoryTool(t *testing.T) {
+	tempDir := t.TempDir()
+
+	upgrader := websocket.Upgrader{}
+	sentMessages := make(chan models.ClientMessage, 10)
+
+	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/me" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(models.User{ID: "bot-id", UserName: "bot", DisplayName: "BotAssistant"})
+			return
+		}
+		if r.URL.Path == "/api/users" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.User{
+				{ID: "user-1", UserName: "alice", DisplayName: "Alice"},
+			})
+			return
+		}
+		if r.URL.Path == "/api/chats" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.Chat{})
+			return
+		}
+		if r.URL.Path == "/api/chat" {
+			conn, err := upgrader.Upgrade(w, r, nil)
+			require.NoError(t, err)
+			defer func() { _ = conn.Close() }()
+
+			for {
+				var msg models.ClientMessage
+				if err := conn.ReadJSON(&msg); err != nil {
+					break
+				}
+				sentMessages <- msg
+			}
+		}
+	}))
+	defer besedkaServer.Close()
+
+	var llmCallCount int32
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := atomic.AddInt32(&llmCallCount, 1)
+		w.Header().Set("Content-Type", "application/json")
+
+		if count == 1 {
+			var req openai.ChatCompletionRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			require.NotEmpty(t, req.Tools)
+
+			// Verify recall_memory is registered in tool list
+			hasRecallTool := false
+			for _, tool := range req.Tools {
+				if tool.Function.Name == "recall_memory" {
+					hasRecallTool = true
+					break
+				}
+			}
+			assert.True(t, hasRecallTool)
+
+			// LLM decides to call recall_memory
+			resp := openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role: openai.ChatMessageRoleAssistant,
+							ToolCalls: []openai.ToolCall{
+								{
+									ID:   "call_mem_123",
+									Type: openai.ToolTypeFunction,
+									Function: openai.FunctionCall{
+										Name:      "recall_memory",
+										Arguments: `{"query": "database Postgres"}`,
+									},
+								},
+							},
+						},
+						FinishReason: openai.FinishReasonToolCalls,
+					},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		// Second call with tool output
+		var req openai.ChatCompletionRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+
+		// Assert tool message is passed back
+		hasToolMessage := false
+		for _, m := range req.Messages {
+			if m.Role == openai.ChatMessageRoleTool && m.ToolCallID == "call_mem_123" {
+				hasToolMessage = true
+				assert.Contains(t, m.Content, "Postgres 16")
+				break
+			}
+		}
+		assert.True(t, hasToolMessage)
+
+		resp := openai.ChatCompletionResponse{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Message: openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "According to our memory records, we decided to use Postgres 16 for all production clusters.",
+					},
+					FinishReason: openai.FinishReasonStop,
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer llmServer.Close()
+
+	cfg := &config.Config{
+		BotHandle:         "@bot",
+		BesedkaURL:        besedkaServer.URL,
+		OpenAIBaseURL:     llmServer.URL,
+		OpenAIAPIKey:      "test-key",
+		OpenAIModel:       "test-model",
+		DataDir:           tempDir,
+		MsgRingBufferSize: 10,
+	}
+
+	llmClient := llm.NewClient(cfg, llmServer.Client())
+	gw := NewGateway(cfg, llmClient)
+	gw.httpClient = besedkaServer.Client()
+	defer gw.Stop()
+
+	// Pre-index a message into memory
+	ctx := context.Background()
+	err := gw.MemoryManager().IndexMessages(ctx, "townhall", false, []memory.MessageToStore{
+		{
+			Seq:        1,
+			Timestamp:  time.Now().Unix(),
+			ChatID:     "townhall",
+			UserID:     "user-1",
+			SenderName: "Alice",
+			Role:       "user",
+			Content:    "We agreed to use Postgres 16 for all production clusters.",
+		},
+	})
+	require.NoError(t, err)
+
+	// Connect WebSocket
+	err = gw.DialWebSocket(ctx)
+	require.NoError(t, err)
+
+	// Pre-fetch bot user metadata
+	_, err = gw.FetchBotUser(ctx)
+	require.NoError(t, err)
+
+	incomingMsg := models.Message{
+		Seq:       2,
+		ChatID:    "townhall",
+		UserID:    "user-1",
+		Content:   "@bot what database did we decide to use?",
+		Timestamp: time.Now().Unix(),
+	}
+
+	err = gw.ProcessMessage(ctx, incomingMsg)
+	require.NoError(t, err)
+
+	select {
+	case reply := <-sentMessages:
+		assert.Equal(t, models.ClientMessageTypeSend, reply.Type)
+		assert.Equal(t, "townhall", reply.ChatID)
+		assert.Contains(t, reply.Content, "Postgres 16")
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for bot reply")
+	}
+
+	assert.Equal(t, int32(2), atomic.LoadInt32(&llmCallCount))
+}
+
 
 
 

@@ -44,7 +44,7 @@ func NewSQLiteStore(fname string, init bool) (*SQLiteStorage, error) {
 		}
 	} else {
 		// mode=rw will fail if fname does not exist as opposed to default mode=rwc
-		dsn = fmt.Sprintf("file://%s?mode=rw", fname)
+		dsn = fmt.Sprintf("file:%s?mode=rw", fname)
 	}
 
 	db, err := sql.Open("sqlite", dsn)

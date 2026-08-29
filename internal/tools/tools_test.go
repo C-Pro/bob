@@ -6,7 +6,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	"bob/internal/config"
+	"bob/internal/memory"
 	"bob/internal/tools/tavily"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -15,10 +18,10 @@ import (
 )
 
 func TestWebSearchToolDefinition(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry := NewRegistry(nil, nil)
 	tools := registry.ToolDefinitions()
 
-	require.Len(t, tools, 2)
+	require.Len(t, tools, 3)
 	tool := tools[0]
 	assert.Equal(t, openai.ToolTypeFunction, tool.Type)
 	require.NotNil(t, tool.Function)
@@ -44,10 +47,10 @@ func TestWebSearchToolDefinition(t *testing.T) {
 }
 
 func TestWebFetchToolDefinition(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry := NewRegistry(nil, nil)
 	tools := registry.ToolDefinitions()
 
-	require.Len(t, tools, 2)
+	require.Len(t, tools, 3)
 	tool := tools[1]
 	assert.Equal(t, openai.ToolTypeFunction, tool.Type)
 	require.NotNil(t, tool.Function)
@@ -72,6 +75,33 @@ func TestWebFetchToolDefinition(t *testing.T) {
 	assert.Contains(t, required, "url")
 }
 
+func TestRecallMemoryToolDefinition(t *testing.T) {
+	registry := NewRegistry(nil, nil)
+	tools := registry.ToolDefinitions()
+
+	require.Len(t, tools, 3)
+	tool := tools[2]
+	assert.Equal(t, openai.ToolTypeFunction, tool.Type)
+	require.NotNil(t, tool.Function)
+	assert.Equal(t, "recall_memory", tool.Function.Name)
+	assert.Contains(t, tool.Function.Description, "memory")
+
+	paramBytes, err := json.Marshal(tool.Function.Parameters)
+	require.NoError(t, err)
+
+	var schema map[string]interface{}
+	err = json.Unmarshal(paramBytes, &schema)
+	require.NoError(t, err)
+	assert.Equal(t, "object", schema["type"])
+	props, ok := schema["properties"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Contains(t, props, "query")
+	assert.Contains(t, props, "limit")
+	required, ok := schema["required"].([]interface{})
+	require.True(t, ok)
+	assert.Contains(t, required, "query")
+}
+
 func TestExecuteWebSearchSuccess(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		resp := tavily.SearchResponse{
@@ -91,7 +121,7 @@ func TestExecuteWebSearchSuccess(t *testing.T) {
 	defer ts.Close()
 
 	tavilyClient := tavily.NewClient("test-key", ts.URL, ts.Client())
-	registry := NewRegistry(tavilyClient)
+	registry := NewRegistry(tavilyClient, nil)
 
 	args := `{"query": "golang news", "search_depth": "basic", "max_results": 3}`
 	resultStr, err := registry.Execute(context.Background(), "web_search", args)
@@ -118,7 +148,7 @@ func TestExecuteWebFetchAutoStaticSuccess(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	registry := NewRegistry(nil)
+	registry := NewRegistry(nil, nil)
 	args, err := json.Marshal(WebFetchArgs{URL: ts.URL, Mode: "auto"})
 	require.NoError(t, err)
 
@@ -158,7 +188,7 @@ func TestExecuteWebFetchAutoDynamicFallbackToTavily(t *testing.T) {
 	defer tavilyServer.Close()
 
 	tavilyClient := tavily.NewClient("test-key", tavilyServer.URL, tavilyServer.Client())
-	registry := NewRegistry(tavilyClient)
+	registry := NewRegistry(tavilyClient, nil)
 
 	args, err := json.Marshal(WebFetchArgs{URL: webServer.URL, Mode: "auto"})
 	require.NoError(t, err)
@@ -184,7 +214,7 @@ func TestExecuteWebFetchAutoDynamicFallbackDirect(t *testing.T) {
 	defer webServer.Close()
 
 	// Registry without Tavily client
-	registry := NewRegistry(nil)
+	registry := NewRegistry(nil, nil)
 
 	args, err := json.Marshal(WebFetchArgs{URL: webServer.URL, Mode: "auto"})
 	require.NoError(t, err)
@@ -209,7 +239,7 @@ func TestExecuteWebFetchRawMode(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	registry := NewRegistry(nil)
+	registry := NewRegistry(nil, nil)
 	args, err := json.Marshal(WebFetchArgs{URL: ts.URL, Mode: "raw"})
 	require.NoError(t, err)
 
@@ -241,7 +271,7 @@ func TestExecuteWebFetchExtractMode(t *testing.T) {
 	defer tavilyServer.Close()
 
 	tavilyClient := tavily.NewClient("test-key", tavilyServer.URL, tavilyServer.Client())
-	registry := NewRegistry(tavilyClient)
+	registry := NewRegistry(tavilyClient, nil)
 
 	args, err := json.Marshal(WebFetchArgs{URL: "https://example.com/app", Mode: "extract"})
 	require.NoError(t, err)
@@ -263,7 +293,7 @@ func TestExecuteWebFetchBinary(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	registry := NewRegistry(nil)
+	registry := NewRegistry(nil, nil)
 	args, err := json.Marshal(WebFetchArgs{URL: ts.URL, Mode: "auto"})
 	require.NoError(t, err)
 
@@ -279,7 +309,7 @@ func TestExecuteWebFetchBinary(t *testing.T) {
 }
 
 func TestExecuteWebFetchValidation(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry := NewRegistry(nil, nil)
 
 	// Empty URL
 	_, err := registry.Execute(context.Background(), "web_fetch", `{"url": ""}`)
@@ -295,14 +325,14 @@ func TestExecuteWebFetchValidation(t *testing.T) {
 }
 
 func TestExecuteUnknownTool(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry := NewRegistry(nil, nil)
 	_, err := registry.Execute(context.Background(), "unknown_tool", `{}`)
 	assert.ErrorContains(t, err, "unknown tool: unknown_tool")
 }
 
 func TestExecuteInvalidJSONArgs(t *testing.T) {
 	tavilyClient := tavily.NewClient("test-key", "https://api.tavily.com", nil)
-	registry := NewRegistry(tavilyClient)
+	registry := NewRegistry(tavilyClient, nil)
 
 	_, err := registry.Execute(context.Background(), "web_search", `invalid-json`)
 	assert.Error(t, err)
@@ -311,9 +341,119 @@ func TestExecuteInvalidJSONArgs(t *testing.T) {
 
 func TestExecuteEmptyQuery(t *testing.T) {
 	tavilyClient := tavily.NewClient("test-key", "https://api.tavily.com", nil)
-	registry := NewRegistry(tavilyClient)
+	registry := NewRegistry(tavilyClient, nil)
 
 	_, err := registry.Execute(context.Background(), "web_search", `{"query": ""}`)
 	assert.ErrorContains(t, err, "query cannot be empty")
 }
+
+func TestExecuteRecallMemory_Success(t *testing.T) {
+	tempDir := t.TempDir()
+
+	cfg := &config.Config{
+		DataDir: tempDir,
+	}
+	memMgr := memory.NewManager(cfg, nil)
+	defer func() { _ = memMgr.Close() }()
+
+	ctx := context.Background()
+	now := time.Now().Unix()
+
+	// Index townhall message
+	err := memMgr.IndexMessages(ctx, "townhall", false, []memory.MessageToStore{
+		{
+			Seq:        1,
+			Timestamp:  now,
+			ChatID:     "townhall",
+			UserID:     "alice",
+			SenderName: "Alice",
+			Role:       "user",
+			Content:    "We agreed to use Postgres 16 database for all production clusters.",
+		},
+	})
+	require.NoError(t, err)
+
+	// Index private DM message
+	err = memMgr.IndexMessages(ctx, "dm_user1", true, []memory.MessageToStore{
+		{
+			Seq:        10,
+			Timestamp:  now + 1,
+			ChatID:     "dm_user1",
+			UserID:     "user1",
+			SenderName: "User One",
+			Role:       "user",
+			Content:    "My personal favorite database is SQLite with WAL mode.",
+		},
+	})
+	require.NoError(t, err)
+
+	registry := NewRegistry(nil, memMgr)
+
+	// 1. Query in Townhall context
+	thCtx := WithChatSession(ctx, ChatSessionContext{ChatID: "townhall", IsDM: false})
+	thRes, err := registry.Execute(thCtx, "recall_memory", `{"query": "Postgres", "limit": 3}`)
+	require.NoError(t, err)
+
+	var thObj map[string]interface{}
+	err = json.Unmarshal([]byte(thRes), &thObj)
+	require.NoError(t, err)
+	assert.Equal(t, float64(1), thObj["count"])
+	assert.Contains(t, thObj["formatted_results"], "[Townhall]")
+	assert.Contains(t, thObj["formatted_results"], "Postgres 16")
+
+	// 2. Query in DM context
+	dmCtx := WithChatSession(ctx, ChatSessionContext{ChatID: "dm_user1", IsDM: true})
+	dmRes, err := registry.Execute(dmCtx, "recall_memory", `{"query": "database", "limit": 5}`)
+	require.NoError(t, err)
+
+	var dmObj map[string]interface{}
+	err = json.Unmarshal([]byte(dmRes), &dmObj)
+	require.NoError(t, err)
+	assert.Equal(t, float64(2), dmObj["count"])
+	assert.Contains(t, dmObj["formatted_results"], "[Direct Message]")
+	assert.Contains(t, dmObj["formatted_results"], "SQLite with WAL")
+	assert.Contains(t, dmObj["formatted_results"], "[Townhall]")
+}
+
+func TestExecuteRecallMemory_EmptyResults(t *testing.T) {
+	tempDir := t.TempDir()
+
+	cfg := &config.Config{
+		DataDir: tempDir,
+	}
+	memMgr := memory.NewManager(cfg, nil)
+	defer func() { _ = memMgr.Close() }()
+
+	registry := NewRegistry(nil, memMgr)
+	res, err := registry.Execute(context.Background(), "recall_memory", `{"query": "nonexistent"}`)
+	require.NoError(t, err)
+
+	var obj map[string]interface{}
+	err = json.Unmarshal([]byte(res), &obj)
+	require.NoError(t, err)
+	assert.Equal(t, float64(0), obj["count"])
+	assert.Contains(t, obj["message"], "No relevant memories found")
+}
+
+func TestExecuteRecallMemory_NoMemoryManager(t *testing.T) {
+	registry := NewRegistry(nil, nil)
+	_, err := registry.Execute(context.Background(), "recall_memory", `{"query": "hello"}`)
+	assert.ErrorContains(t, err, "memory manager is not configured")
+}
+
+func TestExecuteRecallMemory_InvalidArgs(t *testing.T) {
+	tempDir := t.TempDir()
+
+	memMgr := memory.NewManager(&config.Config{DataDir: tempDir}, nil)
+	defer func() { _ = memMgr.Close() }()
+
+	registry := NewRegistry(nil, memMgr)
+
+	_, err := registry.Execute(context.Background(), "recall_memory", `invalid-json`)
+	assert.ErrorContains(t, err, "failed to parse arguments")
+
+	_, err = registry.Execute(context.Background(), "recall_memory", `{"query": ""}`)
+	assert.ErrorContains(t, err, "query cannot be empty")
+}
+
 

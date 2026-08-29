@@ -37,4 +37,6 @@
 ## 7. Tools & External Integrations
 - **Web Search API:** Tavily REST API (`POST /search`) with native Go HTTP client, exponential retry backoff, and OpenAI function calling integration.
 - **Web Extraction & Readability:** `github.com/go-shiori/go-readability` for HTML DOM extraction and content sanitization; Tavily Extract REST API (`POST /extract`) for dynamic client-rendered SPA fallback.
+- **Long-Term Memory & Isolated RAG:** Pure-Go SQLite Vector & FTS5 engine via `github.com/liliang-cn/cortexdb/v2` (`internal/memory`), supporting `recall_memory` function calling tool, sequence watermark tracking, asynchronous eviction batch indexing, startup historical backfill catch-up, and strict privacy isolation across DMs and Townhall.
+- **Embedding Provider:** OpenAI-compatible `/v1/embeddings` endpoint client (`internal/llm`) with exponential retry backoff, configurable via `EMBEDDING_MODEL` (e.g. `text-embedding-004` or `gemini-embedding-2`), with graceful fallback to pure FTS5 BM25 search when unconfigured.
 

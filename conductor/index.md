@@ -23,5 +23,5 @@
 
 ---
 
-- [ ] **Track: sqvect Long-Term Memory & Isolated RAG**
+- [x] **Track: sqvect Long-Term Memory & Isolated RAG**
 *Link: [./tracks/sqvect_20260828/](./tracks/sqvect_20260828/)*

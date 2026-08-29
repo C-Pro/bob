@@ -5,10 +5,11 @@ Bob is an autonomous AI agent service designed for the [Besedka](https://github.
 ## Architecture & Core Features
 
 - **Ingress & Networking:** Connects via WebSocket (`/api/chat`) with automatic reconnect, ping keepalive, and REST API metadata caching (`/api/me`, `/api/users`, `/api/chats`, `/api/chats/{id}/messages`).
-- **Context Management:** In-memory, thread-safe per-chat ring buffers (`internal/chatcontext`) bounded by `MSG_RING_BUFFER_SIZE` with on-demand historical backfill and metadata caching.
+- **Context Management:** In-memory, thread-safe per-chat ring buffers (`internal/chatcontext`) bounded by `MSG_RING_BUFFER_SIZE` with on-demand historical backfill, metadata caching, and chunked batch eviction.
+- **Long-Term Memory & Isolated RAG:** Per-chat SQLite vector and FTS5 storage (`internal/memory`) with sequence watermark tracking, asynchronous batch indexing on eviction, startup sequence catch-up, and strict privacy isolation via `recall_memory` tool.
 - **Prompt Rendering:** Contextual system prompt formatting for Townhall and DM interactions (`internal/prompt`).
 - **GEOIP Location Reporting:** Periodic server location lookup using round-robin querying across public GEOIP providers (`ip-api.com`, `ipapi.co`, `ipinfo.io`) and periodic WebSocket location frame transmission (`internal/geoip`).
-- **LLM Provider:** OpenAI-compatible API client (`internal/llm`) with exponential retry backoff and tool/function support.
+- **LLM Provider:** OpenAI-compatible API client (`internal/llm`) with exponential retry backoff, embedding generation, and tool/function support.
 
 ## Coding Style
 

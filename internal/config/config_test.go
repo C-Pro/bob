@@ -25,6 +25,7 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	_ = os.Unsetenv("TAVILY_API_KEY")
 	_ = os.Unsetenv("TAVILY_BASE_URL")
 	_ = os.Unsetenv("DATA_DIR")
+	_ = os.Unsetenv("EMBEDDING_MODEL")
 
 	cfg, err := LoadFromEnv()
 	require.NoError(t, err)
@@ -38,6 +39,7 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	assert.Equal(t, 10, cfg.DMMaxParagraphs)
 	assert.Equal(t, 100, cfg.MsgRingBufferSize)
 	assert.Equal(t, "./data", cfg.DataDir)
+	assert.Equal(t, "", cfg.EmbeddingModel)
 	assert.Equal(t, "data/bob.db", cfg.DBPath("bob.db"))
 }
 
@@ -57,6 +59,7 @@ func TestLoadFromEnvStandardOpenAI(t *testing.T) {
 	t.Setenv("TAVILY_API_KEY", "tvly-test-key-12345")
 	t.Setenv("TAVILY_BASE_URL", "https://custom.tavily.api/v1")
 	t.Setenv("DATA_DIR", "/var/lib/bob")
+	t.Setenv("EMBEDDING_MODEL", "gemini-embedding-2")
 
 	cfg, err := LoadFromEnv()
 	require.NoError(t, err)
@@ -71,6 +74,7 @@ func TestLoadFromEnvStandardOpenAI(t *testing.T) {
 	assert.Equal(t, 15, cfg.DMMaxParagraphs)
 	assert.Equal(t, 50, cfg.MsgRingBufferSize)
 	assert.Equal(t, "/var/lib/bob", cfg.DataDir)
+	assert.Equal(t, "gemini-embedding-2", cfg.EmbeddingModel)
 	assert.Equal(t, "/var/lib/bob/custom.db", cfg.DBPath("custom.db"))
 }
 

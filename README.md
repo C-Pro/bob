@@ -6,6 +6,7 @@ Bob is an AI agent for the [Besedka](https://github.com/c-pro/besedka) self-host
 
 - **WebSocket ingress** with automatic reconnect and ping keepalive
 - **Multi-turn context & chunked eviction** — per-chat in-memory ring buffers with historical backfill and stepped batch eviction (pruning 1/3 of the buffer on overflow) to keep the prompt prefix static and maximize LLM prefix caching
+- **Long-term isolated memory & RAG (`recall_memory`)** — persistent SQLite vector and FTS5 memory per chat with watermark tracking, background indexing upon ring buffer eviction, startup sequence catch-up, and strict privacy isolation (Townhall searches townhall memory; DMs search own DM + townhall memory)
 - **Multimodal image & file attachments** — automatic ingestion and base64 encoding of image thumbnails via OpenAI `image_url` payloads, plus inlined markdown code blocks for text-based code/config attachments
 - **Live web search** via [Tavily](https://tavily.com/) (when `TAVILY_API_KEY` is set)
 - **Web page fetch & extraction** with readability parsing and dynamic rendering fallback
@@ -39,6 +40,7 @@ Optional:
 
 ```sh
 DATA_DIR=./data                           # directory for SQLite databases (must be writable)
+EMBEDDING_MODEL=text-embedding-004        # embedding model for vector semantic search (defaults to FTS5 lexical search if unset)
 TAVILY_API_KEY=<your-tavily-key>          # enables web search tool
 MSG_RING_BUFFER_SIZE=100                  # context window size per chat
 TOWNHALL_MAX_PARAGRAPHS=2                 # response length limit in Townhall
@@ -79,11 +81,12 @@ internal/
   config/           — environment-based configuration
   gateway/          — WebSocket/REST gateway to Besedka
   geoip/            — server location lookup
-  llm/              — OpenAI-compatible LLM client
+  llm/              — OpenAI-compatible LLM & embeddings client
+  memory/           — isolated SQLite vector + FTS5 long-term memory store
   models/           — shared data types
   prompt/           — system prompt rendering
   store/            — SQLite database storage & single-step migrations
-  tools/            — tool registry, Tavily search, web fetch
+  tools/            — tool registry, memory recall, Tavily search, web fetch
 ```
 
 ## License

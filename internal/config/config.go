@@ -29,6 +29,7 @@ type Config struct {
 	TavilyAPIKey          string
 	TavilyBaseURL         string
 	DataDir               string
+	EmbeddingModel        string
 }
 
 // LoadFromEnv loads configuration from environment variables (or .env file) with sensible defaults.
@@ -61,6 +62,7 @@ func LoadFromEnv() (*Config, error) {
 		DMMaxParagraphs:       getEnvIntOrDefault("DM_MAX_PARAGRAPHS", 10),
 		MsgRingBufferSize:     getEnvIntOrDefault("MSG_RING_BUFFER_SIZE", 100),
 		DataDir:               getEnvOrDefault("DATA_DIR", "./data"),
+		EmbeddingModel:        getEnvOrDefault("EMBEDDING_MODEL", ""),
 	}
 
 	// Normalize bot handle to ensure it starts with @

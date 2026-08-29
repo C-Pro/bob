@@ -37,6 +37,7 @@ func main() {
 		"besedkaURL", cfg.BesedkaURL,
 		"openAIModel", cfg.OpenAIModel,
 		"openAIBaseURL", cfg.OpenAIBaseURL,
+		"embeddingModel", cfg.EmbeddingModel,
 		"webSearchEnabled", cfg.TavilyAPIKey != "",
 		"townhallMaxParagraphs", cfg.TownhallMaxParagraphs,
 		"dmMaxParagraphs", cfg.DMMaxParagraphs,
@@ -77,7 +78,7 @@ func main() {
 		slog.Info("server location determined via GEOIP", "lat", loc.Lat, "lng", loc.Lng)
 	}
 
-	llmClient := llm.NewClient(cfg, httpClient)
+	llmClient := llm.NewClient(cfg, nil)
 	gw := gateway.NewGateway(cfg, llmClient)
 	if loc != nil {
 		gw.SetLocation(loc)
