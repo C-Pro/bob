@@ -412,6 +412,25 @@ func (g *Gateway) SendLocation(loc *models.Location) error {
 	return conn.WriteJSON(clientMsg)
 }
 
+// SendPong sends an application-level pong heartbeat frame to Besedka.
+func (g *Gateway) SendPong() error {
+	g.mu.Lock()
+	conn := g.conn
+	g.mu.Unlock()
+
+	if conn == nil {
+		return errors.New("websocket connection is not established")
+	}
+
+	clientMsg := models.ClientMessage{
+		Type: models.ClientMessageTypePong,
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return conn.WriteJSON(clientMsg)
+}
+
 func (g *Gateway) handleEvictedBatch(chatID string, evicted []chatcontext.Entry) {
 	g.mu.Lock()
 	memMgr := g.memoryManager
@@ -848,7 +867,7 @@ func (g *Gateway) Start(ctx context.Context) error {
 			}
 		}()
 
-		// WebSocket Ping Keepalive ticker to prevent 1006 idle timeout
+		// WebSocket Ping/Pong keepalive ticker to prevent idle timeout
 		pingDone := make(chan struct{})
 		g.mu.Lock()
 		activeConn := g.conn
@@ -874,10 +893,13 @@ func (g *Gateway) Start(ctx context.Context) error {
 					return
 				case <-ticker.C:
 					g.mu.Lock()
-					if g.conn == c && c != nil {
-						_ = c.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(5*time.Second))
-					}
+					isSame := g.conn == c
 					g.mu.Unlock()
+					if isSame && c != nil {
+						if err := g.SendPong(); err != nil {
+							slog.Debug("failed to send periodic keepalive pong", "error", err)
+						}
+					}
 				}
 			}
 		}(activeConn)
@@ -937,6 +959,13 @@ func (g *Gateway) Start(ctx context.Context) error {
 			var serverMsg models.ServerMessage
 			if err := json.Unmarshal(body, &serverMsg); err != nil {
 				slog.Debug("ignored non-JSON websocket frame", "error", err)
+				continue
+			}
+
+			if serverMsg.Type == models.ServerMessageTypePing {
+				if err := g.SendPong(); err != nil {
+					slog.Warn("failed to send pong response to ping frame", "error", err)
+				}
 				continue
 			}
 

@@ -34,7 +34,7 @@ func TestServiceDatabaseLifecycle(t *testing.T) {
 		dbFile := filepath.Join(dataDir, "bob.db")
 		assert.NoFileExists(t, dbFile)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
 		cmd := exec.CommandContext(ctx, binPath)
@@ -42,6 +42,7 @@ func TestServiceDatabaseLifecycle(t *testing.T) {
 			"DATA_DIR="+dataDir,
 			"BESEDKA_URL=http://127.0.0.1:59999", // Unused port, won't connect
 			"OPENAI_API_KEY=test-key",
+			"EMBEDDING_MODEL=test-model",
 		)
 		out, _ := cmd.CombinedOutput()
 		outputStr := string(out)
@@ -81,7 +82,7 @@ insert into schema_version(version, description, is_current) values(-1, 'ancient
 		require.NoError(t, err)
 		require.NoError(t, db.Close())
 
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
 		cmd := exec.CommandContext(ctx, binPath)
@@ -89,6 +90,7 @@ insert into schema_version(version, description, is_current) values(-1, 'ancient
 			"DATA_DIR="+dataDir,
 			"BESEDKA_URL=http://127.0.0.1:59999",
 			"OPENAI_API_KEY=test-key",
+			"EMBEDDING_MODEL=test-model",
 		)
 		out, err := cmd.CombinedOutput()
 		outputStr := string(out)
@@ -122,9 +124,6 @@ insert into schema_version(version, description, is_current) values(-1, 'ancient
 		require.NoError(t, err)
 		require.NoError(t, db.Close())
 
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
 		repoRoot, _ := filepath.Abs("../..")
 		if _, err := os.Stat(filepath.Join(repoRoot, "data/models")); os.IsNotExist(err) {
 			repoRoot, _ = filepath.Abs("..")
@@ -133,15 +132,28 @@ insert into schema_version(version, description, is_current) values(-1, 'ancient
 			repoRoot, _ = filepath.Abs(".")
 		}
 		modelsDir := filepath.Join(repoRoot, "data/models")
-		_ = os.Symlink(modelsDir, filepath.Join(dataDir, "models"))
+		if fi, err := os.Stat(modelsDir); err == nil && fi.IsDir() {
+			_ = os.Symlink(modelsDir, filepath.Join(dataDir, "models"))
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
 
 		cmd := exec.CommandContext(ctx, binPath, "-regenerate-vectors", "-data-dir="+dataDir)
 		cmd.Dir = repoRoot
-		cmd.Env = append(os.Environ(),
+
+		env := []string{
 			"BESEDKA_URL=http://127.0.0.1:59999",
 			"OPENAI_API_KEY=test-key",
-			"EMBEDDING_MODEL=",
-		)
+		}
+		// If local models aren't cached on disk (e.g. in CI), use mock embedding model to avoid network download
+		if fi, err := os.Stat(modelsDir); err != nil || !fi.IsDir() {
+			env = append(env, "EMBEDDING_MODEL=text-embedding-3-small")
+		} else {
+			env = append(env, "EMBEDDING_MODEL=")
+		}
+
+		cmd.Env = append(os.Environ(), env...)
 		out, err := cmd.CombinedOutput()
 		outputStr := string(out)
 

@@ -1818,7 +1818,117 @@ func TestProcessMessageWithRecallMemoryTool(t *testing.T) {
 	assert.Equal(t, int32(2), atomic.LoadInt32(&llmCallCount))
 }
 
+func TestSendPong(t *testing.T) {
+	cfg := &config.Config{
+		BotHandle:  "@bot",
+		BesedkaURL: "http://127.0.0.1:9999",
+	}
+	gw := NewGateway(cfg, nil)
 
+	// When not connected, SendPong returns error
+	err := gw.SendPong()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "websocket connection is not established")
 
+	// Set up mock server
+	upgrader := websocket.Upgrader{}
+	receivedMsgs := make(chan models.ClientMessage, 5)
 
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		require.NoError(t, err)
+		defer func() { _ = conn.Close() }()
 
+		for {
+			var clientMsg models.ClientMessage
+			if err := conn.ReadJSON(&clientMsg); err != nil {
+				break
+			}
+			receivedMsgs <- clientMsg
+		}
+	}))
+	defer server.Close()
+
+	cfg.BesedkaURL = server.URL
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err = gw.DialWebSocket(ctx)
+	require.NoError(t, err)
+	defer gw.Stop()
+
+	err = gw.SendPong()
+	require.NoError(t, err)
+
+	select {
+	case msg := <-receivedMsgs:
+		assert.Equal(t, models.ClientMessageTypePong, msg.Type)
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for pong message")
+	}
+}
+
+func TestGateway_PingPongKeepaliveHandling(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	receivedMsgs := make(chan models.ClientMessage, 10)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/me" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(models.User{ID: "bot-id", UserName: "bot", DisplayName: "Bot"})
+			return
+		}
+		if r.URL.Path == "/api/users" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.User{})
+			return
+		}
+		if r.URL.Path == "/api/chats" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.Chat{{ID: "townhall", Type: "townhall"}})
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/chats/") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.Message{})
+			return
+		}
+
+		conn, err := upgrader.Upgrade(w, r, nil)
+		require.NoError(t, err)
+		defer func() { _ = conn.Close() }()
+
+		// Send ping to client
+		_ = conn.WriteJSON(models.ServerMessage{Type: models.ServerMessageTypePing})
+
+		for {
+			var clientMsg models.ClientMessage
+			if err := conn.ReadJSON(&clientMsg); err != nil {
+				break
+			}
+			receivedMsgs <- clientMsg
+		}
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		BotHandle:  "@bot",
+		BesedkaURL: server.URL,
+	}
+	gw := NewGateway(cfg, nil)
+	gw.httpClient = server.Client()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		_ = gw.Start(ctx)
+	}()
+
+	select {
+	case msg := <-receivedMsgs:
+		assert.Equal(t, models.ClientMessageTypePong, msg.Type)
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for pong response to server ping")
+	}
+}

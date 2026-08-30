@@ -46,6 +46,18 @@ func TestJSONSerialization(t *testing.T) {
 	assert.Equal(t, "townhall", sMsg.ChatID)
 	require.Len(t, sMsg.Messages, 1)
 	assert.Equal(t, "Test message", sMsg.Messages[0].Content)
+
+	// Test Ping and Pong messages
+	pingJSON := `{"type":"ping"}`
+	var pingMsg ServerMessage
+	err = json.Unmarshal([]byte(pingJSON), &pingMsg)
+	require.NoError(t, err)
+	assert.Equal(t, ServerMessageTypePing, pingMsg.Type)
+
+	pongMsg := ClientMessage{Type: ClientMessageTypePong}
+	pongData, err := json.Marshal(pongMsg)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"type":"pong"}`, string(pongData))
 }
 
 func TestLocationJSONSerialization(t *testing.T) {
