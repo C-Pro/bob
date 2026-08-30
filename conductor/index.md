@@ -25,3 +25,9 @@
 
 - [x] **Track: sqvect Long-Term Memory & Isolated RAG**
 *Link: [./tracks/sqvect_20260828/](./tracks/sqvect_20260828/)*
+
+---
+
+- [ ] **Track: Local Embeddings & Vector Regeneration CLI**
+*Link: [./tracks/local-embeddings_20260830/](./tracks/local-embeddings_20260830/)*
+
