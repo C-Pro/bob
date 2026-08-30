@@ -12,13 +12,14 @@ lint-go:
 		-v $(HOME)/.cache/golangci-lint:/root/.cache/golangci-lint \
 		-w /app \
 		-e GOFLAGS="-mod=vendor" \
-		golangci/golangci-lint:v2.12.2 \
+		-e GOEXPERIMENT="simd" \
+		golangci/golangci-lint:latest \
 		golangci-lint run
 
 test: test-go
 
 test-go:
-	go test -v -covermode=atomic -coverprofile=coverage.out -race ./...
+	GOEXPERIMENT=simd go test -v -covermode=atomic -coverprofile=coverage.out -race ./...
 
 semgrep:
 	docker run --rm -v $(PWD):/src returntocorp/semgrep:1.106.0 semgrep scan --config=p/default

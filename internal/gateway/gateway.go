@@ -20,12 +20,14 @@ import (
 	"bob/internal/chatcontext"
 	"bob/internal/config"
 	"bob/internal/llm"
+	"bob/internal/memory"
 	"bob/internal/models"
 	"bob/internal/prompt"
 	"bob/internal/tools"
 	"bob/internal/tools/tavily"
 
 	"github.com/fasthttp/websocket"
+	"github.com/liliang-cn/cortexdb/v2/pkg/cortexdb"
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -35,6 +37,7 @@ type Gateway struct {
 	llmClient            *llm.Client
 	httpClient           *http.Client
 	toolsRegistry        *tools.Registry
+	memoryManager        *memory.Manager
 	conn                 *websocket.Conn
 	mu                   sync.Mutex
 	running              bool
@@ -46,28 +49,57 @@ type Gateway struct {
 	location             *models.Location
 	locationInterval     time.Duration
 	initialLocationDelay time.Duration
+	indexingWg           sync.WaitGroup
 }
 
 // NewGateway creates a new Besedka Gateway instance.
 func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 	httpClient := &http.Client{Timeout: 10 * time.Second}
+
+	var embedder cortexdb.Embedder
+	if cfg.EmbeddingModel != "" && llmClient != nil {
+		embedder = llm.NewEmbedder(llmClient, cfg.EmbeddingModel)
+	}
+	memoryManager := memory.NewManager(cfg, embedder)
+
 	var tavilyClient *tavily.Client
 	if cfg.TavilyAPIKey != "" {
 		tavilyClient = tavily.NewClient(cfg.TavilyAPIKey, cfg.TavilyBaseURL, httpClient)
 	}
-	toolsRegistry := tools.NewRegistry(tavilyClient)
+	toolsRegistry := tools.NewRegistry(tavilyClient, memoryManager)
 
-	return &Gateway{
+	gw := &Gateway{
 		cfg:                  cfg,
 		llmClient:            llmClient,
 		httpClient:           httpClient,
 		toolsRegistry:        toolsRegistry,
+		memoryManager:        memoryManager,
 		userCache:            NewUserCache(),
 		contextManager:       chatcontext.NewManager(cfg.MsgRingBufferSize),
 		startTime:            time.Now(),
 		locationInterval:     9 * time.Minute,
 		initialLocationDelay: 1 * time.Second,
 	}
+
+	gw.contextManager.SetOnEvict(func(chatID string, evicted []chatcontext.Entry) {
+		gw.handleEvictedBatch(chatID, evicted)
+	})
+
+	return gw
+}
+
+// MemoryManager returns the Gateway's memory Manager.
+func (g *Gateway) MemoryManager() *memory.Manager {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.memoryManager
+}
+
+// SetMemoryManager sets the memory Manager for the gateway.
+func (g *Gateway) SetMemoryManager(m *memory.Manager) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.memoryManager = m
 }
 
 // SetToolsRegistry sets the tool registry for the gateway.
@@ -380,11 +412,150 @@ func (g *Gateway) SendLocation(loc *models.Location) error {
 	return conn.WriteJSON(clientMsg)
 }
 
-// WarmupChat loads historical messages for a single chat into its ring buffer.
+// SendPong sends an application-level pong heartbeat frame to Besedka.
+func (g *Gateway) SendPong() error {
+	g.mu.Lock()
+	conn := g.conn
+	g.mu.Unlock()
+
+	if conn == nil {
+		return errors.New("websocket connection is not established")
+	}
+
+	clientMsg := models.ClientMessage{
+		Type: models.ClientMessageTypePong,
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return conn.WriteJSON(clientMsg)
+}
+
+func (g *Gateway) handleEvictedBatch(chatID string, evicted []chatcontext.Entry) {
+	g.mu.Lock()
+	memMgr := g.memoryManager
+	g.mu.Unlock()
+
+	if memMgr == nil || len(evicted) == 0 {
+		return
+	}
+	isDM := chatID != "townhall"
+	msgs := make([]memory.MessageToStore, 0, len(evicted))
+	for _, e := range evicted {
+		msgs = append(msgs, memory.MessageToStore{
+			Seq:        e.Seq,
+			Timestamp:  e.Timestamp,
+			ChatID:     chatID,
+			UserID:     e.SenderID,
+			SenderName: e.SenderName,
+			Role:       e.Role,
+			Content:    e.Content,
+		})
+	}
+
+	g.indexingWg.Go(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		if err := memMgr.IndexMessages(ctx, chatID, isDM, msgs); err != nil {
+			slog.Warn("async indexing of evicted batch failed", "chatID", chatID, "error", err)
+		}
+	})
+}
+
+// CatchupChatMemory fetches historical messages from Besedka in batches of up to 100 to catch up missing memory indexes.
+func (g *Gateway) CatchupChatMemory(ctx context.Context, chatID string, isDM bool, latestSeq int64) {
+	g.mu.Lock()
+	memMgr := g.memoryManager
+	g.mu.Unlock()
+
+	if memMgr == nil || latestSeq <= 0 {
+		return
+	}
+
+	lastIndexedSeq, err := memMgr.GetWatermark(ctx, chatID, isDM)
+	if err != nil {
+		slog.Debug("could not get watermark for catchup", "chatID", chatID, "error", err)
+		return
+	}
+
+	if latestSeq <= lastIndexedSeq {
+		return
+	}
+
+	const batchSize int64 = 100
+	fromSeq := lastIndexedSeq + 1
+
+	for fromSeq <= latestSeq {
+		toSeq := fromSeq + batchSize - 1
+		if toSeq > latestSeq {
+			toSeq = latestSeq
+		}
+
+		fetchedMsgs, err := g.FetchChatMessages(ctx, chatID, fromSeq, toSeq)
+		if err != nil {
+			slog.Warn("failed to fetch historical messages for memory catchup", "chatID", chatID, "fromSeq", fromSeq, "toSeq", toSeq, "error", err)
+			break
+		}
+		if len(fetchedMsgs) == 0 {
+			break
+		}
+
+		g.mu.Lock()
+		botID := g.botUserID
+		botName := g.botUser.GetDisplayName()
+		g.mu.Unlock()
+
+		toStore := make([]memory.MessageToStore, 0, len(fetchedMsgs))
+		for _, m := range fetchedMsgs {
+			cleanContent := ExtractMessageText(m)
+			extraText, _ := g.processAttachments(ctx, m.Attachments)
+			fullContent := strings.TrimSpace(cleanContent + extraText)
+			if fullContent == "" {
+				continue
+			}
+
+			senderName := g.userCache.GetDisplayName(m.UserID)
+			role := "user"
+			if botID != "" && m.UserID == botID {
+				role = "assistant"
+				senderName = botName
+			}
+
+			toStore = append(toStore, memory.MessageToStore{
+				Seq:        m.Seq,
+				Timestamp:  m.Timestamp,
+				ChatID:     chatID,
+				UserID:     m.UserID,
+				SenderName: senderName,
+				Role:       role,
+				Content:    fullContent,
+			})
+		}
+
+		if len(toStore) > 0 {
+			if err := memMgr.IndexMessages(ctx, chatID, isDM, toStore); err != nil {
+				slog.Warn("failed to index historical batch during memory catchup", "chatID", chatID, "error", err)
+				break
+			}
+		}
+
+		lastReturnedSeq := fetchedMsgs[len(fetchedMsgs)-1].Seq
+		if lastReturnedSeq >= fromSeq {
+			fromSeq = lastReturnedSeq + 1
+		} else {
+			fromSeq = toSeq + 1
+		}
+	}
+}
+
+// WarmupChat loads historical messages for a single chat into its ring buffer and performs memory catchup.
 func (g *Gateway) WarmupChat(ctx context.Context, chatID string, lastSeq int64) {
 	if chatID == "" {
 		return
 	}
+
+	isDM := chatID != "townhall"
+	g.CatchupChatMemory(ctx, chatID, isDM, lastSeq)
 
 	g.mu.Lock()
 	botID := g.botUserID
@@ -423,6 +594,7 @@ func (g *Gateway) WarmupChat(ctx context.Context, chatID string, lastSeq int64) 
 
 		if botID != "" && m.UserID == botID {
 			rb.Push(chatcontext.Entry{
+				Seq:        m.Seq,
 				Role:       "assistant",
 				SenderID:   m.UserID,
 				SenderName: botName,
@@ -433,6 +605,7 @@ func (g *Gateway) WarmupChat(ctx context.Context, chatID string, lastSeq int64) 
 		} else {
 			senderName := g.userCache.GetDisplayName(m.UserID)
 			rb.Push(chatcontext.Entry{
+				Seq:        m.Seq,
 				Role:       "user",
 				SenderID:   m.UserID,
 				SenderName: senderName,
@@ -495,6 +668,9 @@ func (g *Gateway) WarmupContext(ctx context.Context) error {
 
 // ProcessMessage handles a single incoming message from Besedka.
 func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+
 	if msg.ChatID == "" {
 		msg.ChatID = "townhall"
 	}
@@ -539,6 +715,7 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 		}
 		if !isDuplicate {
 			g.contextManager.Push(msg.ChatID, chatcontext.Entry{
+				Seq:        msg.Seq,
 				Role:       "assistant",
 				SenderID:   msg.UserID,
 				SenderName: botUser.GetDisplayName(),
@@ -573,6 +750,7 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 	}
 
 	rb.Push(chatcontext.Entry{
+		Seq:        msg.Seq,
 		Role:       "user",
 		SenderID:   msg.UserID,
 		SenderName: senderName,
@@ -615,8 +793,12 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 	var reply string
 	var err error
 	if toolsRegistry != nil && len(toolsRegistry.ToolDefinitions()) > 0 {
+		toolCtx := tools.WithChatSession(ctx, tools.ChatSessionContext{
+			ChatID: msg.ChatID,
+			IsDM:   isDM,
+		})
 		reply, err = g.llmClient.GenerateChatResponseWithToolLoop(
-			ctx,
+			toolCtx,
 			llmMsgs,
 			toolsRegistry.ToolDefinitions(),
 			toolsRegistry,
@@ -685,7 +867,7 @@ func (g *Gateway) Start(ctx context.Context) error {
 			}
 		}()
 
-		// WebSocket Ping Keepalive ticker to prevent 1006 idle timeout
+		// WebSocket Ping/Pong keepalive ticker to prevent idle timeout
 		pingDone := make(chan struct{})
 		g.mu.Lock()
 		activeConn := g.conn
@@ -714,7 +896,9 @@ func (g *Gateway) Start(ctx context.Context) error {
 					isSame := g.conn == c
 					g.mu.Unlock()
 					if isSame && c != nil {
-						_ = c.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(5*time.Second))
+						if err := g.SendPong(); err != nil {
+							slog.Debug("failed to send periodic keepalive pong", "error", err)
+						}
 					}
 				}
 			}
@@ -778,6 +962,13 @@ func (g *Gateway) Start(ctx context.Context) error {
 				continue
 			}
 
+			if serverMsg.Type == models.ServerMessageTypePing {
+				if err := g.SendPong(); err != nil {
+					slog.Warn("failed to send pong response to ping frame", "error", err)
+				}
+				continue
+			}
+
 			if serverMsg.Type == models.ServerMessageTypeMessages {
 				for _, m := range serverMsg.Messages {
 					if m.ChatID == "" {
@@ -806,10 +997,18 @@ func (g *Gateway) Start(ctx context.Context) error {
 // Stop closes the Gateway connection cleanly.
 func (g *Gateway) Stop() {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	g.running = false
 	if g.conn != nil {
 		_ = g.conn.Close()
 		g.conn = nil
+	}
+	g.mu.Unlock()
+
+	g.indexingWg.Wait()
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.memoryManager != nil {
+		_ = g.memoryManager.Close()
 	}
 }

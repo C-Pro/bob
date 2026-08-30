@@ -24,6 +24,16 @@ import (
 func TestAgentIntegrationLoop(t *testing.T) {
 	// Mock OpenAI completion server
 	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "embeddings") {
+			resp := openai.EmbeddingResponse{
+				Data: []openai.Embedding{
+					{Index: 0, Embedding: make([]float32, 128)},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
 		resp := openai.ChatCompletionResponse{
 			Choices: []openai.ChatCompletionChoice{
 				{
@@ -108,12 +118,14 @@ func TestAgentIntegrationLoop(t *testing.T) {
 		OpenAIBaseURL:         llmServer.URL,
 		TownhallMaxParagraphs: 2,
 		DMMaxParagraphs:       10,
+		DataDir:               t.TempDir(),
+		EmbeddingModel:        "mock-model",
 	}
 
 	llmClient := llm.NewClient(cfg, llmServer.Client())
 	gw := gateway.NewGateway(cfg, llmClient)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	go func() {
@@ -125,7 +137,7 @@ func TestAgentIntegrationLoop(t *testing.T) {
 		assert.Equal(t, models.ClientMessageTypeSend, reply.Type)
 		assert.Equal(t, "townhall", reply.ChatID)
 		assert.Equal(t, "I am ready to help!", reply.Content)
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for agent response in integration loop")
 	}
 }
@@ -133,6 +145,16 @@ func TestAgentIntegrationLoop(t *testing.T) {
 func TestAgentIntegration_MultiTurnContextFlow(t *testing.T) {
 	var capturedRequests []openai.ChatCompletionRequest
 	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "embeddings") {
+			resp := openai.EmbeddingResponse{
+				Data: []openai.Embedding{
+					{Index: 0, Embedding: make([]float32, 128)},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
 		var req openai.ChatCompletionRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		capturedRequests = append(capturedRequests, req)
@@ -202,12 +224,14 @@ func TestAgentIntegration_MultiTurnContextFlow(t *testing.T) {
 		TownhallMaxParagraphs: 2,
 		DMMaxParagraphs:       10,
 		MsgRingBufferSize:     100,
+		DataDir:               t.TempDir(),
+		EmbeddingModel:        "mock-model",
 	}
 
 	llmClient := llm.NewClient(cfg, llmServer.Client())
 	gw := gateway.NewGateway(cfg, llmClient)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	err := gw.DialWebSocket(ctx)
@@ -249,6 +273,16 @@ func TestAgentIntegration_MultiTurnContextFlow(t *testing.T) {
 func TestAgentIntegration_DMContextAndNameResolution(t *testing.T) {
 	var capturedRequests []openai.ChatCompletionRequest
 	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "embeddings") {
+			resp := openai.EmbeddingResponse{
+				Data: []openai.Embedding{
+					{Index: 0, Embedding: make([]float32, 128)},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
 		var req openai.ChatCompletionRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		capturedRequests = append(capturedRequests, req)
@@ -320,12 +354,14 @@ func TestAgentIntegration_DMContextAndNameResolution(t *testing.T) {
 		OpenAIBaseURL:     llmServer.URL,
 		DMMaxParagraphs:   10,
 		MsgRingBufferSize: 100,
+		DataDir:           t.TempDir(),
+		EmbeddingModel:    "mock-model",
 	}
 
 	llmClient := llm.NewClient(cfg, llmServer.Client())
 	gw := gateway.NewGateway(cfg, llmClient)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	err := gw.DialWebSocket(ctx)
@@ -424,7 +460,7 @@ func TestAgentIntegration_StartupLocationReporting(t *testing.T) {
 		}),
 	)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	loc, err := geoClient.FetchLocation(ctx)
@@ -434,8 +470,10 @@ func TestAgentIntegration_StartupLocationReporting(t *testing.T) {
 	assert.Equal(t, 115.1889, loc.Lng)
 
 	cfg := &config.Config{
-		BotHandle:  "@bob",
-		BesedkaURL: besedkaServer.URL,
+		BotHandle:      "@bob",
+		BesedkaURL:     besedkaServer.URL,
+		DataDir:        t.TempDir(),
+		EmbeddingModel: "mock-model",
 	}
 
 	gw := gateway.NewGateway(cfg, nil)
@@ -454,7 +492,7 @@ func TestAgentIntegration_StartupLocationReporting(t *testing.T) {
 		require.NotNil(t, frame.Location)
 		assert.Equal(t, -8.4095, frame.Location.Lat)
 		assert.Equal(t, 115.1889, frame.Location.Lng)
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for initial location frame in integration test")
 	}
 

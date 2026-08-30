@@ -2,6 +2,7 @@ package fasthttp
 
 import (
 	"crypto/tls"
+	"encoding/binary"
 	"net"
 	"sync"
 )
@@ -31,10 +32,7 @@ func (cc *perIPConnCounter) Unregister(ip uint32) {
 		// developer safeguard
 		panic("BUG: perIPConnCounter.Register() wasn't called")
 	}
-	n := cc.m[ip] - 1
-	if n < 0 {
-		n = 0
-	}
+	n := max(cc.m[ip]-1, 0)
 	cc.m[ip] = n
 }
 
@@ -43,7 +41,8 @@ type perIPConn struct {
 
 	perIPConnCounter *perIPConnCounter
 
-	ip uint32
+	ip   uint32
+	lock sync.Mutex
 }
 
 type perIPTLSConn struct {
@@ -51,7 +50,8 @@ type perIPTLSConn struct {
 
 	perIPConnCounter *perIPConnCounter
 
-	ip uint32
+	ip   uint32
+	lock sync.Mutex
 }
 
 func acquirePerIPConn(conn net.Conn, ip uint32, counter *perIPConnCounter) net.Conn {
@@ -85,17 +85,33 @@ func acquirePerIPConn(conn net.Conn, ip uint32, counter *perIPConnCounter) net.C
 }
 
 func (c *perIPConn) Close() error {
-	err := c.Conn.Close()
-	c.perIPConnCounter.Unregister(c.ip)
+	c.lock.Lock()
+	cc := c.Conn
 	c.Conn = nil
+	c.lock.Unlock()
+
+	if cc == nil {
+		return nil
+	}
+
+	err := cc.Close()
+	c.perIPConnCounter.Unregister(c.ip)
 	c.perIPConnCounter.perIPConnPool.Put(c)
 	return err
 }
 
 func (c *perIPTLSConn) Close() error {
-	err := c.Conn.Close()
-	c.perIPConnCounter.Unregister(c.ip)
+	c.lock.Lock()
+	cc := c.Conn
 	c.Conn = nil
+	c.lock.Unlock()
+
+	if cc == nil {
+		return nil
+	}
+
+	err := cc.Close()
+	c.perIPConnCounter.Unregister(c.ip)
 	c.perIPConnCounter.perIPTLSConnPool.Put(c)
 	return err
 }
@@ -121,10 +137,7 @@ func ip2uint32(ip net.IP) uint32 {
 }
 
 func uint322ip(ip uint32) net.IP {
-	b := make([]byte, 4)
-	b[0] = byte(ip >> 24)
-	b[1] = byte(ip >> 16)
-	b[2] = byte(ip >> 8)
-	b[3] = byte(ip)
+	b := make(net.IP, net.IPv4len)
+	binary.BigEndian.PutUint32(b, ip)
 	return b
 }

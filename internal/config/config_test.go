@@ -25,6 +25,8 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	_ = os.Unsetenv("TAVILY_API_KEY")
 	_ = os.Unsetenv("TAVILY_BASE_URL")
 	_ = os.Unsetenv("DATA_DIR")
+	_ = os.Unsetenv("EMBEDDING_MODEL")
+	_ = os.Unsetenv("EMBEDDING_PRECISION")
 
 	cfg, err := LoadFromEnv()
 	require.NoError(t, err)
@@ -38,6 +40,8 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	assert.Equal(t, 10, cfg.DMMaxParagraphs)
 	assert.Equal(t, 100, cfg.MsgRingBufferSize)
 	assert.Equal(t, "./data", cfg.DataDir)
+	assert.Equal(t, "", cfg.EmbeddingModel)
+	assert.Equal(t, "bf16", cfg.EmbeddingPrecision)
 	assert.Equal(t, "data/bob.db", cfg.DBPath("bob.db"))
 }
 
@@ -57,6 +61,8 @@ func TestLoadFromEnvStandardOpenAI(t *testing.T) {
 	t.Setenv("TAVILY_API_KEY", "tvly-test-key-12345")
 	t.Setenv("TAVILY_BASE_URL", "https://custom.tavily.api/v1")
 	t.Setenv("DATA_DIR", "/var/lib/bob")
+	t.Setenv("EMBEDDING_MODEL", "gemini-embedding-2")
+	t.Setenv("EMBEDDING_PRECISION", "int8")
 
 	cfg, err := LoadFromEnv()
 	require.NoError(t, err)
@@ -71,6 +77,8 @@ func TestLoadFromEnvStandardOpenAI(t *testing.T) {
 	assert.Equal(t, 15, cfg.DMMaxParagraphs)
 	assert.Equal(t, 50, cfg.MsgRingBufferSize)
 	assert.Equal(t, "/var/lib/bob", cfg.DataDir)
+	assert.Equal(t, "gemini-embedding-2", cfg.EmbeddingModel)
+	assert.Equal(t, "int8", cfg.EmbeddingPrecision)
 	assert.Equal(t, "/var/lib/bob/custom.db", cfg.DBPath("custom.db"))
 }
 
@@ -118,4 +126,35 @@ func TestConfigValidation(t *testing.T) {
 	cfg.MsgRingBufferSize = 0
 	err = cfg.Validate(false)
 	assert.ErrorContains(t, err, "invalid MSG_RING_BUFFER_SIZE: 0")
+}
+
+func TestLoadDotEnv(t *testing.T) {
+	tempFile, err := os.CreateTemp(t.TempDir(), ".env*")
+	require.NoError(t, err)
+	defer func() { _ = tempFile.Close() }()
+
+	content := `
+# Comment line
+PLAIN_KEY=plain_val
+export EXPORTED_KEY=exported_val
+export DOUBLE_QUOTED="hello world"
+export SINGLE_QUOTED='single world'
+export PRE_EXISTING=new_val
+`
+	_, err = tempFile.WriteString(content)
+	require.NoError(t, err)
+
+	_ = os.Unsetenv("PLAIN_KEY")
+	_ = os.Unsetenv("EXPORTED_KEY")
+	_ = os.Unsetenv("DOUBLE_QUOTED")
+	_ = os.Unsetenv("SINGLE_QUOTED")
+	t.Setenv("PRE_EXISTING", "original_val")
+
+	LoadDotEnv(tempFile.Name())
+
+	assert.Equal(t, "plain_val", os.Getenv("PLAIN_KEY"))
+	assert.Equal(t, "exported_val", os.Getenv("EXPORTED_KEY"))
+	assert.Equal(t, "hello world", os.Getenv("DOUBLE_QUOTED"))
+	assert.Equal(t, "single world", os.Getenv("SINGLE_QUOTED"))
+	assert.Equal(t, "original_val", os.Getenv("PRE_EXISTING"))
 }

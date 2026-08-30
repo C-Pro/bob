@@ -1,0 +1,8 @@
+{
+  "track_id": "sqvect_20260828",
+  "type": "feature",
+  "status": "new",
+  "created_at": "2026-08-28T17:50:00Z",
+  "updated_at": "2026-08-28T17:50:00Z",
+  "description": "Integrate sqvect for agent long-term memory and RAG with isolated SQLite database files, DM privacy isolation, sequence watermark recovery, and hybrid retrieval."
+}
