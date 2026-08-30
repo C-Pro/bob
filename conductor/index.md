@@ -28,6 +28,6 @@
 
 ---
 
-- [ ] **Track: Local Embeddings & Vector Regeneration CLI**
+- [x] **Track: Local Embeddings & Vector Regeneration CLI**
 *Link: [./tracks/local-embeddings_20260830/](./tracks/local-embeddings_20260830/)*
 

@@ -30,6 +30,7 @@ type Config struct {
 	TavilyBaseURL         string
 	DataDir               string
 	EmbeddingModel        string
+	EmbeddingPrecision    string
 }
 
 // LoadFromEnv loads configuration from environment variables (or .env file) with sensible defaults.
@@ -63,6 +64,7 @@ func LoadFromEnv() (*Config, error) {
 		MsgRingBufferSize:     getEnvIntOrDefault("MSG_RING_BUFFER_SIZE", 100),
 		DataDir:               getEnvOrDefault("DATA_DIR", "./data"),
 		EmbeddingModel:        getEnvOrDefault("EMBEDDING_MODEL", ""),
+		EmbeddingPrecision:    strings.ToLower(getEnvOrDefault("EMBEDDING_PRECISION", "bf16")),
 	}
 
 	// Normalize bot handle to ensure it starts with @
@@ -141,7 +143,7 @@ func LoadDotEnv(filename string) {
 		if len(parts) == 2 {
 			key := strings.TrimSpace(parts[0])
 			val := strings.TrimSpace(parts[1])
-			if os.Getenv(key) == "" {
+			if _, exists := os.LookupEnv(key); !exists {
 				_ = os.Setenv(key, val)
 			}
 		}

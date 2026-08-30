@@ -1531,17 +1531,20 @@ func TestGateway_EvictionToMemoryIndexing(t *testing.T) {
 		Timestamp:  now + 3,
 	})
 
-	// Allow async goroutine to complete
-	time.Sleep(100 * time.Millisecond)
+	// Allow async indexing goroutine to complete
+	var hits []memory.MemoryItem
+	require.Eventually(t, func() bool {
+		var err error
+		hits, err = gw.MemoryManager().Search(ctx, "secret", "townhall", false, 5)
+		return err == nil && len(hits) > 0
+	}, 15*time.Second, 150*time.Millisecond)
 
 	// Verify watermark was updated
 	wm, err := gw.MemoryManager().GetWatermark(ctx, "townhall", false)
 	require.NoError(t, err)
 	assert.Equal(t, int64(10), wm)
 
-	// Verify message is searchable in memory store
-	hits, err := gw.MemoryManager().Search(ctx, "secret", "townhall", false, 5)
-	require.NoError(t, err)
+	// Verify message content in memory store
 	require.NotEmpty(t, hits)
 	assert.Contains(t, hits[0].Content, "Super secret project alpha")
 }

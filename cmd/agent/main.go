@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log/slog"
 	"net/http"
 	"os"
@@ -13,19 +14,69 @@ import (
 	"bob/internal/gateway"
 	"bob/internal/geoip"
 	"bob/internal/llm"
+	"bob/internal/memory"
 	"bob/internal/store"
+
+	"github.com/liliang-cn/cortexdb/v2/pkg/cortexdb"
 )
 
 const mainDBFname = "bob.db"
 
 func main() {
-	slog.Info("starting Besedka AI Agent service")
+	regenerateFlag := flag.Bool("regenerate-vectors", false, "Regenerate vector embeddings for all memory chunks across all chat databases in DATA_DIR and exit")
+	reembedFlag := flag.Bool("reembed", false, "Alias for -regenerate-vectors")
+	dataDirFlag := flag.String("data-dir", "", "Override DATA_DIR directory path")
+	flag.Parse()
 
 	cfg, err := config.LoadFromEnv()
 	if err != nil {
 		slog.Error("failed to load configuration", "error", err)
 		os.Exit(1)
 	}
+	if *dataDirFlag != "" {
+		cfg.DataDir = *dataDirFlag
+	}
+
+	if *regenerateFlag || *reembedFlag {
+		slog.Info("running vector regeneration tool")
+		var embedder cortexdb.Embedder
+		if cfg.EmbeddingModel != "" {
+			llmClient := llm.NewClient(cfg, nil)
+			embedder = llm.NewEmbedder(llmClient, cfg.EmbeddingModel)
+		} else {
+			localEmb, err := llm.NewLocalEmbedder(cfg)
+			if err != nil {
+				slog.Error("failed to initialize local embedder for vector regeneration", "error", err)
+				os.Exit(1)
+			}
+			defer func() { _ = localEmb.Close() }()
+			embedder = localEmb
+		}
+
+		modelName := cfg.EmbeddingModel
+		if modelName == "" {
+			modelName = llm.DefaultLocalModel
+		}
+		slog.Info("starting vector regeneration", "dataDir", cfg.DataDir, "model", modelName, "dim", embedder.Dim())
+		report, err := memory.RegenerateAllVectors(context.Background(), cfg, embedder, 16)
+		if err != nil {
+			slog.Error("vector regeneration failed", "error", err)
+			os.Exit(1)
+		}
+		slog.Info("vector regeneration completed",
+			"databases", report.TotalDatabases,
+			"chunks", report.TotalChunks,
+			"reembedded", report.Reembedded,
+			"failed", report.Failed,
+		)
+		if report.Failed > 0 {
+			slog.Warn("some memory chunks failed to re-embed", "errors", report.Errors)
+			os.Exit(1)
+		}
+		return
+	}
+
+	slog.Info("starting Besedka AI Agent service")
 
 	if err := cfg.Validate(true); err != nil {
 		slog.Error("configuration validation failed", "error", err)

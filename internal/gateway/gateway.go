@@ -27,6 +27,7 @@ import (
 	"bob/internal/tools/tavily"
 
 	"github.com/fasthttp/websocket"
+	"github.com/liliang-cn/cortexdb/v2/pkg/cortexdb"
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -48,13 +49,14 @@ type Gateway struct {
 	location             *models.Location
 	locationInterval     time.Duration
 	initialLocationDelay time.Duration
+	indexingWg           sync.WaitGroup
 }
 
 // NewGateway creates a new Besedka Gateway instance.
 func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 	httpClient := &http.Client{Timeout: 10 * time.Second}
 
-	var embedder *llm.Embedder
+	var embedder cortexdb.Embedder
 	if cfg.EmbeddingModel != "" && llmClient != nil {
 		embedder = llm.NewEmbedder(llmClient, cfg.EmbeddingModel)
 	}
@@ -432,7 +434,9 @@ func (g *Gateway) handleEvictedBatch(chatID string, evicted []chatcontext.Entry)
 		})
 	}
 
+	g.indexingWg.Add(1)
 	go func() {
+		defer g.indexingWg.Done()
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 		if err := memMgr.IndexMessages(ctx, chatID, isDM, msgs); err != nil {
@@ -966,12 +970,17 @@ func (g *Gateway) Start(ctx context.Context) error {
 // Stop closes the Gateway connection cleanly.
 func (g *Gateway) Stop() {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	g.running = false
 	if g.conn != nil {
 		_ = g.conn.Close()
 		g.conn = nil
 	}
+	g.mu.Unlock()
+
+	g.indexingWg.Wait()
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	if g.memoryManager != nil {
 		_ = g.memoryManager.Close()
 	}

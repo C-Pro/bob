@@ -30,7 +30,8 @@ func TestWatermarkTracking(t *testing.T) {
 	tempDir := t.TempDir()
 
 	cfg := &config.Config{
-		DataDir: tempDir,
+		DataDir:        tempDir,
+		EmbeddingModel: "none",
 	}
 	manager := NewManager(cfg, nil)
 	defer func() { _ = manager.Close() }()
@@ -72,7 +73,8 @@ func TestFTS5FallbackSearchAndIsolation(t *testing.T) {
 	tempDir := t.TempDir()
 
 	cfg := &config.Config{
-		DataDir: tempDir,
+		DataDir:        tempDir,
+		EmbeddingModel: "none",
 	}
 	// No embedder configured -> tests FTS5 keyword fallback
 	manager := NewManager(cfg, nil)
@@ -274,3 +276,77 @@ func TestSemanticVectorSearchWithEmbedder(t *testing.T) {
 	assert.Equal(t, "[Townhall]", hits[0].Source)
 	assert.Contains(t, hits[0].Content, "Golang")
 }
+
+type mockEmbedder struct {
+	dim   int
+	model string
+	fn    func(text string) []float32
+}
+
+func (m *mockEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
+	if m.fn != nil {
+		return m.fn(text), nil
+	}
+	vec := make([]float32, m.dim)
+	for i := range vec {
+		vec[i] = 0.1
+	}
+	return vec, nil
+}
+
+func (m *mockEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	results := make([][]float32, len(texts))
+	for i, t := range texts {
+		v, _ := m.Embed(ctx, t)
+		results[i] = v
+	}
+	return results, nil
+}
+
+func (m *mockEmbedder) Dim() int {
+	return m.dim
+}
+
+func (m *mockEmbedder) Model() string {
+	return m.model
+}
+
+func TestDimensionMismatchGracefulFallback(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &config.Config{
+		DataDir: tempDir,
+	}
+
+	ctx := context.Background()
+	now := time.Now().Unix()
+
+	// 1. Index messages with a 3-dimensional embedder
+	emb3 := &mockEmbedder{dim: 3, model: "model-3d"}
+	mgr1 := NewManager(cfg, emb3)
+	msgs := []MessageToStore{
+		{
+			Seq:        1,
+			Timestamp:  now,
+			ChatID:     "townhall",
+			UserID:     "user1",
+			SenderName: "Alice",
+			Role:       "user",
+			Content:    "Kubernetes cluster deployment on bare metal servers.",
+		},
+	}
+	err := mgr1.IndexMessages(ctx, "townhall", false, msgs)
+	require.NoError(t, err)
+	require.NoError(t, mgr1.Close())
+
+	// 2. Open new manager with a 5-dimensional embedder (simulating model switch)
+	emb5 := &mockEmbedder{dim: 5, model: "model-5d"}
+	mgr2 := NewManager(cfg, emb5)
+	defer func() { _ = mgr2.Close() }()
+
+	// Search query - vector search across mismatched dimensions falls back gracefully to lexical search
+	hits, err := mgr2.Search(ctx, "Kubernetes", "townhall", false, 5)
+	require.NoError(t, err)
+	require.NotEmpty(t, hits, "search should return results via graceful fallback")
+	assert.Contains(t, hits[0].Content, "Kubernetes")
+}
+

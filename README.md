@@ -39,8 +39,9 @@ BOT_HANDLE=@botname
 Optional:
 
 ```sh
-DATA_DIR=./data                           # directory for SQLite databases (must be writable)
-EMBEDDING_MODEL=text-embedding-004        # embedding model for vector semantic search (defaults to FTS5 lexical search if unset)
+DATA_DIR=./data                           # directory for SQLite databases and local models (must be writable)
+EMBEDDING_MODEL=                          # embedding model (defaults to local go-embed with MiniLM-L12-v2 if unset)
+EMBEDDING_PRECISION=bf16                  # precision mode for local embeddings: bf16 (default, ~225MB), fp32, int8
 TAVILY_API_KEY=<your-tavily-key>          # enables web search tool
 MSG_RING_BUFFER_SIZE=100                  # context window size per chat
 TOWNHALL_MAX_PARAGRAPHS=2                 # response length limit in Townhall
@@ -50,7 +51,11 @@ DM_MAX_PARAGRAPHS=10                      # response length limit in DMs
 ### Run
 
 ```sh
+# Run agent service
 go run ./cmd/agent
+
+# Regenerate all vector embeddings across all chat databases (e.g. after changing models)
+go run ./cmd/agent -regenerate-vectors
 ```
 
 ### Docker

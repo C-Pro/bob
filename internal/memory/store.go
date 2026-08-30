@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -58,13 +59,37 @@ type MessageToStore struct {
 // Manager manages isolated SQLite sqvect databases per chat and watermark tracking.
 type Manager struct {
 	cfg      *config.Config
-	embedder *llm.Embedder
+	embedder cortexdb.Embedder
 	dbsMu    sync.RWMutex
 	dbs      map[string]*cortexdb.DB
 }
 
+func isNilEmbedder(e cortexdb.Embedder) bool {
+	if e == nil {
+		return true
+	}
+	v := reflect.ValueOf(e)
+	return v.Kind() == reflect.Pointer && v.IsNil()
+}
+
 // NewManager creates a new memory Store manager.
-func NewManager(cfg *config.Config, embedder *llm.Embedder) *Manager {
+// If embedder is nil and cfg.EmbeddingModel is empty, a LocalEmbedder using go-embed is initialized.
+// If cfg.EmbeddingModel is "none" or "disabled", embedder remains nil (pure FTS5 mode).
+func NewManager(cfg *config.Config, embedder cortexdb.Embedder) *Manager {
+	if isNilEmbedder(embedder) {
+		embedder = nil
+	}
+	if embedder == nil && cfg != nil {
+		modelSetting := strings.ToLower(strings.TrimSpace(cfg.EmbeddingModel))
+		if modelSetting != "none" && modelSetting != "disabled" && modelSetting != "off" && modelSetting == "" {
+			localEmb, err := llm.NewLocalEmbedder(cfg)
+			if err != nil {
+				slog.Warn("could not initialize local embedding engine, falling back to FTS5 lexical search", "error", err)
+			} else {
+				embedder = localEmb
+			}
+		}
+	}
 	return &Manager{
 		cfg:      cfg,
 		embedder: embedder,
@@ -104,7 +129,7 @@ func (m *Manager) GetDB(ctx context.Context, chatID string, isDM bool) (*cortexd
 	}
 
 	opts := make([]cortexdb.Option, 0, 1)
-	if m.embedder != nil && m.embedder.Model() != "" {
+	if m.embedder != nil {
 		opts = append(opts, cortexdb.WithEmbedder(m.embedder))
 	}
 
@@ -343,6 +368,15 @@ func (m *Manager) searchDB(ctx context.Context, db *cortexdb.DB, query string, l
 		TopK:  limit,
 	})
 	if err != nil {
+		slog.Warn("memory search encountered error, falling back to lexical search", "query", query, "error", err)
+		lexResp, lexErr := db.SearchMemory(ctx, cortexdb.MemorySearchRequest{
+			Query:         query,
+			RetrievalMode: cortexdb.RetrievalModeLexical,
+			TopK:          limit,
+		})
+		if lexErr == nil && lexResp != nil {
+			return lexResp.Results, nil
+		}
 		return nil, err
 	}
 	return resp.Results, nil
@@ -410,7 +444,7 @@ func parseMetadataInt64(val any) int64 {
 	}
 }
 
-// Close closes all open database handles.
+// Close closes all open database handles and embedder resources.
 func (m *Manager) Close() error {
 	m.dbsMu.Lock()
 	defer m.dbsMu.Unlock()
@@ -422,5 +456,12 @@ func (m *Manager) Close() error {
 		}
 		delete(m.dbs, key)
 	}
+
+	if closer, ok := m.embedder.(interface{ Close() error }); ok {
+		if err := closer.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
 	return firstErr
 }

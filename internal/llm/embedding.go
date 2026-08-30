@@ -86,6 +86,9 @@ func NewEmbedder(client *Client, model string) *Embedder {
 
 // Embed converts a single text string into a vector.
 func (e *Embedder) Embed(ctx context.Context, text string) ([]float32, error) {
+	if e == nil {
+		return nil, errors.New("embedder is nil")
+	}
 	if strings.TrimSpace(text) == "" {
 		return nil, errors.New("empty text provided")
 	}
@@ -101,6 +104,9 @@ func (e *Embedder) Embed(ctx context.Context, text string) ([]float32, error) {
 
 // EmbedBatch converts multiple texts into vectors.
 func (e *Embedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	if e == nil {
+		return nil, errors.New("embedder is nil")
+	}
 	if len(texts) == 0 {
 		return nil, nil
 	}
@@ -121,6 +127,9 @@ func (e *Embedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32,
 
 // Dim returns the known vector dimension of the embedder (or 0 if not yet determined).
 func (e *Embedder) Dim() int {
+	if e == nil {
+		return 0
+	}
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.dim
@@ -128,5 +137,8 @@ func (e *Embedder) Dim() int {
 
 // Model returns the configured embedding model name.
 func (e *Embedder) Model() string {
+	if e == nil {
+		return ""
+	}
 	return e.model
 }

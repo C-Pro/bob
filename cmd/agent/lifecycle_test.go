@@ -97,4 +97,55 @@ insert into schema_version(version, description, is_current) values(-1, 'ancient
 		assert.Error(t, err)
 		assert.True(t, strings.Contains(outputStr, "database version mismatch") || strings.Contains(outputStr, "failed to initialize SQLite database"))
 	})
+
+	t.Run("Vector regeneration CLI flag runs and exits cleanly", func(t *testing.T) {
+		dataDir := filepath.Join(t.TempDir(), "data")
+		require.NoError(t, os.MkdirAll(dataDir, 0o755))
+		thFile := filepath.Join(dataDir, "townhall.db")
+
+		// Initialize dummy townhall.db with a memory record
+		db, err := sql.Open("sqlite", thFile)
+		require.NoError(t, err)
+		_, err = db.Exec(`
+			CREATE TABLE IF NOT EXISTS messages (
+				id TEXT PRIMARY KEY,
+				session_id TEXT NOT NULL,
+				role TEXT NOT NULL,
+				content TEXT NOT NULL,
+				vector BLOB,
+				metadata TEXT,
+				created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+			);
+			INSERT INTO messages (id, session_id, role, content)
+			VALUES ('chunk_th_1_1', 'memory:global:default', 'user', 'Testing CLI vector regeneration');
+		`)
+		require.NoError(t, err)
+		require.NoError(t, db.Close())
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		repoRoot, _ := filepath.Abs("../..")
+		if _, err := os.Stat(filepath.Join(repoRoot, "data/models")); os.IsNotExist(err) {
+			repoRoot, _ = filepath.Abs("..")
+		}
+		modelsDir := filepath.Join(repoRoot, "data/models")
+
+		cmd := exec.CommandContext(ctx, binPath, "-regenerate-vectors", "-data-dir="+dataDir)
+		cmd.Dir = repoRoot
+		cmd.Env = append(os.Environ(),
+			"BESEDKA_URL=http://127.0.0.1:59999",
+			"OPENAI_API_KEY=test-key",
+			"EMBEDDING_MODEL=",
+			"MODELS_DIR="+modelsDir,
+		)
+		out, err := cmd.CombinedOutput()
+		outputStr := string(out)
+
+		require.NoError(t, err, "vector regeneration CLI failed: %s", outputStr)
+		assert.Contains(t, outputStr, "running vector regeneration tool")
+		assert.Contains(t, outputStr, "vector regeneration completed")
+		assert.Contains(t, outputStr, "reembedded=1")
+	})
 }
+
