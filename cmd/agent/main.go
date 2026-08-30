@@ -23,6 +23,9 @@ import (
 const mainDBFname = "bob.db"
 
 func main() {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
 	regenerateFlag := flag.Bool("regenerate-vectors", false, "Regenerate vector embeddings for all memory chunks across all chat databases in DATA_DIR and exit")
 	reembedFlag := flag.Bool("reembed", false, "Alias for -regenerate-vectors")
 	dataDirFlag := flag.String("data-dir", "", "Override DATA_DIR directory path")
@@ -58,7 +61,7 @@ func main() {
 			modelName = llm.DefaultLocalModel
 		}
 		slog.Info("starting vector regeneration", "dataDir", cfg.DataDir, "model", modelName, "dim", embedder.Dim())
-		report, err := memory.RegenerateAllVectors(context.Background(), cfg, embedder, 16)
+		report, err := memory.RegenerateAllVectors(ctx, cfg, embedder, 16)
 		if err != nil {
 			slog.Error("vector regeneration failed", "error", err)
 			os.Exit(1)
@@ -96,9 +99,6 @@ func main() {
 		"dataDir", cfg.DataDir,
 		"dbPath", cfg.DBPath(mainDBFname),
 	)
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
 
 	// Initialize SQLite database storage
 	st, err := store.OpenOrCreate(cfg.DBPath(mainDBFname))

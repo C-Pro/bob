@@ -1,8 +1,8 @@
 # Technology Stack: Self-Improving General Use AI Agent
 
 ## 1. Programming Language & Core Runtime
-- **Language:** Go (1.26+)
-- **Concurrency & I/O:** Standard library (`net/http`, `context`, `sync`, `encoding/json`, `time`)
+- **Language:** Go (1.27+) with `GOEXPERIMENT=simd`
+- **Concurrency & I/O:** Standard library (`net/http`, `context`, `sync`, `encoding/json`, `time`), Go 1.25+ `sync.WaitGroup.Go`
 - **Coding Standards:** Go 1.22+ routing style (`mux.HandleFunc("POST /...", ...)`), idiomatic Go formatting (`gofmt`, `go vet`)
 
 ## 2. Ingress & Networking (Besedka Integration)
@@ -24,12 +24,12 @@
 - **Database & Persistent Storage:** SQLite via pure Go `modernc.org/sqlite` (no CGO) in `internal/store`, supporting configurable `DATA_DIR`, automated schema initialization (`schema.tmpl`), single-step version migrations (`migrate.tmpl`), and automated git tagging (`db-release-N`).
 
 ## 5. Testing & Code Quality
-- **Testing Framework:** Native Go `testing` package, `go test -race -cover`
+- **Testing Framework:** Native Go `testing` package, `GOEXPERIMENT=simd go test -race -cover`
 - **Integration & E2E Testing:** Go integration tests running against local Besedka instance (`http://localhost:8080`)
 - **Static Analysis & Security:** `golangci-lint`, `osv-scanner`, `semgrep`
 
 ## 6. Containerization & Deployment Infrastructure
-- **Containerization:** Multi-stage Dockerfile based on `golang:1.26-alpine` build step and minimal runtime image (`alpine:latest` / `distroless`)
+- **Containerization:** Multi-stage Dockerfile based on `golang:1.27-alpine` build step with `GOEXPERIMENT=simd` and minimal runtime image (`scratch` / `alpine:latest`)
 - **Deployment Platform:** GCP Spot VM (co-located on the same Spot VM instances as Besedka)
 - **Container Registry:** GCP Artifact Registry (`asia-southeast2-docker.pkg.dev`)
 - **CI/CD Orchestration:** GitHub Actions (`pipeline.yml` with `workflow_dispatch`, `push` to `main` for test VM, and `v*` tag triggers for prod VM)

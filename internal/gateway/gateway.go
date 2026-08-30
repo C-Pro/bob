@@ -434,15 +434,13 @@ func (g *Gateway) handleEvictedBatch(chatID string, evicted []chatcontext.Entry)
 		})
 	}
 
-	g.indexingWg.Add(1)
-	go func() {
-		defer g.indexingWg.Done()
+	g.indexingWg.Go(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 		if err := memMgr.IndexMessages(ctx, chatID, isDM, msgs); err != nil {
 			slog.Warn("async indexing of evicted batch failed", "chatID", chatID, "error", err)
 		}
-	}()
+	})
 }
 
 // CatchupChatMemory fetches historical messages from Besedka in batches of up to 100 to catch up missing memory indexes.

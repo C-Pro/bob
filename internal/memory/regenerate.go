@@ -133,8 +133,28 @@ func regenerateDatabaseVectors(ctx context.Context, dbPath string, embedder cort
 	report.TotalChunks += len(records)
 	slog.Info("processing memory chunks for vector regeneration", "db", dbPath, "count", len(records), "batchSize", batchSize)
 
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		report.Failed += len(records)
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	stmt, err := tx.PrepareContext(ctx, `UPDATE messages SET vector = ? WHERE id = ?`)
+	if err != nil {
+		report.Failed += len(records)
+		return fmt.Errorf("prepare update statement: %w", err)
+	}
+	defer func() {
+		_ = stmt.Close()
+	}()
+
+	dbReembedded := 0
 	for start := 0; start < len(records); start += batchSize {
 		if ctx.Err() != nil {
+			report.Failed += len(records) - dbReembedded
 			return ctx.Err()
 		}
 
@@ -151,63 +171,46 @@ func regenerateDatabaseVectors(ctx context.Context, dbPath string, embedder cort
 
 		vectors, err := embedder.EmbedBatch(ctx, texts)
 		if err != nil {
-			report.Failed += len(batch)
+			report.Failed += len(records) - dbReembedded
 			errMsg := fmt.Sprintf("%s: EmbedBatch failed at offset %d: %v", filepath.Base(dbPath), start, err)
 			slog.Error("batch embedding generation failed", "error", err, "db", dbPath, "offset", start)
 			report.Errors = append(report.Errors, errMsg)
-			continue
+			return fmt.Errorf("batch embedding failed: %w", err)
 		}
 
 		if len(vectors) != len(batch) {
-			report.Failed += len(batch)
+			report.Failed += len(records) - dbReembedded
 			errMsg := fmt.Sprintf("%s: EmbedBatch returned %d vectors for %d texts at offset %d", filepath.Base(dbPath), len(vectors), len(batch), start)
 			slog.Error("inconsistent vector count", "expected", len(batch), "got", len(vectors), "db", dbPath)
 			report.Errors = append(report.Errors, errMsg)
-			continue
+			return errors.New("inconsistent vector count returned from embedder")
 		}
 
-		tx, err := db.BeginTx(ctx, nil)
-		if err != nil {
-			report.Failed += len(batch)
-			report.Errors = append(report.Errors, fmt.Sprintf("%s: begin tx error: %v", filepath.Base(dbPath), err))
-			continue
-		}
-
-		stmt, err := tx.PrepareContext(ctx, `UPDATE messages SET vector = ? WHERE id = ?`)
-		if err != nil {
-			_ = tx.Rollback()
-			report.Failed += len(batch)
-			report.Errors = append(report.Errors, fmt.Sprintf("%s: prepare update stmt: %v", filepath.Base(dbPath), err))
-			continue
-		}
-
-		batchSuccess := 0
 		for i, r := range batch {
 			vecBytes, err := EncodeMemoryVector(vectors[i])
 			if err != nil {
-				report.Failed++
-				report.Errors = append(report.Errors, fmt.Sprintf("%s: encode vector for %s: %v", filepath.Base(dbPath), r.id, err))
-				continue
+				report.Failed += len(records) - dbReembedded
+				errMsg := fmt.Sprintf("%s: encode vector for %s: %v", filepath.Base(dbPath), r.id, err)
+				report.Errors = append(report.Errors, errMsg)
+				return fmt.Errorf("encode vector failed: %w", err)
 			}
 
 			if _, err := stmt.ExecContext(ctx, vecBytes, r.id); err != nil {
-				report.Failed++
-				report.Errors = append(report.Errors, fmt.Sprintf("%s: update vector for %s: %v", filepath.Base(dbPath), r.id, err))
-				continue
+				report.Failed += len(records) - dbReembedded
+				errMsg := fmt.Sprintf("%s: update vector for %s: %v", filepath.Base(dbPath), r.id, err)
+				report.Errors = append(report.Errors, errMsg)
+				return fmt.Errorf("update vector failed: %w", err)
 			}
-			batchSuccess++
+			dbReembedded++
 		}
-		_ = stmt.Close()
-
-		if err := tx.Commit(); err != nil {
-			report.Failed += batchSuccess
-			report.Errors = append(report.Errors, fmt.Sprintf("%s: commit tx: %v", filepath.Base(dbPath), err))
-			continue
-		}
-
-		report.Reembedded += batchSuccess
 	}
 
+	if err := tx.Commit(); err != nil {
+		report.Failed += len(records)
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+
+	report.Reembedded += dbReembedded
 	return nil
 }
 

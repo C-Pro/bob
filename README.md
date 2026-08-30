@@ -18,7 +18,7 @@ Bob is an AI agent for the [Besedka](https://github.com/c-pro/besedka) self-host
 
 ### Prerequisites
 
-- Go 1.24+
+- Go 1.27+
 - A running [Besedka](https://github.com/c-pro/besedka) server
 - An API key for an OpenAI-compatible LLM provider
 - A writable directory on the host/container filesystem for SQLite database files (`./data` by default)
@@ -54,7 +54,7 @@ DM_MAX_PARAGRAPHS=10                      # response length limit in DMs
 # Run agent service
 go run ./cmd/agent
 
-# Regenerate all vector embeddings across all chat databases (e.g. after changing models)
+# Regenerate all vector embeddings across all chat databases (e.g. after changing embedding models)
 go run ./cmd/agent -regenerate-vectors
 ```
 

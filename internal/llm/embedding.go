@@ -84,7 +84,7 @@ func NewEmbedder(client *Client, model string) *Embedder {
 	}
 }
 
-// Embed converts a single text string into a vector.
+// Embed converts a single text string into a vector by delegating to EmbedBatch.
 func (e *Embedder) Embed(ctx context.Context, text string) ([]float32, error) {
 	if e == nil {
 		return nil, errors.New("embedder is nil")
@@ -102,7 +102,7 @@ func (e *Embedder) Embed(ctx context.Context, text string) ([]float32, error) {
 	return vecs[0], nil
 }
 
-// EmbedBatch converts multiple texts into vectors.
+// EmbedBatch converts multiple texts into vectors using the OpenAI-compatible batch API client.
 func (e *Embedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
 	if e == nil {
 		return nil, errors.New("embedder is nil")

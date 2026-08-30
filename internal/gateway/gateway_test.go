@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1485,8 +1487,20 @@ func TestWarmupChat_WithAttachments(t *testing.T) {
 	assert.Contains(t, entries[1].Content, "[Attachment app.log]:\n```\nhistorical log line\n```")
 }
 
+func linkTestModels(t *testing.T, dataDir string) {
+	t.Helper()
+	absDataModels, err := filepath.Abs("../../data/models")
+	if err == nil {
+		if fi, err := os.Stat(absDataModels); err == nil && fi.IsDir() {
+			target := filepath.Join(dataDir, "models")
+			_ = os.Symlink(absDataModels, target)
+		}
+	}
+}
+
 func TestGateway_EvictionToMemoryIndexing(t *testing.T) {
 	tempDir := t.TempDir()
+	linkTestModels(t, tempDir)
 
 	cfg := &config.Config{
 		DataDir:           tempDir,
@@ -1551,6 +1565,7 @@ func TestGateway_EvictionToMemoryIndexing(t *testing.T) {
 
 func TestGateway_StartupSequenceCatchup(t *testing.T) {
 	tempDir := t.TempDir()
+	linkTestModels(t, tempDir)
 
 	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/me" {
@@ -1628,6 +1643,7 @@ func TestGateway_StartupSequenceCatchup(t *testing.T) {
 
 func TestProcessMessageWithRecallMemoryTool(t *testing.T) {
 	tempDir := t.TempDir()
+	linkTestModels(t, tempDir)
 
 	upgrader := websocket.Upgrader{}
 	sentMessages := make(chan models.ClientMessage, 10)

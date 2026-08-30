@@ -7,9 +7,11 @@ import (
 	"html"
 	"io"
 	"io/fs"
+	"maps"
 	"mime"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -70,7 +72,7 @@ func ServeFileUncompressed(ctx *RequestCtx, path string) {
 // Use ServeFileBytesUncompressed is you don't need serving compressed
 // file contents.
 //
-// See also RequestCtx.SendFileBytes.
+// See also RequestCtx.SendFileBytes, ServeFileLiteral.
 //
 // WARNING: do not pass any user supplied paths to this function!
 // WARNING: if path is based on user input users will be able to request
@@ -91,7 +93,11 @@ func ServeFileBytes(ctx *RequestCtx, path []byte) {
 //
 // Use ServeFileUncompressed is you don't need serving compressed file contents.
 //
-// See also RequestCtx.SendFile.
+// ServeFile interprets path as a URI path internally. Percent-encoded
+// sequences may be decoded, and '?' or '#' may be treated as URI delimiters.
+// Use ServeFileLiteral if you need literal path semantics.
+//
+// See also RequestCtx.SendFile, ServeFileLiteral.
 //
 // WARNING: do not pass any user supplied paths to this function!
 // WARNING: if path is based on user input users will be able to request
@@ -101,27 +107,44 @@ func ServeFile(ctx *RequestCtx, path string) {
 		rootFSHandler = rootFS.NewRequestHandler()
 	})
 
-	if path == "" || !filepath.IsAbs(path) {
-		// extend relative path to absolute path
-		hasTrailingSlash := path != "" && (path[len(path)-1] == '/' || path[len(path)-1] == '\\')
-
-		var err error
-		path = filepath.FromSlash(path)
-		if path, err = filepath.Abs(path); err != nil {
-			ctx.Logger().Printf("cannot resolve path %q to absolute file path: %v", path, err)
-			ctx.Error("Internal Server Error", StatusInternalServerError)
-			return
-		}
-		if hasTrailingSlash {
-			path += "/"
-		}
+	path, ok := normalizeServeFilePath(ctx, path)
+	if !ok {
+		return
 	}
-
-	// convert the path to forward slashes regardless the OS in order to set the URI properly
-	// the handler will convert back to OS path separator before opening the file
-	path = filepath.ToSlash(path)
-
 	ctx.Request.SetRequestURI(path)
+	rootFSHandler(ctx)
+}
+
+// ServeFileLiteral returns HTTP response containing compressed file contents
+// from the given path using literal path semantics.
+//
+// Reserved URI characters in path such as '%', '?' and '#' are preserved
+// instead of being interpreted during internal request URI processing.
+//
+// HTTP response may contain uncompressed file contents in the following cases:
+//
+//   - Missing 'Accept-Encoding: gzip' request header.
+//   - No write access to directory containing the file.
+//
+// Directory contents is returned if path points to directory.
+//
+// Use ServeFileUncompressed if you don't need serving compressed file contents.
+//
+// See also RequestCtx.SendFileLiteral, ServeFile.
+//
+// WARNING: do not pass any user supplied paths to this function!
+// WARNING: if path is based on user input users will be able to request
+// any file on your filesystem! Use fasthttp.FS with a sane Root instead.
+func ServeFileLiteral(ctx *RequestCtx, path string) {
+	rootFSOnce.Do(func() {
+		rootFSHandler = rootFS.NewRequestHandler()
+	})
+
+	path, ok := normalizeServeFilePath(ctx, path)
+	if !ok {
+		return
+	}
+	ctx.Request.SetRequestURIBytes(appendQuotedPath(nil, s2b(path)))
 	rootFSHandler(ctx)
 }
 
@@ -133,6 +156,7 @@ var (
 		GenerateIndexPages: true,
 		Compress:           true,
 		CompressBrotli:     true,
+		CompressZstd:       true,
 		AcceptByteRange:    true,
 	}
 	rootFSHandler RequestHandler
@@ -147,8 +171,34 @@ var (
 //
 // Directory contents is returned if path points to directory.
 //
-// See also ServeFile.
+// ServeFS interprets path as a URI path internally. Percent-encoded
+// sequences may be decoded, and '?' or '#' may be treated as URI delimiters.
+// Use ServeFSLiteral if you need literal path semantics.
+//
+// See also ServeFile, ServeFSLiteral.
 func ServeFS(ctx *RequestCtx, filesystem fs.FS, path string) {
+	serveFS(ctx, filesystem, path, false)
+}
+
+// ServeFSLiteral returns HTTP response containing compressed file contents
+// from the given fs.FS's path using literal path semantics.
+//
+// Reserved URI characters in path such as '%', '?' and '#' are preserved
+// instead of being interpreted during internal request URI processing.
+//
+// HTTP response may contain uncompressed file contents in the following cases:
+//
+//   - Missing 'Accept-Encoding: gzip' request header.
+//   - No write access to directory containing the file.
+//
+// Directory contents is returned if path points to directory.
+//
+// See also ServeFS, ServeFileLiteral.
+func ServeFSLiteral(ctx *RequestCtx, filesystem fs.FS, path string) {
+	serveFS(ctx, filesystem, path, true)
+}
+
+func serveFS(ctx *RequestCtx, filesystem fs.FS, path string, literal bool) {
 	f := &FS{
 		FS:                 filesystem,
 		Root:               "",
@@ -156,12 +206,39 @@ func ServeFS(ctx *RequestCtx, filesystem fs.FS, path string) {
 		GenerateIndexPages: true,
 		Compress:           true,
 		CompressBrotli:     true,
+		CompressZstd:       true,
 		AcceptByteRange:    true,
 	}
 	handler := f.NewRequestHandler()
 
-	ctx.Request.SetRequestURI(path)
+	if literal {
+		ctx.Request.SetRequestURIBytes(appendQuotedPath(nil, s2b(path)))
+	} else {
+		ctx.Request.SetRequestURI(path)
+	}
 	handler(ctx)
+}
+
+func normalizeServeFilePath(ctx *RequestCtx, path string) (string, bool) {
+	if path == "" || !filepath.IsAbs(path) {
+		// extend relative path to absolute path
+		hasTrailingSlash := path != "" && (path[len(path)-1] == '/' || path[len(path)-1] == '\\')
+
+		var err error
+		path = filepath.FromSlash(path)
+		if path, err = filepath.Abs(path); err != nil {
+			ctx.Logger().Printf("cannot resolve path %q to absolute file path: %v", path, err)
+			ctx.Error("Internal Server Error", StatusInternalServerError)
+			return "", false
+		}
+		if hasTrailingSlash {
+			path += "/"
+		}
+	}
+
+	// convert the path to forward slashes regardless the OS in order to set the URI properly
+	// the handler will convert back to OS path separator before opening the file
+	return filepath.ToSlash(path), true
 }
 
 // PathRewriteFunc must return new request path based on arbitrary ctx
@@ -170,7 +247,7 @@ func ServeFS(ctx *RequestCtx, filesystem fs.FS, path string) {
 // Path rewriter is used in FS for translating the current request
 // to the local filesystem path relative to FS.Root.
 //
-// The returned path must not contain '/../' substrings due to security reasons,
+// The returned path must not contain '..' path segments due to security reasons,
 // since such paths may refer files outside FS.Root.
 //
 // The returned path may refer to ctx members. For example, ctx.Path().
@@ -321,12 +398,19 @@ type FS struct {
 	// absolute paths on any filesystem.
 	AllowEmptyRoot bool
 
-	// Uses brotli encoding and fallbacks to gzip in responses if set to true, uses gzip if set to false.
+	// Uses brotli encoding and fallbacks to zstd or gzip in responses if set to true, uses zstd or gzip if set to false.
 	//
 	// This value has sense only if Compress is set.
 	//
 	// Brotli encoding is disabled by default.
 	CompressBrotli bool
+
+	// Uses zstd encoding and fallbacks to gzip in responses if set to true, uses gzip if set to false.
+	//
+	// This value has sense only if Compress is set.
+	//
+	// zstd encoding is disabled by default.
+	CompressZstd bool
 
 	// Index pages for directories without files matching IndexNames
 	// are automatically generated if set.
@@ -442,6 +526,22 @@ func (fs *FS) normalizeRoot(root string) string {
 
 		// convert the root directory slashes to the native format
 		root = filepath.FromSlash(root)
+	} else {
+		if root == "" {
+			return root
+		}
+
+		// Normalize fs.FS roots to slash-separated relative paths.
+		root = strings.ReplaceAll(root, "\\", "/")
+		root = strings.TrimLeft(root, "/")
+		if root == "" {
+			return root
+		}
+		root = path.Clean(root)
+		if root == "." {
+			return "."
+		}
+		return root
 	}
 
 	// strip trailing slashes from the root path
@@ -468,9 +568,7 @@ func (fs *FS) initRequestHandler() {
 		compressedFileSuffixes["gzip"] == compressedFileSuffixes["zstd"] {
 		// Copy global map
 		compressedFileSuffixes = make(map[string]string, len(FSCompressedFileSuffixes))
-		for k, v := range FSCompressedFileSuffixes {
-			compressedFileSuffixes[k] = v
-		}
+		maps.Copy(compressedFileSuffixes, FSCompressedFileSuffixes)
 	}
 
 	if fs.CompressedFileSuffix != "" {
@@ -487,6 +585,7 @@ func (fs *FS) initRequestHandler() {
 		generateIndexPages:     fs.GenerateIndexPages,
 		compress:               fs.Compress,
 		compressBrotli:         fs.CompressBrotli,
+		compressZstd:           fs.CompressZstd,
 		compressRoot:           compressRoot,
 		pathNotFound:           fs.PathNotFound,
 		acceptByteRange:        fs.AcceptByteRange,
@@ -518,6 +617,7 @@ type fsHandler struct {
 	generateIndexPages bool
 	compress           bool
 	compressBrotli     bool
+	compressZstd       bool
 	acceptByteRange    bool
 }
 
@@ -542,16 +642,12 @@ type fsFile struct {
 
 func (ff *fsFile) NewReader() (io.Reader, error) {
 	if ff.isBig() {
-		r, err := ff.bigFileReader()
-		if err != nil {
-			ff.decReadersCount()
-		}
-		return r, err
+		return ff.bigFileReader()
 	}
-	return ff.smallFileReader()
+	return ff.smallFileReader(), nil
 }
 
-func (ff *fsFile) smallFileReader() (io.Reader, error) {
+func (ff *fsFile) smallFileReader() io.Reader {
 	v := ff.h.smallFileReaderPool.Get()
 	if v == nil {
 		v = &fsSmallFileReader{}
@@ -560,9 +656,9 @@ func (ff *fsFile) smallFileReader() (io.Reader, error) {
 	r.ff = ff
 	r.endPos = ff.contentLength
 	if r.startPos > 0 {
-		return nil, errors.New("bug: fsSmallFileReader with non-nil startPos found in the pool")
+		panic("bug: fsSmallFileReader with non-nil startPos found in the pool")
 	}
-	return r, nil
+	return r
 }
 
 // Files bigger than this size are sent with sendfile.
@@ -620,12 +716,12 @@ func (ff *fsFile) Release() {
 }
 
 func (ff *fsFile) decReadersCount() {
-	ff.h.cacheManager.WithLock(func() {
-		ff.readersCount--
-		if ff.readersCount < 0 {
-			ff.readersCount = 0
-		}
-	})
+	ff.h.cacheManager.Lock()
+	ff.readersCount--
+	if ff.readersCount < 0 {
+		panic("bug: fsFile.readersCount < 0")
+	}
+	ff.h.cacheManager.Unlock()
 }
 
 // bigFileReader attempts to trigger sendfile
@@ -785,9 +881,10 @@ func (r *fsSmallFileReader) WriteTo(w io.Writer) (int64, error) {
 }
 
 type cacheManager interface {
-	WithLock(work func())
-	GetFileFromCache(cacheKind CacheKind, path string) (*fsFile, bool)
-	SetFileToCache(cacheKind CacheKind, path string, ff *fsFile) *fsFile
+	Lock()
+	Unlock()
+	GetFileFromCache(cacheKind CacheKind, path []byte) (*fsFile, bool)
+	SetFileToCache(cacheKind CacheKind, path []byte, ff *fsFile) *fsFile
 }
 
 var (
@@ -831,19 +928,22 @@ type noopCacheManager struct {
 	cacheLock sync.Mutex
 }
 
-func (n *noopCacheManager) WithLock(work func()) {
+func (n *noopCacheManager) Lock() {
 	n.cacheLock.Lock()
+}
 
-	work()
-
+func (n *noopCacheManager) Unlock() {
 	n.cacheLock.Unlock()
 }
 
-func (*noopCacheManager) GetFileFromCache(cacheKind CacheKind, path string) (*fsFile, bool) {
+func (*noopCacheManager) GetFileFromCache(cacheKind CacheKind, path []byte) (*fsFile, bool) {
 	return nil, false
 }
 
-func (*noopCacheManager) SetFileToCache(cacheKind CacheKind, path string, ff *fsFile) *fsFile {
+func (n *noopCacheManager) SetFileToCache(cacheKind CacheKind, path []byte, ff *fsFile) *fsFile {
+	n.cacheLock.Lock()
+	ff.readersCount++
+	n.cacheLock.Unlock()
 	return ff
 }
 
@@ -856,11 +956,11 @@ type inMemoryCacheManager struct {
 	cacheLock     sync.Mutex
 }
 
-func (cm *inMemoryCacheManager) WithLock(work func()) {
+func (cm *inMemoryCacheManager) Lock() {
 	cm.cacheLock.Lock()
+}
 
-	work()
-
+func (cm *inMemoryCacheManager) Unlock() {
 	cm.cacheLock.Unlock()
 }
 
@@ -878,11 +978,11 @@ func (cm *inMemoryCacheManager) getFsCache(cacheKind CacheKind) map[string]*fsFi
 	return fileCache
 }
 
-func (cm *inMemoryCacheManager) GetFileFromCache(cacheKind CacheKind, path string) (*fsFile, bool) {
+func (cm *inMemoryCacheManager) GetFileFromCache(cacheKind CacheKind, path []byte) (*fsFile, bool) {
 	fileCache := cm.getFsCache(cacheKind)
 
 	cm.cacheLock.Lock()
-	ff, ok := fileCache[path]
+	ff, ok := fileCache[string(path)]
 	if ok {
 		ff.readersCount++
 	}
@@ -891,13 +991,13 @@ func (cm *inMemoryCacheManager) GetFileFromCache(cacheKind CacheKind, path strin
 	return ff, ok
 }
 
-func (cm *inMemoryCacheManager) SetFileToCache(cacheKind CacheKind, path string, ff *fsFile) *fsFile {
+func (cm *inMemoryCacheManager) SetFileToCache(cacheKind CacheKind, path []byte, ff *fsFile) *fsFile {
 	fileCache := cm.getFsCache(cacheKind)
 
 	cm.cacheLock.Lock()
-	ff1, ok := fileCache[path]
+	ff1, ok := fileCache[string(path)]
 	if !ok {
-		fileCache[path] = ff
+		fileCache[string(path)] = ff
 		ff.readersCount++
 	} else {
 		ff1.readersCount++
@@ -994,14 +1094,61 @@ func cleanCacheNolock(
 	return pendingFiles, filesToRelease
 }
 
-func (h *fsHandler) pathToFilePath(path string) string {
-	if _, ok := h.filesystem.(*osFS); !ok {
-		if len(path) < 1 {
-			return path
-		}
-		return path[1:]
+func (h *fsHandler) pathToFilePath(path []byte, hasTrailingSlash bool) string {
+	if hasTrailingSlash {
+		path = path[:len(path)-1]
 	}
-	return filepath.FromSlash(h.root + path)
+	hasLeadingSlash := len(path) > 0 && path[0] == '/'
+
+	if _, ok := h.filesystem.(*osFS); !ok {
+		root := h.root
+		if root == "." {
+			root = ""
+		}
+		if len(path) < 1 || (hasLeadingSlash && len(path) == 1) {
+			if h.root == "." {
+				return "."
+			}
+			return root
+		}
+
+		if root == "" {
+			if hasLeadingSlash {
+				return string(path[1:])
+			}
+			return string(path)
+		}
+
+		// Use byte buffer pool to avoid string concatenation allocations.
+		b := bytebufferpool.Get()
+		defer bytebufferpool.Put(b)
+
+		b.B = append(b.B, root...)
+		b.B = append(b.B, '/')
+		if hasLeadingSlash {
+			b.B = append(b.B, path[1:]...)
+		} else {
+			b.B = append(b.B, path...)
+		}
+
+		return string(b.B)
+	}
+
+	// Use byte buffer pool to avoid string concatenation allocations
+	b := bytebufferpool.Get()
+	defer bytebufferpool.Put(b)
+
+	b.B = append(b.B, h.root...)
+	if hasLeadingSlash {
+		b.B = append(b.B, path...)
+	} else {
+		if h.root != "" && len(path) > 0 {
+			b.B = append(b.B, '/')
+		}
+		b.B = append(b.B, path...)
+	}
+
+	return filepath.FromSlash(string(b.B))
 }
 
 func (h *fsHandler) filePathToCompressed(filePath string) string {
@@ -1029,11 +1176,11 @@ func (h *fsHandler) handleRequest(ctx *RequestCtx) {
 		return
 	}
 	if h.pathRewrite != nil {
-		// There is no need to check for '/../' if path = ctx.Path(),
+		// There is no need to check rewritten paths if path = ctx.Path(),
 		// since ctx.Path must normalize and sanitize the path.
 
-		if n := bytes.Index(path, strSlashDotDotSlash); n >= 0 {
-			ctx.Logger().Printf("cannot serve path with '/../' at position %d due to security reasons: %q", n, path)
+		if hasDotDotPathSegment(path) {
+			ctx.Logger().Printf("cannot serve rewritten path with '..' path segment due to security reasons: %q", path)
 			ctx.Error("Internal Server Error", StatusInternalServerError)
 			return
 		}
@@ -1049,26 +1196,20 @@ func (h *fsHandler) handleRequest(ctx *RequestCtx) {
 			mustCompress = true
 			fileCacheKind = brotliCacheKind
 			fileEncoding = "br"
+		case h.compressZstd && ctx.Request.Header.HasAcceptEncodingBytes(strZstd):
+			mustCompress = true
+			fileCacheKind = zstdCacheKind
+			fileEncoding = "zstd"
 		case ctx.Request.Header.HasAcceptEncodingBytes(strGzip):
 			mustCompress = true
 			fileCacheKind = gzipCacheKind
 			fileEncoding = "gzip"
-		case ctx.Request.Header.HasAcceptEncodingBytes(strZstd):
-			mustCompress = true
-			fileCacheKind = zstdCacheKind
-			fileEncoding = "zstd"
 		}
 	}
 
-	originalPathStr := string(path)
-	pathStr := originalPathStr
-	if hasTrailingSlash {
-		pathStr = originalPathStr[:len(originalPathStr)-1]
-	}
-
-	ff, ok := h.cacheManager.GetFileFromCache(fileCacheKind, originalPathStr)
+	ff, ok := h.cacheManager.GetFileFromCache(fileCacheKind, path)
 	if !ok {
-		filePath := h.pathToFilePath(pathStr)
+		filePath := h.pathToFilePath(path, hasTrailingSlash)
 
 		var err error
 		ff, err = h.openFSFile(filePath, mustCompress, fileEncoding)
@@ -1101,7 +1242,7 @@ func (h *fsHandler) handleRequest(ctx *RequestCtx) {
 			return
 		}
 
-		ff = h.cacheManager.SetFileToCache(fileCacheKind, originalPathStr, ff)
+		ff = h.cacheManager.SetFileToCache(fileCacheKind, path, ff)
 	}
 
 	if !ctx.IfModifiedSince(ff.lastModified) {
@@ -1112,6 +1253,7 @@ func (h *fsHandler) handleRequest(ctx *RequestCtx) {
 
 	r, err := ff.NewReader()
 	if err != nil {
+		ff.decReadersCount()
 		ctx.Logger().Printf("cannot obtain file reader for path=%q: %v", path, err)
 		ctx.Error("Internal Server Error", StatusInternalServerError)
 		return
@@ -1122,10 +1264,13 @@ func (h *fsHandler) handleRequest(ctx *RequestCtx) {
 		switch fileEncoding {
 		case "br":
 			hdr.SetContentEncodingBytes(strBr)
+			hdr.addVaryBytes(strAcceptEncoding)
 		case "gzip":
 			hdr.SetContentEncodingBytes(strGzip)
+			hdr.addVaryBytes(strAcceptEncoding)
 		case "zstd":
 			hdr.SetContentEncodingBytes(strZstd)
+			hdr.addVaryBytes(strAcceptEncoding)
 		}
 	}
 
@@ -1206,10 +1351,7 @@ func ParseByteRange(byteRange []byte, contentLength int) (startPos, endPos int, 
 		if err != nil {
 			return 0, 0, err
 		}
-		startPos := contentLength - v
-		if startPos < 0 {
-			startPos = 0
-		}
+		startPos := max(contentLength-v, 0)
 		return startPos, contentLength - 1, nil
 	}
 
@@ -1734,11 +1876,25 @@ func stripLeadingSlashes(path []byte, stripSlashes int) []byte {
 	return path
 }
 
-func stripTrailingSlashes(path []byte) []byte {
-	for len(path) > 0 && path[len(path)-1] == '/' {
-		path = path[:len(path)-1]
+func hasDotDotPathSegment(path []byte) bool {
+	segmentStart := 0
+	for i := 0; i <= len(path); i++ {
+		isSeparator := i == len(path)
+		if i < len(path) {
+			isSeparator = path[i] == '/'
+			if filepath.Separator == '\\' && path[i] == '\\' {
+				isSeparator = true
+			}
+		}
+		if !isSeparator {
+			continue
+		}
+		if i-segmentStart == 2 && path[segmentStart] == '.' && path[segmentStart+1] == '.' {
+			return true
+		}
+		segmentStart = i + 1
 	}
-	return path
+	return false
 }
 
 func fileExtension(path string, compressed bool, compressedFileSuffix string) string {

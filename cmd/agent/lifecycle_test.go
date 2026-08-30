@@ -129,7 +129,11 @@ insert into schema_version(version, description, is_current) values(-1, 'ancient
 		if _, err := os.Stat(filepath.Join(repoRoot, "data/models")); os.IsNotExist(err) {
 			repoRoot, _ = filepath.Abs("..")
 		}
+		if _, err := os.Stat(filepath.Join(repoRoot, "data/models")); os.IsNotExist(err) {
+			repoRoot, _ = filepath.Abs(".")
+		}
 		modelsDir := filepath.Join(repoRoot, "data/models")
+		_ = os.Symlink(modelsDir, filepath.Join(dataDir, "models"))
 
 		cmd := exec.CommandContext(ctx, binPath, "-regenerate-vectors", "-data-dir="+dataDir)
 		cmd.Dir = repoRoot
@@ -137,7 +141,6 @@ insert into schema_version(version, description, is_current) values(-1, 'ancient
 			"BESEDKA_URL=http://127.0.0.1:59999",
 			"OPENAI_API_KEY=test-key",
 			"EMBEDDING_MODEL=",
-			"MODELS_DIR="+modelsDir,
 		)
 		out, err := cmd.CombinedOutput()
 		outputStr := string(out)

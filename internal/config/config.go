@@ -128,6 +128,7 @@ func getEnvIntOrDefault(key string, defaultValue int) int {
 }
 
 // LoadDotEnv parses a simple .env file and populates environment variables that are not yet set.
+// Supports both 'KEY=VAL' and 'export KEY=VAL' syntax, including quoted values.
 func LoadDotEnv(filename string) {
 	data, err := os.ReadFile(filename)
 	if err != nil {
@@ -139,10 +140,16 @@ func LoadDotEnv(filename string) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+		if strings.HasPrefix(line, "export ") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		}
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) == 2 {
 			key := strings.TrimSpace(parts[0])
 			val := strings.TrimSpace(parts[1])
+			if len(val) >= 2 && ((strings.HasPrefix(val, `"`) && strings.HasSuffix(val, `"`)) || (strings.HasPrefix(val, `'`) && strings.HasSuffix(val, `'`))) {
+				val = val[1 : len(val)-1]
+			}
 			if _, exists := os.LookupEnv(key); !exists {
 				_ = os.Setenv(key, val)
 			}

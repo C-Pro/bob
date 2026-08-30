@@ -36,28 +36,6 @@ func NewLocalEmbedder(cfg *config.Config, extraOpts ...engine.Option) (*LocalEmb
 
 	modelName := DefaultLocalModel
 	modelsDir := filepath.Join(cfg.DataDir, "models", modelName)
-
-	candidatePaths := []string{
-		os.Getenv("MODELS_DIR"),
-		filepath.Join(cfg.DataDir, "models"),
-		"./data/models",
-		"../data/models",
-		"../../data/models",
-	}
-	for _, cand := range candidatePaths {
-		if cand == "" {
-			continue
-		}
-		if _, err := os.Stat(filepath.Join(cand, modelName, "model.safetensors")); err == nil {
-			modelsDir = filepath.Join(cand, modelName)
-			break
-		}
-		if _, err := os.Stat(filepath.Join(cand, "model.safetensors")); err == nil {
-			modelsDir = cand
-			break
-		}
-	}
-
 	if err := os.MkdirAll(modelsDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create models directory %s: %w", modelsDir, err)
 	}

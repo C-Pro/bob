@@ -127,3 +127,34 @@ func TestConfigValidation(t *testing.T) {
 	err = cfg.Validate(false)
 	assert.ErrorContains(t, err, "invalid MSG_RING_BUFFER_SIZE: 0")
 }
+
+func TestLoadDotEnv(t *testing.T) {
+	tempFile, err := os.CreateTemp(t.TempDir(), ".env*")
+	require.NoError(t, err)
+	defer func() { _ = tempFile.Close() }()
+
+	content := `
+# Comment line
+PLAIN_KEY=plain_val
+export EXPORTED_KEY=exported_val
+export DOUBLE_QUOTED="hello world"
+export SINGLE_QUOTED='single world'
+export PRE_EXISTING=new_val
+`
+	_, err = tempFile.WriteString(content)
+	require.NoError(t, err)
+
+	_ = os.Unsetenv("PLAIN_KEY")
+	_ = os.Unsetenv("EXPORTED_KEY")
+	_ = os.Unsetenv("DOUBLE_QUOTED")
+	_ = os.Unsetenv("SINGLE_QUOTED")
+	t.Setenv("PRE_EXISTING", "original_val")
+
+	LoadDotEnv(tempFile.Name())
+
+	assert.Equal(t, "plain_val", os.Getenv("PLAIN_KEY"))
+	assert.Equal(t, "exported_val", os.Getenv("EXPORTED_KEY"))
+	assert.Equal(t, "hello world", os.Getenv("DOUBLE_QUOTED"))
+	assert.Equal(t, "single world", os.Getenv("SINGLE_QUOTED"))
+	assert.Equal(t, "original_val", os.Getenv("PRE_EXISTING"))
+}

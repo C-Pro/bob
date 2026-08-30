@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.26.6-alpine AS builder
+FROM golang:1.27-alpine AS builder
 
 WORKDIR /app
 
@@ -11,9 +11,10 @@ RUN adduser -D -u 10001 -g '' appuser && \
 # Copy source code (includes vendor directory)
 COPY . .
 
-# Build the agent application
+# Build the agent application with SIMD enabled
 ARG TARGETOS
 ARG TARGETARCH
+ENV GOEXPERIMENT=simd
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -mod=vendor -ldflags="-w -s" -o agent ./cmd/agent
 
 # Final stage
