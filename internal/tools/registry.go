@@ -5,27 +5,56 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
+	"time"
 
+	"bob/internal/memory"
 	"bob/internal/tools/tavily"
 	"bob/internal/tools/webfetch"
 
 	openai "github.com/sashabaranov/go-openai"
 )
 
+type chatContextKey struct{}
+
+// ChatSessionContext holds request-scoped chat context for tool execution.
+type ChatSessionContext struct {
+	ChatID string
+	IsDM   bool
+}
+
+// WithChatSession returns a new context with the given ChatSessionContext attached.
+func WithChatSession(ctx context.Context, session ChatSessionContext) context.Context {
+	return context.WithValue(ctx, chatContextKey{}, session)
+}
+
+// ChatSessionFromContext retrieves the ChatSessionContext from context if present.
+func ChatSessionFromContext(ctx context.Context) (ChatSessionContext, bool) {
+	s, ok := ctx.Value(chatContextKey{}).(ChatSessionContext)
+	return s, ok
+}
+
 // Registry manages available LLM tool definitions and executes tool calls.
 type Registry struct {
 	tavilyClient    *tavily.Client
+	memoryManager   *memory.Manager
 	toolDefinitions []openai.Tool
 }
 
 // NewRegistry creates a new tool registry and initializes static tool definitions once.
-func NewRegistry(tavilyClient *tavily.Client) *Registry {
+func NewRegistry(tavilyClient *tavily.Client, memoryManager *memory.Manager) *Registry {
 	r := &Registry{
-		tavilyClient: tavilyClient,
+		tavilyClient:  tavilyClient,
+		memoryManager: memoryManager,
 	}
 	r.initToolDefinitions()
 	return r
+}
+
+// SetMemoryManager updates the memory manager.
+func (r *Registry) SetMemoryManager(m *memory.Manager) {
+	r.memoryManager = m
 }
 
 func (r *Registry) initToolDefinitions() {
@@ -65,6 +94,21 @@ func (r *Registry) initToolDefinitions() {
 		"required": []string{"url"},
 	}
 
+	recallMemorySchema := map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"query": map[string]interface{}{
+				"type":        "string",
+				"description": "The search query to recall past conversations, topics, facts, or discussions from long-term memory.",
+			},
+			"limit": map[string]interface{}{
+				"type":        "integer",
+				"description": "Maximum number of memory passages to retrieve (1-10, default 5).",
+			},
+		},
+		"required": []string{"query"},
+	}
+
 	r.toolDefinitions = []openai.Tool{
 		{
 			Type: openai.ToolTypeFunction,
@@ -80,6 +124,14 @@ func (r *Registry) initToolDefinitions() {
 				Name:        "web_fetch",
 				Description: "Fetch and extract text content from a web page URL or raw text/code file. Supports 3 modes: 'auto' (default: parses HTML into clean readable text with dynamic fallback), 'raw' (recommended for raw code, scripts, JSON, or configs without HTML parsing), and 'extract' (uses Tavily Extract directly for heavy dynamic SPAs or if 'auto' failed to capture needed content). All outputs are capped at 16KB.",
 				Parameters:  webFetchSchema,
+			},
+		},
+		{
+			Type: openai.ToolTypeFunction,
+			Function: &openai.FunctionDefinition{
+				Name:        "recall_memory",
+				Description: "Recall relevant past conversation history, discussions, topics, and facts from long-term memory. Use this tool when users ask about previous topics, past conversations, or shared history.",
+				Parameters:  recallMemorySchema,
 			},
 		},
 	}
@@ -103,6 +155,12 @@ type WebFetchArgs struct {
 	Mode string `json:"mode,omitempty"`
 }
 
+// RecallMemoryArgs defines arguments for the recall_memory tool.
+type RecallMemoryArgs struct {
+	Query string `json:"query"`
+	Limit int    `json:"limit,omitempty"`
+}
+
 // Execute dispatches a tool execution by function name and arguments JSON.
 func (r *Registry) Execute(ctx context.Context, name string, argsJSON string) (string, error) {
 	switch name {
@@ -110,9 +168,93 @@ func (r *Registry) Execute(ctx context.Context, name string, argsJSON string) (s
 		return r.executeWebSearch(ctx, argsJSON)
 	case "web_fetch":
 		return r.executeWebFetch(ctx, argsJSON)
+	case "recall_memory":
+		return r.executeRecallMemory(ctx, argsJSON)
 	default:
 		return "", fmt.Errorf("unknown tool: %s", name)
 	}
+}
+
+func (r *Registry) executeRecallMemory(ctx context.Context, argsJSON string) (string, error) {
+	if r.memoryManager == nil {
+		return "", errors.New("memory manager is not configured")
+	}
+
+	var args RecallMemoryArgs
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return "", fmt.Errorf("failed to parse arguments: %w", err)
+	}
+
+	args.Query = strings.TrimSpace(args.Query)
+	if args.Query == "" {
+		return "", errors.New("query cannot be empty")
+	}
+
+	limit := args.Limit
+	if limit <= 0 {
+		limit = 5
+	}
+
+	session, _ := ChatSessionFromContext(ctx)
+	chatID := session.ChatID
+	if chatID == "" {
+		chatID = "townhall"
+	}
+	isDM := session.IsDM
+	if chatID == "townhall" {
+		isDM = false
+	}
+
+	items, err := r.memoryManager.Search(ctx, args.Query, chatID, isDM, limit)
+	if err != nil {
+		return "", fmt.Errorf("memory search error: %w", err)
+	}
+
+	slog.Info("executed recall_memory", "query", args.Query, "hits", len(items))
+
+	if len(items) == 0 {
+		payload := map[string]interface{}{
+			"query":    args.Query,
+			"count":    0,
+			"memories": []interface{}{},
+			"message":  "No relevant memories found in long-term memory for the given query.",
+		}
+		respBytes, _ := json.Marshal(payload)
+		return string(respBytes), nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString("### Recalled Conversation Chunks:\n")
+	for _, item := range items {
+		var timeRange string
+		if item.StartTime > 0 && item.EndTime > 0 {
+			startT := time.Unix(item.StartTime, 0).UTC().Format("2006-01-02 15:04:05")
+			endT := time.Unix(item.EndTime, 0).UTC().Format("2006-01-02 15:04:05")
+			timeRange = fmt.Sprintf(" (%s to %s UTC)", startT, endT)
+		} else if item.StartTime > 0 {
+			timeRange = fmt.Sprintf(" (%s UTC)", time.Unix(item.StartTime, 0).UTC().Format("2006-01-02 15:04:05"))
+		}
+
+		seqRange := fmt.Sprintf("seq %d-%d", item.StartSeq, item.EndSeq)
+		if item.StartSeq == item.EndSeq {
+			seqRange = fmt.Sprintf("seq %d", item.StartSeq)
+		}
+
+		fmt.Fprintf(&sb, "\n--- %s [%s]%s ---\n%s\n", item.Source, seqRange, timeRange, strings.TrimSpace(item.Content))
+	}
+
+	payload := map[string]interface{}{
+		"query":             args.Query,
+		"count":             len(items),
+		"memories":          items,
+		"formatted_results": strings.TrimSpace(sb.String()),
+	}
+
+	respBytes, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("failed to format memory response: %w", err)
+	}
+	return string(respBytes), nil
 }
 
 func (r *Registry) executeWebSearch(ctx context.Context, argsJSON string) (string, error) {

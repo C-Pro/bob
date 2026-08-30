@@ -39,7 +39,6 @@ All SQLite vector databases are stored within the configured `DATA_DIR` (e.g. `.
 - **Catch-up on Startup / Missing DB**:
   - When opening a chat database or starting the service, compare the server's latest message sequence against `last_indexed_seq`.
   - If latest sequence > `last_indexed_seq`, fetch missing historical messages from Besedka REST API (`/api/chats/{id}/messages`) in batches of up to 100 messages, index them into `sqvect`, and update `last_indexed_seq`.
-- **Backup & Disaster Recovery**: Enables periodic snapshots / backups of SQLite databases while guaranteeing complete catch-up on service startup.
 
 ### 3.3 Asynchronous Batch Eviction Indexing
 - **Eviction Hook**: When `RingBuffer.Push` exceeds `MsgRingBufferSize` and evicts a batch of messages (1/3 capacity), the evicted entries are dispatched to an asynchronous background worker queue.

@@ -15,6 +15,7 @@ type ImageAttachment struct {
 
 // Entry represents a single turn in a chat conversation.
 type Entry struct {
+	Seq        int64             `json:"seq,omitempty"`    // message sequence number
 	Role       string            `json:"role"`             // "user" or "assistant"
 	SenderID   string            `json:"senderId"`         // user/bot ID
 	SenderName string            `json:"senderName"`       // display name or username
@@ -23,11 +24,15 @@ type Entry struct {
 	Timestamp  int64             `json:"timestamp"`        // unix timestamp
 }
 
+// EvictionHook is a callback invoked with evicted entries when capacity is exceeded.
+type EvictionHook func(evicted []Entry)
+
 // RingBuffer is a thread-safe circular buffer holding up to `capacity` entries.
 type RingBuffer struct {
 	mu       sync.RWMutex
 	capacity int
 	entries  []Entry
+	onEvict  EvictionHook
 }
 
 // NewRingBuffer creates a new RingBuffer with the given maximum capacity.
@@ -41,20 +46,36 @@ func NewRingBuffer(capacity int) *RingBuffer {
 	}
 }
 
+// SetOnEvict sets a callback function to be called when entries are evicted.
+func (rb *RingBuffer) SetOnEvict(hook EvictionHook) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	rb.onEvict = hook
+}
+
 // Push adds an entry to the ring buffer. When capacity is exceeded, it evicts
 // a chunk of the oldest messages (1/3 of capacity) at once to keep the conversation
 // prefix stable and maximize LLM prefix caching.
 func (rb *RingBuffer) Push(entry Entry) {
-	rb.mu.Lock()
-	defer rb.mu.Unlock()
+	var evicted []Entry
+	var hook EvictionHook
 
+	rb.mu.Lock()
 	rb.entries = append(rb.entries, entry)
 	if len(rb.entries) > rb.capacity {
 		evictCount := rb.capacity / 3
 		if evictCount < 1 {
 			evictCount = 1
 		}
+		evicted = make([]Entry, evictCount)
+		copy(evicted, rb.entries[:evictCount])
 		rb.entries = rb.entries[evictCount:]
+		hook = rb.onEvict
+	}
+	rb.mu.Unlock()
+
+	if hook != nil && len(evicted) > 0 {
+		hook(evicted)
 	}
 }
 
@@ -149,6 +170,7 @@ type Manager struct {
 	mu              sync.RWMutex
 	defaultCapacity int
 	buffers         map[string]*RingBuffer
+	onEvict         func(chatID string, evicted []Entry)
 }
 
 // NewManager creates a new chat context manager.
@@ -159,6 +181,21 @@ func NewManager(defaultCapacity int) *Manager {
 	return &Manager{
 		defaultCapacity: defaultCapacity,
 		buffers:         make(map[string]*RingBuffer),
+	}
+}
+
+// SetOnEvict sets a global eviction hook called whenever entries are evicted from any chat buffer.
+func (m *Manager) SetOnEvict(hook func(chatID string, evicted []Entry)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onEvict = hook
+	for chatID, rb := range m.buffers {
+		cid := chatID
+		rb.SetOnEvict(func(evicted []Entry) {
+			if hook != nil {
+				hook(cid, evicted)
+			}
+		})
 	}
 }
 
@@ -178,6 +215,13 @@ func (m *Manager) GetOrCreate(chatID string) *RingBuffer {
 		return rb
 	}
 	rb = NewRingBuffer(m.defaultCapacity)
+	if m.onEvict != nil {
+		cid := chatID
+		hook := m.onEvict
+		rb.SetOnEvict(func(evicted []Entry) {
+			hook(cid, evicted)
+		})
+	}
 	m.buffers[chatID] = rb
 	return rb
 }

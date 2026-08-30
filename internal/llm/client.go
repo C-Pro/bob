@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -234,7 +235,7 @@ func NewClient(cfg *config.Config, httpClient *http.Client) *Client {
 	}
 
 	var baseTransport http.RoundTripper
-	clientTimeout := 30 * time.Second
+	clientTimeout := 120 * time.Second
 	if httpClient != nil {
 		baseTransport = httpClient.Transport
 		if httpClient.Timeout > 0 {
@@ -415,6 +416,7 @@ func (c *Client) GenerateChatResponseWithToolLoop(
 
 		// Execute each tool call and append the result as a tool role message
 		for _, toolCall := range assistantMsg.ToolCalls {
+			slog.Info("LLM requested tool execution", "tool", toolCall.Function.Name, "args", toolCall.Function.Arguments)
 			var toolResult string
 			if executor == nil {
 				toolResult = `{"error": "tool execution is not configured"}`

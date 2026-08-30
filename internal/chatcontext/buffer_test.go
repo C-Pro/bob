@@ -281,3 +281,61 @@ func TestManager_PerChatSeparation(t *testing.T) {
 	emptyMsgs := mgr.GetLLMMessages("dm_nonexistent")
 	assert.Empty(t, emptyMsgs)
 }
+
+func TestRingBuffer_EvictionHook(t *testing.T) {
+	rb := NewRingBuffer(3)
+	var evictedEntries []Entry
+	var mu sync.Mutex
+
+	rb.SetOnEvict(func(evicted []Entry) {
+		mu.Lock()
+		defer mu.Unlock()
+		evictedEntries = append(evictedEntries, evicted...)
+	})
+
+	rb.Push(Entry{Seq: 1, Content: "Msg 1"})
+	rb.Push(Entry{Seq: 2, Content: "Msg 2"})
+	rb.Push(Entry{Seq: 3, Content: "Msg 3"})
+
+	mu.Lock()
+	assert.Empty(t, evictedEntries)
+	mu.Unlock()
+
+	// 4th push triggers eviction of 1 item (Msg 1)
+	rb.Push(Entry{Seq: 4, Content: "Msg 4"})
+
+	mu.Lock()
+	require.Len(t, evictedEntries, 1)
+	assert.Equal(t, int64(1), evictedEntries[0].Seq)
+	assert.Equal(t, "Msg 1", evictedEntries[0].Content)
+	mu.Unlock()
+}
+
+func TestManager_EvictionHook(t *testing.T) {
+	mgr := NewManager(3)
+	type evictedCall struct {
+		chatID  string
+		entries []Entry
+	}
+	var calls []evictedCall
+	var mu sync.Mutex
+
+	mgr.SetOnEvict(func(chatID string, evicted []Entry) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, evictedCall{chatID: chatID, entries: evicted})
+	})
+
+	for i := 1; i <= 4; i++ {
+		mgr.Push("dm_user1", Entry{Seq: int64(i), Content: fmt.Sprintf("User1 Msg %d", i)})
+	}
+
+	mu.Lock()
+	require.Len(t, calls, 1)
+	assert.Equal(t, "dm_user1", calls[0].chatID)
+	require.Len(t, calls[0].entries, 1)
+	assert.Equal(t, int64(1), calls[0].entries[0].Seq)
+	assert.Equal(t, "User1 Msg 1", calls[0].entries[0].Content)
+	mu.Unlock()
+}
+

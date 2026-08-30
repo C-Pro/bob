@@ -99,10 +99,12 @@ type ClientMessageType string
 const (
 	ClientMessageTypeSend     ClientMessageType = "send"
 	ClientMessageTypeLocation ClientMessageType = "location"
+	ClientMessageTypePong     ClientMessageType = "pong"
 )
 
 type ServerMessageType string
 
 const (
 	ServerMessageTypeMessages ServerMessageType = "messages"
+	ServerMessageTypePing     ServerMessageType = "ping"
 )

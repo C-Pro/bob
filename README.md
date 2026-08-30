@@ -6,6 +6,7 @@ Bob is an AI agent for the [Besedka](https://github.com/c-pro/besedka) self-host
 
 - **WebSocket ingress** with automatic reconnect and ping keepalive
 - **Multi-turn context & chunked eviction** — per-chat in-memory ring buffers with historical backfill and stepped batch eviction (pruning 1/3 of the buffer on overflow) to keep the prompt prefix static and maximize LLM prefix caching
+- **Long-term isolated memory & RAG (`recall_memory`)** — persistent SQLite vector and FTS5 memory per chat with watermark tracking, background indexing upon ring buffer eviction, startup sequence catch-up, and strict privacy isolation (Townhall searches townhall memory; DMs search own DM + townhall memory)
 - **Multimodal image & file attachments** — automatic ingestion and base64 encoding of image thumbnails via OpenAI `image_url` payloads, plus inlined markdown code blocks for text-based code/config attachments
 - **Live web search** via [Tavily](https://tavily.com/) (when `TAVILY_API_KEY` is set)
 - **Web page fetch & extraction** with readability parsing and dynamic rendering fallback
@@ -17,7 +18,7 @@ Bob is an AI agent for the [Besedka](https://github.com/c-pro/besedka) self-host
 
 ### Prerequisites
 
-- Go 1.24+
+- Go 1.27+
 - A running [Besedka](https://github.com/c-pro/besedka) server
 - An API key for an OpenAI-compatible LLM provider
 - A writable directory on the host/container filesystem for SQLite database files (`./data` by default)
@@ -38,7 +39,9 @@ BOT_HANDLE=@botname
 Optional:
 
 ```sh
-DATA_DIR=./data                           # directory for SQLite databases (must be writable)
+DATA_DIR=./data                           # directory for SQLite databases and local models (must be writable)
+EMBEDDING_MODEL=                          # embedding model (defaults to local go-embed with MiniLM-L12-v2 if unset)
+EMBEDDING_PRECISION=bf16                  # precision mode for local embeddings: bf16 (default, ~225MB), fp32, int8
 TAVILY_API_KEY=<your-tavily-key>          # enables web search tool
 MSG_RING_BUFFER_SIZE=100                  # context window size per chat
 TOWNHALL_MAX_PARAGRAPHS=2                 # response length limit in Townhall
@@ -48,7 +51,11 @@ DM_MAX_PARAGRAPHS=10                      # response length limit in DMs
 ### Run
 
 ```sh
+# Run agent service
 go run ./cmd/agent
+
+# Regenerate all vector embeddings across all chat databases (e.g. after changing embedding models)
+go run ./cmd/agent -regenerate-vectors
 ```
 
 ### Docker
@@ -79,11 +86,12 @@ internal/
   config/           — environment-based configuration
   gateway/          — WebSocket/REST gateway to Besedka
   geoip/            — server location lookup
-  llm/              — OpenAI-compatible LLM client
+  llm/              — OpenAI-compatible LLM & embeddings client
+  memory/           — isolated SQLite vector + FTS5 long-term memory store
   models/           — shared data types
   prompt/           — system prompt rendering
   store/            — SQLite database storage & single-step migrations
-  tools/            — tool registry, Tavily search, web fetch
+  tools/            — tool registry, memory recall, Tavily search, web fetch
 ```
 
 ## License
