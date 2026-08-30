@@ -3,12 +3,12 @@ module bob
 go 1.27.0
 
 require (
+	github.com/C-Pro/go-embed v0.2.0
 	github.com/fasthttp/websocket v1.5.12
 	github.com/go-shiori/go-readability v0.0.0-20251205110129-5db1dc9836f0
 	github.com/liliang-cn/cortexdb/v2 v2.82.2
 	github.com/sashabaranov/go-openai v1.42.0
 	github.com/stretchr/testify v1.11.1
-	go-embed v0.0.0-00010101000000-000000000000
 	modernc.org/sqlite v1.57.0
 )
 
@@ -53,5 +53,3 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
-
-replace go-embed => github.com/C-Pro/go-embed v0.0.0-20260830042752-be2fca2fbfe7

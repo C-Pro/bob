@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -80,6 +81,8 @@ func DetectModelPrefixes(dataDir, modelName string, silent bool) (queryPrefix, p
 	}
 }
 
+var downloadMu sync.Mutex
+
 // downloadOptionalFile attempts to download an optional file from url without failing on 404.
 func downloadOptionalFile(url, destPath string) error {
 	client := &http.Client{Timeout: 10 * time.Second}
@@ -104,12 +107,48 @@ func downloadOptionalFile(url, destPath string) error {
 		return err
 	}
 
-	return os.WriteFile(destPath, data, 0644)
+	dir := filepath.Dir(destPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+
+	tmpFile, err := os.CreateTemp(dir, filepath.Base(destPath)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+	defer func() {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+	}()
+
+	if _, err := tmpFile.Write(data); err != nil {
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+
+	if fi, err := os.Stat(destPath); err == nil && fi.Size() > 0 {
+		return nil
+	}
+
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		if fi, statErr := os.Stat(destPath); statErr == nil && fi.Size() > 0 {
+			return nil
+		}
+		return err
+	}
+
+	return nil
 }
 
 // EnsureModelFiles checks if the required model weights (model.safetensors and tokenizer.json)
 // exist in targetDir. If they do not exist, it automatically downloads them from Hugging Face.
 func EnsureModelFiles(dataDir, modelName string, silent bool) (safetensorsPath, tokenizerPath string, err error) {
+	downloadMu.Lock()
+	defer downloadMu.Unlock()
+
 	if modelName == "" {
 		modelName = DefaultModelName
 	}
@@ -167,39 +206,57 @@ func downloadFile(url, destPath string, silent bool) error {
 		return fmt.Errorf("bad HTTP status: %s", resp.Status)
 	}
 
-	tmpPath := destPath + ".tmp"
-	outFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to create temp file %s: %w", tmpPath, err)
+	dir := filepath.Dir(destPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
+
+	base := filepath.Base(destPath)
+	tmpFile, err := os.CreateTemp(dir, base+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer func() {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+	}()
 
 	var reader io.Reader = resp.Body
 	if !silent && resp.ContentLength > 0 {
 		reader = &progressReader{
 			Reader: resp.Body,
 			Total:  resp.ContentLength,
-			Name:   filepath.Base(destPath),
+			Name:   base,
 		}
 	}
 
-	if _, err := io.Copy(outFile, reader); err != nil {
-		outFile.Close()
-		os.Remove(tmpPath)
+	if _, err := io.Copy(tmpFile, reader); err != nil {
 		return fmt.Errorf("failed during streaming download: %w", err)
 	}
 
-	if err := outFile.Close(); err != nil {
-		os.Remove(tmpPath)
+	if err := tmpFile.Sync(); err != nil {
+		return fmt.Errorf("failed to sync file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
 		return fmt.Errorf("failed to close file: %w", err)
 	}
 
+	// If another process or thread already finalized the file, clean up and succeed
+	if fi, err := os.Stat(destPath); err == nil && fi.Size() > 0 {
+		return nil
+	}
+
 	if err := os.Rename(tmpPath, destPath); err != nil {
-		os.Remove(tmpPath)
+		// If rename failed, check if another process finalized it concurrently
+		if fi, statErr := os.Stat(destPath); statErr == nil && fi.Size() > 0 {
+			return nil
+		}
 		return fmt.Errorf("failed to finalize downloaded file: %w", err)
 	}
 
 	if !silent {
-		fmt.Printf("go-embed: successfully downloaded %s\n", filepath.Base(destPath))
+		fmt.Printf("go-embed: successfully downloaded %s\n", base)
 	}
 
 	return nil

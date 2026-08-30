@@ -12,7 +12,7 @@ import (
 
 	"bob/internal/config"
 
-	"go-embed/pkg/engine"
+	embed "github.com/C-Pro/go-embed"
 )
 
 // DefaultLocalModel is the default pure Go CPU embedding model.
@@ -21,7 +21,7 @@ const DefaultLocalModel = "sentence-transformers/paraphrase-multilingual-MiniLM-
 // LocalEmbedder wraps the go-embed inference engine to provide pure-Go embeddings
 // conforming to cortexdb's Embedder interface.
 type LocalEmbedder struct {
-	engine    *engine.Engine
+	engine    *embed.Engine
 	modelName string
 	dim       int
 	mu        sync.RWMutex
@@ -29,7 +29,7 @@ type LocalEmbedder struct {
 }
 
 // NewLocalEmbedder initializes the go-embed inference engine using the provided configuration.
-func NewLocalEmbedder(cfg *config.Config, extraOpts ...engine.Option) (*LocalEmbedder, error) {
+func NewLocalEmbedder(cfg *config.Config, extraOpts ...embed.Option) (*LocalEmbedder, error) {
 	if cfg == nil {
 		return nil, errors.New("config is nil")
 	}
@@ -40,24 +40,24 @@ func NewLocalEmbedder(cfg *config.Config, extraOpts ...engine.Option) (*LocalEmb
 		return nil, fmt.Errorf("failed to create models directory %s: %w", modelsDir, err)
 	}
 
-	prec := engine.PrecisionBF16
+	prec := embed.PrecisionBF16
 	switch strings.ToLower(strings.TrimSpace(cfg.EmbeddingPrecision)) {
 	case "int8":
-		prec = engine.PrecisionINT8
+		prec = embed.PrecisionINT8
 	case "fp32":
-		prec = engine.PrecisionFP32
+		prec = embed.PrecisionFP32
 	case "bf16", "":
-		prec = engine.PrecisionBF16
+		prec = embed.PrecisionBF16
 	}
 
-	opts := []engine.Option{
-		engine.WithDataDir(modelsDir),
-		engine.WithModelName(modelName),
-		engine.WithPrecision(prec),
+	opts := []embed.Option{
+		embed.WithDataDir(modelsDir),
+		embed.WithModelName(modelName),
+		embed.WithPrecision(prec),
 	}
 	opts = append(opts, extraOpts...)
 
-	eng, err := engine.NewEngine(opts...)
+	eng, err := embed.NewEngine(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize go-embed engine: %w", err)
 	}
@@ -70,7 +70,7 @@ func NewLocalEmbedder(cfg *config.Config, extraOpts ...engine.Option) (*LocalEmb
 }
 
 // NewLocalEmbedderWithEngine constructs a LocalEmbedder wrapping an existing engine instance.
-func NewLocalEmbedderWithEngine(eng *engine.Engine, modelName string) *LocalEmbedder {
+func NewLocalEmbedderWithEngine(eng *embed.Engine, modelName string) *LocalEmbedder {
 	if modelName == "" {
 		modelName = DefaultLocalModel
 	}

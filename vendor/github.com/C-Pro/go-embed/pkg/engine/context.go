@@ -5,7 +5,7 @@ import (
 	"strings"
 	"sync"
 
-	"go-embed/pkg/tokenizer"
+	"github.com/C-Pro/go-embed/pkg/tokenizer"
 )
 
 const (

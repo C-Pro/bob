@@ -5,8 +5,8 @@ import (
 	"os"
 	"strings"
 
-	"go-embed/pkg/safetensors"
-	"go-embed/pkg/tokenizer"
+	"github.com/C-Pro/go-embed/pkg/safetensors"
+	"github.com/C-Pro/go-embed/pkg/tokenizer"
 )
 
 const (
