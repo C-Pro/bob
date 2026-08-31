@@ -105,6 +105,19 @@ func (m *Manager) dbKey(chatID string, isDM bool) (string, string) {
 	return "dm_" + sanitized, filepath.Join(m.cfg.DataDir, fmt.Sprintf("dm_%s.db", sanitized))
 }
 
+// ActiveDBs returns a map of database filenames to their active *sql.DB connection handles.
+func (m *Manager) ActiveDBs() map[string]*sql.DB {
+	m.dbsMu.RLock()
+	defer m.dbsMu.RUnlock()
+
+	active := make(map[string]*sql.DB, len(m.dbs))
+	for key, db := range m.dbs {
+		filename := key + ".db"
+		active[filename] = db.SQL()
+	}
+	return active
+}
+
 // GetDB retrieves or opens the SQLite database for the specified chat context.
 func (m *Manager) GetDB(ctx context.Context, chatID string, isDM bool) (*cortexdb.DB, error) {
 	key, path := m.dbKey(chatID, isDM)
