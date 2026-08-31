@@ -73,7 +73,8 @@ func LoadFromEnv() (*Config, error) {
 	if s3Prefix != "" && !strings.HasSuffix(s3Prefix, "/") {
 		s3Prefix = s3Prefix + "/"
 	}
-	s3PathStyle := getEnvOrDefault("S3_PATH_STYLE", "true") == "true" || getEnvOrDefault("S3_PATH_STYLE", "true") == "1"
+	s3PathStyleStr := getEnvOrDefault("S3_PATH_STYLE", "true")
+	s3PathStyle := s3PathStyleStr == "true" || s3PathStyleStr == "1"
 
 	cfg := &Config{
 		BotHandle:             getEnvOrDefault("BOT_HANDLE", "@bot"),

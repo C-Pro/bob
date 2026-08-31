@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"io"
@@ -39,8 +40,10 @@ func TestRecoverDBsIfMissing(t *testing.T) {
 	require.NoError(t, err)
 	_ = db.Close()
 
-	artifactBytes, err := EncodeSnapshot(dbPath, secret)
+	var buf bytes.Buffer
+	err = EncodeSnapshot(dbPath, secret, &buf)
 	require.NoError(t, err)
+	artifactBytes := buf.Bytes()
 
 	manifest := NewManifest()
 	manifest.Databases["bob.db"] = DBBackupEntry{

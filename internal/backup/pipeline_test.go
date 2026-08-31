@@ -26,14 +26,16 @@ func TestEncodeAndDecodeSnapshotRoundtrip(t *testing.T) {
 	_ = db.Close()
 
 	secret := "test-secret-123"
-	artifact, err := EncodeSnapshot(dbPath, secret)
+	var buf bytes.Buffer
+	err = EncodeSnapshot(dbPath, secret, &buf)
 	require.NoError(t, err)
+	artifact := buf.Bytes()
 	assert.NotEmpty(t, artifact)
 	assert.True(t, bytes.HasPrefix(artifact, []byte("BOBB\x01\x10")))
 
 	// Restore to a new location
 	restoredPath := filepath.Join(tempDir, "restored.db")
-	err = DecodeSnapshot(artifact, secret, restoredPath)
+	err = DecodeSnapshot(bytes.NewReader(artifact), secret, restoredPath)
 	require.NoError(t, err)
 
 	restoredDB, err := sql.Open("sqlite", restoredPath)
@@ -59,11 +61,12 @@ func TestDecodeSnapshotWrongSecret(t *testing.T) {
 	require.NoError(t, err)
 
 	secret := "correct-secret"
-	artifact, err := EncodeSnapshot(dbPath, secret)
+	var buf bytes.Buffer
+	err = EncodeSnapshot(dbPath, secret, &buf)
 	require.NoError(t, err)
 
 	restoredPath := filepath.Join(tempDir, "restored.db")
-	err = DecodeSnapshot(artifact, "wrong-secret", restoredPath)
+	err = DecodeSnapshot(bytes.NewReader(buf.Bytes()), "wrong-secret", restoredPath)
 	assert.ErrorContains(t, err, "failed to decrypt artifact")
 	assert.NoFileExists(t, restoredPath)
 }

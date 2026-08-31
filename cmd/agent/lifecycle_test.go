@@ -1,6 +1,7 @@
 package main_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -268,8 +269,10 @@ insert into schema_version(version, description, is_current) values(-1, 'ancient
 		require.NoError(t, err)
 		require.NoError(t, srcDB.Close())
 
-		artifact, err := backup.EncodeSnapshot(srcDBFile, secret)
+		var buf bytes.Buffer
+		err = backup.EncodeSnapshot(srcDBFile, secret, &buf)
 		require.NoError(t, err)
+		artifact := buf.Bytes()
 
 		manifest := backup.NewManifest()
 		manifest.Databases["bob.db"] = backup.DBBackupEntry{

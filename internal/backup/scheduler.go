@@ -1,12 +1,12 @@
 package backup
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -41,6 +41,7 @@ func NewScheduler(cfg *config.Config, obj *objectstore.Client, activeDBs func() 
 	if interval <= 0 {
 		interval = time.Hour
 	}
+
 	return &Scheduler{
 		cfg:       cfg,
 		obj:       obj,
@@ -57,11 +58,16 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
 
+	first := true
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
+			if first {
+				first = false
+				continue
+			}
 			if err := s.DoBackup(ctx); err != nil {
 				slog.Error("scheduled database backup failed", "error", err)
 			}
@@ -93,7 +99,11 @@ func (s *Scheduler) DoBackup(ctx context.Context) error {
 		return nil
 	}
 
-	tmpDir, err := os.MkdirTemp("", "bob-backup-*")
+	if err := os.MkdirAll(s.cfg.DataDir, 0755); err != nil {
+		return fmt.Errorf("failed to create data directory: %w", err)
+	}
+
+	tmpDir, err := os.MkdirTemp(s.cfg.DataDir, "bob-backup-*")
 	if err != nil {
 		return fmt.Errorf("failed to create temporary backup directory: %w", err)
 	}
@@ -111,26 +121,50 @@ func (s *Scheduler) DoBackup(ctx context.Context) error {
 			return fmt.Errorf("failed to snapshot %s: %w", target.Name, err)
 		}
 
-		// 2. Compress and encrypt snapshot
-		artifactBytes, err := EncodeSnapshot(snapFile, s.cfg.Secret)
+		// 2. Compress and encrypt snapshot to an artifact file on disk
+		artifactFile := filepath.Join(tmpDir, fmt.Sprintf("%s.artifact.bk", filepath.Base(snapFile)))
+		artF, err := os.Create(artifactFile)
+		if err != nil {
+			_ = os.Remove(snapFile)
+			return fmt.Errorf("failed to create artifact file: %w", err)
+		}
+
+		err = EncodeSnapshot(snapFile, s.cfg.Secret, artF)
+		_ = artF.Close()
 		_ = os.Remove(snapFile)
 		if err != nil {
+			_ = os.Remove(artifactFile)
 			return fmt.Errorf("failed to encode snapshot for %s: %w", target.Name, err)
+		}
+
+		artStat, err := os.Stat(artifactFile)
+		if err != nil {
+			_ = os.Remove(artifactFile)
+			return fmt.Errorf("failed to stat artifact file: %w", err)
+		}
+
+		uploadF, err := os.Open(artifactFile)
+		if err != nil {
+			_ = os.Remove(artifactFile)
+			return fmt.Errorf("failed to open artifact file for upload: %w", err)
 		}
 
 		// 3. Upload to S3
 		ts := s.now().UTC()
 		key := fmt.Sprintf("%s%s/%s.bk", s.prefix, target.Name, ts.Format("20060102T150405Z"))
-		if err := s.obj.Put(ctx, key, bytes.NewReader(artifactBytes), int64(len(artifactBytes))); err != nil {
+		err = s.obj.Put(ctx, key, uploadF, artStat.Size())
+		_ = uploadF.Close()
+		_ = os.Remove(artifactFile)
+		if err != nil {
 			return fmt.Errorf("failed to upload backup for %s: %w", target.Name, err)
 		}
-		slog.Info("database backup uploaded", "db", target.Name, "key", key, "bytes", len(artifactBytes))
+		slog.Info("database backup uploaded", "db", target.Name, "key", key, "bytes", artStat.Size())
 
 		// 4. Update manifest entry
 		manifest.Databases[target.Name] = DBBackupEntry{
 			Key:       key,
 			Timestamp: ts,
-			Size:      int64(len(artifactBytes)),
+			Size:      artStat.Size(),
 		}
 
 		// 5. Retention prune for this database

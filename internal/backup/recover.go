@@ -3,7 +3,6 @@ package backup
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -78,14 +77,10 @@ func RecoverDBsIfMissing(ctx context.Context, cfg *config.Config, obj *objectsto
 			return false, fmt.Errorf("failed to download backup for %s (%s): %w", dbName, entry.Key, err)
 		}
 
-		data, err := io.ReadAll(rc)
+		destPath := filepath.Join(cfg.DataDir, dbName)
+		err = DecodeSnapshot(rc, cfg.Secret, destPath)
 		_ = rc.Close()
 		if err != nil {
-			return false, fmt.Errorf("failed to read backup artifact for %s: %w", dbName, err)
-		}
-
-		destPath := filepath.Join(cfg.DataDir, dbName)
-		if err := DecodeSnapshot(data, cfg.Secret, destPath); err != nil {
 			return false, fmt.Errorf("failed to decode/restore database %s: %w", dbName, err)
 		}
 		slog.Info("recovered database from object storage", "db", dbName, "key", entry.Key, "dest", destPath)
