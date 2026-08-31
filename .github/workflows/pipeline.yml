@@ -38,7 +38,7 @@ jobs:
       - name: Check out code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Scan the code
-        run: /osv-scanner -r . || if [ $? -eq 128 ]; then true; else exit $?; fi
+        run: /osv-scanner scan source --no-call-analysis=go -r .
 
   golangci-lint:
     name: Run golangci-lint

@@ -9,4 +9,6 @@ data/
 *.db-shm
 internal/gateway/models/
 secret.test
+secret.prod
+secret.*
 *.test
