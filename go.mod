@@ -9,6 +9,7 @@ require (
 	github.com/liliang-cn/cortexdb/v2 v2.82.2
 	github.com/sashabaranov/go-openai v1.42.0
 	github.com/stretchr/testify v1.11.1
+	golang.org/x/crypto v0.55.0
 	modernc.org/sqlite v1.57.0
 )
 

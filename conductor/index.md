@@ -33,6 +33,6 @@
 
 ---
 
-- [ ] **Track: S3 Encrypted Database Backup & Restore**
+- [x] **Track: S3 Encrypted Database Backup & Restore**
 *Link: [./tracks/db-backup_20260831/](./tracks/db-backup_20260831/)*
 

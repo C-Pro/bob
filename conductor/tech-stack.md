@@ -43,4 +43,5 @@
   - **Remote LLM API (Optional):** OpenAI-compatible `/v1/embeddings` endpoint client (`internal/llm`) with exponential retry backoff, active when `EMBEDDING_MODEL` is explicitly configured (e.g. `gemini-embedding-2`, `text-embedding-004`).
   - **Lexical Fallback:** Graceful fallback to pure FTS5 BM25 search when embedding generation fails or when vector dimensions mismatch.
   - **Vector Regeneration CLI:** Standalone vector migration tool via `cmd/agent -regenerate-vectors` / `-reembed` to batch recompute embeddings (`EmbedBatch`) across all chat databases when switching models.
+- **Database Backup & Object Storage:** Minimal standard-library AWS SigV4 S3 REST client (`internal/objectstore`), Argon2id + AES-256-GCM encryption pipeline with `BOBB` magic header and streaming gzip compression (`internal/backup`), JSON manifest metadata tracking (`manifest.json`), MinIO CI service integration testing.
 
