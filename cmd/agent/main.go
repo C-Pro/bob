@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"flag"
 	"log/slog"
 	"net/http"
@@ -10,11 +11,13 @@ import (
 	"syscall"
 	"time"
 
+	"bob/internal/backup"
 	"bob/internal/config"
 	"bob/internal/gateway"
 	"bob/internal/geoip"
 	"bob/internal/llm"
 	"bob/internal/memory"
+	"bob/internal/objectstore"
 	"bob/internal/store"
 
 	"github.com/liliang-cn/cortexdb/v2/pkg/cortexdb"
@@ -28,6 +31,8 @@ func main() {
 
 	regenerateFlag := flag.Bool("regenerate-vectors", false, "Regenerate vector embeddings for all memory chunks across all chat databases in DATA_DIR and exit")
 	reembedFlag := flag.Bool("reembed", false, "Alias for -regenerate-vectors")
+	initDBFlag := flag.Bool("init-db", false, "Skip S3 database recovery on startup and initialize fresh empty databases")
+	backupFlag := flag.Bool("backup", false, "Trigger an immediate full backup of all databases to S3 and exit")
 	dataDirFlag := flag.String("data-dir", "", "Override DATA_DIR directory path")
 	flag.Parse()
 
@@ -79,6 +84,44 @@ func main() {
 		return
 	}
 
+	// Initialize S3 object storage client if configured
+	var objClient *objectstore.Client
+	if cfg.S3Enabled() {
+		objClient, err = objectstore.New(objectstore.Config{
+			Endpoint:  cfg.S3Endpoint,
+			Region:    cfg.S3Region,
+			Bucket:    cfg.S3Bucket,
+			AccessKey: cfg.S3AccessKey,
+			SecretKey: cfg.S3SecretKey,
+			PathStyle: cfg.S3PathStyle,
+		})
+		if err != nil {
+			slog.Error("failed to initialize object storage client", "error", err)
+			os.Exit(1)
+		}
+	}
+
+	// On-demand backup execution via CLI flag
+	if *backupFlag {
+		if objClient == nil {
+			slog.Error("S3 object storage is not configured; cannot take database backup")
+			os.Exit(1)
+		}
+		if err := cfg.Validate(false); err != nil {
+			slog.Error("configuration validation failed for backup", "error", err)
+			os.Exit(1)
+		}
+
+		slog.Info("executing on-demand database backup to object storage", "bucket", cfg.S3Bucket, "prefix", cfg.S3BackupPrefix)
+		scheduler := backup.NewScheduler(cfg, objClient, nil)
+		if err := scheduler.DoBackup(ctx); err != nil {
+			slog.Error("on-demand backup failed", "error", err)
+			os.Exit(1)
+		}
+		slog.Info("on-demand database backup completed successfully")
+		return
+	}
+
 	slog.Info("starting Besedka AI Agent service")
 
 	if err := cfg.Validate(true); err != nil {
@@ -98,7 +141,19 @@ func main() {
 		"msgRingBufferSize", cfg.MsgRingBufferSize,
 		"dataDir", cfg.DataDir,
 		"dbPath", cfg.DBPath(mainDBFname),
+		"s3Enabled", cfg.S3Enabled(),
 	)
+
+	// Recover databases from object storage if missing locally
+	if objClient != nil {
+		recovered, err := backup.RecoverDBsIfMissing(ctx, cfg, objClient, *initDBFlag)
+		if err != nil {
+			slog.Error("database recovery from object storage failed", "error", err)
+			os.Exit(1)
+		} else if recovered {
+			slog.Info("database recovery from object storage completed", "dataDir", cfg.DataDir)
+		}
+	}
 
 	// Initialize SQLite database storage
 	st, err := store.OpenOrCreate(cfg.DBPath(mainDBFname))
@@ -135,10 +190,44 @@ func main() {
 		gw.SetLocation(loc)
 	}
 
+	// Start periodic backup scheduler if S3 is enabled
+	var scheduler *backup.Scheduler
+	if objClient != nil {
+		activeDBsProvider := func() map[string]*sql.DB {
+			active := map[string]*sql.DB{
+				mainDBFname: st.DB(),
+			}
+			if gw.MemoryManager() != nil {
+				for name, db := range gw.MemoryManager().ActiveDBs() {
+					active[name] = db
+				}
+			}
+			return active
+		}
+		scheduler = backup.NewScheduler(cfg, objClient, activeDBsProvider)
+		go func() {
+			if err := scheduler.Run(ctx); err != nil && err != context.Canceled {
+				slog.Error("backup scheduler stopped with error", "error", err)
+			}
+		}()
+	}
+
 	go func() {
 		<-ctx.Done()
 		slog.Info("shutdown signal received, closing agent gateway...")
 		gw.Stop()
+
+		// Perform final database backup on shutdown
+		if scheduler != nil {
+			slog.Info("performing final database backup on shutdown...")
+			bCtx, bCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer bCancel()
+			if err := scheduler.DoBackup(bCtx); err != nil {
+				slog.Error("final shutdown database backup failed", "error", err)
+			} else {
+				slog.Info("final shutdown database backup completed")
+			}
+		}
 	}()
 
 	slog.Info("starting agent gateway event loop")

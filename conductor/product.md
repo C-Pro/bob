@@ -18,6 +18,8 @@ Self-improving general use AI agent for Besedka chat. Phase 1 delivers a request
 - **Local-First Testing & Harness:** Complete local test setup allowing manual browser testing against a local Besedka instance before any cloud deployment.
 - **Live Web Search Tool:** Multi-turn tool execution loop (`internal/tools`) enabling real-time web search capabilities via Tavily REST API when `TAVILY_API_KEY` is configured.
 - **Web Page Fetch & Extraction Tool:** Direct URL retrieval and content extraction tool (`web_fetch`) with HTML readability parsing (`go-readability`), 16KB output limit, heuristic fallback detection, and Tavily Extract dynamic rendering support across `auto`, `raw`, and `extract` modes.
+- **Encrypted Database Snapshots & S3 Backup:** Scheduled sequential snapshotting (hourly ticker) using SQLite `VACUUM INTO`, streaming gzip compression, AES-256-GCM encryption with Argon2id-derived keys from `SECRET` / `AUTH_SECRET`, atomic upload to S3-compatible object storage under `bob_agent/`, centralized JSON manifest tracking, automated retention pruning, `--backup` on-demand CLI flag, and final snapshot on graceful shutdown.
+- **Automated Startup Recovery:** Seamless recovery on startup from S3 manifest when local databases are missing in `DATA_DIR`, with `--init-db` flag to bypass recovery and initialize fresh empty databases.
 
 ## Deployment & CI/CD Strategy
 - **Co-located Spot VM Deployment:** Bot containers/processes deploy on the **same GCP Spot VMs** as the Besedka instances (test bot co-located with test Besedka, prod bot co-located with prod Besedka).

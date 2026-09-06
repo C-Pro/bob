@@ -8,3 +8,7 @@ data/
 *.db-wal
 *.db-shm
 internal/gateway/models/
+secret.test
+secret.prod
+secret.*
+*.test

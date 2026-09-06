@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -28,6 +29,18 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	_ = os.Unsetenv("EMBEDDING_MODEL")
 	_ = os.Unsetenv("EMBEDDING_PRECISION")
 
+	_ = os.Unsetenv("SECRET")
+	_ = os.Unsetenv("AUTH_SECRET")
+	_ = os.Unsetenv("S3_ENDPOINT")
+	_ = os.Unsetenv("S3_REGION")
+	_ = os.Unsetenv("S3_BUCKET")
+	_ = os.Unsetenv("S3_ACCESS_KEY")
+	_ = os.Unsetenv("S3_SECRET_KEY")
+	_ = os.Unsetenv("S3_PATH_STYLE")
+	_ = os.Unsetenv("S3_BACKUP_INTERVAL")
+	_ = os.Unsetenv("S3_BACKUP_KEEP")
+	_ = os.Unsetenv("S3_BACKUP_PREFIX")
+
 	cfg, err := LoadFromEnv()
 	require.NoError(t, err)
 	assert.Equal(t, "@bot", cfg.BotHandle)
@@ -43,6 +56,11 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	assert.Equal(t, "", cfg.EmbeddingModel)
 	assert.Equal(t, "bf16", cfg.EmbeddingPrecision)
 	assert.Equal(t, "data/bob.db", cfg.DBPath("bob.db"))
+	assert.False(t, cfg.S3Enabled())
+	assert.Equal(t, "bob_agent/", cfg.S3BackupPrefix)
+	assert.Equal(t, "us-east-1", cfg.S3Region)
+	assert.True(t, cfg.S3PathStyle)
+	assert.Equal(t, 7, cfg.S3BackupKeep)
 }
 
 func TestLoadFromEnvStandardOpenAI(t *testing.T) {
@@ -80,6 +98,33 @@ func TestLoadFromEnvStandardOpenAI(t *testing.T) {
 	assert.Equal(t, "gemini-embedding-2", cfg.EmbeddingModel)
 	assert.Equal(t, "int8", cfg.EmbeddingPrecision)
 	assert.Equal(t, "/var/lib/bob/custom.db", cfg.DBPath("custom.db"))
+}
+
+func TestLoadFromEnvS3(t *testing.T) {
+	t.Setenv("SECRET", "custom-secret")
+	t.Setenv("S3_ENDPOINT", "http://127.0.0.1:9000")
+	t.Setenv("S3_REGION", "eu-central-1")
+	t.Setenv("S3_BUCKET", "bob-backups")
+	t.Setenv("S3_ACCESS_KEY", "access-123")
+	t.Setenv("S3_SECRET_KEY", "secret-456")
+	t.Setenv("S3_PATH_STYLE", "false")
+	t.Setenv("S3_BACKUP_INTERVAL", "2h")
+	t.Setenv("S3_BACKUP_KEEP", "14")
+	t.Setenv("S3_BACKUP_PREFIX", "custom_bob")
+
+	cfg, err := LoadFromEnv()
+	require.NoError(t, err)
+	assert.True(t, cfg.S3Enabled())
+	assert.Equal(t, "custom-secret", cfg.Secret)
+	assert.Equal(t, "http://127.0.0.1:9000", cfg.S3Endpoint)
+	assert.Equal(t, "eu-central-1", cfg.S3Region)
+	assert.Equal(t, "bob-backups", cfg.S3Bucket)
+	assert.Equal(t, "access-123", cfg.S3AccessKey)
+	assert.Equal(t, "secret-456", cfg.S3SecretKey)
+	assert.False(t, cfg.S3PathStyle)
+	assert.Equal(t, 2*time.Hour, cfg.S3BackupInterval)
+	assert.Equal(t, 14, cfg.S3BackupKeep)
+	assert.Equal(t, "custom_bob/", cfg.S3BackupPrefix)
 }
 
 func TestLoadFromEnvGeminiFallback(t *testing.T) {
@@ -126,6 +171,37 @@ func TestConfigValidation(t *testing.T) {
 	cfg.MsgRingBufferSize = 0
 	err = cfg.Validate(false)
 	assert.ErrorContains(t, err, "invalid MSG_RING_BUFFER_SIZE: 0")
+
+	// S3 validation tests
+	cfg.MsgRingBufferSize = 100
+	cfg.S3Bucket = "my-bucket"
+	cfg.S3Endpoint = ""
+	err = cfg.Validate(false)
+	assert.ErrorContains(t, err, "S3_BUCKET and S3_ENDPOINT must be set together")
+
+	cfg.S3Endpoint = "http://localhost:9000"
+	err = cfg.Validate(false)
+	assert.ErrorContains(t, err, "SECRET (or AUTH_SECRET) is required")
+
+	cfg.Secret = "my-secret-key"
+	err = cfg.Validate(false)
+	assert.ErrorContains(t, err, "S3_ACCESS_KEY and S3_SECRET_KEY are required")
+
+	cfg.S3AccessKey = "access"
+	cfg.S3SecretKey = "secret"
+	cfg.S3BackupInterval = 1 * time.Hour
+	cfg.S3BackupKeep = 0
+	err = cfg.Validate(false)
+	assert.ErrorContains(t, err, "S3_BACKUP_KEEP must be greater than 0")
+
+	cfg.S3BackupKeep = 7
+	cfg.S3BackupInterval = 0
+	err = cfg.Validate(false)
+	assert.ErrorContains(t, err, "S3_BACKUP_INTERVAL must be greater than 0")
+
+	cfg.S3BackupInterval = 1 * time.Hour
+	err = cfg.Validate(false)
+	assert.NoError(t, err)
 }
 
 func TestLoadDotEnv(t *testing.T) {

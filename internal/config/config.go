@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // DefaultUserAgent is the standard User-Agent header used for outgoing HTTP requests.
@@ -31,6 +32,21 @@ type Config struct {
 	DataDir               string
 	EmbeddingModel        string
 	EmbeddingPrecision    string
+	Secret                string
+	S3Endpoint            string
+	S3Region              string
+	S3Bucket              string
+	S3AccessKey           string
+	S3SecretKey           string
+	S3PathStyle           bool
+	S3BackupInterval      time.Duration
+	S3BackupKeep          int
+	S3BackupPrefix        string
+}
+
+// S3Enabled reports whether object-storage backup is configured.
+func (c *Config) S3Enabled() bool {
+	return c.S3Bucket != "" && c.S3Endpoint != ""
 }
 
 // LoadFromEnv loads configuration from environment variables (or .env file) with sensible defaults.
@@ -46,6 +62,19 @@ func LoadFromEnv() (*Config, error) {
 	model := getEnvOrDefault("OPENAI_MODEL", getEnvOrDefault("GEMINI_MODEL", "gemini-3.7-flash"))
 	baseURL := getEnvOrDefault("OPENAI_BASE_URL", getEnvOrDefault("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"))
 	tavilyBaseURL := strings.TrimSuffix(getEnvOrDefault("TAVILY_BASE_URL", "https://api.tavily.com"), "/")
+	backupIntervalStr := getEnvOrDefault("S3_BACKUP_INTERVAL", "1h")
+	backupInterval, err := time.ParseDuration(backupIntervalStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid S3_BACKUP_INTERVAL: %w", err)
+	}
+
+	secret := getEnvOrDefault("SECRET", os.Getenv("AUTH_SECRET"))
+	s3Prefix := getEnvOrDefault("S3_BACKUP_PREFIX", "bob_agent/")
+	if s3Prefix != "" && !strings.HasSuffix(s3Prefix, "/") {
+		s3Prefix = s3Prefix + "/"
+	}
+	s3PathStyleStr := getEnvOrDefault("S3_PATH_STYLE", "true")
+	s3PathStyle := s3PathStyleStr == "true" || s3PathStyleStr == "1"
 
 	cfg := &Config{
 		BotHandle:             getEnvOrDefault("BOT_HANDLE", "@bot"),
@@ -65,6 +94,16 @@ func LoadFromEnv() (*Config, error) {
 		DataDir:               getEnvOrDefault("DATA_DIR", "./data"),
 		EmbeddingModel:        getEnvOrDefault("EMBEDDING_MODEL", ""),
 		EmbeddingPrecision:    strings.ToLower(getEnvOrDefault("EMBEDDING_PRECISION", "bf16")),
+		Secret:                secret,
+		S3Endpoint:            os.Getenv("S3_ENDPOINT"),
+		S3Region:              getEnvOrDefault("S3_REGION", "us-east-1"),
+		S3Bucket:              os.Getenv("S3_BUCKET"),
+		S3AccessKey:           os.Getenv("S3_ACCESS_KEY"),
+		S3SecretKey:           os.Getenv("S3_SECRET_KEY"),
+		S3PathStyle:           s3PathStyle,
+		S3BackupInterval:      backupInterval,
+		S3BackupKeep:          getEnvIntOrDefault("S3_BACKUP_KEEP", 7),
+		S3BackupPrefix:        s3Prefix,
 	}
 
 	// Normalize bot handle to ensure it starts with @
@@ -107,6 +146,23 @@ func (c *Config) Validate(requireAPIKey bool) error {
 	}
 	if c.MsgRingBufferSize <= 0 {
 		return fmt.Errorf("invalid MSG_RING_BUFFER_SIZE: %d", c.MsgRingBufferSize)
+	}
+	if (c.S3Bucket == "") != (c.S3Endpoint == "") {
+		return errors.New("S3_BUCKET and S3_ENDPOINT must be set together")
+	}
+	if c.S3Enabled() {
+		if strings.TrimSpace(c.Secret) == "" {
+			return errors.New("SECRET (or AUTH_SECRET) is required when S3 backup is enabled")
+		}
+		if strings.TrimSpace(c.S3AccessKey) == "" || strings.TrimSpace(c.S3SecretKey) == "" {
+			return errors.New("S3_ACCESS_KEY and S3_SECRET_KEY are required when S3 backup is enabled")
+		}
+		if c.S3BackupInterval <= 0 {
+			return errors.New("S3_BACKUP_INTERVAL must be greater than 0")
+		}
+		if c.S3BackupKeep <= 0 {
+			return errors.New("S3_BACKUP_KEEP must be greater than 0")
+		}
 	}
 	return nil
 }

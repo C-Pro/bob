@@ -1,2 +1,5 @@
 # osv-scanner configuration
-# No currently ignored vulnerabilities.
+
+[[IgnoredVulns]]
+id = "GO-2026-5932"
+reason = "golang.org/x/crypto/openpgp unmaintained; app does not use openpgp, only argon2"

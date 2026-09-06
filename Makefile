@@ -25,7 +25,10 @@ semgrep:
 	docker run --rm -v $(PWD):/src returntocorp/semgrep:1.106.0 semgrep scan --config=p/default
 
 osv-scanner:
-	docker run --rm -e GOTOOLCHAIN=auto -v $(PWD):/src -w /src ghcr.io/google/osv-scanner:latest -r .
+	docker run --rm -e GOTOOLCHAIN=auto -v $(PWD):/src -w /src ghcr.io/google/osv-scanner:latest scan source --no-call-analysis=go -r .
+
+test-backup-integration:
+	go test -v -tags integration ./internal/backup/...
 
 docker-build:
 	docker build -t bob:latest .
