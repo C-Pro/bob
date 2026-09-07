@@ -48,20 +48,20 @@ The uncommitted changes on branch `feature/sandbox` cannot be deployed to produc
 
 The security assessment identified 12 distinct vulnerabilities across the sandbox and tool subsystems, ranked below by severity according to the Common Weakness Enumeration (CWE) standards:
 
-| Vulnerability ID | Vulnerability Title | Affected Component | Severity | CWE Classification |
-| :--- | :--- | :--- | :---: | :--- |
-| **VULN-01** | Path Traversal in `UserWorkspaceDir` via Traversal Sequences | `internal/sandbox/manager.go:110-113` | **CRITICAL** | CWE-22, CWE-23 |
-| **VULN-02** | Default-Open Whitelist Bypass in `FilteringProxy` in Restricted Mode | `internal/sandbox/proxy.go:288-311` | **CRITICAL** | CWE-284, CWE-698 |
-| **VULN-03** | Docker Driver `NetworkRestricted` Bypass via Advisory-Only Proxy | `internal/sandbox/docker/driver.go:186-202` | **HIGH** | CWE-693 |
-| **VULN-04** | Host Denial of Service via Fork Bomb & Missing Limits in Bubblewrap | `internal/sandbox/bwrap/driver.go:98-160` | **HIGH** | CWE-400, CWE-770 |
-| **VULN-05** | Docker Exec Process Leak on Timeout Expiration | `internal/sandbox/docker/driver.go:270-353` | **HIGH** | CWE-775, CWE-404 |
-| **VULN-06** | Open LAN Proxy Exposure via `0.0.0.0` Binding & Private IP Check | `internal/sandbox/docker/driver.go:127`, `proxy.go:204` | **MEDIUM** | CWE-284, CWE-200 |
-| **VULN-07** | TOCTOU State Machine Race Condition in `ApproveSandbox` | `internal/sandbox/manager.go:214-247` | **MEDIUM** | CWE-362 |
-| **VULN-08** | Unbounded CONNECT Tunnel Goroutine & File Descriptor Leak | `internal/sandbox/proxy.go:345-369` | **MEDIUM** | CWE-400, CWE-775 |
-| **VULN-09** | Broken DNS Resolution on systemd-resolved Hosts in Bubblewrap | `internal/sandbox/bwrap/driver.go:329-338` | **MEDIUM** | CWE-732 |
-| **VULN-10** | Monotonic Memory Leak in Sandbox Expiration Reaper | `internal/sandbox/manager.go:354-379` | **LOW** | CWE-775, CWE-400 |
-| **VULN-11** | Direct Shell Command Dispatch via Unparsed `sh -c` | `internal/tools/registry.go:780` | **LOW** | CWE-78 |
-| **VULN-12** | Unescaped Reason String Formatting in Approval Cards | `internal/tools/registry.go:734` | **LOW** | CWE-116 |
+| Vulnerability ID | Vulnerability Title | Affected Component | Severity | Status | CWE Classification |
+| :--- | :--- | :--- | :---: | :---: | :--- |
+| **VULN-01** | Path Traversal in `UserWorkspaceDir` via Traversal Sequences | `internal/sandbox/manager.go:110-113` | **CRITICAL** | **DONE** | CWE-22, CWE-23 |
+| **VULN-02** | Default-Open Whitelist Bypass in `FilteringProxy` in Restricted Mode | `internal/sandbox/proxy.go:288-311` | **CRITICAL** | **DONE** | CWE-284, CWE-698 |
+| **VULN-03** | Docker Driver `NetworkRestricted` Bypass via Advisory-Only Proxy | `internal/sandbox/docker/driver.go:186-202` | **HIGH** | **PARKED** | CWE-693 |
+| **VULN-04** | Host Denial of Service via Fork Bomb & Missing Limits in Bubblewrap | `internal/sandbox/bwrap/driver.go:98-160` | **HIGH** | **DONE** | CWE-400, CWE-770 |
+| **VULN-05** | Docker Exec Process Leak on Timeout Expiration | `internal/sandbox/docker/driver.go:270-353` | **HIGH** | **DONE** | CWE-775, CWE-404 |
+| **VULN-06** | Open LAN Proxy Exposure via `0.0.0.0` Binding & Private IP Check | `internal/sandbox/docker/driver.go:127`, `proxy.go:204` | **MEDIUM** | **DONE** | CWE-284, CWE-200 |
+| **VULN-07** | TOCTOU State Machine Race Condition in `ApproveSandbox` | `internal/sandbox/manager.go:214-247` | **MEDIUM** | **DONE** | CWE-362 |
+| **VULN-08** | Unbounded CONNECT Tunnel Goroutine & File Descriptor Leak | `internal/sandbox/proxy.go:345-369` | **MEDIUM** | **DONE** | CWE-400, CWE-775 |
+| **VULN-09** | Broken DNS Resolution on systemd-resolved Hosts in Bubblewrap | `internal/sandbox/bwrap/driver.go:329-338` | **MEDIUM** | **DONE** | CWE-732 |
+| **VULN-10** | Monotonic Memory Leak in Sandbox Expiration Reaper | `internal/sandbox/manager.go:354-379` | **LOW** | **DONE** | CWE-775, CWE-400 |
+| **VULN-11** | Direct Shell Command Dispatch via Unparsed `sh -c` | `internal/tools/registry.go:780` | **LOW** | **PARKED** | CWE-78 |
+| **VULN-12** | Unescaped Reason String Formatting in Approval Cards | `internal/tools/registry.go:734` | **LOW** | **DONE** | CWE-116 |
 
 ---
 
