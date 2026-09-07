@@ -2,6 +2,7 @@ package tools
 
 import (
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -11,6 +12,7 @@ import (
 // ProgressReporter periodically reports execution progress to the user during long tasks.
 type ProgressReporter struct {
 	mu       sync.Mutex
+	wg       sync.WaitGroup
 	chatID   string
 	task     string
 	current  string
@@ -43,7 +45,16 @@ func (p *ProgressReporter) Start() {
 		return
 	}
 
+	p.mu.Lock()
+	if p.stopped {
+		p.mu.Unlock()
+		return
+	}
+	p.wg.Add(1)
+	p.mu.Unlock()
+
 	go func() {
+		defer p.wg.Done()
 		ticker := time.NewTicker(p.interval)
 		defer ticker.Stop()
 
@@ -62,7 +73,9 @@ func (p *ProgressReporter) Start() {
 				p.mu.Unlock()
 
 				msg := FormatProgressMessage(task, current)
-				_ = p.sendFunc(p.chatID, msg)
+				if err := p.sendFunc(p.chatID, msg); err != nil {
+					slog.Warn("failed to send progress notification", "chatID", p.chatID, "error", err)
+				}
 			}
 		}
 	}()
@@ -115,18 +128,21 @@ func (p *ProgressReporter) SetCommand(cmdStr string) {
 	p.SetCurrent(string(r))
 }
 
-// Stop terminates the reporting ticker.
+// Stop terminates the reporting ticker and waits for any active tick to complete.
 func (p *ProgressReporter) Stop() {
 	if p == nil || p.disabled {
 		return
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.stopped {
+		p.mu.Unlock()
 		return
 	}
 	p.stopped = true
 	close(p.stopCh)
+	p.mu.Unlock()
+
+	p.wg.Wait()
 }
 
 // FormatProgressMessage constructs a human-readable progress report.

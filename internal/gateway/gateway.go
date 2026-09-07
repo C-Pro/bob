@@ -881,7 +881,7 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 	if taskDesc == "" {
 		taskDesc = msg.Content
 	}
-	noProgress := userPrefersNoProgress(msg.Content) || (currentTask != "" && userPrefersNoProgress(currentTask))
+	noProgress := !isDM || userPrefersNoProgress(msg.Content) || (currentTask != "" && userPrefersNoProgress(currentTask))
 	progress := tools.NewProgressReporter(msg.ChatID, taskDesc, func(chatID, text string) error {
 		return g.SendMessage(chatID, text)
 	}, 30*time.Second, noProgress)
@@ -948,6 +948,8 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 	}
 
 	formattedReply := FormatResponse(reply, isDM, g.cfg.TownhallMaxParagraphs, g.cfg.DMMaxParagraphs)
+
+	progress.Stop()
 
 	if err := g.SendMessage(msg.ChatID, formattedReply); err != nil {
 		return fmt.Errorf("failed to send reply to chat %s: %w", msg.ChatID, err)

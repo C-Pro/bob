@@ -534,7 +534,7 @@ To transition branch `feature/sandbox` into a production-ready state, engineerin
   Make `defaultMandatoryBlockedCIDRs` private; return deep copies; inject test overrides via `ProxyConfig.CustomBlocked`.
 - **[DONE] R2.3 Thread-Safe Container Handles**:
   Synchronize `sbx.InternalID` reads in `docker/driver.go` using a read-write mutex.
-- **R2.4 Synchronize `ProgressReporter`**:
+- **[DONE] R2.4 Synchronize `ProgressReporter`**:
   Add `sync.WaitGroup` to `ProgressReporter.Stop()` and explicitly stop the reporter prior to calling `g.SendMessage` for the final reply.
 - **R2.5 Handle Unix Domain Socket Half-Close & Context Leaks**:
   Assert against `type closeWriter interface { CloseWrite() error }` in `proxy.go:handleConnect` and terminate copy routines on `req.Context().Done()`.
@@ -544,7 +544,7 @@ To transition branch `feature/sandbox` into a production-ready state, engineerin
 ### Phase 3: UX & Performance Refinements
 - **R3.1 Markdown-Aware Paragraph Truncation**:
   Update `FormatResponse` to parse Markdown blocks, ensuring tables and code blocks are not split naively and code fences are always closed.
-- **R3.2 Restrict Progress Notifications to DMs**:
+- **[DONE] R3.2 Restrict Progress Notifications to DMs**:
   Disable `ProgressReporter` for Townhall messages (`msg.ChatID == "townhall"`) to prevent public room spam.
 - **R3.3 Natural Progress Messaging**:
   Refactor `FormatProgressMessage` to avoid prepending "Looking for" to imperative sentences.

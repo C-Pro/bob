@@ -87,6 +87,27 @@ func (s *UserSandbox) SetInternalID(id string) {
 	s.InternalID = id
 }
 
+// Clone returns a shallow copy of UserSandbox with its own mutex.
+func (s *UserSandbox) Clone() *UserSandbox {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return &UserSandbox{
+		UserID:       s.UserID,
+		ChatID:       s.ChatID,
+		Driver:       s.Driver,
+		DockerImage:  s.DockerImage,
+		Network:      s.Network,
+		Mounts:       s.Mounts,
+		Devices:      s.Devices,
+		Reason:       s.Reason,
+		CreatedAt:    s.CreatedAt,
+		ExpiresAt:    s.ExpiresAt,
+		Status:       s.Status,
+		InternalID:   s.InternalID,
+		WorkspaceDir: s.WorkspaceDir,
+	}
+}
+
 // ExecResult contains the output and status of a command executed in a sandbox.
 type ExecResult struct {
 	ExitCode int

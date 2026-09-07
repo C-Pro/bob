@@ -367,11 +367,11 @@ func (m *Manager) GetStatus(userID string) (*UserSandbox, bool) {
 		return nil, false
 	}
 	// Copy to prevent data races
-	cpy := *sbx
+	cpy := sbx.Clone()
 	if cpy.Status == StatusRunning && time.Now().After(cpy.ExpiresAt) {
 		cpy.Status = StatusExpired
 	}
-	return &cpy, true
+	return cpy, true
 }
 
 func (m *Manager) reaperLoop() {
