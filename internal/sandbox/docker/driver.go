@@ -168,7 +168,7 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 		if wholeWorkspaceMount.ReadOnly {
 			mode = "ro"
 		}
-		binds = append(binds, fmt.Sprintf("%s:/workspace:%s", absWorkspace, mode))
+		binds = append(binds, fmt.Sprintf("%s:%s:%s", absWorkspace, sandbox.DefaultWorkspaceMountPath, mode))
 	} else {
 		for _, m := range subMounts {
 			hostSubpath, _, err := sandbox.ValidateMountPath(absWorkspace, m.RelativePath)
@@ -180,7 +180,7 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 			}
 			dest := m.SandboxPath
 			if dest == "" {
-				dest = filepath.Join("/workspace", m.RelativePath)
+				dest = filepath.Join(sandbox.DefaultWorkspaceMountPath, m.RelativePath)
 			}
 			mode := "rw"
 			if m.ReadOnly {
@@ -211,7 +211,7 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 	createPayload := map[string]interface{}{
 		"Image":      image,
 		"Cmd":        []string{"sleep", "infinity"},
-		"WorkingDir": "/workspace",
+		"WorkingDir": sandbox.DefaultWorkspaceMountPath,
 		"HostConfig": hostConfig,
 	}
 
@@ -284,6 +284,10 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 	defer cancel()
 
 	var env []string
+	env = append(env,
+		"HOME="+sandbox.DefaultWorkspaceMountPath,
+		"PWD="+sandbox.DefaultWorkspaceMountPath,
+	)
 	if sbx.Network.Mode == sandbox.NetworkRestricted {
 		d.mu.Lock()
 		proxy := d.proxies[sbx.UserID]
@@ -307,6 +311,7 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 		"AttachStderr": true,
 		"Cmd":          cmd,
 		"Env":          env,
+		"WorkingDir":   sandbox.DefaultWorkspaceMountPath,
 	}
 	bodyJSON, _ := json.Marshal(execCreatePayload)
 

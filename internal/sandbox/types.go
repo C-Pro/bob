@@ -14,6 +14,10 @@ const (
 	DriverDocker DriverType = "docker"
 )
 
+// DefaultWorkspaceMountPath defines the standard directory inside the sandbox environment
+// where the user workspace is mounted and set as the working directory across all drivers.
+const DefaultWorkspaceMountPath = "/workspace"
+
 // NetworkMode defines the network isolation level.
 type NetworkMode string
 

@@ -89,10 +89,14 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 		return errors.New("bubblewrap (bwrap) is not available on host")
 	}
 
-	if err := os.MkdirAll(userWorkspaceDir, 0o755); err != nil {
+	absWorkspace, err := filepath.Abs(userWorkspaceDir)
+	if err != nil {
+		return fmt.Errorf("failed to resolve user workspace directory: %w", err)
+	}
+	if err := os.MkdirAll(absWorkspace, 0o755); err != nil {
 		return fmt.Errorf("failed to create user workspace directory: %w", err)
 	}
-	sbx.WorkspaceDir = userWorkspaceDir
+	sbx.WorkspaceDir = absWorkspace
 
 	if sbx.Network.Mode == sandbox.NetworkRestricted {
 		d.mu.Lock()
@@ -203,13 +207,13 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 
 	if wholeWorkspaceMount != nil {
 		if wholeWorkspaceMount.ReadOnly {
-			args = append(args, "--ro-bind", absWorkspace, "/workspace")
+			args = append(args, "--ro-bind", absWorkspace, sandbox.DefaultWorkspaceMountPath)
 		} else {
-			args = append(args, "--bind", absWorkspace, "/workspace")
+			args = append(args, "--bind", absWorkspace, sandbox.DefaultWorkspaceMountPath)
 		}
 	} else {
 		// Isolate scratch workspace on tmpfs
-		args = append(args, "--tmpfs", "/workspace")
+		args = append(args, "--tmpfs", sandbox.DefaultWorkspaceMountPath)
 		for _, m := range subMounts {
 			hostSubpath, _, err := sandbox.ValidateMountPath(absWorkspace, m.RelativePath)
 			if err != nil {
@@ -220,7 +224,7 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 			}
 			sandboxDest := m.SandboxPath
 			if sandboxDest == "" {
-				sandboxDest = filepath.Join("/workspace", m.RelativePath)
+				sandboxDest = filepath.Join(sandbox.DefaultWorkspaceMountPath, m.RelativePath)
 			}
 			if m.ReadOnly {
 				args = append(args, "--ro-bind", hostSubpath, sandboxDest)
@@ -230,7 +234,7 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 		}
 	}
 
-	args = append(args, "--chdir", "/workspace")
+	args = append(args, "--chdir", sandbox.DefaultWorkspaceMountPath)
 
 	var proxySockPath string
 	if sbx.Network.Mode == sandbox.NetworkRestricted {
@@ -247,7 +251,8 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 	args = append(args,
 		"--clearenv",
 		"--setenv", "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-		"--setenv", "HOME", "/workspace",
+		"--setenv", "HOME", sandbox.DefaultWorkspaceMountPath,
+		"--setenv", "PWD", sandbox.DefaultWorkspaceMountPath,
 		"--setenv", "TERM", "dumb",
 	)
 

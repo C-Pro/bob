@@ -204,6 +204,7 @@ func TestDockerDriver_NetworkRestrictedProxyReachability(t *testing.T) {
 
 	var capturedCreateHostConfig map[string]interface{}
 	var capturedExecEnv []string
+	var capturedExecWorkingDir string
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_ping", func(w http.ResponseWriter, r *http.Request) {
@@ -227,6 +228,9 @@ func TestDockerDriver_NetworkRestrictedProxyReachability(t *testing.T) {
 	mux.HandleFunc("/containers/mock-restr-container/exec", func(w http.ResponseWriter, r *http.Request) {
 		var payload map[string]interface{}
 		_ = json.NewDecoder(r.Body).Decode(&payload)
+		if wd, ok := payload["WorkingDir"].(string); ok {
+			capturedExecWorkingDir = wd
+		}
 		if envList, ok := payload["Env"].([]interface{}); ok {
 			for _, e := range envList {
 				capturedExecEnv = append(capturedExecEnv, e.(string))
@@ -301,7 +305,11 @@ func TestDockerDriver_NetworkRestrictedProxyReachability(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 0, res.ExitCode)
 
-	// Verify environment variables in exec instance
+	// Verify working directory and environment variables in exec instance
+	assert.Equal(t, sandbox.DefaultWorkspaceMountPath, capturedExecWorkingDir)
+	assert.Contains(t, capturedExecEnv, "HOME="+sandbox.DefaultWorkspaceMountPath)
+	assert.Contains(t, capturedExecEnv, "PWD="+sandbox.DefaultWorkspaceMountPath)
+
 	var hasHttpProxy, hasHostDockerInternal bool
 	for _, envVar := range capturedExecEnv {
 		if strings.HasPrefix(envVar, "HTTP_PROXY=") {
