@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -605,3 +606,37 @@ func TestSandboxToolExecution(t *testing.T) {
 	_, err = reg.Execute(dmCtx, "sandbox_exec", `{"command": "echo 1"}`)
 	assert.ErrorContains(t, err, "no active sandbox found")
 }
+
+func TestExecuteSandboxRequest_NotifierError(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &config.Config{
+		DataDir:        tempDir,
+		SandboxEnabled: true,
+		SandboxDrivers: []string{"bwrap"},
+	}
+	mockDriver := &mockSandboxDriver{available: true}
+	sandboxMgr := sandbox.NewManager(cfg, []sandbox.Driver{mockDriver})
+	defer func() { _ = sandboxMgr.Close() }()
+
+	reg := NewRegistry(nil, nil, sandboxMgr)
+	ctx := context.Background()
+
+	var sbxRequested bool
+	dmCtx := WithChatSession(ctx, ChatSessionContext{
+		ChatID: "dm_user1",
+		UserID: "user1",
+		IsDM:   true,
+		Notifier: func(chatID, text string) error {
+			return errors.New("network disconnection")
+		},
+		SandboxRequestCreated: &sbxRequested,
+	})
+
+	_, err := reg.Execute(dmCtx, "sandbox_request", `{
+		"driver": "bwrap",
+		"network": "none",
+		"reason": "Run tests"
+	}`)
+	assert.ErrorContains(t, err, "failed to send approval card")
+}
+

@@ -524,7 +524,7 @@ To transition branch `feature/sandbox` into a production-ready state, engineerin
   Reject network requests if `Mode == NetworkRestricted` and `len(AllowedHosts) == 0`.
 - **[DONE] R1.3 Resolve Google Gemini Turn Resumption Bug**:
   In `internal/gateway/gateway.go:1232`, append a synthetic user continuation turn (`"Sandbox approved. Proceed with: " + sbx.Reason`) so the message list sent to Gemini terminates with a user turn.
-- **R1.4 Handle Approval Card Notification Errors**:
+- **[DONE] R1.4 Handle Approval Card Notification Errors**:
   Replace `_ = session.Notifier(session.ChatID, card.String())` in `internal/tools/registry.go:739` with explicit error handling and error returns.
 
 ### Phase 2: Concurrency & Architecture Hardening

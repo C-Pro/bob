@@ -736,7 +736,9 @@ func (r *Registry) executeSandboxRequest(ctx context.Context, argsJSON string) (
 	card.WriteString("Reply `/sandbox approve` to approve or `/sandbox deny` to reject.")
 
 	if session.Notifier != nil {
-		_ = session.Notifier(session.ChatID, card.String())
+		if err := session.Notifier(session.ChatID, card.String()); err != nil {
+			return "", fmt.Errorf("failed to send approval card: %w", err)
+		}
 	}
 	if session.SandboxRequestCreated != nil {
 		*session.SandboxRequestCreated = true
