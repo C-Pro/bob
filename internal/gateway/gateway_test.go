@@ -101,6 +101,15 @@ func TestFormatResponse(t *testing.T) {
 	// Single paragraph
 	shortText := "Single paragraph response."
 	assert.Equal(t, shortText, FormatResponse(shortText, false, 2, 10))
+
+	// Markdown code block with blank lines should count as a single block
+	codeBlockText := "Intro paragraph.\n\n```go\nfunc main() {\n\n\tprintln(\"hello\")\n}\n```\n\nOutro paragraph."
+	// Limit 2 should keep intro and the entire code block
+	assert.Equal(t, "Intro paragraph.\n\n```go\nfunc main() {\n\n\tprintln(\"hello\")\n}\n```", FormatResponse(codeBlockText, false, 2, 10))
+
+	// Truncated code block should ensure code fence is closed
+	unclosedCodeText := "Intro.\n\n```python\nprint('code')"
+	assert.Equal(t, "Intro.\n\n```python\nprint('code')\n```", FormatResponse(unclosedCodeText, false, 2, 10))
 }
 
 func TestGatewayWebSocketIntegration(t *testing.T) {

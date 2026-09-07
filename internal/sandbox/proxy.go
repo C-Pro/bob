@@ -98,7 +98,11 @@ func NewFilteringProxyWithConfig(cfg ProxyConfig) (*FilteringProxy, error) {
 			_ = ln.Close()
 			return nil, fmt.Errorf("failed to bind proxy unix socket %s: %w", cfg.SocketPath, err)
 		}
-		_ = os.Chmod(cfg.SocketPath, 0o666)
+		if err := os.Chmod(cfg.SocketPath, 0o666); err != nil {
+			_ = unixLn.Close()
+			_ = ln.Close()
+			return nil, fmt.Errorf("failed to chmod proxy unix socket %s: %w", cfg.SocketPath, err)
+		}
 	}
 
 	var allowedClientNets []*net.IPNet
@@ -133,12 +137,16 @@ func NewFilteringProxyWithConfig(cfg ProxyConfig) (*FilteringProxy, error) {
 	}
 
 	go func() {
-		_ = fp.server.Serve(ln)
+		if err := fp.server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("filtering proxy TCP server error", "error", err)
+		}
 	}()
 
 	if unixLn != nil {
 		go func() {
-			_ = fp.server.Serve(unixLn)
+			if err := fp.server.Serve(unixLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				slog.Error("filtering proxy Unix socket server error", "error", err)
+			}
 		}()
 	}
 
@@ -504,6 +512,9 @@ func (p *FilteringProxy) handleHTTP(w http.ResponseWriter, req *http.Request, ta
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	n, _ := io.Copy(w, resp.Body)
+	n, err := io.Copy(w, resp.Body)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		slog.Debug("error copying proxy response body", "target", targetHost, "error", err)
+	}
 	p.logAccess(req.RemoteAddr, req.Method, req.URL.String(), req.Proto, resp.StatusCode, n, "ALLOWED", "")
 }

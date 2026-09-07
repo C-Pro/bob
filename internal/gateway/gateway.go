@@ -312,7 +312,7 @@ func IsMentionedOrDM(handle, chatID, content string) (bool, string) {
 	return false, ""
 }
 
-// FormatResponse applies paragraph limits according to channel type.
+// FormatResponse applies paragraph limits according to channel type while preserving Markdown blocks.
 func FormatResponse(content string, isDM bool, maxTownhallParas, maxDMParas int) string {
 	maxParas := maxTownhallParas
 	if isDM {
@@ -324,20 +324,81 @@ func FormatResponse(content string, isDM bool, maxTownhallParas, maxDMParas int)
 
 	// Normalize CRLF
 	normalized := strings.ReplaceAll(content, "\r\n", "\n")
-	paras := strings.Split(normalized, "\n\n")
+	lines := strings.Split(normalized, "\n")
 
-	nonEmptyParas := make([]string, 0, len(paras))
-	for _, p := range paras {
-		if strings.TrimSpace(p) != "" {
-			nonEmptyParas = append(nonEmptyParas, p)
+	var blocks []string
+	var currentBlock []string
+	inCodeBlock := false
+	fenceMarker := ""
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Check for code block fences (``` or ~~~)
+		if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
+			marker := trimmed[:3]
+			if !inCodeBlock {
+				inCodeBlock = true
+				fenceMarker = marker
+			} else if strings.HasPrefix(trimmed, fenceMarker) {
+				inCodeBlock = false
+				fenceMarker = ""
+			}
+			currentBlock = append(currentBlock, line)
+			continue
+		}
+
+		if inCodeBlock {
+			currentBlock = append(currentBlock, line)
+			continue
+		}
+
+		// Outside code blocks: a blank line marks a paragraph boundary
+		if trimmed == "" {
+			if len(currentBlock) > 0 {
+				blockContent := strings.TrimSpace(strings.Join(currentBlock, "\n"))
+				if blockContent != "" {
+					blocks = append(blocks, blockContent)
+				}
+				currentBlock = nil
+			}
+			continue
+		}
+
+		currentBlock = append(currentBlock, line)
+	}
+
+	if len(currentBlock) > 0 {
+		blockContent := strings.TrimSpace(strings.Join(currentBlock, "\n"))
+		if blockContent != "" {
+			blocks = append(blocks, blockContent)
 		}
 	}
 
-	if len(nonEmptyParas) <= maxParas {
-		return strings.Join(nonEmptyParas, "\n\n")
+	if len(blocks) == 0 {
+		return ""
 	}
 
-	return strings.Join(nonEmptyParas[:maxParas], "\n\n")
+	selected := blocks
+	if len(blocks) > maxParas {
+		selected = blocks[:maxParas]
+	}
+
+	result := strings.Join(selected, "\n\n")
+
+	// Ensure any opened code block fence is properly closed
+	openFences := 0
+	for _, line := range strings.Split(result, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") {
+			openFences++
+		}
+	}
+	if openFences%2 != 0 {
+		result += "\n```"
+	}
+
+	return result
 }
 
 // DialWebSocket connects to the Besedka chat WebSocket endpoint.
@@ -938,7 +999,7 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 		return nil
 	}
 
-	if isDM && sm != nil {
+	if err == nil && isDM && sm != nil {
 		if sbx, ok := sm.GetStatus(msg.UserID); ok && sbx != nil && sbx.Status == sandbox.StatusRunning {
 			if !userStatedSandboxPreference(msg.Content) && !strings.Contains(reply, "/sandbox destroy") {
 				rem := time.Until(sbx.ExpiresAt).Round(time.Minute)
@@ -1185,7 +1246,9 @@ func (g *Gateway) Stop() {
 	g.mu.Lock()
 	g.running = false
 	if g.conn != nil {
-		_ = g.conn.Close()
+		if err := g.conn.Close(); err != nil {
+			slog.Warn("error closing websocket connection on gateway stop", "error", err)
+		}
 		g.conn = nil
 	}
 	g.mu.Unlock()
@@ -1195,10 +1258,14 @@ func (g *Gateway) Stop() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.memoryManager != nil {
-		_ = g.memoryManager.Close()
+		if err := g.memoryManager.Close(); err != nil {
+			slog.Warn("error closing memory manager on gateway stop", "error", err)
+		}
 	}
 	if g.sandboxManager != nil {
-		_ = g.sandboxManager.Close()
+		if err := g.sandboxManager.Close(); err != nil {
+			slog.Warn("error closing sandbox manager on gateway stop", "error", err)
+		}
 	}
 }
 

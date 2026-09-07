@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -309,7 +310,9 @@ func LoadDotEnv(filename string) {
 				val = val[1 : len(val)-1]
 			}
 			if _, exists := os.LookupEnv(key); !exists {
-				_ = os.Setenv(key, val)
+				if err := os.Setenv(key, val); err != nil {
+					slog.Warn("failed to set environment variable from dot env", "key", key, "err", err)
+				}
 			}
 		}
 	}

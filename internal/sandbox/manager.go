@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -73,7 +74,9 @@ func (m *Manager) Close() error {
 	for _, sbx := range m.sandboxes {
 		if sbx.Status == StatusRunning {
 			if d, ok := m.drivers[sbx.Driver]; ok {
-				_ = d.Destroy(ctx, sbx)
+				if err := d.Destroy(ctx, sbx); err != nil {
+					slog.Warn("failed to destroy sandbox on manager shutdown", "user", sbx.UserID, "error", err)
+				}
 			}
 		}
 	}
@@ -272,7 +275,9 @@ func (m *Manager) ApproveSandbox(ctx context.Context, userID string) (*UserSandb
 	current, stillExists := m.sandboxes[userID]
 	if !stillExists || current != sbx {
 		m.mu.Unlock()
-		_ = driver.Destroy(ctx, sbx)
+		if err := driver.Destroy(ctx, sbx); err != nil {
+			slog.Warn("failed to destroy cancelled sandbox", "user", userID, "error", err)
+		}
 		return nil, errors.New("sandbox creation was cancelled")
 	}
 	sbx.Status = StatusRunning
@@ -313,7 +318,9 @@ func (m *Manager) Exec(ctx context.Context, userID string, cmd []string, request
 		sbx.Status = StatusExpired
 		m.mu.Unlock()
 		if driver != nil {
-			_ = driver.Destroy(ctx, sbx)
+			if err := driver.Destroy(ctx, sbx); err != nil {
+				slog.Error("failed to destroy expired sandbox during exec", "user_id", userID, "driver", sbx.Driver, "err", err)
+			}
 		}
 		return nil, errors.New("sandbox lifetime has expired; please request a new sandbox")
 	}
@@ -392,26 +399,30 @@ func (m *Manager) reaperLoop() {
 func (m *Manager) pruneExpired() {
 	m.mu.Lock()
 	now := time.Now()
-	var expired []*UserSandbox
+	var toDestroy []*UserSandbox
 
-	for _, sbx := range m.sandboxes {
+	for userID, sbx := range m.sandboxes {
 		if sbx.Status == StatusRunning && now.After(sbx.ExpiresAt) {
-			expired = append(expired, sbx)
+			toDestroy = append(toDestroy, sbx)
 			sbx.Status = StatusExpired
+		} else if sbx.Status == StatusExpired && now.After(sbx.ExpiresAt.Add(1*time.Hour)) {
+			delete(m.sandboxes, userID)
 		}
 	}
 	m.mu.Unlock()
 
-	if len(expired) == 0 {
+	if len(toDestroy) == 0 {
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	for _, sbx := range expired {
+	for _, sbx := range toDestroy {
 		if d, ok := m.drivers[sbx.Driver]; ok {
-			_ = d.Destroy(ctx, sbx)
+			if err := d.Destroy(ctx, sbx); err != nil {
+				slog.Warn("failed to destroy expired sandbox", "user", sbx.UserID, "error", err)
+			}
 		}
 	}
 }

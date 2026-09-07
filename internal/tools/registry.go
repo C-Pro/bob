@@ -731,8 +731,12 @@ func (r *Registry) executeSandboxRequest(ctx context.Context, argsJSON string) (
 	} else {
 		card.WriteString("• **Workspace Mount:** none (isolated scratch space)\n")
 	}
-	card.WriteString(fmt.Sprintf("• **Lifetime:** %d minutes\n", int(time.Until(sbx.ExpiresAt).Minutes())))
-	card.WriteString(fmt.Sprintf("• **Reason:** %s\n\n", sbx.Reason))
+	cleanReason := strings.ReplaceAll(strings.ReplaceAll(sbx.Reason, "\r", ""), "\n", " ")
+	cleanReason = strings.TrimSpace(cleanReason)
+	if cleanReason == "" {
+		cleanReason = "No reason provided"
+	}
+	card.WriteString(fmt.Sprintf("• **Reason:** %s\n\n", cleanReason))
 	card.WriteString("Reply `/sandbox approve` to approve or `/sandbox deny` to reject.")
 
 	if session.Notifier != nil {

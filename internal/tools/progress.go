@@ -164,7 +164,16 @@ func FormatProgressMessage(task, current string) string {
 		strings.HasPrefix(lower, "searching for ") ||
 		strings.HasPrefix(lower, "running ") ||
 		strings.HasPrefix(lower, "executing ") ||
-		strings.HasPrefix(lower, "finding ") {
+		strings.HasPrefix(lower, "finding ") ||
+		strings.HasPrefix(lower, "find ") ||
+		strings.HasPrefix(lower, "working on ") ||
+		strings.HasPrefix(lower, "please ") ||
+		strings.HasPrefix(lower, "calculate ") ||
+		strings.HasPrefix(lower, "compute ") ||
+		strings.HasPrefix(lower, "check ") ||
+		strings.HasPrefix(lower, "build ") ||
+		strings.HasPrefix(lower, "generate ") ||
+		strings.HasPrefix(lower, "create ") {
 		// Capitalize first letter of task
 		r := []rune(cleanTask)
 		r[0] = []rune(strings.ToUpper(string(r[0])))[0]

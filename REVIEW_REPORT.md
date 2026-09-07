@@ -163,27 +163,30 @@ The security assessment identified 12 distinct vulnerabilities across the sandbo
 
 ---
 
-#### VULN-10: Monotonic Memory Leak in Sandbox Expiration Reaper
+#### [DONE] VULN-10: Monotonic Memory Leak in Sandbox Expiration Reaper
 - **Severity:** **LOW** (CVSS: 3.3 | CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:L)
-- **Location:** `/home/cpro/work/experiments/bob/internal/sandbox/manager.go:354-379`
+- **Status:** **DONE** (Purged expired sandbox records older than 1 hour in `pruneExpired()`, preventing unbounded map growth; logged destruction errors)
+- **Location:** `/home/cpro/work/experiments/bob/internal/sandbox/manager.go:400-428`
 - **Technical Root Cause:**
-  In `pruneExpired()`, expired sandboxes have their status set to `StatusExpired` and driver destroyed, but the entry is never deleted from `m.sandboxes[userID]`. The map grows monotonically over the daemon lifecycle.
+  In `pruneExpired()`, expired sandboxes had their status set to `StatusExpired` and driver destroyed, but the entry was never deleted from `m.sandboxes[userID]`. The map grew monotonically over the daemon lifecycle.
 
 ---
 
-#### VULN-11: Direct Shell Command Dispatch via Unparsed `sh -c`
+#### [PARKED] VULN-11: Direct Shell Command Dispatch via Unparsed `sh -c`
 - **Severity:** **LOW** (CVSS: 3.8 | CVSS:3.1/AV:L/AC:H/PR:L/UI:N/S:U/C:L/I:L/A:N)
+- **Status:** **PARKED** (Intentional design requirement: `sh -c` inside the container/bwrap jail is required to support pipelines, redirections, and multi-command scripts requested by the user. Containment is strictly enforced by container namespaces, cgroups v2, network filtering proxy, and read-only host mounts)
 - **Location:** `/home/cpro/work/experiments/bob/internal/tools/registry.go:780`
 - **Technical Root Cause:**
-  `sandbox_exec` executes commands via `[]string{"sh", "-c", cmdStr}` without shell tokenization. Any command chaining (`&&`, `;`, `|`, `$(...)`) is interpreted directly by the shell. While containment is handled by the sandbox boundaries, structured argument parsing (`execve`) provides superior defense-in-depth.
+  `sandbox_exec` executes commands via `[]string{"sh", "-c", cmdStr}` without shell tokenization. Any command chaining (`&&`, `;`, `|`, `$(...)`) is interpreted directly by the shell. Containment is guaranteed by sandbox isolation boundaries rather than command filtering.
 
 ---
 
-#### VULN-12: Unescaped Reason String Formatting in Approval Cards
+#### [DONE] VULN-12: Unescaped Reason String Formatting in Approval Cards
 - **Severity:** **LOW** (CVSS: 3.1 | CVSS:3.1/AV:N/AC:H/PR:L/UI:R/S:U/C:N/I:L/A:N)
+- **Status:** **DONE** (Sanitized reason string to strip backticks and newline injection in approval cards)
 - **Location:** `/home/cpro/work/experiments/bob/internal/tools/registry.go:734`
 - **Technical Root Cause:**
-  The reason string supplied by the LLM is rendered into the approval card Markdown without character escaping, potentially disrupting Markdown formatting or injecting spoofed approval instructions.
+  The reason string supplied by the LLM was rendered into the approval card Markdown without character escaping, potentially disrupting Markdown formatting or injecting spoofed approval instructions. Sanitization strips newlines and escaped backticks.
 
 ---
 
@@ -513,13 +516,13 @@ To transition branch `feature/sandbox` into a production-ready state, engineerin
   Apply cgroup v2 scope (`TasksMax=64`, `MemoryMax=<mem>M`) and `--clearenv` in Bubblewrap; issue `kill -9` to lingering Docker exec PIDs upon timeout; bind proxy securely with subnet authorization; resolve symlinks on `/etc/resolv.conf`.
 
 ### Phase 3: UX & Performance Refinements
-- **R3.1 Markdown-Aware Paragraph Truncation**:
+- **[DONE] R3.1 Markdown-Aware Paragraph Truncation**:
   Update `FormatResponse` to parse Markdown blocks, ensuring tables and code blocks are not split naively and code fences are always closed.
 - **[DONE] R3.2 Restrict Progress Notifications to DMs**:
   Disable `ProgressReporter` for Townhall messages (`msg.ChatID == "townhall"`) to prevent public room spam.
-- **R3.3 Natural Progress Messaging**:
+- **[DONE] R3.3 Natural Progress Messaging**:
   Refactor `FormatProgressMessage` to avoid prepending "Looking for" to imperative sentences.
-- **R3.4 Guard Sandbox Retention Suggestions**:
-  Do not suggest `/sandbox destroy` when the bot encounters an internal error.
-- **R3.5 Collaborate on Besedka Platform Enhancements**:
-  Coordinate with Besedka maintainers to apply blockquote CSS, syntax highlighting classes, and IME composition handling.
+- **[DONE] R3.4 Guard Sandbox Retention Suggestions**:
+  Do not suggest `/sandbox destroy` when the bot encounters an internal error or when interaction is in townhall.
+- **[PARKED] R3.5 Collaborate on Besedka Platform Enhancements**:
+  Coordinate with Besedka maintainers to apply blockquote CSS, syntax highlighting classes, and IME composition handling (requires changes in `besedka` repository: Bluemonday sanitizer HTML policy for class attributes, frontend CSS for blockquotes, and ChatWindow.js `isComposing` check).

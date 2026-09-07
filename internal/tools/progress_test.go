@@ -46,6 +46,24 @@ func TestFormatProgressMessage(t *testing.T) {
 			current:  "",
 			expected: "Looking for database records. Task is running.",
 		},
+		{
+			name:     "imperative verb please",
+			task:     "Please check the server logs",
+			current:  "Grep",
+			expected: "Please check the server logs. Grep is running.",
+		},
+		{
+			name:     "imperative verb calculate",
+			task:     "calculate total memory consumption",
+			current:  "Bash",
+			expected: "Calculate total memory consumption. Bash is running.",
+		},
+		{
+			name:     "imperative verb find",
+			task:     "find missing configs",
+			current:  "Find",
+			expected: "Find missing configs. Find is running.",
+		},
 	}
 
 	for _, tc := range tests {

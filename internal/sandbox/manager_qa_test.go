@@ -299,5 +299,14 @@ func TestManager_EdgeCasesAndErrorHandling(t *testing.T) {
 		status, exists := mgr.GetStatus("user_exp")
 		require.True(t, exists)
 		assert.Equal(t, StatusExpired, status.Status)
+
+		// Verify that after 1 hour of expiration, subsequent prune purges the record from memory (VULN-10)
+		mgr.mu.Lock()
+		sbx.ExpiresAt = time.Now().Add(-2 * time.Hour)
+		mgr.mu.Unlock()
+
+		mgr.pruneExpired()
+		_, exists = mgr.GetStatus("user_exp")
+		assert.False(t, exists, "old expired sandbox should be purged from memory to prevent leak")
 	})
 }
