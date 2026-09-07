@@ -522,7 +522,7 @@ To transition branch `feature/sandbox` into a production-ready state, engineerin
   Validate `userID` against `^[a-zA-Z0-9_-]{1,64}$` and verify `filepath.Rel` does not escape `m.cfg.DataDir/sandboxes`.
 - **[DONE] R1.2 Enforce Default-Deny in `FilteringProxy` (VULN-02)**:
   Reject network requests if `Mode == NetworkRestricted` and `len(AllowedHosts) == 0`.
-- **R1.3 Resolve Google Gemini Turn Resumption Bug**:
+- **[DONE] R1.3 Resolve Google Gemini Turn Resumption Bug**:
   In `internal/gateway/gateway.go:1232`, append a synthetic user continuation turn (`"Sandbox approved. Proceed with: " + sbx.Reason`) so the message list sent to Gemini terminates with a user turn.
 - **R1.4 Handle Approval Card Notification Errors**:
   Replace `_ = session.Notifier(session.ChatID, card.String())` in `internal/tools/registry.go:739` with explicit error handling and error returns.

@@ -858,12 +858,24 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 	slog.Info("processing bot message request", "chatID", msg.ChatID, "sender", senderName)
 
 	bufferedMsgs := g.contextManager.GetLLMMessages(msg.ChatID)
-	llmMsgs := make([]openai.ChatCompletionMessage, 0, len(bufferedMsgs)+1)
+	llmMsgs := make([]openai.ChatCompletionMessage, 0, len(bufferedMsgs)+2)
 	llmMsgs = append(llmMsgs, openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleSystem,
 		Content: systemPrompt,
 	})
 	llmMsgs = append(llmMsgs, bufferedMsgs...)
+
+	// Defense-in-depth: Ensure message list never ends with an assistant message (e.g. Gemini 400 constraint)
+	if len(llmMsgs) > 0 && llmMsgs[len(llmMsgs)-1].Role == openai.ChatMessageRoleAssistant {
+		continuation := "Please continue."
+		if currentTask != "" {
+			continuation = "Please proceed with: " + currentTask
+		}
+		llmMsgs = append(llmMsgs, openai.ChatCompletionMessage{
+			Role:    openai.ChatMessageRoleUser,
+			Content: continuation,
+		})
+	}
 
 	taskDesc := currentTask
 	if taskDesc == "" {
@@ -1226,6 +1238,15 @@ func (g *Gateway) handleSandboxCommand(ctx context.Context, msg models.Message, 
 			SenderID:   botID,
 			SenderName: botUser.GetDisplayName(),
 			Content:    ackMsg,
+			Timestamp:  time.Now().Unix(),
+		})
+
+		userContinuation := "Sandbox is approved. Please proceed with: " + sbx.Reason
+		g.contextManager.Push(msg.ChatID, chatcontext.Entry{
+			Role:       "user",
+			SenderID:   msg.UserID,
+			SenderName: senderName,
+			Content:    userContinuation,
 			Timestamp:  time.Now().Unix(),
 		})
 
