@@ -528,7 +528,7 @@ To transition branch `feature/sandbox` into a production-ready state, engineerin
   Replace `_ = session.Notifier(session.ChatID, card.String())` in `internal/tools/registry.go:739` with explicit error handling and error returns.
 
 ### Phase 2: Concurrency & Architecture Hardening
-- **R2.1 Eliminate TOCTOU Approval Race**:
+- **[DONE] R2.1 Eliminate TOCTOU Approval Race**:
   Add `StatusCreating` state to `SandboxStatus`. Hold lock during transition to prevent concurrent approvals or orphaned containers on denial.
 - **R2.2 Enforce Immutability on `MandatoryBlockedCIDRs`**:
   Make `defaultMandatoryBlockedCIDRs` private; return deep copies; inject test overrides via `ProxyConfig.CustomBlocked`.

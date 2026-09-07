@@ -49,6 +49,7 @@ type SandboxStatus string
 const (
 	StatusNone            SandboxStatus = "none"
 	StatusPendingApproval SandboxStatus = "pending_approval"
+	StatusCreating        SandboxStatus = "creating"
 	StatusRunning         SandboxStatus = "running"
 	StatusExpired         SandboxStatus = "expired"
 )

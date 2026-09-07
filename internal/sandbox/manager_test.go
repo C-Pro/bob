@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -230,3 +231,63 @@ func TestManagerNetworkModesValidation(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, sbx2.Mounts, 1)
 }
+
+type slowMockDriver struct {
+	mockDriver
+	mu sync.Mutex
+}
+
+func (s *slowMockDriver) Create(ctx context.Context, sbx *UserSandbox, workspace string) error {
+	time.Sleep(50 * time.Millisecond)
+	s.mu.Lock()
+	s.createdCount++
+	s.mu.Unlock()
+	return nil
+}
+
+func TestManager_ApproveSandbox_TOCTOURace(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &config.Config{
+		DataDir:                   tempDir,
+		SandboxEnabled:            true,
+		SandboxDrivers:            []string{"bwrap"},
+		SandboxMaxLifetime:        30 * time.Minute,
+		SandboxDefaultExecTimeout: 1 * time.Minute,
+		SandboxMaxExecTimeout:     10 * time.Minute,
+	}
+	driver := &slowMockDriver{mockDriver: mockDriver{driverType: DriverBwrap, available: true}}
+	mgr := NewManager(cfg, []Driver{driver})
+	defer func() { _ = mgr.Close() }()
+
+	ctx := context.Background()
+	_, err := mgr.RequestSandbox(ctx, "user1", "chat1", RequestParams{
+		Driver:      DriverBwrap,
+		NetworkMode: NetworkNone,
+		Reason:      "Race test",
+	})
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			_, errs[idx] = mgr.ApproveSandbox(ctx, "user1")
+		}(i)
+	}
+	wg.Wait()
+
+	successes := 0
+	for _, err := range errs {
+		if err == nil {
+			successes++
+		}
+	}
+	assert.Equal(t, 1, successes, "Exactly one ApproveSandbox call must succeed")
+
+	driver.mu.Lock()
+	assert.Equal(t, 1, driver.createdCount, "Driver.Create must only be called once")
+	driver.mu.Unlock()
+}
+

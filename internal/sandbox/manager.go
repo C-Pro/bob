@@ -145,6 +145,9 @@ func (m *Manager) RequestSandbox(ctx context.Context, userID, chatID string, par
 		if existing.Status == StatusPendingApproval {
 			return nil, errors.New("you already have a pending sandbox request awaiting approval; use /sandbox approve or /sandbox deny")
 		}
+		if existing.Status == StatusCreating {
+			return nil, errors.New("a sandbox is currently being created; please wait")
+		}
 	}
 
 	// Validate network mode is permitted by server policy
@@ -240,13 +243,20 @@ func (m *Manager) ApproveSandbox(ctx context.Context, userID string) (*UserSandb
 		m.mu.Unlock()
 		return nil, fmt.Errorf("driver %s not found", sbx.Driver)
 	}
+	sbx.Status = StatusCreating
 	m.mu.Unlock()
 
 	userWorkspace, err := m.UserWorkspaceDir(userID)
 	if err != nil {
+		m.mu.Lock()
+		delete(m.sandboxes, userID)
+		m.mu.Unlock()
 		return nil, fmt.Errorf("invalid user workspace: %w", err)
 	}
 	if err := os.MkdirAll(userWorkspace, 0o755); err != nil {
+		m.mu.Lock()
+		delete(m.sandboxes, userID)
+		m.mu.Unlock()
 		return nil, fmt.Errorf("failed to create user workspace: %w", err)
 	}
 
@@ -259,6 +269,12 @@ func (m *Manager) ApproveSandbox(ctx context.Context, userID string) (*UserSandb
 	}
 
 	m.mu.Lock()
+	current, stillExists := m.sandboxes[userID]
+	if !stillExists || current != sbx {
+		m.mu.Unlock()
+		_ = driver.Destroy(ctx, sbx)
+		return nil, errors.New("sandbox creation was cancelled")
+	}
 	sbx.Status = StatusRunning
 	m.mu.Unlock()
 
@@ -272,6 +288,9 @@ func (m *Manager) DenySandbox(userID string) error {
 
 	sbx, ok := m.sandboxes[userID]
 	if !ok || sbx.Status != StatusPendingApproval {
+		if ok && sbx.Status == StatusCreating {
+			return errors.New("sandbox is currently being created and cannot be denied")
+		}
 		return errors.New("no pending sandbox request found to deny")
 	}
 

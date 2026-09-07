@@ -415,7 +415,7 @@ func TestApproveSandbox_StateRaceCondition(t *testing.T) {
 	statusDuringCreate := sbx.Status
 	mgr.mu.Unlock()
 
-	assert.Equal(t, StatusPendingApproval, statusDuringCreate, "DEFECT: status remains StatusPendingApproval while driver.Create() is running")
+	assert.Equal(t, StatusCreating, statusDuringCreate, "Status must transition to StatusCreating while driver.Create() is running")
 
 	// Unblock driver.Create()
 	close(createBlock)
