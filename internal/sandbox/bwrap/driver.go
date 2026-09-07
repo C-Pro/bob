@@ -17,9 +17,17 @@ import (
 
 // Driver implements sandbox.Driver using bubblewrap (/usr/bin/bwrap).
 type Driver struct {
-	bwrapPath string
-	mu        sync.Mutex
-	proxies   map[string]*sandbox.FilteringProxy // keyed by userID
+	bwrapPath          string
+	mu                 sync.Mutex
+	proxies            map[string]*sandbox.FilteringProxy // keyed by userID
+	customBlockedCIDRs []string
+}
+
+// SetCustomBlockedCIDRs overrides default mandatory blocked CIDRs for testing.
+func (d *Driver) SetCustomBlockedCIDRs(cidrs []string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.customBlockedCIDRs = cidrs
 }
 
 // NewDriver creates a new Bubblewrap driver.
@@ -70,9 +78,10 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 		}
 		sockPath := filepath.Join(os.TempDir(), fmt.Sprintf("bob-proxy-%s.sock", sbx.UserID))
 		proxy, err := sandbox.NewFilteringProxyWithConfig(sandbox.ProxyConfig{
-			Policy:     sbx.Network,
-			ListenTCP:  "127.0.0.1:0",
-			SocketPath: sockPath,
+			Policy:        sbx.Network,
+			ListenTCP:     "127.0.0.1:0",
+			SocketPath:    sockPath,
+			CustomBlocked: d.customBlockedCIDRs,
 		})
 		if err != nil {
 			return fmt.Errorf("failed to start filtering proxy for user %s: %w", sbx.UserID, err)

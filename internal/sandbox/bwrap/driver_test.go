@@ -73,9 +73,7 @@ func TestBwrap_NetworkRestrictedAirgap(t *testing.T) {
 		t.Skip("bwrap not available on host, skipping test")
 	}
 
-	origBlocked := sandbox.MandatoryBlockedCIDRs
-	sandbox.MandatoryBlockedCIDRs = []string{"169.254.0.0/16"}
-	defer func() { sandbox.MandatoryBlockedCIDRs = origBlocked }()
+	driver.SetCustomBlockedCIDRs([]string{"169.254.0.0/16"})
 
 	// 1. Backend server on host
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

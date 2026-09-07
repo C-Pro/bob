@@ -530,7 +530,7 @@ To transition branch `feature/sandbox` into a production-ready state, engineerin
 ### Phase 2: Concurrency & Architecture Hardening
 - **[DONE] R2.1 Eliminate TOCTOU Approval Race**:
   Add `StatusCreating` state to `SandboxStatus`. Hold lock during transition to prevent concurrent approvals or orphaned containers on denial.
-- **R2.2 Enforce Immutability on `MandatoryBlockedCIDRs`**:
+- **[DONE] R2.2 Enforce Immutability on `MandatoryBlockedCIDRs`**:
   Make `defaultMandatoryBlockedCIDRs` private; return deep copies; inject test overrides via `ProxyConfig.CustomBlocked`.
 - **R2.3 Thread-Safe Container Handles**:
   Synchronize `sbx.InternalID` reads in `docker/driver.go` using a read-write mutex.

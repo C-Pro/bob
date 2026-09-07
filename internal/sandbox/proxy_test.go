@@ -17,10 +17,6 @@ import (
 )
 
 func TestFilteringProxyHTTP(t *testing.T) {
-	origBlocked := MandatoryBlockedCIDRs
-	MandatoryBlockedCIDRs = []string{"169.254.0.0/16"}
-	defer func() { MandatoryBlockedCIDRs = origBlocked }()
-
 	// 1. Create a dummy backend HTTP server
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -32,10 +28,13 @@ func TestFilteringProxyHTTP(t *testing.T) {
 	require.NoError(t, err)
 
 	// 2. Start proxy with restricted access allowing only the backend host
-	proxy, err := NewFilteringProxy(NetworkPolicy{
-		Mode:         NetworkRestricted,
-		AllowedHosts: []string{backendURL.Hostname()},
-		BlockedHosts: []string{"forbidden.com"},
+	proxy, err := NewFilteringProxyWithConfig(ProxyConfig{
+		Policy: NetworkPolicy{
+			Mode:         NetworkRestricted,
+			AllowedHosts: []string{backendURL.Hostname()},
+			BlockedHosts: []string{"forbidden.com"},
+		},
+		CustomBlocked: []string{"169.254.0.0/16"},
 	})
 	require.NoError(t, err)
 	defer func() { _ = proxy.Close() }()
@@ -77,10 +76,6 @@ func TestFilteringProxyHTTP(t *testing.T) {
 }
 
 func TestFilteringProxyConnect(t *testing.T) {
-	origBlocked := MandatoryBlockedCIDRs
-	MandatoryBlockedCIDRs = []string{"169.254.0.0/16"}
-	defer func() { MandatoryBlockedCIDRs = origBlocked }()
-
 	// Create a dummy backend TCP echo server
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -104,9 +99,12 @@ func TestFilteringProxyConnect(t *testing.T) {
 	backendHost, backendPort, err := net.SplitHostPort(ln.Addr().String())
 	require.NoError(t, err)
 
-	proxy, err := NewFilteringProxy(NetworkPolicy{
-		Mode:         NetworkRestricted,
-		AllowedHosts: []string{backendHost},
+	proxy, err := NewFilteringProxyWithConfig(ProxyConfig{
+		Policy: NetworkPolicy{
+			Mode:         NetworkRestricted,
+			AllowedHosts: []string{backendHost},
+		},
+		CustomBlocked: []string{"169.254.0.0/16"},
 	})
 	require.NoError(t, err)
 	defer func() { _ = proxy.Close() }()
@@ -196,10 +194,6 @@ func TestFilteringProxyBlocksLoopbackAndPrivateNetworks(t *testing.T) {
 }
 
 func TestFilteringProxyHopByHopHeaders(t *testing.T) {
-	origBlocked := MandatoryBlockedCIDRs
-	MandatoryBlockedCIDRs = []string{"169.254.0.0/16"}
-	defer func() { MandatoryBlockedCIDRs = origBlocked }()
-
 	var receivedHeaders http.Header
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedHeaders = r.Header.Clone()
@@ -214,9 +208,12 @@ func TestFilteringProxyHopByHopHeaders(t *testing.T) {
 	backendURL, err := url.Parse(backend.URL)
 	require.NoError(t, err)
 
-	proxy, err := NewFilteringProxy(NetworkPolicy{
-		Mode:         NetworkRestricted,
-		AllowedHosts: []string{backendURL.Hostname()},
+	proxy, err := NewFilteringProxyWithConfig(ProxyConfig{
+		Policy: NetworkPolicy{
+			Mode:         NetworkRestricted,
+			AllowedHosts: []string{backendURL.Hostname()},
+		},
+		CustomBlocked: []string{"169.254.0.0/16"},
 	})
 	require.NoError(t, err)
 	defer func() { _ = proxy.Close() }()
@@ -288,10 +285,6 @@ func TestFilteringProxyDNSRebindingPrevention(t *testing.T) {
 }
 
 func TestFilteringProxyUnixSocket(t *testing.T) {
-	origBlocked := MandatoryBlockedCIDRs
-	MandatoryBlockedCIDRs = []string{"169.254.0.0/16"}
-	defer func() { MandatoryBlockedCIDRs = origBlocked }()
-
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("unix-proxy-ok"))
@@ -309,8 +302,9 @@ func TestFilteringProxyUnixSocket(t *testing.T) {
 			Mode:         NetworkRestricted,
 			AllowedHosts: []string{backendURL.Hostname()},
 		},
-		ListenTCP:  "127.0.0.1:0",
-		SocketPath: sockPath,
+		ListenTCP:     "127.0.0.1:0",
+		SocketPath:    sockPath,
+		CustomBlocked: []string{"169.254.0.0/16"},
 	})
 	require.NoError(t, err)
 	defer func() { _ = proxy.Close() }()
@@ -344,6 +338,26 @@ func TestFilteringProxyUnixSocket(t *testing.T) {
 	// Close proxy and verify socket is removed
 	require.NoError(t, proxy.Close())
 	assert.NoFileExists(t, sockPath)
+}
+
+func TestMandatoryBlockedCIDRs_Immutability(t *testing.T) {
+	cidrs1 := MandatoryBlockedCIDRs()
+	assert.NotEmpty(t, cidrs1)
+
+	// Mutate the returned slice
+	cidrs1[0] = "0.0.0.0/0"
+
+	// Subsequent call must return pristine original list
+	cidrs2 := MandatoryBlockedCIDRs()
+	assert.NotEqual(t, "0.0.0.0/0", cidrs2[0])
+	assert.Equal(t, "127.0.0.0/8", cidrs2[0])
+
+	// ValidateNetworkPolicy must still include 127.0.0.0/8
+	pol, err := ValidateNetworkPolicy(NetworkPolicy{
+		Mode: NetworkRestricted,
+	})
+	require.NoError(t, err)
+	assert.Contains(t, pol.BlockedCIDRs, "127.0.0.0/8")
 }
 
 

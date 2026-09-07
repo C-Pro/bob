@@ -17,9 +17,10 @@ import (
 
 // ProxyConfig specifies configuration options for FilteringProxy.
 type ProxyConfig struct {
-	Policy     NetworkPolicy
-	ListenTCP  string // TCP bind address (e.g. "127.0.0.1:0" or "0.0.0.0:0"). If empty, defaults to "127.0.0.1:0".
-	SocketPath string // Optional path for a Unix domain socket listener.
+	Policy        NetworkPolicy
+	ListenTCP     string   // TCP bind address (e.g. "127.0.0.1:0" or "0.0.0.0:0"). If empty, defaults to "127.0.0.1:0".
+	SocketPath    string   // Optional path for a Unix domain socket listener.
+	CustomBlocked []string // Optional test override to bypass defaultMandatoryBlockedCIDRs.
 }
 
 // FilteringProxy is an in-process HTTP/CONNECT proxy that enforces domain and CIDR whitelisting/blacklisting.
@@ -46,7 +47,11 @@ func NewFilteringProxy(policy NetworkPolicy) (*FilteringProxy, error) {
 
 // NewFilteringProxyWithConfig starts a filtering proxy with customized TCP and Unix socket listeners.
 func NewFilteringProxyWithConfig(cfg ProxyConfig) (*FilteringProxy, error) {
-	sanitizedPolicy, err := ValidateNetworkPolicy(cfg.Policy)
+	mandatory := defaultMandatoryBlockedCIDRs
+	if cfg.CustomBlocked != nil {
+		mandatory = cfg.CustomBlocked
+	}
+	sanitizedPolicy, err := ValidateNetworkPolicyWithOverrides(cfg.Policy, mandatory)
 	if err != nil {
 		return nil, fmt.Errorf("invalid proxy network policy: %w", err)
 	}

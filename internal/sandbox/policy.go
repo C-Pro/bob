@@ -10,8 +10,8 @@ import (
 )
 
 var (
-	// MandatoryBlockedCIDRs protects cloud metadata, loopback, private RFC 1918, and Docker networks.
-	MandatoryBlockedCIDRs = []string{
+	// defaultMandatoryBlockedCIDRs protects cloud metadata, loopback, private RFC 1918, and Docker networks.
+	defaultMandatoryBlockedCIDRs = []string{
 		"127.0.0.0/8",    // IPv4 loopback
 		"10.0.0.0/8",     // RFC 1918 Class A
 		"172.16.0.0/12",  // RFC 1918 Class B (including Docker bridge 172.17.0.0/16)
@@ -30,6 +30,13 @@ var (
 		"localhost",
 	}
 )
+
+// MandatoryBlockedCIDRs returns a defensive deep copy of the default mandatory blocked CIDRs.
+func MandatoryBlockedCIDRs() []string {
+	out := make([]string, len(defaultMandatoryBlockedCIDRs))
+	copy(out, defaultMandatoryBlockedCIDRs)
+	return out
+}
 
 // ValidateMountPath verifies that relativePath resides strictly inside userWorkspaceDir.
 // If relativePath is ".", "", or "/", it mounts the whole workspace (isWholeWorkspace = true).
@@ -80,8 +87,14 @@ func ValidateMountPath(userWorkspaceDir, relativePath string) (string, bool, err
 }
 
 // ValidateNetworkPolicy validates and sanitizes a requested network policy,
-// unconditionally injecting mandatory cloud metadata blocks.
+// unconditionally injecting mandatory cloud metadata and private network blocks.
 func ValidateNetworkPolicy(policy NetworkPolicy) (NetworkPolicy, error) {
+	return ValidateNetworkPolicyWithOverrides(policy, defaultMandatoryBlockedCIDRs)
+}
+
+// ValidateNetworkPolicyWithOverrides validates and sanitizes a requested network policy
+// with a customized list of mandatory blocked CIDRs.
+func ValidateNetworkPolicyWithOverrides(policy NetworkPolicy, mandatoryCIDRs []string) (NetworkPolicy, error) {
 	sanitized := NetworkPolicy{
 		Mode: policy.Mode,
 	}
@@ -130,7 +143,7 @@ func ValidateNetworkPolicy(policy NetworkPolicy) (NetworkPolicy, error) {
 				cidrSet[clean] = struct{}{}
 			}
 		}
-		for _, c := range MandatoryBlockedCIDRs {
+		for _, c := range mandatoryCIDRs {
 			cidrSet[c] = struct{}{}
 		}
 		for c := range cidrSet {

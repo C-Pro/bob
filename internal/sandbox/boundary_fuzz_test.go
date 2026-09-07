@@ -107,7 +107,7 @@ func FuzzResolveAndValidate(f *testing.F) {
 			Mode:         NetworkRestricted,
 			AllowedHosts: []string{"allowed.org", "sub.allowed.org"},
 			BlockedHosts: MandatoryBlockedHosts,
-			BlockedCIDRs: MandatoryBlockedCIDRs,
+			BlockedCIDRs: MandatoryBlockedCIDRs(),
 		},
 	}
 
@@ -130,7 +130,7 @@ func FuzzResolveAndValidate(f *testing.F) {
 
 		// Invariant: If parsed as IP and matches blocked CIDR, must always be rejected
 		if parsed := net.ParseIP(cleanHost); parsed != nil {
-			for _, cidrStr := range MandatoryBlockedCIDRs {
+			for _, cidrStr := range MandatoryBlockedCIDRs() {
 				_, cidr, parseErr := net.ParseCIDR(cidrStr)
 				if parseErr == nil && cidr.Contains(parsed) {
 					if err == nil {
@@ -264,7 +264,7 @@ func TestFilteringProxy_RestrictedEmptyDomains_DefaultOpen(t *testing.T) {
 			Mode:         NetworkRestricted,
 			AllowedHosts: []string{}, // Empty domain whitelist
 			BlockedHosts: MandatoryBlockedHosts,
-			BlockedCIDRs: MandatoryBlockedCIDRs,
+			BlockedCIDRs: MandatoryBlockedCIDRs(),
 		},
 	}
 
@@ -284,7 +284,7 @@ func TestFilteringProxy_RestrictedEmptyDomains_DefaultOpen(t *testing.T) {
 			Mode:         NetworkRestricted,
 			AllowedHosts: []string{"allowed.example.com"},
 			BlockedHosts: MandatoryBlockedHosts,
-			BlockedCIDRs: MandatoryBlockedCIDRs,
+			BlockedCIDRs: MandatoryBlockedCIDRs(),
 		},
 	}
 	_, errStrict := proxyStrict.resolveAndValidate(context.Background(), "93.184.216.34")
@@ -298,7 +298,7 @@ func TestFilteringProxy_LANClientIPAuthorization(t *testing.T) {
 		policy: NetworkPolicy{
 			Mode:         NetworkNone,
 			BlockedHosts: MandatoryBlockedHosts,
-			BlockedCIDRs: MandatoryBlockedCIDRs,
+			BlockedCIDRs: MandatoryBlockedCIDRs(),
 		},
 	}
 
