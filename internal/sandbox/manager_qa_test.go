@@ -300,7 +300,7 @@ func TestManager_EdgeCasesAndErrorHandling(t *testing.T) {
 		require.True(t, exists)
 		assert.Equal(t, StatusExpired, status.Status)
 
-		// Verify that after 1 hour of expiration, subsequent prune purges the record from memory (VULN-10)
+		// Verify that after 1 hour of expiration, subsequent prune purges the record from memory
 		mgr.mu.Lock()
 		sbx.ExpiresAt = time.Now().Add(-2 * time.Hour)
 		mgr.mu.Unlock()

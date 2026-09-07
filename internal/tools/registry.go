@@ -206,12 +206,16 @@ func (r *Registry) initToolDefinitions() {
 				"type":        "string",
 				"description": "Shell command line to execute inside your active sandbox. IMPORTANT: Use one-shot, non-interactive commands only (do NOT use TUI tools like nano, vim, top, or interactive prompts).",
 			},
+			"description": map[string]interface{}{
+				"type":        "string",
+				"description": "Short one-line description of what this command runs or accomplishes in the sandbox (e.g. 'Running test suite', 'Calculating factorial of 6', 'Installing dependencies'). Used to report real-time progress to the user.",
+			},
 			"timeout_seconds": map[string]interface{}{
 				"type":        "integer",
 				"description": "Command execution timeout in seconds (default 60, min 5, max 600).",
 			},
 		},
-		"required": []string{"command"},
+		"required": []string{"command", "description"},
 	}
 
 	sandboxDestroySchema := map[string]interface{}{
@@ -259,7 +263,7 @@ func (r *Registry) initToolDefinitions() {
 			Type: openai.ToolTypeFunction,
 			Function: &openai.FunctionDefinition{
 				Name:        "sandbox_exec",
-				Description: "Execute a shell command inside your active sandbox. Output (stdout, stderr, exit code) is returned upon completion. Use non-interactive, one-shot commands only.",
+				Description: "Execute a shell command inside your active sandbox. Output (stdout, stderr, exit code) is returned upon completion. Use non-interactive, one-shot commands only. Provide a short one-line description of what is being run to report progress to the user.",
 				Parameters:  sandboxExecSchema,
 			},
 		},
@@ -661,6 +665,7 @@ type SandboxRequestArgs struct {
 // SandboxExecArgs defines arguments for the sandbox_exec tool.
 type SandboxExecArgs struct {
 	Command        string `json:"command"`
+	Description    string `json:"description,omitempty"`
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
 }
 
@@ -778,7 +783,11 @@ func (r *Registry) executeSandboxExec(ctx context.Context, argsJSON string) (str
 	}
 
 	if session.Progress != nil {
-		session.Progress.SetCommand(cmdStr)
+		if desc := strings.TrimSpace(args.Description); desc != "" {
+			session.Progress.SetCurrent(desc)
+		} else {
+			session.Progress.SetCommand(cmdStr)
+		}
 	}
 
 	timeout := time.Duration(args.TimeoutSeconds) * time.Second

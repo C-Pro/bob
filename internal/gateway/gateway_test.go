@@ -90,26 +90,20 @@ func TestIsMentionedOrDM(t *testing.T) {
 func TestFormatResponse(t *testing.T) {
 	longText := "Paragraph 1: Introduction.\n\nParagraph 2: Second section.\n\nParagraph 3: Third section.\n\nParagraph 4: Conclusion."
 
-	// Townhall (limit 2)
+	// Verifies that paragraph limits are advisory (in prompt) and not hard-truncated
 	townhallRes := FormatResponse(longText, false, 2, 10)
-	assert.Equal(t, "Paragraph 1: Introduction.\n\nParagraph 2: Second section.", townhallRes)
+	assert.Equal(t, longText, townhallRes)
 
-	// DM (limit 10)
 	dmRes := FormatResponse(longText, true, 2, 10)
-	assert.Equal(t, "Paragraph 1: Introduction.\n\nParagraph 2: Second section.\n\nParagraph 3: Third section.\n\nParagraph 4: Conclusion.", dmRes)
+	assert.Equal(t, longText, dmRes)
 
-	// Single paragraph
-	shortText := "Single paragraph response."
-	assert.Equal(t, shortText, FormatResponse(shortText, false, 2, 10))
+	// Trims leading and trailing whitespace
+	paddedText := "   \n\nSingle paragraph response.\n\n   "
+	assert.Equal(t, "Single paragraph response.", FormatResponse(paddedText, false, 2, 10))
 
-	// Markdown code block with blank lines should count as a single block
+	// Markdown code blocks preserved intact
 	codeBlockText := "Intro paragraph.\n\n```go\nfunc main() {\n\n\tprintln(\"hello\")\n}\n```\n\nOutro paragraph."
-	// Limit 2 should keep intro and the entire code block
-	assert.Equal(t, "Intro paragraph.\n\n```go\nfunc main() {\n\n\tprintln(\"hello\")\n}\n```", FormatResponse(codeBlockText, false, 2, 10))
-
-	// Truncated code block should ensure code fence is closed
-	unclosedCodeText := "Intro.\n\n```python\nprint('code')"
-	assert.Equal(t, "Intro.\n\n```python\nprint('code')\n```", FormatResponse(unclosedCodeText, false, 2, 10))
+	assert.Equal(t, codeBlockText, FormatResponse(codeBlockText, false, 2, 10))
 }
 
 func TestGatewayWebSocketIntegration(t *testing.T) {

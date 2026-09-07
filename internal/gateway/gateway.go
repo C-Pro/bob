@@ -312,93 +312,10 @@ func IsMentionedOrDM(handle, chatID, content string) (bool, string) {
 	return false, ""
 }
 
-// FormatResponse applies paragraph limits according to channel type while preserving Markdown blocks.
+// FormatResponse prepares the LLM reply content for transmission.
+// Advisory paragraph limits are guided via system prompts rather than hard truncation.
 func FormatResponse(content string, isDM bool, maxTownhallParas, maxDMParas int) string {
-	maxParas := maxTownhallParas
-	if isDM {
-		maxParas = maxDMParas
-	}
-	if maxParas <= 0 {
-		return content
-	}
-
-	// Normalize CRLF
-	normalized := strings.ReplaceAll(content, "\r\n", "\n")
-	lines := strings.Split(normalized, "\n")
-
-	var blocks []string
-	var currentBlock []string
-	inCodeBlock := false
-	fenceMarker := ""
-
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-
-		// Check for code block fences (``` or ~~~)
-		if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
-			marker := trimmed[:3]
-			if !inCodeBlock {
-				inCodeBlock = true
-				fenceMarker = marker
-			} else if strings.HasPrefix(trimmed, fenceMarker) {
-				inCodeBlock = false
-				fenceMarker = ""
-			}
-			currentBlock = append(currentBlock, line)
-			continue
-		}
-
-		if inCodeBlock {
-			currentBlock = append(currentBlock, line)
-			continue
-		}
-
-		// Outside code blocks: a blank line marks a paragraph boundary
-		if trimmed == "" {
-			if len(currentBlock) > 0 {
-				blockContent := strings.TrimSpace(strings.Join(currentBlock, "\n"))
-				if blockContent != "" {
-					blocks = append(blocks, blockContent)
-				}
-				currentBlock = nil
-			}
-			continue
-		}
-
-		currentBlock = append(currentBlock, line)
-	}
-
-	if len(currentBlock) > 0 {
-		blockContent := strings.TrimSpace(strings.Join(currentBlock, "\n"))
-		if blockContent != "" {
-			blocks = append(blocks, blockContent)
-		}
-	}
-
-	if len(blocks) == 0 {
-		return ""
-	}
-
-	selected := blocks
-	if len(blocks) > maxParas {
-		selected = blocks[:maxParas]
-	}
-
-	result := strings.Join(selected, "\n\n")
-
-	// Ensure any opened code block fence is properly closed
-	openFences := 0
-	for _, line := range strings.Split(result, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "```") {
-			openFences++
-		}
-	}
-	if openFences%2 != 0 {
-		result += "\n```"
-	}
-
-	return result
+	return strings.TrimSpace(content)
 }
 
 // DialWebSocket connects to the Besedka chat WebSocket endpoint.

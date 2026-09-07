@@ -146,39 +146,40 @@ func (p *ProgressReporter) Stop() {
 }
 
 // FormatProgressMessage constructs a human-readable progress report.
-// E.g.: "Looking for GetUserCall sites. Grep is running."
+// If a multi-word description is provided (e.g. by the model via sandbox_exec),
+// it is reported directly. Otherwise, it falls back to reporting task and command status.
 func FormatProgressMessage(task, current string) string {
 	cleanCurrent := strings.TrimSpace(current)
+	cleanTask := strings.TrimSpace(task)
+
+	// If current is a model-generated description (multi-word phrase), report it directly
+	if cleanCurrent != "" && cleanCurrent != "Process" && cleanCurrent != "Task" && strings.Contains(cleanCurrent, " ") {
+		r := []rune(cleanCurrent)
+		r[0] = []rune(strings.ToUpper(string(r[0])))[0]
+		res := string(r)
+		if !strings.HasSuffix(res, ".") && !strings.HasSuffix(res, "!") && !strings.HasSuffix(res, "?") {
+			res += "."
+		}
+		return res
+	}
+
 	if cleanCurrent == "" {
 		cleanCurrent = "Task"
 	}
 
-	cleanTask := strings.TrimSpace(task)
 	if cleanTask == "" {
 		return fmt.Sprintf("%s is running.", cleanCurrent)
 	}
 
 	lower := strings.ToLower(cleanTask)
-	prefix := "Looking for "
 	if strings.HasPrefix(lower, "looking for ") ||
 		strings.HasPrefix(lower, "searching for ") ||
 		strings.HasPrefix(lower, "running ") ||
-		strings.HasPrefix(lower, "executing ") ||
-		strings.HasPrefix(lower, "finding ") ||
-		strings.HasPrefix(lower, "find ") ||
-		strings.HasPrefix(lower, "working on ") ||
-		strings.HasPrefix(lower, "please ") ||
-		strings.HasPrefix(lower, "calculate ") ||
-		strings.HasPrefix(lower, "compute ") ||
-		strings.HasPrefix(lower, "check ") ||
-		strings.HasPrefix(lower, "build ") ||
-		strings.HasPrefix(lower, "generate ") ||
-		strings.HasPrefix(lower, "create ") {
-		// Capitalize first letter of task
+		strings.HasPrefix(lower, "executing ") {
 		r := []rune(cleanTask)
 		r[0] = []rune(strings.ToUpper(string(r[0])))[0]
 		return fmt.Sprintf("%s. %s is running.", string(r), cleanCurrent)
 	}
 
-	return fmt.Sprintf("%s%s. %s is running.", prefix, cleanTask, cleanCurrent)
+	return fmt.Sprintf("Looking for %s. %s is running.", cleanTask, cleanCurrent)
 }
