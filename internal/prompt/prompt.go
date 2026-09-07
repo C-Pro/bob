@@ -11,7 +11,7 @@ import (
 
 const (
 	DefaultTownhallTemplate = "You are {{.BotDisplayName}} ({{.BotHandle}}), an AI assistant participating in the Besedka Townhall chat. Answer directly, accurately, and professionally. Keep your answer concise and brief (maximum {{.MaxParagraphs}} paragraphs) without unnecessary conversational filler. You have access to long-term memory via the `recall_memory` tool and live web search. When asked about past conversations, user preferences, previous topics, or facts that are not present in your immediate context, ALWAYS search your memory with `recall_memory` before concluding that information was not mentioned."
-	DefaultDMTemplate       = "You are {{.BotDisplayName}} ({{.BotHandle}}), an AI assistant in a direct message conversation with {{.UserDisplayName}} in the Besedka chat application. Answer clearly, accurately, and helpfully using markdown formatting. Keep your answer brief (maximum {{.MaxParagraphs}} paragraphs). You have access to long-term memory via the `recall_memory` tool and live web search. When asked about past conversations, user preferences, previous topics, or facts that are not present in your immediate context, ALWAYS search your memory with `recall_memory` before concluding that information was not mentioned."
+	DefaultDMTemplate       = "You are {{.BotDisplayName}} ({{.BotHandle}}), an AI assistant in a direct message conversation with {{.UserDisplayName}} in the Besedka chat application. Answer clearly, accurately, and helpfully using markdown formatting. Keep your answer brief (maximum {{.MaxParagraphs}} paragraphs). You have access to long-term memory via the `recall_memory` tool and live web search. When asked about past conversations, user preferences, previous topics, or facts that are not present in your immediate context, ALWAYS search your memory with `recall_memory` before concluding that information was not mentioned.{{if .SandboxActive}} You have an active sandbox (unconditional destruction in {{.SandboxTTL}}). Once your task is completed and results are reported, unless the user explicitly stated what to do with the sandbox (e.g. keep or destroy), always ask the user if they would like to destroy the sandbox (`/sandbox destroy`) or keep it, and mention the remaining TTL.{{end}}"
 )
 
 var (
@@ -32,6 +32,8 @@ type DMPromptData struct {
 	BotHandle       string
 	UserDisplayName string
 	MaxParagraphs   int
+	SandboxActive   bool
+	SandboxTTL      string
 }
 
 // RenderTownhallPrompt builds the system prompt for Townhall conversations.
@@ -76,6 +78,11 @@ func RenderTownhallPrompt(bot models.User, botHandle string, maxParagraphs int) 
 
 // RenderDMPrompt builds the system prompt for Direct Message conversations with a specific user.
 func RenderDMPrompt(bot models.User, botHandle string, targetUser models.User, maxParagraphs int) string {
+	return RenderDMPromptWithSandbox(bot, botHandle, targetUser, maxParagraphs, false, "")
+}
+
+// RenderDMPromptWithSandbox builds the system prompt for Direct Message conversations with optional sandbox status context.
+func RenderDMPromptWithSandbox(bot models.User, botHandle string, targetUser models.User, maxParagraphs int, sandboxActive bool, sandboxTTL string) string {
 	botDisplayName := bot.GetDisplayName()
 	if botDisplayName == "" || botDisplayName == bot.ID {
 		if bot.GetUserName() != "" {
@@ -115,6 +122,8 @@ func RenderDMPrompt(bot models.User, botHandle string, targetUser models.User, m
 		BotHandle:       handle,
 		UserDisplayName: userDisplayName,
 		MaxParagraphs:   maxParagraphs,
+		SandboxActive:   sandboxActive,
+		SandboxTTL:      sandboxTTL,
 	}
 
 	var buf bytes.Buffer

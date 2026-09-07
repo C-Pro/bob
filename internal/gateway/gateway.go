@@ -23,6 +23,9 @@ import (
 	"bob/internal/memory"
 	"bob/internal/models"
 	"bob/internal/prompt"
+	"bob/internal/sandbox"
+	"bob/internal/sandbox/bwrap"
+	"bob/internal/sandbox/docker"
 	"bob/internal/tools"
 	"bob/internal/tools/tavily"
 
@@ -38,6 +41,7 @@ type Gateway struct {
 	httpClient           *http.Client
 	toolsRegistry        *tools.Registry
 	memoryManager        *memory.Manager
+	sandboxManager       *sandbox.Manager
 	conn                 *websocket.Conn
 	mu                   sync.Mutex
 	running              bool
@@ -66,7 +70,20 @@ func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 	if cfg.TavilyAPIKey != "" {
 		tavilyClient = tavily.NewClient(cfg.TavilyAPIKey, cfg.TavilyBaseURL, httpClient)
 	}
-	toolsRegistry := tools.NewRegistry(tavilyClient, memoryManager)
+
+	var sandboxManager *sandbox.Manager
+	if cfg.SandboxEnabled {
+		bwrapDriver := bwrap.NewDriver()
+		dockerDriver := docker.NewDriver(docker.Config{
+			SocketPath:    cfg.SandboxDockerSocket,
+			AllowedImages: cfg.SandboxAllowedImages,
+			CPULimit:      cfg.SandboxCPULimit,
+			MemoryLimitMB: cfg.SandboxMemoryLimitMB,
+		})
+		sandboxManager = sandbox.NewManager(cfg, []sandbox.Driver{bwrapDriver, dockerDriver})
+	}
+
+	toolsRegistry := tools.NewRegistry(tavilyClient, memoryManager, sandboxManager)
 
 	gw := &Gateway{
 		cfg:                  cfg,
@@ -74,6 +91,7 @@ func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 		httpClient:           httpClient,
 		toolsRegistry:        toolsRegistry,
 		memoryManager:        memoryManager,
+		sandboxManager:       sandboxManager,
 		userCache:            NewUserCache(),
 		contextManager:       chatcontext.NewManager(cfg.MsgRingBufferSize),
 		startTime:            time.Now(),
@@ -107,6 +125,23 @@ func (g *Gateway) SetToolsRegistry(r *tools.Registry) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.toolsRegistry = r
+}
+
+// SandboxManager returns the Gateway's sandbox Manager.
+func (g *Gateway) SandboxManager() *sandbox.Manager {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.sandboxManager
+}
+
+// SetSandboxManager sets the sandbox Manager for the gateway and updates the tools registry.
+func (g *Gateway) SetSandboxManager(sm *sandbox.Manager) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.sandboxManager = sm
+	if g.toolsRegistry != nil {
+		g.toolsRegistry.SetSandboxManager(sm)
+	}
 }
 
 var (
@@ -763,21 +798,65 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 		return nil
 	}
 
+	cleanText := strings.TrimSpace(fullContent)
+	cleanText = strings.Trim(cleanText, "`")
+	cleanText = strings.TrimSpace(cleanText)
+
 	isDM := msg.ChatID != "townhall"
+	if isDM && strings.HasPrefix(cleanText, "/sandbox") {
+		return g.handleSandboxCommand(ctx, msg, cleanText, senderName)
+	}
+
+	return g.generateAndSendAgentReply(ctx, msg, isDM, senderName, "")
+}
+
+func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Message, isDM bool, senderName, currentTask string) error {
+	g.mu.Lock()
+	botID := g.botUserID
+	botUser := g.botUser
+	if botUser.ID == "" && botID != "" {
+		if u, ok := g.userCache.Get(botID); ok {
+			botUser = u
+		}
+	}
+	toolsRegistry := g.toolsRegistry
+	sm := g.sandboxManager
+	g.mu.Unlock()
+
+	if g.llmClient == nil {
+		return nil
+	}
+
+	var sandboxActive bool
+	var sandboxTTL string
+	if sm != nil && isDM {
+		if sbx, ok := sm.GetStatus(msg.UserID); ok && sbx != nil && sbx.Status == sandbox.StatusRunning {
+			sandboxActive = true
+			rem := time.Until(sbx.ExpiresAt).Round(time.Minute)
+			if rem < 0 {
+				rem = 0
+			}
+			sandboxTTL = rem.String()
+		}
+	}
+
 	var systemPrompt string
 	if isDM {
 		targetUser, ok := g.userCache.Get(msg.UserID)
 		if !ok || targetUser.GetDisplayName() == "" {
 			targetUser = models.User{ID: msg.UserID, DisplayName: senderName, UserName: senderName}
 		}
-		systemPrompt = prompt.RenderDMPrompt(botUser, g.cfg.BotHandle, targetUser, g.cfg.DMMaxParagraphs)
+		if sandboxActive {
+			systemPrompt = prompt.RenderDMPromptWithSandbox(botUser, g.cfg.BotHandle, targetUser, g.cfg.DMMaxParagraphs, true, sandboxTTL)
+		} else {
+			systemPrompt = prompt.RenderDMPrompt(botUser, g.cfg.BotHandle, targetUser, g.cfg.DMMaxParagraphs)
+		}
 	} else {
 		systemPrompt = prompt.RenderTownhallPrompt(botUser, g.cfg.BotHandle, g.cfg.TownhallMaxParagraphs)
 	}
 
 	slog.Info("processing bot message request", "chatID", msg.ChatID, "sender", senderName)
 
-	// 6. Build multi-turn context
 	bufferedMsgs := g.contextManager.GetLLMMessages(msg.ChatID)
 	llmMsgs := make([]openai.ChatCompletionMessage, 0, len(bufferedMsgs)+1)
 	llmMsgs = append(llmMsgs, openai.ChatCompletionMessage{
@@ -786,21 +865,42 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 	})
 	llmMsgs = append(llmMsgs, bufferedMsgs...)
 
-	g.mu.Lock()
-	toolsRegistry := g.toolsRegistry
-	g.mu.Unlock()
+	taskDesc := currentTask
+	if taskDesc == "" {
+		taskDesc = msg.Content
+	}
+	noProgress := userPrefersNoProgress(msg.Content) || (currentTask != "" && userPrefersNoProgress(currentTask))
+	progress := tools.NewProgressReporter(msg.ChatID, taskDesc, func(chatID, text string) error {
+		return g.SendMessage(chatID, text)
+	}, 30*time.Second, noProgress)
+	progress.Start()
+	defer progress.Stop()
+
+	var sandboxRequestCreated bool
+	sessionCtx := tools.ChatSessionContext{
+		ChatID: msg.ChatID,
+		UserID: msg.UserID,
+		IsDM:   isDM,
+		Notifier: func(chatID, text string) error {
+			return g.SendMessage(chatID, text)
+		},
+		Progress:              progress,
+		SandboxRequestCreated: &sandboxRequestCreated,
+	}
+
+	var toolDefs []openai.Tool
+	if toolsRegistry != nil {
+		toolDefs = toolsRegistry.ToolDefinitionsForSession(sessionCtx)
+	}
 
 	var reply string
 	var err error
-	if toolsRegistry != nil && len(toolsRegistry.ToolDefinitions()) > 0 {
-		toolCtx := tools.WithChatSession(ctx, tools.ChatSessionContext{
-			ChatID: msg.ChatID,
-			IsDM:   isDM,
-		})
+	if toolsRegistry != nil && len(toolDefs) > 0 {
+		toolCtx := tools.WithChatSession(ctx, sessionCtx)
 		reply, err = g.llmClient.GenerateChatResponseWithToolLoop(
 			toolCtx,
 			llmMsgs,
-			toolsRegistry.ToolDefinitions(),
+			toolDefs,
 			toolsRegistry,
 			5,
 		)
@@ -812,13 +912,35 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 		reply = "Sorry, I encountered an issue processing your request. Please try again later."
 	}
 
+	if sandboxRequestCreated {
+		g.contextManager.Push(msg.ChatID, chatcontext.Entry{
+			Role:       "assistant",
+			SenderID:   botID,
+			SenderName: botUser.GetDisplayName(),
+			Content:    "Sandbox approval requested.",
+			Timestamp:  time.Now().Unix(),
+		})
+		return nil
+	}
+
+	if isDM && sm != nil {
+		if sbx, ok := sm.GetStatus(msg.UserID); ok && sbx != nil && sbx.Status == sandbox.StatusRunning {
+			if !userStatedSandboxPreference(msg.Content) && !strings.Contains(reply, "/sandbox destroy") {
+				rem := time.Until(sbx.ExpiresAt).Round(time.Minute)
+				if rem < 0 {
+					rem = 0
+				}
+				reply += fmt.Sprintf("\n\n💡 Would you like to destroy the sandbox (`/sandbox destroy`) or keep it? It will automatically be destroyed in %s.", rem)
+			}
+		}
+	}
+
 	formattedReply := FormatResponse(reply, isDM, g.cfg.TownhallMaxParagraphs, g.cfg.DMMaxParagraphs)
 
 	if err := g.SendMessage(msg.ChatID, formattedReply); err != nil {
 		return fmt.Errorf("failed to send reply to chat %s: %w", msg.ChatID, err)
 	}
 
-	// 7. Append bot's sent reply to the ring buffer
 	g.contextManager.Push(msg.ChatID, chatcontext.Entry{
 		Role:       "assistant",
 		SenderID:   botID,
@@ -828,6 +950,53 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 	})
 
 	return nil
+}
+
+func userPrefersNoProgress(text string) bool {
+	lower := strings.ToLower(text)
+	phrases := []string{
+		"no progress",
+		"without progress",
+		"don't report progress",
+		"dont report progress",
+		"do not report progress",
+		"quietly",
+		"silently",
+		"silent mode",
+		"no updates",
+		"suppress progress",
+		"skip progress",
+	}
+	for _, p := range phrases {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func userStatedSandboxPreference(text string) bool {
+	lower := strings.ToLower(text)
+	phrases := []string{
+		"destroy sandbox",
+		"keep sandbox",
+		"destroy it",
+		"keep it",
+		"leave sandbox",
+		"leave it running",
+		"kill sandbox",
+		"terminate sandbox",
+		"close sandbox",
+		"don't destroy",
+		"dont destroy",
+		"do not destroy",
+	}
+	for _, p := range phrases {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // Start listens for incoming WebSocket messages and processes them until context is cancelled.
@@ -1011,4 +1180,154 @@ func (g *Gateway) Stop() {
 	if g.memoryManager != nil {
 		_ = g.memoryManager.Close()
 	}
+	if g.sandboxManager != nil {
+		_ = g.sandboxManager.Close()
+	}
+}
+
+func (g *Gateway) handleSandboxCommand(ctx context.Context, msg models.Message, text, senderName string) error {
+	g.mu.Lock()
+	botID := g.botUserID
+	botUser := g.botUser
+	if botUser.ID == "" && botID != "" {
+		if u, ok := g.userCache.Get(botID); ok {
+			botUser = u
+		}
+	}
+	sm := g.sandboxManager
+	g.mu.Unlock()
+
+	if botID != "" && msg.UserID == botID {
+		return nil // Bot is prohibited from approving or manipulating sandboxes
+	}
+
+	if sm == nil {
+		return g.SendMessage(msg.ChatID, "Sandbox execution is disabled on this server.")
+	}
+
+	parts := strings.Fields(strings.TrimSpace(text))
+	subcmd := ""
+	if len(parts) > 1 {
+		subcmd = strings.ToLower(parts[1])
+	}
+
+	switch subcmd {
+	case "approve":
+		sbx, err := sm.ApproveSandbox(ctx, msg.UserID)
+		if err != nil {
+			return g.SendMessage(msg.ChatID, fmt.Sprintf("⚠️ Failed to approve sandbox: %v", err))
+		}
+		ackMsg := fmt.Sprintf("Sandbox created successfully, proceeding with %s...", sbx.Reason)
+		if err := g.SendMessage(msg.ChatID, ackMsg); err != nil {
+			return fmt.Errorf("failed to send approval message: %w", err)
+		}
+		g.contextManager.Push(msg.ChatID, chatcontext.Entry{
+			Role:       "assistant",
+			SenderID:   botID,
+			SenderName: botUser.GetDisplayName(),
+			Content:    ackMsg,
+			Timestamp:  time.Now().Unix(),
+		})
+
+		return g.generateAndSendAgentReply(ctx, msg, true, senderName, sbx.Reason)
+
+	case "deny":
+		err := sm.DenySandbox(msg.UserID)
+		if err != nil {
+			return g.SendMessage(msg.ChatID, fmt.Sprintf("⚠️ Failed to deny sandbox: %v", err))
+		}
+		reply := "❌ **Sandbox request denied.**"
+		g.contextManager.Push(msg.ChatID, chatcontext.Entry{
+			Role:       "assistant",
+			SenderID:   botID,
+			SenderName: botUser.GetDisplayName(),
+			Content:    reply,
+			Timestamp:  time.Now().Unix(),
+		})
+		return g.SendMessage(msg.ChatID, reply)
+
+	case "destroy":
+		err := sm.Destroy(ctx, msg.UserID)
+		if err != nil {
+			return g.SendMessage(msg.ChatID, fmt.Sprintf("⚠️ Failed to destroy sandbox: %v", err))
+		}
+		reply := "🧹 **Sandbox terminated and resources released.**"
+		g.contextManager.Push(msg.ChatID, chatcontext.Entry{
+			Role:       "assistant",
+			SenderID:   botID,
+			SenderName: botUser.GetDisplayName(),
+			Content:    reply,
+			Timestamp:  time.Now().Unix(),
+		})
+		return g.SendMessage(msg.ChatID, reply)
+
+	case "status":
+		sbx, _ := sm.GetStatus(msg.UserID)
+		return g.SendMessage(msg.ChatID, g.formatSandboxStatus(sbx))
+
+	default:
+		helpText := "🔒 **Sandbox Commands:**\n" +
+			"• `/sandbox approve` — Approve pending sandbox request\n" +
+			"• `/sandbox deny` — Deny pending sandbox request\n" +
+			"• `/sandbox destroy` — Terminate your active sandbox\n" +
+			"• `/sandbox status` — View status of your sandbox"
+		return g.SendMessage(msg.ChatID, helpText)
+	}
+}
+
+func (g *Gateway) formatSandboxStatus(sbx *sandbox.UserSandbox) string {
+	if sbx == nil || sbx.Status == sandbox.StatusNone {
+		return "ℹ️ You do not have an active or pending sandbox."
+	}
+
+	switch sbx.Status {
+	case sandbox.StatusPendingApproval:
+		var b strings.Builder
+		b.WriteString("⏳ **Sandbox Request Awaiting Your Approval**\n")
+		g.appendSandboxDetails(&b, sbx)
+		b.WriteString("\nReply `/sandbox approve` to approve or `/sandbox deny` to reject.")
+		return b.String()
+
+	case sandbox.StatusRunning:
+		var b strings.Builder
+		b.WriteString("🟢 **Active Sandbox Status**\n")
+		g.appendSandboxDetails(&b, sbx)
+		return b.String()
+
+	case sandbox.StatusExpired:
+		return "⌛ **Your previous sandbox has expired.** The agent can request a new sandbox when needed."
+
+	default:
+		return fmt.Sprintf("ℹ️ Sandbox status: %s", sbx.Status)
+	}
+}
+
+func (g *Gateway) appendSandboxDetails(b *strings.Builder, sbx *sandbox.UserSandbox) {
+	b.WriteString(fmt.Sprintf("- **Driver:** %s\n", sbx.Driver))
+	if sbx.Driver == sandbox.DriverDocker && sbx.DockerImage != "" {
+		b.WriteString(fmt.Sprintf("- **Docker Image:** %s\n", sbx.DockerImage))
+	}
+	b.WriteString(fmt.Sprintf("- **Network:** %s\n", sbx.Network.Mode))
+	if len(sbx.Network.AllowedHosts) > 0 {
+		b.WriteString(fmt.Sprintf("- **Allowed Domains:** %s\n", strings.Join(sbx.Network.AllowedHosts, ", ")))
+	}
+	if len(sbx.Mounts) > 0 {
+		b.WriteString("- **Mounts (in workspace):**\n")
+		for _, m := range sbx.Mounts {
+			ro := "read-write"
+			if m.ReadOnly {
+				ro = "read-only"
+			}
+			pathStr := m.RelativePath
+			if pathStr == "." || pathStr == "" {
+				pathStr = "(whole workspace)"
+			}
+			b.WriteString(fmt.Sprintf("  • %s (%s)\n", pathStr, ro))
+		}
+	}
+	remaining := time.Until(sbx.ExpiresAt).Round(time.Minute)
+	if remaining < 0 {
+		remaining = 0
+	}
+	b.WriteString(fmt.Sprintf("- **Time Remaining:** %s\n", remaining))
 }

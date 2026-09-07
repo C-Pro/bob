@@ -40,11 +40,23 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	_ = os.Unsetenv("S3_BACKUP_INTERVAL")
 	_ = os.Unsetenv("S3_BACKUP_KEEP")
 	_ = os.Unsetenv("S3_BACKUP_PREFIX")
+	_ = os.Unsetenv("SANDBOX_ENABLED")
+	_ = os.Unsetenv("SANDBOX_DRIVERS")
+	_ = os.Unsetenv("SANDBOX_DOCKER_SOCKET")
+	_ = os.Unsetenv("SANDBOX_ALLOWED_IMAGES")
+	_ = os.Unsetenv("SANDBOX_ALLOWED_NETWORK_MODES")
+	_ = os.Unsetenv("SANDBOX_MAX_LIFETIME")
+	_ = os.Unsetenv("SANDBOX_DEFAULT_EXEC_TIMEOUT")
+	_ = os.Unsetenv("SANDBOX_MAX_EXEC_TIMEOUT")
+	_ = os.Unsetenv("SANDBOX_CPU_LIMIT")
+	_ = os.Unsetenv("SANDBOX_MEMORY_LIMIT_MB")
 
 	cfg, err := LoadFromEnv()
 	require.NoError(t, err)
 	assert.Equal(t, "@bot", cfg.BotHandle)
 	assert.Equal(t, "http://127.0.0.1:8080", cfg.BesedkaURL)
+	assert.Equal(t, "", cfg.BesedkaAPIKey)
+	assert.Equal(t, "", cfg.OpenAIAPIKey)
 	assert.Equal(t, "gemini-3.7-flash", cfg.OpenAIModel)
 	assert.Equal(t, "https://generativelanguage.googleapis.com/v1beta/openai/", cfg.OpenAIBaseURL)
 	assert.Equal(t, "", cfg.TavilyAPIKey)
@@ -61,6 +73,16 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	assert.Equal(t, "us-east-1", cfg.S3Region)
 	assert.True(t, cfg.S3PathStyle)
 	assert.Equal(t, 7, cfg.S3BackupKeep)
+	assert.True(t, cfg.SandboxEnabled)
+	assert.Equal(t, []string{"bwrap", "docker"}, cfg.SandboxDrivers)
+	assert.Equal(t, "/var/run/docker.sock", cfg.SandboxDockerSocket)
+	assert.Equal(t, []string{"alpine:latest", "golang:alpine", "python:3.11-slim", "node:20-slim"}, cfg.SandboxAllowedImages)
+	assert.Equal(t, []string{"none", "restricted"}, cfg.SandboxAllowedNetworkModes)
+	assert.Equal(t, 30*time.Minute, cfg.SandboxMaxLifetime)
+	assert.Equal(t, 1*time.Minute, cfg.SandboxDefaultExecTimeout)
+	assert.Equal(t, 10*time.Minute, cfg.SandboxMaxExecTimeout)
+	assert.Equal(t, 1.0, cfg.SandboxCPULimit)
+	assert.Equal(t, 512, cfg.SandboxMemoryLimitMB)
 }
 
 func TestLoadFromEnvStandardOpenAI(t *testing.T) {
@@ -233,4 +255,103 @@ export PRE_EXISTING=new_val
 	assert.Equal(t, "hello world", os.Getenv("DOUBLE_QUOTED"))
 	assert.Equal(t, "single world", os.Getenv("SINGLE_QUOTED"))
 	assert.Equal(t, "original_val", os.Getenv("PRE_EXISTING"))
+}
+
+func TestSandboxConfigValidation(t *testing.T) {
+	cfg := &Config{
+		OpenAIAPIKey:               "test-key",
+		BesedkaURL:                 "http://127.0.0.1:8080",
+		TownhallMaxParagraphs:      2,
+		DMMaxParagraphs:            10,
+		MsgRingBufferSize:          100,
+		SandboxEnabled:             true,
+		SandboxDrivers:             []string{"bwrap"},
+		SandboxAllowedNetworkModes: []string{"none", "restricted"},
+		SandboxMaxLifetime:         30 * time.Minute,
+		SandboxDefaultExecTimeout:  1 * time.Minute,
+		SandboxMaxExecTimeout:      10 * time.Minute,
+		SandboxCPULimit:            1.0,
+		SandboxMemoryLimitMB:       512,
+	}
+	require.NoError(t, cfg.Validate(true))
+
+	// Drivers cannot be empty
+	cfg.SandboxDrivers = nil
+	err := cfg.Validate(true)
+	assert.ErrorContains(t, err, "SANDBOX_DRIVERS cannot be empty")
+	cfg.SandboxDrivers = []string{"docker"}
+
+	// Allowed network modes cannot be empty
+	cfg.SandboxAllowedNetworkModes = nil
+	err = cfg.Validate(true)
+	assert.ErrorContains(t, err, "SANDBOX_ALLOWED_NETWORK_MODES cannot be empty")
+	cfg.SandboxAllowedNetworkModes = []string{"invalid_mode"}
+	err = cfg.Validate(true)
+	assert.ErrorContains(t, err, "invalid network mode in SANDBOX_ALLOWED_NETWORK_MODES")
+	cfg.SandboxAllowedNetworkModes = []string{"none", "restricted"}
+
+	// Max lifetime > 0
+	cfg.SandboxMaxLifetime = 0
+	err = cfg.Validate(true)
+	assert.ErrorContains(t, err, "SANDBOX_MAX_LIFETIME must be greater than 0")
+	cfg.SandboxMaxLifetime = 30 * time.Minute
+
+	// Default exec timeout > 0
+	cfg.SandboxDefaultExecTimeout = 0
+	err = cfg.Validate(true)
+	assert.ErrorContains(t, err, "SANDBOX_DEFAULT_EXEC_TIMEOUT must be greater than 0")
+	cfg.SandboxDefaultExecTimeout = 1 * time.Minute
+
+	// Max exec timeout >= default
+	cfg.SandboxMaxExecTimeout = 30 * time.Second
+	err = cfg.Validate(true)
+	assert.ErrorContains(t, err, "SANDBOX_MAX_EXEC_TIMEOUT cannot be less than SANDBOX_DEFAULT_EXEC_TIMEOUT")
+	cfg.SandboxMaxExecTimeout = 10 * time.Minute
+
+	// CPU limit > 0
+	cfg.SandboxCPULimit = 0
+	err = cfg.Validate(true)
+	assert.ErrorContains(t, err, "SANDBOX_CPU_LIMIT must be greater than 0")
+	cfg.SandboxCPULimit = 1.5
+
+	// Memory limit > 0
+	cfg.SandboxMemoryLimitMB = 0
+	err = cfg.Validate(true)
+	assert.ErrorContains(t, err, "SANDBOX_MEMORY_LIMIT_MB must be greater than 0")
+	cfg.SandboxMemoryLimitMB = 1024
+
+	// Valid now
+	assert.NoError(t, cfg.Validate(true))
+
+	// When disabled, invalid sandbox values are ignored
+	cfg.SandboxEnabled = false
+	cfg.SandboxDrivers = nil
+	cfg.SandboxAllowedNetworkModes = nil
+	assert.NoError(t, cfg.Validate(true))
+}
+
+func TestSandboxCustomEnv(t *testing.T) {
+	t.Setenv("SANDBOX_ENABLED", "false")
+	t.Setenv("SANDBOX_DRIVERS", "docker, bwrap")
+	t.Setenv("SANDBOX_DOCKER_SOCKET", "/custom/docker.sock")
+	t.Setenv("SANDBOX_ALLOWED_IMAGES", "custom/image:tag, other:latest")
+	t.Setenv("SANDBOX_ALLOWED_NETWORK_MODES", "none, restricted, full")
+	t.Setenv("SANDBOX_MAX_LIFETIME", "1h")
+	t.Setenv("SANDBOX_DEFAULT_EXEC_TIMEOUT", "2m")
+	t.Setenv("SANDBOX_MAX_EXEC_TIMEOUT", "15m")
+	t.Setenv("SANDBOX_CPU_LIMIT", "2.5")
+	t.Setenv("SANDBOX_MEMORY_LIMIT_MB", "1024")
+
+	cfg, err := LoadFromEnv()
+	require.NoError(t, err)
+	assert.False(t, cfg.SandboxEnabled)
+	assert.Equal(t, []string{"docker", "bwrap"}, cfg.SandboxDrivers)
+	assert.Equal(t, "/custom/docker.sock", cfg.SandboxDockerSocket)
+	assert.Equal(t, []string{"custom/image:tag", "other:latest"}, cfg.SandboxAllowedImages)
+	assert.Equal(t, []string{"none", "restricted", "full"}, cfg.SandboxAllowedNetworkModes)
+	assert.Equal(t, 1*time.Hour, cfg.SandboxMaxLifetime)
+	assert.Equal(t, 2*time.Minute, cfg.SandboxDefaultExecTimeout)
+	assert.Equal(t, 15*time.Minute, cfg.SandboxMaxExecTimeout)
+	assert.Equal(t, 2.5, cfg.SandboxCPULimit)
+	assert.Equal(t, 1024, cfg.SandboxMemoryLimitMB)
 }

@@ -15,34 +15,50 @@ const DefaultUserAgent = "Besedka-Bot/1.0"
 
 // Config holds runtime configuration settings for the agent.
 type Config struct {
-	BotHandle             string
-	BesedkaURL            string
-	BesedkaAPIKey         string
-	OpenAIAPIKey          string
-	OpenAIModel           string
-	OpenAIBaseURL         string
-	GeminiAPIKey          string // Deprecated: backward-compatible fallback for OpenAIAPIKey
-	GeminiModel           string // Deprecated: backward-compatible fallback for OpenAIModel
-	GeminiBaseURL         string // Deprecated: backward-compatible fallback for OpenAIBaseURL
-	TownhallMaxParagraphs int
-	DMMaxParagraphs       int
-	MsgRingBufferSize     int
-	TavilyAPIKey          string
-	TavilyBaseURL         string
-	DataDir               string
-	EmbeddingModel        string
-	EmbeddingPrecision    string
-	Secret                string
-	S3Endpoint            string
-	S3Region              string
-	S3Bucket              string
-	S3AccessKey           string
-	S3SecretKey           string
-	S3PathStyle           bool
-	S3BackupInterval      time.Duration
-	S3BackupKeep          int
-	S3BackupPrefix        string
+	BotHandle                  string
+	BesedkaURL                 string
+	BesedkaAPIKey              string
+	OpenAIAPIKey               string
+	OpenAIModel                string
+	OpenAIBaseURL              string
+	GeminiAPIKey               string // Deprecated: backward-compatible fallback for OpenAIAPIKey
+	GeminiModel                string // Deprecated: backward-compatible fallback for OpenAIModel
+	GeminiBaseURL              string // Deprecated: backward-compatible fallback for OpenAIBaseURL
+	TownhallMaxParagraphs      int
+	DMMaxParagraphs            int
+	MsgRingBufferSize          int
+	TavilyAPIKey               string
+	TavilyBaseURL              string
+	DataDir                    string
+	EmbeddingModel             string
+	EmbeddingPrecision         string
+	Secret                     string
+	S3Endpoint                 string
+	S3Region                   string
+	S3Bucket                   string
+	S3AccessKey                string
+	S3SecretKey                string
+	S3PathStyle                bool
+	S3BackupInterval           time.Duration
+	S3BackupKeep               int
+	S3BackupPrefix             string
+	SandboxEnabled             bool
+	SandboxDrivers             []string
+	SandboxDockerSocket        string
+	SandboxAllowedImages       []string
+	SandboxAllowedNetworkModes []string
+	SandboxMaxLifetime         time.Duration
+	SandboxDefaultExecTimeout  time.Duration
+	SandboxMaxExecTimeout      time.Duration
+	SandboxCPULimit            float64
+	SandboxMemoryLimitMB       int
 }
+
+// DefaultSandboxAllowedImages defines standard safe container images.
+var DefaultSandboxAllowedImages = []string{"alpine:latest", "golang:alpine", "python:3.11-slim", "node:20-slim"}
+
+// DefaultSandboxAllowedNetworkModes defines standard safe network modes (full is disabled by default).
+var DefaultSandboxAllowedNetworkModes = []string{"none", "restricted"}
 
 // S3Enabled reports whether object-storage backup is configured.
 func (c *Config) S3Enabled() bool {
@@ -77,33 +93,43 @@ func LoadFromEnv() (*Config, error) {
 	s3PathStyle := s3PathStyleStr == "true" || s3PathStyleStr == "1"
 
 	cfg := &Config{
-		BotHandle:             getEnvOrDefault("BOT_HANDLE", "@bot"),
-		BesedkaURL:            getEnvOrDefault("BESEDKA_URL", defaultBesedkaURL),
-		BesedkaAPIKey:         os.Getenv("BESEDKA_API_KEY"),
-		OpenAIAPIKey:          apiKey,
-		OpenAIModel:           model,
-		OpenAIBaseURL:         baseURL,
-		GeminiAPIKey:          apiKey,
-		GeminiModel:           model,
-		GeminiBaseURL:         baseURL,
-		TavilyAPIKey:          getEnvOrDefault("TAVILY_API_KEY", ""),
-		TavilyBaseURL:         tavilyBaseURL,
-		TownhallMaxParagraphs: getEnvIntOrDefault("TOWNHALL_MAX_PARAGRAPHS", 2),
-		DMMaxParagraphs:       getEnvIntOrDefault("DM_MAX_PARAGRAPHS", 10),
-		MsgRingBufferSize:     getEnvIntOrDefault("MSG_RING_BUFFER_SIZE", 100),
-		DataDir:               getEnvOrDefault("DATA_DIR", "./data"),
-		EmbeddingModel:        getEnvOrDefault("EMBEDDING_MODEL", ""),
-		EmbeddingPrecision:    strings.ToLower(getEnvOrDefault("EMBEDDING_PRECISION", "bf16")),
-		Secret:                secret,
-		S3Endpoint:            os.Getenv("S3_ENDPOINT"),
-		S3Region:              getEnvOrDefault("S3_REGION", "us-east-1"),
-		S3Bucket:              os.Getenv("S3_BUCKET"),
-		S3AccessKey:           os.Getenv("S3_ACCESS_KEY"),
-		S3SecretKey:           os.Getenv("S3_SECRET_KEY"),
-		S3PathStyle:           s3PathStyle,
-		S3BackupInterval:      backupInterval,
-		S3BackupKeep:          getEnvIntOrDefault("S3_BACKUP_KEEP", 7),
-		S3BackupPrefix:        s3Prefix,
+		BotHandle:                  getEnvOrDefault("BOT_HANDLE", "@bot"),
+		BesedkaURL:                 getEnvOrDefault("BESEDKA_URL", defaultBesedkaURL),
+		BesedkaAPIKey:              os.Getenv("BESEDKA_API_KEY"),
+		OpenAIAPIKey:               apiKey,
+		OpenAIModel:                model,
+		OpenAIBaseURL:              baseURL,
+		GeminiAPIKey:               apiKey,
+		GeminiModel:                model,
+		GeminiBaseURL:              baseURL,
+		TavilyAPIKey:               getEnvOrDefault("TAVILY_API_KEY", ""),
+		TavilyBaseURL:              tavilyBaseURL,
+		TownhallMaxParagraphs:      getEnvIntOrDefault("TOWNHALL_MAX_PARAGRAPHS", 2),
+		DMMaxParagraphs:            getEnvIntOrDefault("DM_MAX_PARAGRAPHS", 10),
+		MsgRingBufferSize:          getEnvIntOrDefault("MSG_RING_BUFFER_SIZE", 100),
+		DataDir:                    getEnvOrDefault("DATA_DIR", "./data"),
+		EmbeddingModel:             getEnvOrDefault("EMBEDDING_MODEL", ""),
+		EmbeddingPrecision:         strings.ToLower(getEnvOrDefault("EMBEDDING_PRECISION", "bf16")),
+		Secret:                     secret,
+		S3Endpoint:                 os.Getenv("S3_ENDPOINT"),
+		S3Region:                   getEnvOrDefault("S3_REGION", "us-east-1"),
+		S3Bucket:                   os.Getenv("S3_BUCKET"),
+		S3AccessKey:                os.Getenv("S3_ACCESS_KEY"),
+		S3SecretKey:                os.Getenv("S3_SECRET_KEY"),
+		S3PathStyle:                s3PathStyle,
+		S3BackupInterval:           backupInterval,
+		S3BackupKeep:               getEnvIntOrDefault("S3_BACKUP_KEEP", 7),
+		S3BackupPrefix:             s3Prefix,
+		SandboxEnabled:             getEnvBoolOrDefault("SANDBOX_ENABLED", true),
+		SandboxDrivers:             getEnvSliceOrDefault("SANDBOX_DRIVERS", []string{"bwrap", "docker"}),
+		SandboxDockerSocket:        getEnvOrDefault("SANDBOX_DOCKER_SOCKET", "/var/run/docker.sock"),
+		SandboxAllowedImages:       getEnvSliceOrDefault("SANDBOX_ALLOWED_IMAGES", DefaultSandboxAllowedImages),
+		SandboxAllowedNetworkModes: getEnvSliceOrDefault("SANDBOX_ALLOWED_NETWORK_MODES", DefaultSandboxAllowedNetworkModes),
+		SandboxMaxLifetime:         getEnvDurationOrDefault("SANDBOX_MAX_LIFETIME", 30*time.Minute),
+		SandboxDefaultExecTimeout:  getEnvDurationOrDefault("SANDBOX_DEFAULT_EXEC_TIMEOUT", 1*time.Minute),
+		SandboxMaxExecTimeout:      getEnvDurationOrDefault("SANDBOX_MAX_EXEC_TIMEOUT", 10*time.Minute),
+		SandboxCPULimit:            getEnvFloatOrDefault("SANDBOX_CPU_LIMIT", 1.0),
+		SandboxMemoryLimitMB:       getEnvIntOrDefault("SANDBOX_MEMORY_LIMIT_MB", 512),
 	}
 
 	// Normalize bot handle to ensure it starts with @
@@ -164,6 +190,35 @@ func (c *Config) Validate(requireAPIKey bool) error {
 			return errors.New("S3_BACKUP_KEEP must be greater than 0")
 		}
 	}
+	if c.SandboxEnabled {
+		if len(c.SandboxDrivers) == 0 {
+			return errors.New("SANDBOX_DRIVERS cannot be empty when sandbox is enabled")
+		}
+		if len(c.SandboxAllowedNetworkModes) == 0 {
+			return errors.New("SANDBOX_ALLOWED_NETWORK_MODES cannot be empty when sandbox is enabled")
+		}
+		for _, m := range c.SandboxAllowedNetworkModes {
+			lower := strings.ToLower(strings.TrimSpace(m))
+			if lower != "none" && lower != "restricted" && lower != "full" {
+				return fmt.Errorf("invalid network mode in SANDBOX_ALLOWED_NETWORK_MODES: %s", m)
+			}
+		}
+		if c.SandboxMaxLifetime <= 0 {
+			return errors.New("SANDBOX_MAX_LIFETIME must be greater than 0")
+		}
+		if c.SandboxDefaultExecTimeout <= 0 {
+			return errors.New("SANDBOX_DEFAULT_EXEC_TIMEOUT must be greater than 0")
+		}
+		if c.SandboxMaxExecTimeout < c.SandboxDefaultExecTimeout {
+			return errors.New("SANDBOX_MAX_EXEC_TIMEOUT cannot be less than SANDBOX_DEFAULT_EXEC_TIMEOUT")
+		}
+		if c.SandboxCPULimit <= 0 {
+			return errors.New("SANDBOX_CPU_LIMIT must be greater than 0")
+		}
+		if c.SandboxMemoryLimitMB <= 0 {
+			return errors.New("SANDBOX_MEMORY_LIMIT_MB must be greater than 0")
+		}
+	}
 	return nil
 }
 
@@ -177,6 +232,53 @@ func getEnvOrDefault(key, defaultValue string) string {
 func getEnvIntOrDefault(key string, defaultValue int) int {
 	if valStr := strings.TrimSpace(os.Getenv(key)); valStr != "" {
 		if val, err := strconv.Atoi(valStr); err == nil && val > 0 {
+			return val
+		}
+	}
+	return defaultValue
+}
+
+func getEnvBoolOrDefault(key string, defaultValue bool) bool {
+	if val := strings.TrimSpace(os.Getenv(key)); val != "" {
+		lower := strings.ToLower(val)
+		if lower == "false" || lower == "0" || lower == "no" {
+			return false
+		}
+		if lower == "true" || lower == "1" || lower == "yes" {
+			return true
+		}
+	}
+	return defaultValue
+}
+
+func getEnvSliceOrDefault(key string, defaultValue []string) []string {
+	if val := strings.TrimSpace(os.Getenv(key)); val != "" {
+		parts := strings.Split(val, ",")
+		var res []string
+		for _, p := range parts {
+			if trimmed := strings.TrimSpace(p); trimmed != "" {
+				res = append(res, trimmed)
+			}
+		}
+		if len(res) > 0 {
+			return res
+		}
+	}
+	return defaultValue
+}
+
+func getEnvDurationOrDefault(key string, defaultValue time.Duration) time.Duration {
+	if val := strings.TrimSpace(os.Getenv(key)); val != "" {
+		if d, err := time.ParseDuration(val); err == nil && d > 0 {
+			return d
+		}
+	}
+	return defaultValue
+}
+
+func getEnvFloatOrDefault(key string, defaultValue float64) float64 {
+	if valStr := strings.TrimSpace(os.Getenv(key)); valStr != "" {
+		if val, err := strconv.ParseFloat(valStr, 64); err == nil && val > 0 {
 			return val
 		}
 	}

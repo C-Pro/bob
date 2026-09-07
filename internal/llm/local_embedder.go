@@ -35,7 +35,8 @@ func NewLocalEmbedder(cfg *config.Config, extraOpts ...embed.Option) (*LocalEmbe
 	}
 
 	modelName := DefaultLocalModel
-	modelsDir := filepath.Join(cfg.DataDir, "models", modelName)
+	targetDir := filepath.Join(cfg.DataDir, "models", modelName)
+	modelsDir := resolveModelDir(targetDir, modelName)
 	if err := os.MkdirAll(modelsDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create models directory %s: %w", modelsDir, err)
 	}
@@ -226,3 +227,35 @@ func AggregateMultiWindowVectors(rawSlices [][]float32) ([]float32, error) {
 
 	return avg, nil
 }
+
+func resolveModelDir(targetDir, modelName string) string {
+	targetSafetensors := filepath.Join(targetDir, "model.safetensors")
+	if fi, err := os.Stat(targetSafetensors); err == nil && fi.Size() > 0 {
+		return targetDir
+	}
+
+	candidates := []string{
+		filepath.Join(os.Getenv("BOB_MODELS_DIR"), modelName),
+		filepath.Join("models", modelName),
+		filepath.Join("..", "models", modelName),
+		filepath.Join("..", "..", "models", modelName),
+		filepath.Join("data", "models", modelName),
+		filepath.Join("..", "data", "models", modelName),
+		filepath.Join("..", "..", "data", "models", modelName),
+	}
+
+	for _, c := range candidates {
+		if c == "" || c == modelName {
+			continue
+		}
+		if fi, err := os.Stat(filepath.Join(c, "model.safetensors")); err == nil && fi.Size() > 0 {
+			if abs, err := filepath.Abs(c); err == nil {
+				return abs
+			}
+			return c
+		}
+	}
+
+	return targetDir
+}
+

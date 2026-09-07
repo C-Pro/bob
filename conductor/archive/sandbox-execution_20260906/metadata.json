@@ -1,0 +1,8 @@
+{
+  "track_id": "sandbox-execution_20260906",
+  "type": "feature",
+  "status": "completed",
+  "created_at": "2026-09-06T05:00:00Z",
+  "updated_at": "2026-09-06T15:10:00Z",
+  "description": "Implement isolated sandbox execution subsystem supporting unprivileged Bubblewrap (bwrap) and Docker drivers, DM-only access with interactive user approval cards, kernel-enforced network namespace airgapping, domain-filtering proxy with DNS rebinding and hop-by-hop header protection, and dynamic workspace management."
+}
