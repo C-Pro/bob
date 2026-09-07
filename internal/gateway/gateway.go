@@ -895,7 +895,7 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 			llmMsgs,
 			toolDefs,
 			toolsRegistry,
-			5,
+			20,
 		)
 	} else {
 		reply, err = g.llmClient.GenerateChatResponse(ctx, llmMsgs)
