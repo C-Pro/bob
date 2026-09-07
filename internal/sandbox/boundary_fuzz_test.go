@@ -273,10 +273,10 @@ func TestFilteringProxy_RestrictedEmptyDomains_DefaultOpen(t *testing.T) {
 	assert.Error(t, err, "localhost must be blocked")
 
 	// 2. Public internet IP (e.g. 93.184.216.34 for example.com)
-	// DEFECT: Because len(p.policy.AllowedHosts) == 0, the whitelist loop is skipped entirely!
+	// Must be blocked by default-deny when AllowedHosts is empty in Restricted mode
 	ip, err := proxy.resolveAndValidate(context.Background(), "93.184.216.34")
-	assert.NoError(t, err, "DEFECT CONFIRMED: resolveAndValidate returned nil error because whitelist loop was skipped when AllowedHosts is empty")
-	assert.Equal(t, "93.184.216.34", ip.String(), "Public IP was permitted through restricted proxy with empty whitelist")
+	assert.Error(t, err, "Public IP must be rejected when AllowedHosts is empty in Restricted mode")
+	assert.Nil(t, ip)
 
 	// 3. Contrast with populated AllowedHosts: unlisted IP is correctly rejected
 	proxyStrict := &FilteringProxy{

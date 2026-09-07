@@ -284,8 +284,11 @@ func (p *FilteringProxy) resolveAndValidate(ctx context.Context, host string) (n
 		}
 	}
 
-	// 3. If in Restricted mode with AllowedHosts, verify host or IP is explicitly permitted
-	if p.policy.Mode == NetworkRestricted && len(p.policy.AllowedHosts) > 0 {
+	// 3. If in Restricted mode, verify host or IP is explicitly permitted in AllowedHosts whitelist (default-deny)
+	if p.policy.Mode == NetworkRestricted {
+		if len(p.policy.AllowedHosts) == 0 {
+			return nil, fmt.Errorf("restricted network policy requires at least one allowed domain; host %q blocked by default-deny", cleanHost)
+		}
 		allowed := false
 		for _, allowedHost := range p.policy.AllowedHosts {
 			cleanAllowed := strings.ToLower(strings.TrimSpace(allowedHost))
