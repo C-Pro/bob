@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -360,4 +361,118 @@ func TestMandatoryBlockedCIDRs_Immutability(t *testing.T) {
 	assert.Contains(t, pol.BlockedCIDRs, "127.0.0.0/8")
 }
 
+func TestFilteringProxy_UnixSocket_ConnectHalfCloseAndClose(t *testing.T) {
+	// 1. Backend TCP server: reads a request, writes a response, and half-closes (CloseWrite)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = ln.Close() }()
 
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				buf := make([]byte, 4)
+				_, err := io.ReadFull(c, buf)
+				if err != nil {
+					return
+				}
+				_, _ = c.Write([]byte("ECHO:" + string(buf)))
+				if tc, ok := c.(*net.TCPConn); ok {
+					_ = tc.CloseWrite()
+				}
+				// Server keeps read side open for a moment
+				time.Sleep(1 * time.Second)
+			}(conn)
+		}
+	}()
+
+	backendHost, _, err := net.SplitHostPort(ln.Addr().String())
+	require.NoError(t, err)
+
+	tmpDir := t.TempDir()
+	sockPath := filepath.Join(tmpDir, "proxy.sock")
+
+	proxy, err := NewFilteringProxyWithConfig(ProxyConfig{
+		Policy: NetworkPolicy{
+			Mode:         NetworkRestricted,
+			AllowedHosts: []string{backendHost},
+		},
+		ListenTCP:     "127.0.0.1:0",
+		SocketPath:    sockPath,
+		CustomBlocked: []string{"169.254.0.0/16"},
+	})
+	require.NoError(t, err)
+	defer func() { _ = proxy.Close() }()
+
+	// 2. Connect via Unix domain socket to proxy
+	clientConn, err := net.Dial("unix", sockPath)
+	require.NoError(t, err)
+	defer func() { _ = clientConn.Close() }()
+
+	unixConn, ok := clientConn.(*net.UnixConn)
+	require.True(t, ok)
+
+	// Send CONNECT
+	req := "CONNECT " + ln.Addr().String() + " HTTP/1.1\r\nHost: " + ln.Addr().String() + "\r\n\r\n"
+	_, err = unixConn.Write([]byte(req))
+	require.NoError(t, err)
+
+	reader := bufio.NewReader(unixConn)
+	statusLine, err := reader.ReadString('\n')
+	require.NoError(t, err)
+	assert.Contains(t, statusLine, "200 Connection Established")
+
+	for {
+		line, err := reader.ReadString('\n')
+		require.NoError(t, err)
+		if strings.TrimSpace(line) == "" {
+			break
+		}
+	}
+
+	// 3. Write 4 bytes to server. Server will reply and call CloseWrite().
+	// Client should receive response and EOF without waiting for the server to call Close() after 1 second.
+	_, err = unixConn.Write([]byte("ping"))
+	require.NoError(t, err)
+
+	start := time.Now()
+	// Read response until EOF
+	resp, err := io.ReadAll(reader)
+	duration := time.Since(start)
+	require.NoError(t, err)
+	assert.Equal(t, "ECHO:ping", string(resp))
+	// If half-close was propagated to unixConn, duration must be < 500ms (not waiting 1s for server Close)
+	assert.Less(t, duration, 500*time.Millisecond, "CloseWrite on destConn must immediately propagate EOF to clientConn")
+
+	// 4. Test that proxy.Close() actively closes hijacked connections immediately
+	conn2, err := net.Dial("unix", sockPath)
+	require.NoError(t, err)
+	defer func() { _ = conn2.Close() }()
+
+	_, err = conn2.Write([]byte(req))
+	require.NoError(t, err)
+	reader2 := bufio.NewReader(conn2)
+	statusLine2, err := reader2.ReadString('\n')
+	require.NoError(t, err)
+	assert.Contains(t, statusLine2, "200 Connection Established")
+	for {
+		line, err := reader2.ReadString('\n')
+		require.NoError(t, err)
+		if strings.TrimSpace(line) == "" {
+			break
+		}
+	}
+
+	// Now close the proxy; conn2 should be closed immediately (< 100ms)
+	closeStart := time.Now()
+	require.NoError(t, proxy.Close())
+	buf := make([]byte, 10)
+	_, err = conn2.Read(buf)
+	closeDuration := time.Since(closeStart)
+	assert.Error(t, err, "hijacked connection should be closed when proxy is closed")
+	assert.Less(t, closeDuration, 200*time.Millisecond, "proxy.Close must immediately terminate hijacked connections")
+}

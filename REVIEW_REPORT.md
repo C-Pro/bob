@@ -536,8 +536,8 @@ To transition branch `feature/sandbox` into a production-ready state, engineerin
   Synchronize `sbx.InternalID` reads in `docker/driver.go` using a read-write mutex.
 - **[DONE] R2.4 Synchronize `ProgressReporter`**:
   Add `sync.WaitGroup` to `ProgressReporter.Stop()` and explicitly stop the reporter prior to calling `g.SendMessage` for the final reply.
-- **R2.5 Handle Unix Domain Socket Half-Close & Context Leaks**:
-  Assert against `type closeWriter interface { CloseWrite() error }` in `proxy.go:handleConnect` and terminate copy routines on `req.Context().Done()`.
+- **[DONE] R2.5 Handle Unix Domain Socket Half-Close & Context Leaks (VULN-08)**:
+  Assert against `type closeWriter interface { CloseWrite() error }` in `proxy.go:handleConnect`, track active hijacked conns in `FilteringProxy`, and terminate copy routines on `req.Context().Done()`.
 - **R2.6 Resource Constraints in Bubblewrap & Docker**:
   Apply `RLIMIT_NPROC` and `RLIMIT_AS` in Bubblewrap; issue `kill -9` to lingering Docker exec PIDs upon timeout.
 

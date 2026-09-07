@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -34,7 +35,19 @@ type FilteringProxy struct {
 	port         int
 	closed       bool
 	mu           sync.Mutex
+	connsMu      sync.Mutex
+	activeConns  map[net.Conn]struct{}
 	httpClient   *http.Client
+}
+
+type closeWriter interface {
+	CloseWrite() error
+}
+
+func closeWrite(conn net.Conn) {
+	if cw, ok := conn.(closeWriter); ok {
+		_ = cw.CloseWrite()
+	}
 }
 
 // NewFilteringProxy starts an in-process filtering proxy bound to 127.0.0.1 on a free port.
@@ -93,6 +106,7 @@ func NewFilteringProxyWithConfig(cfg ProxyConfig) (*FilteringProxy, error) {
 		addr:         ln.Addr().String(),
 		socketPath:   cfg.SocketPath,
 		port:         port,
+		activeConns:  make(map[net.Conn]struct{}),
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -140,6 +154,22 @@ func (p *FilteringProxy) SocketPath() string {
 	return p.socketPath
 }
 
+func (p *FilteringProxy) trackConn(c net.Conn) {
+	p.connsMu.Lock()
+	defer p.connsMu.Unlock()
+	if p.activeConns != nil {
+		p.activeConns[c] = struct{}{}
+	}
+}
+
+func (p *FilteringProxy) untrackConn(c net.Conn) {
+	p.connsMu.Lock()
+	defer p.connsMu.Unlock()
+	if p.activeConns != nil {
+		delete(p.activeConns, c)
+	}
+}
+
 // Close stops the proxy listener and terminates active connections.
 func (p *FilteringProxy) Close() error {
 	p.mu.Lock()
@@ -148,14 +178,27 @@ func (p *FilteringProxy) Close() error {
 		return nil
 	}
 	p.closed = true
+
+	// Terminate active hijacked connections
+	p.connsMu.Lock()
+	for c := range p.activeConns {
+		_ = c.Close()
+	}
+	p.activeConns = make(map[net.Conn]struct{})
+	p.connsMu.Unlock()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	err := p.server.Shutdown(ctx)
 	if p.unixListener != nil {
-		_ = p.unixListener.Close()
+		if uErr := p.unixListener.Close(); uErr != nil && !errors.Is(uErr, net.ErrClosed) && err == nil {
+			err = uErr
+		}
 	}
 	if p.socketPath != "" {
-		_ = os.Remove(p.socketPath)
+		if rmErr := os.Remove(p.socketPath); rmErr != nil && !os.IsNotExist(rmErr) && err == nil {
+			err = rmErr
+		}
 	}
 	return err
 }
@@ -344,11 +387,28 @@ func (p *FilteringProxy) handleConnect(w http.ResponseWriter, req *http.Request,
 	}
 	defer func() { _ = clientConn.Close() }()
 
+	p.trackConn(clientConn)
+	defer p.untrackConn(clientConn)
+	p.trackConn(destConn)
+	defer p.untrackConn(destConn)
+
 	_, err = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 	if err != nil {
 		p.logAccess(req.RemoteAddr, req.Method, targetHost, req.Proto, http.StatusBadGateway, 0, "ERROR", err.Error())
 		return
 	}
+
+	ctx := req.Context()
+	ctxDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = clientConn.Close()
+			_ = destConn.Close()
+		case <-ctxDone:
+		}
+	}()
+	defer close(ctxDone)
 
 	// Bidirectional tunnel
 	var wg sync.WaitGroup
@@ -359,18 +419,14 @@ func (p *FilteringProxy) handleConnect(w http.ResponseWriter, req *http.Request,
 		defer wg.Done()
 		n, _ := io.Copy(destConn, clientConn)
 		atomic.AddInt64(&bytesToDest, n)
-		if tcpConn, ok := destConn.(*net.TCPConn); ok {
-			_ = tcpConn.CloseWrite()
-		}
+		closeWrite(destConn)
 	}()
 
 	go func() {
 		defer wg.Done()
 		n, _ := io.Copy(clientConn, destConn)
 		atomic.AddInt64(&bytesToClient, n)
-		if tcpConn, ok := clientConn.(*net.TCPConn); ok {
-			_ = tcpConn.CloseWrite()
-		}
+		closeWrite(clientConn)
 	}()
 
 	wg.Wait()
