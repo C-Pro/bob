@@ -532,7 +532,7 @@ To transition branch `feature/sandbox` into a production-ready state, engineerin
   Add `StatusCreating` state to `SandboxStatus`. Hold lock during transition to prevent concurrent approvals or orphaned containers on denial.
 - **[DONE] R2.2 Enforce Immutability on `MandatoryBlockedCIDRs`**:
   Make `defaultMandatoryBlockedCIDRs` private; return deep copies; inject test overrides via `ProxyConfig.CustomBlocked`.
-- **R2.3 Thread-Safe Container Handles**:
+- **[DONE] R2.3 Thread-Safe Container Handles**:
   Synchronize `sbx.InternalID` reads in `docker/driver.go` using a read-write mutex.
 - **R2.4 Synchronize `ProgressReporter`**:
   Add `sync.WaitGroup` to `ProgressReporter.Stop()` and explicitly stop the reporter prior to calling `g.SendMessage` for the final reply.

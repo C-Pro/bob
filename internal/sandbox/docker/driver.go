@@ -235,10 +235,10 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 	if err := json.NewDecoder(createResp.Body).Decode(&createResult); err != nil {
 		return fmt.Errorf("failed to decode container create response: %w", err)
 	}
-	sbx.InternalID = createResult.ID
+	sbx.SetInternalID(createResult.ID)
 
 	// Start container
-	startURL := fmt.Sprintf("http://localhost/containers/%s/start", sbx.InternalID)
+	startURL := fmt.Sprintf("http://localhost/containers/%s/start", sbx.GetInternalID())
 	startReq, err := http.NewRequestWithContext(ctx, http.MethodPost, startURL, nil)
 	if err != nil {
 		_ = d.Destroy(ctx, sbx)
@@ -263,7 +263,8 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 
 // Exec executes a command inside the running sandbox container.
 func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []string, timeout time.Duration) (*sandbox.ExecResult, error) {
-	if sbx.InternalID == "" {
+	internalID := sbx.GetInternalID()
+	if internalID == "" {
 		return nil, errors.New("container has not been created or is not running")
 	}
 
@@ -297,7 +298,7 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 	}
 	bodyJSON, _ := json.Marshal(execCreatePayload)
 
-	createURL := fmt.Sprintf("http://localhost/containers/%s/exec", sbx.InternalID)
+	createURL := fmt.Sprintf("http://localhost/containers/%s/exec", internalID)
 	req, err := http.NewRequestWithContext(execCtx, http.MethodPost, createURL, bytes.NewReader(bodyJSON))
 	if err != nil {
 		return nil, fmt.Errorf("failed to build exec create request: %w", err)
@@ -389,11 +390,12 @@ func (d *Driver) Destroy(ctx context.Context, sbx *sandbox.UserSandbox) error {
 	}
 	d.mu.Unlock()
 
-	if sbx.InternalID == "" {
+	internalID := sbx.GetInternalID()
+	if internalID == "" {
 		return nil
 	}
 
-	deleteURL := fmt.Sprintf("http://localhost/containers/%s?v=1&force=true", sbx.InternalID)
+	deleteURL := fmt.Sprintf("http://localhost/containers/%s?v=1&force=true", internalID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, deleteURL, nil)
 	if err != nil {
 		return fmt.Errorf("failed to build container delete request: %w", err)
@@ -401,11 +403,11 @@ func (d *Driver) Destroy(ctx context.Context, sbx *sandbox.UserSandbox) error {
 
 	resp, err := d.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to delete container %s: %w", sbx.InternalID, err)
+		return fmt.Errorf("failed to delete container %s: %w", internalID, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	sbx.InternalID = ""
+	sbx.SetInternalID("")
 	return nil
 }
 

@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
@@ -56,19 +57,34 @@ const (
 
 // UserSandbox holds the state and configuration of a user's single sandbox.
 type UserSandbox struct {
-	UserID      string
-	ChatID      string
-	Driver      DriverType
-	DockerImage string
-	Network     NetworkPolicy
-	Mounts      []UserMount
-	Devices     DevicePolicy
-	Reason      string
-	CreatedAt   time.Time
-	ExpiresAt   time.Time
+	mu           sync.RWMutex
+	UserID       string
+	ChatID       string
+	Driver       DriverType
+	DockerImage  string
+	Network      NetworkPolicy
+	Mounts       []UserMount
+	Devices      DevicePolicy
+	Reason       string
+	CreatedAt    time.Time
+	ExpiresAt    time.Time
 	Status       SandboxStatus
 	InternalID   string // Driver-specific handle (e.g. docker container ID)
 	WorkspaceDir string // Absolute path to user sandbox workspace on host
+}
+
+// GetInternalID returns the internal driver handle safely under read lock.
+func (s *UserSandbox) GetInternalID() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.InternalID
+}
+
+// SetInternalID sets the internal driver handle safely under write lock.
+func (s *UserSandbox) SetInternalID(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.InternalID = id
 }
 
 // ExecResult contains the output and status of a command executed in a sandbox.

@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -109,7 +111,7 @@ func TestDockerDriverWithMockServer(t *testing.T) {
 
 	err = driver.Create(ctx, sbx, userWorkspace)
 	require.NoError(t, err)
-	assert.Equal(t, "mock-container-abc", sbx.InternalID)
+	assert.Equal(t, "mock-container-abc", sbx.GetInternalID())
 
 	execRes, err := driver.Exec(ctx, sbx, []string{"echo", "hi"}, 5*time.Second)
 	require.NoError(t, err)
@@ -118,7 +120,51 @@ func TestDockerDriverWithMockServer(t *testing.T) {
 
 	err = driver.Destroy(ctx, sbx)
 	require.NoError(t, err)
-	assert.Empty(t, sbx.InternalID)
+	assert.Empty(t, sbx.GetInternalID())
+}
+
+func TestDockerDriver_ConcurrentExecDestroyRace(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/exec") {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"Id": "exec-abc"})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	driver := NewDriver(Config{SocketPath: ts.URL})
+	driver.client = ts.Client()
+
+	sbx := &sandbox.UserSandbox{
+		UserID: "testuser",
+	}
+	sbx.SetInternalID("container-race-test")
+
+	ctx := context.Background()
+	var wg sync.WaitGroup
+
+	// Goroutine 1: Rapid Exec calls reading InternalID
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			_, _ = driver.Exec(ctx, sbx, []string{"echo", "1"}, time.Second)
+		}
+	}()
+
+	// Goroutine 2: Rapid SetInternalID / Destroy clearing InternalID
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			_ = driver.Destroy(ctx, sbx)
+			sbx.SetInternalID("container-race-test")
+		}
+	}()
+
+	wg.Wait()
 }
 
 func TestDemuxDockerStream(t *testing.T) {
