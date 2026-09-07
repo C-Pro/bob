@@ -323,3 +323,138 @@ func TestDockerDriver_NetworkRestrictedProxyReachability(t *testing.T) {
 	assert.True(t, hasHostDockerInternal, "expected HTTP_PROXY to point to host.docker.internal")
 }
 
+func TestDockerDriver_AutoPullMissingImage_Success(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "mock_docker_pull.sock")
+
+	listener, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+	defer func() { _ = listener.Close() }()
+
+	var createCalls int
+	var pullCalled bool
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_ping", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+
+	mux.HandleFunc("/images/create", func(w http.ResponseWriter, r *http.Request) {
+		pullCalled = true
+		assert.Equal(t, "test-image:latest", r.URL.Query().Get("fromImage"))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"Pulling from test-image"}` + "\n" + `{"status":"Digest: sha256:abc"}` + "\n"))
+	})
+
+	mux.HandleFunc("/containers/create", func(w http.ResponseWriter, r *http.Request) {
+		createCalls++
+		if createCalls == 1 {
+			// First attempt fails with 404 No such image
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"No such image: test-image:latest"}`))
+			return
+		}
+		// Second attempt after pull succeeds with 201 Created
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"Id":"container-after-pull-123"}`))
+	})
+
+	mux.HandleFunc("/containers/container-after-pull-123/start", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	mux.HandleFunc("/containers/container-after-pull-123", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusNoContent)
+		}
+	})
+
+	server := &http.Server{Handler: mux}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	defer func() { _ = server.Close() }()
+
+	driver := NewDriver(Config{
+		SocketPath:    sockPath,
+		AllowedImages: []string{"test-image:latest"},
+	})
+
+	ctx := context.Background()
+	userWorkspace := filepath.Join(tempDir, "user_workspace")
+	require.NoError(t, os.MkdirAll(userWorkspace, 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID:      "testuser_pull",
+		DockerImage: "test-image:latest",
+		Network: sandbox.NetworkPolicy{
+			Mode: sandbox.NetworkNone,
+		},
+		Status: sandbox.StatusRunning,
+	}
+
+	err = driver.Create(ctx, sbx, userWorkspace)
+	require.NoError(t, err)
+	assert.True(t, pullCalled, "expected image pull to be called on missing image")
+	assert.Equal(t, 2, createCalls, "expected container create to be retried after pull")
+	assert.Equal(t, "container-after-pull-123", sbx.GetInternalID())
+
+	err = driver.Destroy(ctx, sbx)
+	require.NoError(t, err)
+}
+
+func TestDockerDriver_AutoPullMissingImage_PullError(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "mock_docker_pull_err.sock")
+
+	listener, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+	defer func() { _ = listener.Close() }()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_ping", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+
+	mux.HandleFunc("/containers/create", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"message":"No such image: forbidden-image:latest"}`))
+	})
+
+	mux.HandleFunc("/images/create", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		// Stream reports mid-pull error
+		_, _ = w.Write([]byte(`{"errorDetail":{"message":"pull access denied"},"error":"pull access denied"}` + "\n"))
+	})
+
+	server := &http.Server{Handler: mux}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	defer func() { _ = server.Close() }()
+
+	driver := NewDriver(Config{
+		SocketPath:    sockPath,
+		AllowedImages: []string{"forbidden-image:latest"},
+	})
+
+	ctx := context.Background()
+	userWorkspace := filepath.Join(tempDir, "user_workspace")
+	require.NoError(t, os.MkdirAll(userWorkspace, 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID:      "testuser_pull_fail",
+		DockerImage: "forbidden-image:latest",
+		Network: sandbox.NetworkPolicy{
+			Mode: sandbox.NetworkNone,
+		},
+		Status: sandbox.StatusRunning,
+	}
+
+	err = driver.Create(ctx, sbx, userWorkspace)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "pull access denied")
+}
+

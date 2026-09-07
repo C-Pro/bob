@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -229,6 +230,25 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 	createResp, err := d.client.Do(createReq)
 	if err != nil {
 		return fmt.Errorf("failed to connect to docker daemon: %w", err)
+	}
+
+	if createResp.StatusCode == http.StatusNotFound {
+		_ = createResp.Body.Close()
+		// Image is missing locally; pull it and retry container create
+		if pullErr := d.pullImage(ctx, image); pullErr != nil {
+			return fmt.Errorf("image %s missing locally and pull failed: %w", image, pullErr)
+		}
+
+		retryReq, rErr := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost/containers/create", bytes.NewReader(bodyJSON))
+		if rErr != nil {
+			return fmt.Errorf("failed to build retry container create request: %w", rErr)
+		}
+		retryReq.Header.Set("Content-Type", "application/json")
+
+		createResp, err = d.client.Do(retryReq)
+		if err != nil {
+			return fmt.Errorf("failed to retry container create after image pull: %w", err)
+		}
 	}
 	defer func() { _ = createResp.Body.Close() }()
 
@@ -538,5 +558,58 @@ func getDockerBridgeIP() string {
 		}
 	}
 	return ""
+}
+
+// pullImage streams and downloads a docker image from registry using Docker Engine API.
+func (d *Driver) pullImage(ctx context.Context, image string) error {
+	slog.Info("pulling missing docker image for sandbox", "image", image)
+
+	pullCtx := ctx
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		pullCtx, cancel = context.WithTimeout(ctx, 5*time.Minute)
+		defer cancel()
+	}
+
+	pullURL := fmt.Sprintf("http://localhost/images/create?fromImage=%s", url.QueryEscape(image))
+	req, err := http.NewRequestWithContext(pullCtx, http.MethodPost, pullURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to build image pull request: %w", err)
+	}
+
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to connect to docker daemon for image pull: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("docker image pull returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	// Drain streaming progress messages and verify no error occurred mid-pull
+	dec := json.NewDecoder(resp.Body)
+	for {
+		var msg struct {
+			Status      string `json:"status"`
+			Error       string `json:"error"`
+			ErrorDetail struct {
+				Message string `json:"message"`
+			} `json:"errorDetail"`
+		}
+		if err := dec.Decode(&msg); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return fmt.Errorf("error reading image pull stream: %w", err)
+		}
+		if msg.Error != "" {
+			return fmt.Errorf("docker image pull failed: %s", msg.Error)
+		}
+	}
+
+	slog.Info("successfully pulled docker image for sandbox", "image", image)
+	return nil
 }
 
