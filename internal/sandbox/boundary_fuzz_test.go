@@ -54,7 +54,10 @@ func FuzzUserWorkspaceDir(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, userID string) {
 		// Invariant: UserWorkspaceDir must never panic on arbitrary input
-		workspace := mgr.UserWorkspaceDir(userID)
+		workspace, err := mgr.UserWorkspaceDir(userID)
+		if err != nil {
+			return
+		}
 		if workspace == "" {
 			t.Errorf("workspace path should not be empty")
 		}
@@ -62,10 +65,8 @@ func FuzzUserWorkspaceDir(f *testing.F) {
 		// Check directory containment: path must reside strictly inside sandboxBase
 		rel, err := filepath.Rel(sandboxBase, workspace)
 		isContained := err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
-
-		// Log observed traversal escapes for vulnerability auditing
-		if strings.Contains(userID, "..") && !isContained {
-			t.Logf("[DEFECT VERIFIED] Path traversal escape: input=%q -> workspace=%q (rel=%q)", userID, workspace, rel)
+		if !isContained {
+			t.Errorf("Path traversal escape: input=%q -> workspace=%q (rel=%q)", userID, workspace, rel)
 		}
 	})
 }
@@ -210,46 +211,44 @@ func TestUserWorkspaceDir_PathTraversalDefect(t *testing.T) {
 	testCases := []struct {
 		name              string
 		userID            string
-		expectedEscaped   bool
+		expectError       bool
 		expectedResultDir string
 	}{
 		{
 			name:              "Normal alphanumeric UserID is contained",
 			userID:            "user-12345",
-			expectedEscaped:   false,
+			expectError:       false,
 			expectedResultDir: filepath.Join(sandboxBase, "user-12345"),
 		},
 		{
-			name:              "Path traversal one level up escapes sandboxes to data",
-			userID:            "../victim",
-			expectedEscaped:   true,
-			expectedResultDir: filepath.Join(cfg.DataDir, "victim"),
+			name:        "Path traversal one level up escapes sandboxes to data",
+			userID:      "../victim",
+			expectError: true,
 		},
 		{
-			name:              "Path traversal two levels up escapes data to tempDir",
-			userID:            "../../sensitive_host_file",
-			expectedEscaped:   true,
-			expectedResultDir: filepath.Join(tempDir, "sensitive_host_file"),
+			name:        "Path traversal two levels up escapes data to tempDir",
+			userID:      "../../sensitive_host_file",
+			expectError: true,
 		},
 		{
-			name:              "Deep path traversal resolves to host root",
-			userID:            "../../../../../../../../../../etc",
-			expectedEscaped:   true,
-			expectedResultDir: "/etc",
+			name:        "Deep path traversal resolves to host root",
+			userID:      "../../../../../../../../../../etc",
+			expectError: true,
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			actualPath := mgr.UserWorkspaceDir(tc.userID)
-			assert.Equal(t, tc.expectedResultDir, actualPath)
-
-			rel, err := filepath.Rel(sandboxBase, actualPath)
-			isContained := err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
-
-			if tc.expectedEscaped {
-				assert.False(t, isContained, "Path should have escaped sandboxBase, demonstrating the defect")
+			actualPath, err := mgr.UserWorkspaceDir(tc.userID)
+			if tc.expectError {
+				assert.Error(t, err, "Path traversal must be rejected with error")
 			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tc.expectedResultDir, actualPath)
+
+				rel, err := filepath.Rel(sandboxBase, actualPath)
+				require.NoError(t, err)
+				isContained := rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 				assert.True(t, isContained, "Path should remain inside sandboxBase")
 			}
 		})

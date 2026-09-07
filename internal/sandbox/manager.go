@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -106,10 +107,22 @@ func (m *Manager) AllowedNetworkModes() []string {
 	return []string{string(NetworkNone), string(NetworkRestricted)}
 }
 
+var validUserIDRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
+
 // UserWorkspaceDir returns the absolute path to the user's private workspace.
-func (m *Manager) UserWorkspaceDir(userID string) string {
+// It strictly validates userID against traversal attacks and containment under DataDir/sandboxes.
+func (m *Manager) UserWorkspaceDir(userID string) (string, error) {
+	if !validUserIDRegex.MatchString(userID) {
+		return "", fmt.Errorf("invalid userID %q: must match ^[a-zA-Z0-9_-]{1,64}$", userID)
+	}
 	cleanUID := filepath.Clean(userID)
-	return filepath.Join(m.cfg.DataDir, "sandboxes", cleanUID)
+	sandboxBase := filepath.Join(m.cfg.DataDir, "sandboxes")
+	target := filepath.Join(sandboxBase, cleanUID)
+	rel, err := filepath.Rel(sandboxBase, target)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path traversal detected for userID %q", userID)
+	}
+	return target, nil
 }
 
 // RequestSandbox creates a pending sandbox request awaiting explicit human user approval.
@@ -178,7 +191,10 @@ func (m *Manager) RequestSandbox(ctx context.Context, userID, chatID string, par
 	}
 
 	// Validate mounts relative to user workspace
-	userWorkspace := m.UserWorkspaceDir(userID)
+	userWorkspace, err := m.UserWorkspaceDir(userID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid user workspace: %w", err)
+	}
 	for _, mount := range params.Mounts {
 		if _, _, err := ValidateMountPath(userWorkspace, mount.RelativePath); err != nil {
 			return nil, fmt.Errorf("invalid mount: %w", err)
@@ -226,7 +242,10 @@ func (m *Manager) ApproveSandbox(ctx context.Context, userID string) (*UserSandb
 	}
 	m.mu.Unlock()
 
-	userWorkspace := m.UserWorkspaceDir(userID)
+	userWorkspace, err := m.UserWorkspaceDir(userID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid user workspace: %w", err)
+	}
 	if err := os.MkdirAll(userWorkspace, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create user workspace: %w", err)
 	}

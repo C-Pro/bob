@@ -79,7 +79,9 @@ func TestManagerLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, StatusPendingApproval, sbx.Status)
 	assert.Equal(t, "user1", sbx.UserID)
-	assert.Equal(t, mgr.UserWorkspaceDir("user1"), sbx.WorkspaceDir)
+	expectedWS, err := mgr.UserWorkspaceDir("user1")
+	require.NoError(t, err)
+	assert.Equal(t, expectedWS, sbx.WorkspaceDir)
 
 	// 3. Duplicate request should fail (1-sandbox-per-user limit)
 	_, err = mgr.RequestSandbox(ctx, "user1", "chat1", RequestParams{
@@ -95,7 +97,7 @@ func TestManagerLifecycle(t *testing.T) {
 	approved, err := mgr.ApproveSandbox(ctx, "user1")
 	require.NoError(t, err)
 	assert.Equal(t, StatusRunning, approved.Status)
-	assert.Equal(t, mgr.UserWorkspaceDir("user1"), approved.WorkspaceDir)
+	assert.Equal(t, expectedWS, approved.WorkspaceDir)
 	assert.Equal(t, 1, mockBwrap.createdCount)
 
 	// 6. Request while running should fail
