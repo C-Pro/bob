@@ -716,13 +716,13 @@ func (r *Registry) executeSandboxRequest(ctx context.Context, argsJSON string) (
 
 	var card strings.Builder
 	card.WriteString("🔒 **Sandbox Approval Requested**\n")
-	card.WriteString(fmt.Sprintf("• **Driver:** `%s`\n", sbx.Driver))
+	fmt.Fprintf(&card, "• **Driver:** `%s`\n", sbx.Driver)
 	if sbx.Driver == sandbox.DriverDocker && sbx.DockerImage != "" {
-		card.WriteString(fmt.Sprintf("• **Docker Image:** `%s`\n", sbx.DockerImage))
+		fmt.Fprintf(&card, "• **Docker Image:** `%s`\n", sbx.DockerImage)
 	}
-	card.WriteString(fmt.Sprintf("• **Network:** `%s`\n", sbx.Network.Mode))
+	fmt.Fprintf(&card, "• **Network:** `%s`\n", sbx.Network.Mode)
 	if len(sbx.Network.AllowedHosts) > 0 {
-		card.WriteString(fmt.Sprintf("• **Allowed Domains:** `%s`\n", strings.Join(sbx.Network.AllowedHosts, ", ")))
+		fmt.Fprintf(&card, "• **Allowed Domains:** `%s`\n", strings.Join(sbx.Network.AllowedHosts, ", "))
 	}
 	if len(sbx.Mounts) > 0 {
 		card.WriteString("• **Mounts:**\n")
@@ -731,7 +731,7 @@ func (r *Registry) executeSandboxRequest(ctx context.Context, argsJSON string) (
 			if m.ReadOnly {
 				ro = "read-only"
 			}
-			card.WriteString(fmt.Sprintf("  - `%s` (%s)\n", m.RelativePath, ro))
+			fmt.Fprintf(&card, "  - `%s` (%s)\n", m.RelativePath, ro)
 		}
 	} else {
 		card.WriteString("• **Workspace Mount:** none (isolated scratch space)\n")
@@ -741,7 +741,7 @@ func (r *Registry) executeSandboxRequest(ctx context.Context, argsJSON string) (
 	if cleanReason == "" {
 		cleanReason = "No reason provided"
 	}
-	card.WriteString(fmt.Sprintf("• **Reason:** %s\n\n", cleanReason))
+	fmt.Fprintf(&card, "• **Reason:** %s\n\n", cleanReason)
 	card.WriteString("Reply `/sandbox approve` to approve or `/sandbox deny` to reject.")
 
 	if session.Notifier != nil {
@@ -801,7 +801,7 @@ func (r *Registry) executeSandboxExec(ctx context.Context, argsJSON string) (str
 	}
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Exit Code: %d\nDuration: %s\n", res.ExitCode, res.Duration.Round(time.Millisecond)))
+	fmt.Fprintf(&b, "Exit Code: %d\nDuration: %s\n", res.ExitCode, res.Duration.Round(time.Millisecond))
 	if res.Stdout != "" {
 		b.WriteString("\n[stdout]\n" + res.Stdout)
 	}

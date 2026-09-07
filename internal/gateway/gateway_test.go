@@ -2153,7 +2153,7 @@ func TestGateway_BotCannotApproveSandbox(t *testing.T) {
 				return
 			}
 			go func() {
-				defer conn.Close()
+				defer func() { _ = conn.Close() }()
 				for {
 					var cm models.ClientMessage
 					if err := conn.ReadJSON(&cm); err != nil {
@@ -2427,7 +2427,7 @@ func TestGateway_SandboxApproveGeminiResumption_NoTrailingAssistant(t *testing.T
 			if err != nil {
 				return
 			}
-			defer c.Close()
+			defer func() { _ = c.Close() }()
 			for {
 				_, message, err := c.ReadMessage()
 				if err != nil {

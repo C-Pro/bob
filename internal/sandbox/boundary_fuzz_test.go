@@ -427,7 +427,6 @@ type blockingMockDriver struct {
 	driverType DriverType
 	available  bool
 	onCreate   func()
-	mu         sync.Mutex
 }
 
 func (m *blockingMockDriver) Type() DriverType {

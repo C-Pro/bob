@@ -321,11 +321,6 @@ func (p *FilteringProxy) handleRequest(w http.ResponseWriter, req *http.Request)
 	}
 }
 
-func (p *FilteringProxy) checkAccess(host string) error {
-	_, err := p.resolveAndValidate(context.Background(), host)
-	return err
-}
-
 func (p *FilteringProxy) resolveAndValidate(ctx context.Context, host string) (net.IP, error) {
 	cleanHost := strings.ToLower(strings.TrimSpace(host))
 

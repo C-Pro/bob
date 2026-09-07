@@ -58,7 +58,7 @@ func setupGatewayQATestEnvironment(t *testing.T) (*Gateway, *sandbox.Manager, ch
 			return
 		}
 		go func() {
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 			for {
 				var clientMsg models.ClientMessage
 				if err := conn.ReadJSON(&clientMsg); err != nil {

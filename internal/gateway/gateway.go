@@ -1313,13 +1313,13 @@ func (g *Gateway) formatSandboxStatus(sbx *sandbox.UserSandbox) string {
 }
 
 func (g *Gateway) appendSandboxDetails(b *strings.Builder, sbx *sandbox.UserSandbox) {
-	b.WriteString(fmt.Sprintf("- **Driver:** %s\n", sbx.Driver))
+	fmt.Fprintf(b, "- **Driver:** %s\n", sbx.Driver)
 	if sbx.Driver == sandbox.DriverDocker && sbx.DockerImage != "" {
-		b.WriteString(fmt.Sprintf("- **Docker Image:** %s\n", sbx.DockerImage))
+		fmt.Fprintf(b, "- **Docker Image:** %s\n", sbx.DockerImage)
 	}
-	b.WriteString(fmt.Sprintf("- **Network:** %s\n", sbx.Network.Mode))
+	fmt.Fprintf(b, "- **Network:** %s\n", sbx.Network.Mode)
 	if len(sbx.Network.AllowedHosts) > 0 {
-		b.WriteString(fmt.Sprintf("- **Allowed Domains:** %s\n", strings.Join(sbx.Network.AllowedHosts, ", ")))
+		fmt.Fprintf(b, "- **Allowed Domains:** %s\n", strings.Join(sbx.Network.AllowedHosts, ", "))
 	}
 	if len(sbx.Mounts) > 0 {
 		b.WriteString("- **Mounts (in workspace):**\n")
@@ -1332,12 +1332,12 @@ func (g *Gateway) appendSandboxDetails(b *strings.Builder, sbx *sandbox.UserSand
 			if pathStr == "." || pathStr == "" {
 				pathStr = "(whole workspace)"
 			}
-			b.WriteString(fmt.Sprintf("  • %s (%s)\n", pathStr, ro))
+			fmt.Fprintf(b, "  • %s (%s)\n", pathStr, ro)
 		}
 	}
 	remaining := time.Until(sbx.ExpiresAt).Round(time.Minute)
 	if remaining < 0 {
 		remaining = 0
 	}
-	b.WriteString(fmt.Sprintf("- **Time Remaining:** %s\n", remaining))
+	fmt.Fprintf(b, "- **Time Remaining:** %s\n", remaining)
 }
