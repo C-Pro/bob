@@ -18,26 +18,28 @@ import (
 
 // ProxyConfig specifies configuration options for FilteringProxy.
 type ProxyConfig struct {
-	Policy        NetworkPolicy
-	ListenTCP     string   // TCP bind address (e.g. "127.0.0.1:0" or "0.0.0.0:0"). If empty, defaults to "127.0.0.1:0".
-	SocketPath    string   // Optional path for a Unix domain socket listener.
-	CustomBlocked []string // Optional test override to bypass defaultMandatoryBlockedCIDRs.
+	Policy             NetworkPolicy
+	ListenTCP          string   // TCP bind address (e.g. "127.0.0.1:0" or "0.0.0.0:0"). If empty, defaults to "127.0.0.1:0".
+	SocketPath         string   // Optional path for a Unix domain socket listener.
+	CustomBlocked      []string // Optional test override to bypass defaultMandatoryBlockedCIDRs.
+	AllowedClientCIDRs []string // Optional allowed client CIDRs in addition to loopback.
 }
 
 // FilteringProxy is an in-process HTTP/CONNECT proxy that enforces domain and CIDR whitelisting/blacklisting.
 type FilteringProxy struct {
-	policy       NetworkPolicy
-	listener     net.Listener
-	unixListener net.Listener
-	server       *http.Server
-	addr         string
-	socketPath   string
-	port         int
-	closed       bool
-	mu           sync.Mutex
-	connsMu      sync.Mutex
-	activeConns  map[net.Conn]struct{}
-	httpClient   *http.Client
+	policy             NetworkPolicy
+	listener           net.Listener
+	unixListener       net.Listener
+	server             *http.Server
+	addr               string
+	socketPath         string
+	port               int
+	closed             bool
+	mu                 sync.Mutex
+	connsMu            sync.Mutex
+	activeConns        map[net.Conn]struct{}
+	allowedClientCIDRs []*net.IPNet
+	httpClient         *http.Client
 }
 
 type closeWriter interface {
@@ -99,14 +101,23 @@ func NewFilteringProxyWithConfig(cfg ProxyConfig) (*FilteringProxy, error) {
 		_ = os.Chmod(cfg.SocketPath, 0o666)
 	}
 
+	var allowedClientNets []*net.IPNet
+	for _, rawCIDR := range cfg.AllowedClientCIDRs {
+		_, ipNet, err := net.ParseCIDR(strings.TrimSpace(rawCIDR))
+		if err == nil && ipNet != nil {
+			allowedClientNets = append(allowedClientNets, ipNet)
+		}
+	}
+
 	fp := &FilteringProxy{
-		policy:       sanitizedPolicy,
-		listener:     ln,
-		unixListener: unixLn,
-		addr:         ln.Addr().String(),
-		socketPath:   cfg.SocketPath,
-		port:         port,
-		activeConns:  make(map[net.Conn]struct{}),
+		policy:             sanitizedPolicy,
+		listener:           ln,
+		unixListener:       unixLn,
+		addr:               ln.Addr().String(),
+		socketPath:         cfg.SocketPath,
+		port:               port,
+		activeConns:        make(map[net.Conn]struct{}),
+		allowedClientCIDRs: allowedClientNets,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -254,10 +265,21 @@ func (p *FilteringProxy) handleRequest(w http.ResponseWriter, req *http.Request)
 		clientHost, _, err := net.SplitHostPort(req.RemoteAddr)
 		if err == nil {
 			ip := net.ParseIP(clientHost)
-			if ip != nil && !ip.IsLoopback() && !ip.IsPrivate() && !ip.IsLinkLocalUnicast() {
-				p.logAccess(req.RemoteAddr, req.Method, req.URL.Host, req.Proto, http.StatusForbidden, 0, "DENIED", "client IP not authorized")
-				http.Error(w, "Access Denied: unauthorized client IP", http.StatusForbidden)
-				return
+			if ip != nil {
+				authorized := ip.IsLoopback()
+				if !authorized {
+					for _, cidr := range p.allowedClientCIDRs {
+						if cidr.Contains(ip) {
+							authorized = true
+							break
+						}
+					}
+				}
+				if !authorized {
+					p.logAccess(req.RemoteAddr, req.Method, req.URL.Host, req.Proto, http.StatusForbidden, 0, "DENIED", "client IP not authorized")
+					http.Error(w, "Access Denied: unauthorized client IP", http.StatusForbidden)
+					return
+				}
 			}
 		}
 	}

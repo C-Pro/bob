@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -122,11 +123,18 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 	if sbx.Network.Mode == sandbox.NetworkRestricted {
 		d.mu.Lock()
 		if existing, ok := d.proxies[sbx.UserID]; ok {
-			_ = existing.Close()
+			if err := existing.Close(); err != nil {
+				slog.Warn("failed to close existing proxy", "user", sbx.UserID, "error", err)
+			}
+		}
+		listenTCP := "0.0.0.0:0"
+		if bridgeIP := getDockerBridgeIP(); bridgeIP != "" {
+			listenTCP = bridgeIP + ":0"
 		}
 		proxy, err := sandbox.NewFilteringProxyWithConfig(sandbox.ProxyConfig{
-			Policy:    sbx.Network,
-			ListenTCP: "0.0.0.0:0",
+			Policy:             sbx.Network,
+			ListenTCP:          listenTCP,
+			AllowedClientCIDRs: []string{"172.16.0.0/12"},
 		})
 		if err != nil {
 			d.mu.Unlock()
@@ -247,14 +255,18 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 
 	startResp, err := d.client.Do(startReq)
 	if err != nil {
-		_ = d.Destroy(ctx, sbx)
+		if dErr := d.Destroy(ctx, sbx); dErr != nil {
+			slog.Warn("failed to cleanup container on start error", "user", sbx.UserID, "error", dErr)
+		}
 		return fmt.Errorf("failed to start container: %w", err)
 	}
 	defer func() { _ = startResp.Body.Close() }()
 
 	if startResp.StatusCode != http.StatusNoContent && startResp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(startResp.Body)
-		_ = d.Destroy(ctx, sbx)
+		if dErr := d.Destroy(ctx, sbx); dErr != nil {
+			slog.Warn("failed to cleanup container on unexpected status", "user", sbx.UserID, "error", dErr)
+		}
 		return fmt.Errorf("docker container start returned status %d: %s", startResp.StatusCode, string(respBody))
 	}
 
@@ -341,6 +353,9 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 	startTime := time.Now()
 	startResp, err := d.client.Do(startReq)
 	if err != nil {
+		if execCtx.Err() != nil {
+			d.killExecProcess(internalID, execID)
+		}
 		return nil, fmt.Errorf("failed to start exec: %w", err)
 	}
 	defer func() { _ = startResp.Body.Close() }()
@@ -349,6 +364,9 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 	err = demuxDockerStream(startResp.Body, &stdout, &stderr)
 	duration := time.Since(startTime)
 	if err != nil && !errors.Is(err, io.EOF) {
+		if execCtx.Err() != nil {
+			d.killExecProcess(internalID, execID)
+		}
 		return nil, fmt.Errorf("error reading exec stream: %w", err)
 	}
 
@@ -385,7 +403,9 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 func (d *Driver) Destroy(ctx context.Context, sbx *sandbox.UserSandbox) error {
 	d.mu.Lock()
 	if proxy, ok := d.proxies[sbx.UserID]; ok {
-		_ = proxy.Close()
+		if err := proxy.Close(); err != nil {
+			slog.Warn("failed to close filtering proxy on destroy", "user", sbx.UserID, "error", err)
+		}
 		delete(d.proxies, sbx.UserID)
 	}
 	d.mu.Unlock()
@@ -446,3 +466,72 @@ func demuxDockerStream(r io.Reader, stdout, stderr io.Writer) error {
 		}
 	}
 }
+
+func (d *Driver) killExecProcess(internalID, execID string) {
+	inspectURL := fmt.Sprintf("http://localhost/exec/%s/json", execID)
+	inspectReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, inspectURL, nil)
+	if err != nil {
+		return
+	}
+	inspectResp, err := d.client.Do(inspectReq)
+	if err != nil {
+		return
+	}
+	defer func() { _ = inspectResp.Body.Close() }()
+
+	var inspectResult struct {
+		Running bool `json:"Running"`
+		Pid     int  `json:"Pid"`
+	}
+	if err := json.NewDecoder(inspectResp.Body).Decode(&inspectResult); err != nil {
+		return
+	}
+	if inspectResult.Running && inspectResult.Pid > 0 {
+		killPayload, err := json.Marshal(map[string]interface{}{
+			"Cmd": []string{"kill", "-9", fmt.Sprintf("%d", inspectResult.Pid)},
+		})
+		if err != nil {
+			return
+		}
+		createURL := fmt.Sprintf("http://localhost/containers/%s/exec", internalID)
+		kReq, err := http.NewRequestWithContext(context.Background(), http.MethodPost, createURL, bytes.NewReader(killPayload))
+		if err != nil {
+			return
+		}
+		kReq.Header.Set("Content-Type", "application/json")
+		kResp, err := d.client.Do(kReq)
+		if err != nil {
+			return
+		}
+		defer func() { _ = kResp.Body.Close() }()
+		var kCreateResult struct {
+			ID string `json:"Id"`
+		}
+		if err := json.NewDecoder(kResp.Body).Decode(&kCreateResult); err == nil && kCreateResult.ID != "" {
+			startURL := fmt.Sprintf("http://localhost/exec/%s/start", kCreateResult.ID)
+			sPayload, _ := json.Marshal(map[string]interface{}{"Detach": true})
+			sReq, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, startURL, bytes.NewReader(sPayload))
+			if sReq != nil {
+				sReq.Header.Set("Content-Type", "application/json")
+				if sResp, err := d.client.Do(sReq); err == nil {
+					_ = sResp.Body.Close()
+				}
+			}
+		}
+	}
+}
+
+func getDockerBridgeIP() string {
+	if iface, err := net.InterfaceByName("docker0"); err == nil {
+		addrs, err := iface.Addrs()
+		if err == nil {
+			for _, addr := range addrs {
+				if ipNet, ok := addr.(*net.IPNet); ok && ipNet.IP.To4() != nil {
+					return ipNet.IP.String()
+				}
+			}
+		}
+	}
+	return ""
+}
+

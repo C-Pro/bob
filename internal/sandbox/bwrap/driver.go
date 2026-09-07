@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,9 +19,17 @@ import (
 // Driver implements sandbox.Driver using bubblewrap (/usr/bin/bwrap).
 type Driver struct {
 	bwrapPath          string
+	cpuLimit           float64
+	memoryLimitMB      int
 	mu                 sync.Mutex
 	proxies            map[string]*sandbox.FilteringProxy // keyed by userID
 	customBlockedCIDRs []string
+}
+
+// Config provides configuration parameters for the Bubblewrap driver.
+type Config struct {
+	CPULimit      float64
+	MemoryLimitMB int
 }
 
 // SetCustomBlockedCIDRs overrides default mandatory blocked CIDRs for testing.
@@ -30,12 +39,27 @@ func (d *Driver) SetCustomBlockedCIDRs(cidrs []string) {
 	d.customBlockedCIDRs = cidrs
 }
 
-// NewDriver creates a new Bubblewrap driver.
+// NewDriver creates a new Bubblewrap driver with default limits.
 func NewDriver() *Driver {
+	return NewDriverWithConfig(Config{})
+}
+
+// NewDriverWithConfig creates a new Bubblewrap driver with custom resource limits.
+func NewDriverWithConfig(cfg Config) *Driver {
 	path, _ := exec.LookPath("bwrap")
+	mem := cfg.MemoryLimitMB
+	if mem <= 0 {
+		mem = 512
+	}
+	cpu := cfg.CPULimit
+	if cpu <= 0 {
+		cpu = 1.0
+	}
 	return &Driver{
-		bwrapPath: path,
-		proxies:   make(map[string]*sandbox.FilteringProxy),
+		bwrapPath:     path,
+		cpuLimit:      cpu,
+		memoryLimitMB: mem,
+		proxies:       make(map[string]*sandbox.FilteringProxy),
 	}
 }
 
@@ -74,7 +98,9 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 		d.mu.Lock()
 		defer d.mu.Unlock()
 		if existing, ok := d.proxies[sbx.UserID]; ok {
-			_ = existing.Close()
+			if err := existing.Close(); err != nil {
+				slog.Warn("failed to close existing bwrap proxy", "user", sbx.UserID, "error", err)
+			}
 		}
 		sockPath := filepath.Join(os.TempDir(), fmt.Sprintf("bob-proxy-%s.sock", sbx.UserID))
 		proxy, err := sandbox.NewFilteringProxyWithConfig(sandbox.ProxyConfig{
@@ -217,6 +243,34 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 		}
 	}
 
+	// Configure environment inside the sandbox
+	args = append(args,
+		"--clearenv",
+		"--setenv", "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"--setenv", "HOME", "/workspace",
+		"--setenv", "TERM", "dumb",
+	)
+
+	if sbx.Network.Mode == sandbox.NetworkRestricted {
+		proxyAddr := "http://127.0.0.1:18080"
+		if proxySockPath == "" {
+			d.mu.Lock()
+			proxy := d.proxies[sbx.UserID]
+			d.mu.Unlock()
+			if proxy != nil {
+				proxyAddr = proxy.Addr()
+			}
+		}
+		args = append(args,
+			"--setenv", "http_proxy", proxyAddr,
+			"--setenv", "https_proxy", proxyAddr,
+			"--setenv", "HTTP_PROXY", proxyAddr,
+			"--setenv", "HTTPS_PROXY", proxyAddr,
+			"--setenv", "all_proxy", proxyAddr,
+			"--setenv", "ALL_PROXY", proxyAddr,
+		)
+	}
+
 	// Append command
 	if proxySockPath != "" {
 		forwarderScript := `
@@ -231,7 +285,7 @@ def p(a,b):
    d=a.recv(4096)
    if not d:break
    b.sendall(d)
- except:pass
+  except:pass
  finally:
   try:a.close();b.close()
   except:pass
@@ -262,36 +316,26 @@ exit $EXIT_CODE
 		args = append(args, cmd...)
 	}
 
-	// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
-	bwrapCmd := exec.CommandContext(execCtx, d.bwrapPath, args...)
-
-	// Configure environment variables
-	env := []string{
-		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-		"HOME=/workspace",
-		"TERM=dumb",
-	}
-
-	if sbx.Network.Mode == sandbox.NetworkRestricted {
-		proxyAddr := "http://127.0.0.1:18080"
-		if proxySockPath == "" {
-			d.mu.Lock()
-			proxy := d.proxies[sbx.UserID]
-			d.mu.Unlock()
-			if proxy != nil {
-				proxyAddr = proxy.Addr()
-			}
+	var bwrapCmd *exec.Cmd
+	if hasSystemdUserScope() {
+		memMB := d.memoryLimitMB
+		if memMB <= 0 {
+			memMB = 512
 		}
-		env = append(env,
-			"http_proxy="+proxyAddr,
-			"https_proxy="+proxyAddr,
-			"HTTP_PROXY="+proxyAddr,
-			"HTTPS_PROXY="+proxyAddr,
-			"all_proxy="+proxyAddr,
-			"ALL_PROXY="+proxyAddr,
-		)
+		sysArgs := []string{
+			"--user", "--scope", "-q",
+			"-p", fmt.Sprintf("MemoryMax=%dM", memMB),
+			"-p", "TasksMax=64",
+			"--",
+			d.bwrapPath,
+		}
+		sysArgs = append(sysArgs, args...)
+		// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
+		bwrapCmd = exec.CommandContext(execCtx, "systemd-run", sysArgs...)
+	} else {
+		// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
+		bwrapCmd = exec.CommandContext(execCtx, d.bwrapPath, args...)
 	}
-	bwrapCmd.Env = env
 
 	var stdout, stderr bytes.Buffer
 	bwrapCmd.Stdout = &stdout
@@ -328,7 +372,9 @@ func (d *Driver) Destroy(ctx context.Context, sbx *sandbox.UserSandbox) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if proxy, ok := d.proxies[sbx.UserID]; ok {
-		_ = proxy.Close()
+		if err := proxy.Close(); err != nil {
+			slog.Warn("failed to close bwrap filtering proxy on destroy", "user", sbx.UserID, "error", err)
+		}
 		delete(d.proxies, sbx.UserID)
 	}
 	return nil
@@ -337,12 +383,18 @@ func (d *Driver) Destroy(ctx context.Context, sbx *sandbox.UserSandbox) error {
 func (d *Driver) mountNetFiles(args *[]string) {
 	netFiles := []string{"/etc/resolv.conf", "/etc/ssl", "/etc/ca-certificates"}
 	for _, f := range netFiles {
-		if fi, err := os.Stat(f); err == nil {
-			if fi.IsDir() {
-				*args = append(*args, "--ro-bind", f, f)
-			} else {
-				*args = append(*args, "--ro-bind", f, f)
-			}
+		realPath, err := filepath.EvalSymlinks(f)
+		if err != nil {
+			realPath = f
+		}
+		if _, err := os.Stat(realPath); err == nil {
+			*args = append(*args, "--ro-bind", realPath, f)
 		}
 	}
 }
+
+func hasSystemdUserScope() bool {
+	cmd := exec.Command("systemd-run", "--user", "--scope", "-q", "true")
+	return cmd.Run() == nil
+}
+

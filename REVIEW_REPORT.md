@@ -120,75 +120,46 @@ The security assessment identified 12 distinct vulnerabilities across the sandbo
 
 ---
 
-#### VULN-03: Docker Driver `NetworkRestricted` Bypass via Advisory-Only Proxy
+#### [PARKED] VULN-03: Docker Driver `NetworkRestricted` Bypass via Advisory-Only Proxy
 - **Severity:** **HIGH** (CVSS: 8.2 | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:L/A:N)
-- **Location:** `/home/cpro/work/experiments/bob/internal/sandbox/docker/driver.go:186-202, 273-289`
-- **Technical Root Cause:**
-  When configuring a container under `NetworkRestricted`, the Docker driver attaches the container to the default Docker bridge network (`"NetworkMode": "bridge"`). Network restriction relies entirely on injecting standard proxy environment variables (`http_proxy`, `https_proxy`, `all_proxy`) during `Exec()`. Because the container retains direct layer-3 IP connectivity and a default gateway, any untrusted code inside the container can bypass the proxy using raw sockets, non-standard protocols, or tools with proxy bypass flags (e.g. `curl --noproxy '*'`).
-- **Defensive Mitigation:**
-  Do not use `"NetworkMode": "bridge"`. Attach restricted containers to an internal isolated Docker network (`Internal: true`) with no default gateway, or route all egress traffic through an iptables firewall redirecting to the proxy.
+- **Status:** **PARKED** (Architectural / Infrastructure Decision)
+- **Explanation:** Enforcing strict layer-3 egress network isolation in Docker containers without root privileges (`CAP_NET_ADMIN`) or host iptables rules requires creating custom internal bridge networks (`Internal: true`) and orchestrating a multi-container routing topology to access the host proxy. Bubblewrap natively provides kernel-level layer-3 unprivileged network isolation (`--unshare-all`). For the Docker driver, advisory environment variables with LAN-restricted proxy exposure (VULN-06) and exec timeout process killing (VULN-05) are implemented. Hard layer-3 Docker network enforcement is parked pending host infrastructure decisions.
 
 ---
 
-#### VULN-04: Host Denial of Service via Fork Bomb & Missing Limits in Bubblewrap
+#### [DONE] VULN-04: Host Denial of Service via Fork Bomb & Missing Limits in Bubblewrap
 - **Severity:** **HIGH** (CVSS: 7.5 | CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:H)
-- **Location:** `/home/cpro/work/experiments/bob/internal/sandbox/bwrap/driver.go:98-160`
-- **Technical Root Cause:**
-  While `internal/config/config.go` defines `SandboxCPULimit` (default `1.0`) and `SandboxMemoryLimitMB` (default `512`), the Bubblewrap driver never configures cgroup controllers (`memory.max`, `cpu.max`, `pids.max`) nor applies `rlimits` (`RLIMIT_NPROC`, `RLIMIT_AS`) to the child process. A sandboxed process can execute a fork bomb (`:(){ :|:& };:`) or allocate unbounded memory, exhausting the host kernel PID table or triggering the host OOM killer.
-- **Defensive Mitigation:**
-  Apply `syscall.SysProcAttr` with `rlimit-nproc` (e.g. 64) and `rlimit-as`, or execute `bwrap` within a systemd scope (`systemd-run --scope -p MemoryMax=512M -p TasksMax=64 -- bwrap ...`).
+- **Status:** **DONE** (Implemented cgroups v2 scope via `systemd-run --user --scope` with `TasksMax=64` and `MemoryMax=<mem>M`, and `--clearenv` sandbox environment isolation)
 
 ---
 
-#### VULN-05: Docker Exec Process Leak on Timeout Expiration
+#### [DONE] VULN-05: Docker Exec Process Leak on Timeout Expiration
 - **Severity:** **HIGH** (CVSS: 7.1 | CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:H)
-- **Location:** `/home/cpro/work/experiments/bob/internal/sandbox/docker/driver.go:270-353`
-- **Technical Root Cause:**
-  When `execCtx` reaches its timeout, Go's HTTP client cancels the `/exec/{id}/start` HTTP stream. The Docker Engine API stops streaming stdout/stderr, but does not terminate the exec process inside the container. The background process remains active, consuming host CPU and RAM until the entire container is stopped or deleted.
-- **Defensive Mitigation:**
-  Upon context cancellation, inspect `/exec/{id}/json` to obtain the PID of the exec process and execute `kill -9 <PID>` within the container, or force container recreation.
+- **Status:** **DONE** (Implemented `killExecProcess` inspecting `/exec/{id}/json` and sending `kill -9` to the process PID on context timeout)
 
 ---
 
-#### VULN-06: Open LAN Proxy Exposure via `0.0.0.0` Binding & Private IP Check
+#### [DONE] VULN-06: Open LAN Proxy Exposure via `0.0.0.0` Binding & Private IP Check
 - **Severity:** **MEDIUM** (CVSS: 6.5 | CVSS:3.1/AV:A/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N)
-- **Location:** `/home/cpro/work/experiments/bob/internal/sandbox/docker/driver.go:127-130`, `/home/cpro/work/experiments/bob/internal/sandbox/proxy.go:204-215`
-- **Technical Root Cause:**
-  The Docker driver proxy listener binds to `0.0.0.0:0`, opening the TCP port on all local network interfaces. In `handleRequest`, the client authorization check explicitly permits any client IP where `ip.IsPrivate()` is true. Any host on the local LAN (RFC 1918) can connect to the proxy and route HTTP/CONNECT traffic through Bob without authentication.
-- **Defensive Mitigation:**
-  Bind strictly to the Docker bridge gateway interface (`172.17.0.1:0`) or loopback (`127.0.0.1:0`), and verify client IPs match the specific Docker subnet.
+- **Status:** **DONE** (Enforced default loopback-only client authorization, added `AllowedClientCIDRs`, and bound Docker proxy to `docker0` bridge IP with `172.16.0.0/12` subnet restriction)
 
 ---
 
-#### VULN-07: TOCTOU State Machine Race Condition in `ApproveSandbox`
+#### [DONE] VULN-07: TOCTOU State Machine Race Condition in `ApproveSandbox`
 - **Severity:** **MEDIUM** (CVSS: 5.9 | CVSS:3.1/AV:L/AC:H/PR:L/UI:N/S:U/C:N/I:H/A:L)
-- **Location:** `/home/cpro/work/experiments/bob/internal/sandbox/manager.go:214-247`
-- **Technical Root Cause:**
-  `ApproveSandbox` drops its mutex (`m.mu.Unlock()`) while `sbx.Status` remains `StatusPendingApproval`. Driver creation takes significant time. Concurrent `/sandbox approve` or `/sandbox deny` commands create duplicate containers or leave orphaned, running containers in memory. (Detailed derivation in Section 3.1).
+- **Status:** **DONE**
 
 ---
 
-#### VULN-08: Unbounded CONNECT Tunnel Goroutine & File Descriptor Leak
+#### [DONE] VULN-08: Unbounded CONNECT Tunnel Goroutine & File Descriptor Leak
 - **Severity:** **MEDIUM** (CVSS: 5.3 | CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:L)
-- **Location:** `/home/cpro/work/experiments/bob/internal/sandbox/proxy.go:345-369`
-- **Technical Root Cause:**
-  CONNECT tunnel bidirectional copies do not set idle read/write deadlines on hijacked sockets, nor do they track active sockets in `FilteringProxy`. Calling `FilteringProxy.Close()` invokes `http.Server.Shutdown()`, which ignores hijacked connections. Stalled external connections leak copy goroutines and file descriptors indefinitely.
+- **Status:** **DONE**
 
 ---
 
-#### VULN-09: Broken DNS Resolution on systemd-resolved Hosts in Bubblewrap
+#### [DONE] VULN-09: Broken DNS Resolution on systemd-resolved Hosts in Bubblewrap
 - **Severity:** **MEDIUM** (CVSS: 4.8 | CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:L)
-- **Location:** `/home/cpro/work/experiments/bob/internal/sandbox/bwrap/driver.go:329-338`
-- **Technical Root Cause:**
-  `/etc/resolv.conf` is mounted with `--ro-bind /etc/resolv.conf /etc/resolv.conf`. On modern systemd-resolved Linux hosts, `/etc/resolv.conf` is a symlink to `../run/systemd/resolve/stub-resolv.conf`. Because `/run` inside the sandbox is an isolated empty directory, the symlink target does not exist, causing all DNS resolution inside Bubblewrap to fail.
-- **Defensive Mitigation:**
-  Evaluate symlinks on the host prior to launching Bubblewrap:
-  ```go
-  realResolv, err := filepath.EvalSymlinks("/etc/resolv.conf")
-  if err == nil {
-      *args = append(*args, "--ro-bind", realResolv, "/etc/resolv.conf")
-  }
-  ```
+- **Status:** **DONE** (Evaluated symlinks on `/etc/resolv.conf` with `filepath.EvalSymlinks` to mount the real configuration file)
 
 ---
 
@@ -538,8 +509,8 @@ To transition branch `feature/sandbox` into a production-ready state, engineerin
   Add `sync.WaitGroup` to `ProgressReporter.Stop()` and explicitly stop the reporter prior to calling `g.SendMessage` for the final reply.
 - **[DONE] R2.5 Handle Unix Domain Socket Half-Close & Context Leaks (VULN-08)**:
   Assert against `type closeWriter interface { CloseWrite() error }` in `proxy.go:handleConnect`, track active hijacked conns in `FilteringProxy`, and terminate copy routines on `req.Context().Done()`.
-- **R2.6 Resource Constraints in Bubblewrap & Docker**:
-  Apply `RLIMIT_NPROC` and `RLIMIT_AS` in Bubblewrap; issue `kill -9` to lingering Docker exec PIDs upon timeout.
+- **[DONE] R2.6 Resource Constraints in Bubblewrap & Docker (VULN-04, VULN-05, VULN-06, VULN-09)**:
+  Apply cgroup v2 scope (`TasksMax=64`, `MemoryMax=<mem>M`) and `--clearenv` in Bubblewrap; issue `kill -9` to lingering Docker exec PIDs upon timeout; bind proxy securely with subnet authorization; resolve symlinks on `/etc/resolv.conf`.
 
 ### Phase 3: UX & Performance Refinements
 - **R3.1 Markdown-Aware Paragraph Truncation**:

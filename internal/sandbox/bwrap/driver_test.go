@@ -125,3 +125,33 @@ func TestBwrap_NetworkRestrictedAirgap(t *testing.T) {
 	assert.Equal(t, "403", res.Stdout)
 }
 
+func TestBwrapDriver_ResolvConf(t *testing.T) {
+	driver := NewDriver()
+	ctx := context.Background()
+
+	if !driver.Available(ctx) {
+		t.Skip("bwrap not available on host, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	workspace := filepath.Join(tempDir, "user_dns")
+	require.NoError(t, os.MkdirAll(workspace, 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID: "testuser_dns",
+		Network: sandbox.NetworkPolicy{
+			Mode: sandbox.NetworkFull,
+		},
+		Status: sandbox.StatusRunning,
+	}
+
+	err := driver.Create(ctx, sbx, workspace)
+	require.NoError(t, err)
+	defer func() { _ = driver.Destroy(ctx, sbx) }()
+
+	res, err := driver.Exec(ctx, sbx, []string{"cat", "/etc/resolv.conf"}, 5*time.Second)
+	require.NoError(t, err)
+	t.Logf("stdout: %q, stderr: %q", res.Stdout, res.Stderr)
+	assert.Equal(t, 0, res.ExitCode, "cat /etc/resolv.conf failed: %s", res.Stderr)
+	assert.NotEmpty(t, res.Stdout)
+}

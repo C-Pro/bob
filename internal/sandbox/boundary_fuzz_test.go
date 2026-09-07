@@ -313,19 +313,19 @@ func TestFilteringProxy_LANClientIPAuthorization(t *testing.T) {
 			expectBlocked: false,
 		},
 		{
-			name:          "LAN client 192.168.1.50 is permitted due to ip.IsPrivate()",
+			name:          "LAN client 192.168.1.50 is rejected",
 			clientAddr:    "192.168.1.50:54321",
-			expectBlocked: false, // DEFECT: LAN clients are allowed without auth
+			expectBlocked: true,
 		},
 		{
-			name:          "LAN client 10.0.0.200 is permitted due to ip.IsPrivate()",
+			name:          "LAN client 10.0.0.200 is rejected",
 			clientAddr:    "10.0.0.200:54321",
-			expectBlocked: false, // DEFECT: LAN clients are allowed without auth
+			expectBlocked: true,
 		},
 		{
-			name:          "Docker bridge client 172.17.0.2 is permitted",
+			name:          "Docker bridge client 172.17.0.2 is rejected by default proxy",
 			clientAddr:    "172.17.0.2:54321",
-			expectBlocked: false,
+			expectBlocked: true,
 		},
 		{
 			name:          "Public internet client IP 203.0.113.50 is rejected",
@@ -342,7 +342,7 @@ func TestFilteringProxy_LANClientIPAuthorization(t *testing.T) {
 			ip := net.ParseIP(clientHost)
 			require.NotNil(t, ip)
 
-			isUnauthorized := !ip.IsLoopback() && !ip.IsPrivate() && !ip.IsLinkLocalUnicast()
+			isUnauthorized := !ip.IsLoopback()
 			assert.Equal(t, tc.expectBlocked, isUnauthorized)
 
 			// Verify via synthetic HTTP request through proxy handler

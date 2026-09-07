@@ -476,3 +476,50 @@ func TestFilteringProxy_UnixSocket_ConnectHalfCloseAndClose(t *testing.T) {
 	assert.Error(t, err, "hijacked connection should be closed when proxy is closed")
 	assert.Less(t, closeDuration, 200*time.Millisecond, "proxy.Close must immediately terminate hijacked connections")
 }
+
+func TestFilteringProxy_ClientIPAuthorization(t *testing.T) {
+	// 1. Default proxy: only loopback is authorized; LAN private IP (192.168.1.50) must be rejected
+	proxy, err := NewFilteringProxyWithConfig(ProxyConfig{
+		Policy: NetworkPolicy{
+			Mode:         NetworkRestricted,
+			AllowedHosts: []string{"example.com"},
+		},
+		CustomBlocked: []string{"169.254.0.0/16"},
+	})
+	require.NoError(t, err)
+	defer func() { _ = proxy.Close() }()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	req.RemoteAddr = "192.168.1.50:54321"
+
+	proxy.handleRequest(rec, req)
+	assert.Equal(t, http.StatusForbidden, rec.Code, "unauthorized LAN private IP must be rejected with 403")
+	assert.Contains(t, rec.Body.String(), "unauthorized client IP")
+
+	// 2. Proxy with Docker subnet allowed: 172.17.0.2 is authorized, 192.168.1.50 is rejected
+	dockerProxy, err := NewFilteringProxyWithConfig(ProxyConfig{
+		Policy: NetworkPolicy{
+			Mode:         NetworkRestricted,
+			AllowedHosts: []string{"example.com"},
+		},
+		CustomBlocked:      []string{"169.254.0.0/16"},
+		AllowedClientCIDRs: []string{"172.16.0.0/12"},
+	})
+	require.NoError(t, err)
+	defer func() { _ = dockerProxy.Close() }()
+
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	req2.RemoteAddr = "192.168.1.50:54321"
+	dockerProxy.handleRequest(rec2, req2)
+	assert.Equal(t, http.StatusForbidden, rec2.Code)
+
+	rec3 := httptest.NewRecorder()
+	req3 := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	req3.RemoteAddr = "172.17.0.2:54321"
+	dockerProxy.handleRequest(rec3, req3)
+	// 172.17.0.2 should pass the client IP check (not fail with unauthorized client IP)
+	assert.NotContains(t, rec3.Body.String(), "unauthorized client IP")
+}
+
