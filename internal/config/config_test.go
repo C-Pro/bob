@@ -355,3 +355,27 @@ func TestSandboxCustomEnv(t *testing.T) {
 	assert.Equal(t, 2.5, cfg.SandboxCPULimit)
 	assert.Equal(t, 1024, cfg.SandboxMemoryLimitMB)
 }
+
+func TestLoadFromEnv_SandboxEnabledParsing(t *testing.T) {
+	falsyValues := []string{"false", "0", "no", "n", "off", "disable", "disabled", "OFF", "Disabled"}
+	for _, v := range falsyValues {
+		t.Setenv("SANDBOX_ENABLED", v)
+		cfg, err := LoadFromEnv()
+		require.NoErrorf(t, err, "SANDBOX_ENABLED=%q should parse as false", v)
+		assert.Falsef(t, cfg.SandboxEnabled, "SANDBOX_ENABLED=%q must result in false", v)
+	}
+
+	truthyValues := []string{"true", "1", "yes", "y", "on", "enable", "enabled", "ON", "Enabled"}
+	for _, v := range truthyValues {
+		t.Setenv("SANDBOX_ENABLED", v)
+		cfg, err := LoadFromEnv()
+		require.NoErrorf(t, err, "SANDBOX_ENABLED=%q should parse as true", v)
+		assert.Truef(t, cfg.SandboxEnabled, "SANDBOX_ENABLED=%q must result in true", v)
+	}
+
+	// Invalid value must return an error and fail closed
+	t.Setenv("SANDBOX_ENABLED", "invalid_value")
+	_, err := LoadFromEnv()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid boolean value \"invalid_value\" for SANDBOX_ENABLED")
+}

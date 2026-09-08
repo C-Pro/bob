@@ -258,4 +258,3 @@ func resolveModelDir(targetDir, modelName string) string {
 
 	return targetDir
 }
-

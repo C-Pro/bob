@@ -198,9 +198,9 @@ func FuzzValidateMountPath(f *testing.F) {
 	})
 }
 
-// TestUserWorkspaceDir_PathTraversalDefect documents and confirms the path traversal
-// vulnerability in UserWorkspaceDir where filepath.Clean preserves "../" prefixes.
-func TestUserWorkspaceDir_PathTraversalDefect(t *testing.T) {
+// TestUserWorkspaceDir_PathTraversalPrevention verifies that path traversal attempts
+// in UserWorkspaceDir are rejected.
+func TestUserWorkspaceDir_PathTraversalPrevention(t *testing.T) {
 	tempDir := t.TempDir()
 	cfg := &config.Config{
 		DataDir: filepath.Join(tempDir, "data"),
@@ -255,9 +255,9 @@ func TestUserWorkspaceDir_PathTraversalDefect(t *testing.T) {
 	}
 }
 
-// TestFilteringProxy_RestrictedEmptyDomains_DefaultOpen verifies that in NetworkRestricted mode,
-// an empty AllowedHosts slice causes the whitelist check to be bypassed completely (default-open defect).
-func TestFilteringProxy_RestrictedEmptyDomains_DefaultOpen(t *testing.T) {
+// TestFilteringProxy_RestrictedEmptyDomains verifies that in NetworkRestricted mode,
+// an empty AllowedHosts slice correctly enforces default-deny.
+func TestFilteringProxy_RestrictedEmptyDomains(t *testing.T) {
 	// Setup proxy with Restricted mode but EMPTY AllowedHosts
 	proxy := &FilteringProxy{
 		policy: NetworkPolicy{
@@ -291,8 +291,8 @@ func TestFilteringProxy_RestrictedEmptyDomains_DefaultOpen(t *testing.T) {
 	assert.ErrorContains(t, errStrict, "is not in allowed domains whitelist")
 }
 
-// TestFilteringProxy_LANClientIPAuthorization documents the open LAN proxy risk:
-// handleRequest allows any RFC 1918 private client IP without authentication.
+// TestFilteringProxy_LANClientIPAuthorization verifies that non-loopback client IPs
+// are rejected by the proxy authorization check.
 func TestFilteringProxy_LANClientIPAuthorization(t *testing.T) {
 	proxy := &FilteringProxy{
 		policy: NetworkPolicy{

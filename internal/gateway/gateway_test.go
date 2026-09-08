@@ -286,6 +286,32 @@ func TestProcessMessage_SelfMessageHandling(t *testing.T) {
 	require.Len(t, dmEntries, 1)
 	assert.Equal(t, "assistant", dmEntries[0].Role)
 	assert.Equal(t, "Hello from bot in DM", dmEntries[0].Content)
+
+	// 3. Progress messages from bot (both via ProgressPrefix and recorded progress) should NOT land in contextManager
+	progressMsg := models.Message{
+		UserID:    "bot-123",
+		ChatID:    "dm_user_bot",
+		Content:   "⏳ Looking for files. Grep is running.",
+		Timestamp: time.Now().Unix(),
+	}
+	err = gw.ProcessMessage(context.Background(), progressMsg)
+	require.NoError(t, err)
+
+	// Context manager must still only have 1 entry (progress message discarded)
+	dmEntriesAfterProgress := gw.contextManager.GetOrCreate("dm_user_bot").Entries()
+	assert.Len(t, dmEntriesAfterProgress, 1)
+
+	// Recorded progress message without prefix should also be discarded
+	gw.recordProgressMessage("dm_user_bot", "Custom progress update")
+	customProgressMsg := models.Message{
+		UserID:    "bot-123",
+		ChatID:    "dm_user_bot",
+		Content:   "Custom progress update",
+		Timestamp: time.Now().Unix(),
+	}
+	err = gw.ProcessMessage(context.Background(), customProgressMsg)
+	require.NoError(t, err)
+	assert.Equal(t, 1, gw.contextManager.GetOrCreate("dm_user_bot").Len())
 }
 
 func TestExtractMessageText(t *testing.T) {
@@ -2230,35 +2256,6 @@ func TestGateway_BotCannotApproveSandbox(t *testing.T) {
 	status.Status = sandbox.StatusExpired
 	statusMsg := gw.formatSandboxStatus(status)
 	assert.Contains(t, statusMsg, "expired")
-}
-
-func TestUserPreferencesHelpers(t *testing.T) {
-	t.Run("userPrefersNoProgress", func(t *testing.T) {
-		assert.True(t, userPrefersNoProgress("Please run this quietly"))
-		assert.True(t, userPrefersNoProgress("run tests without progress"))
-		assert.True(t, userPrefersNoProgress("No progress reports needed"))
-		assert.True(t, userPrefersNoProgress("don't report progress"))
-		assert.True(t, userPrefersNoProgress("dont report progress"))
-		assert.True(t, userPrefersNoProgress("do not report progress"))
-		assert.True(t, userPrefersNoProgress("execute silently"))
-		assert.True(t, userPrefersNoProgress("suppress progress"))
-		assert.True(t, userPrefersNoProgress("silent mode"))
-		assert.False(t, userPrefersNoProgress("Please find all occurrences of GetUser"))
-		assert.False(t, userPrefersNoProgress("run calculations"))
-	})
-
-	t.Run("userStatedSandboxPreference", func(t *testing.T) {
-		assert.True(t, userStatedSandboxPreference("Please find files and destroy sandbox"))
-		assert.True(t, userStatedSandboxPreference("destroy it when finished"))
-		assert.True(t, userStatedSandboxPreference("keep sandbox after execution"))
-		assert.True(t, userStatedSandboxPreference("keep it"))
-		assert.True(t, userStatedSandboxPreference("leave sandbox running"))
-		assert.True(t, userStatedSandboxPreference("terminate sandbox"))
-		assert.True(t, userStatedSandboxPreference("close sandbox"))
-		assert.True(t, userStatedSandboxPreference("don't destroy"))
-		assert.False(t, userStatedSandboxPreference("run tests"))
-		assert.False(t, userStatedSandboxPreference("just search the codebase"))
-	})
 }
 
 func TestGateway_SandboxApproveAutoResumesTask(t *testing.T) {

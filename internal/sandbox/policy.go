@@ -13,11 +13,13 @@ var (
 	// defaultMandatoryBlockedCIDRs protects cloud metadata, loopback, private RFC 1918, and Docker networks.
 	defaultMandatoryBlockedCIDRs = []string{
 		"127.0.0.0/8",    // IPv4 loopback
+		"0.0.0.0/8",      // IPv4 "this" network (routes to loopback on Linux)
 		"10.0.0.0/8",     // RFC 1918 Class A
 		"172.16.0.0/12",  // RFC 1918 Class B (including Docker bridge 172.17.0.0/16)
 		"192.168.0.0/16", // RFC 1918 Class C
 		"169.254.0.0/16", // Link-local & cloud metadata (169.254.169.254/32)
 		"::1/128",        // IPv6 loopback
+		"::/128",         // IPv6 unspecified address
 		"fc00::/7",       // IPv6 ULA
 		"fe80::/10",      // IPv6 Link-local
 	}
@@ -28,6 +30,8 @@ var (
 		"metadata",
 		"169.254.169.254",
 		"localhost",
+		"0.0.0.0",
+		"::",
 	}
 )
 
@@ -84,6 +88,58 @@ func ValidateMountPath(userWorkspaceDir, relativePath string) (string, bool, err
 	}
 
 	return targetPath, false, nil
+}
+
+// BlockedSandboxMountPrefixes contains critical filesystem directories inside a sandbox
+// that must never be overwritten by user mounts.
+var BlockedSandboxMountPrefixes = []string{
+	"/",
+	"/bin",
+	"/sbin",
+	"/usr",
+	"/lib",
+	"/lib64",
+	"/lib32",
+	"/etc",
+	"/proc",
+	"/sys",
+	"/dev",
+	"/root",
+	"/boot",
+	"/run",
+	"/var",
+	"/tmp",
+}
+
+// ValidateSandboxMountPath validates the destination path inside the sandbox container.
+// If empty, returns "" with no error (indicating caller should use default workspace path).
+// If specified, the path must be absolute, cleaned, and must not conflict with critical
+// system directories or root.
+func ValidateSandboxMountPath(sandboxPath string) (string, error) {
+	trimmed := strings.TrimSpace(sandboxPath)
+	if trimmed == "" {
+		return "", nil
+	}
+
+	clean := filepath.Clean(trimmed)
+	if !filepath.IsAbs(clean) || strings.HasPrefix(clean, "\\") {
+		return "", fmt.Errorf("sandbox mount path must be an absolute path starting with '/', got: %s", sandboxPath)
+	}
+
+	if clean == "/" {
+		return "", errors.New("sandbox mount path cannot be root ('/')")
+	}
+
+	for _, prefix := range BlockedSandboxMountPrefixes {
+		if prefix == "/" {
+			continue
+		}
+		if clean == prefix || strings.HasPrefix(clean, prefix+"/") {
+			return "", fmt.Errorf("sandbox mount path %q conflicts with protected system directory %s", sandboxPath, prefix)
+		}
+	}
+
+	return clean, nil
 }
 
 // ValidateNetworkPolicy validates and sanitizes a requested network policy,

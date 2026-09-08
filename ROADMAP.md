@@ -130,4 +130,13 @@ Support loading skills based on the current task
 
 ### **Phase 13: RAG for knowledge**
 
-Accumulate facts/knowledge/skills and provide RAG search tool to the agent.  
+Accumulate facts/knowledge/skills and provide RAG search tool to the agent.
+
+### **Phase 14: Generalized User Preferences Storage in CortexDB**
+
+Implement a persistent, structured preferences storage layer backed by CortexDB for per-user and per-chat configuration:
+* **Storage Schema:** Durable key-value and typed preference attributes indexed by user ID and chat ID.
+* **Progress Reporting Preferences:** User-level setting to opt out of or customize progress notifications (e.g. `quiet_mode`, `suppress_progress`), replacing ad-hoc text heuristics.
+* **Sandbox Retention Preferences:** Configurable policy for container lifecycles post-task (e.g. `auto_destroy_on_completion: true/false`, custom idle timeouts).
+* **Control Interface:** Explicit command interactions (e.g. `/set preference ...`) and agent tool invocation for querying and mutating preferences safely.
+

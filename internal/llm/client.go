@@ -456,4 +456,3 @@ func (c *Client) GenerateChatResponseWithToolLoop(
 
 	return finalResp.Choices[0].Message.Content, nil
 }
-

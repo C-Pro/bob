@@ -379,4 +379,3 @@ insert into schema_version(version, description, is_current) values(-1, 'ancient
 		assert.Contains(t, outputStr, "skipping S3 recovery")
 	})
 }
-

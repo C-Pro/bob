@@ -99,7 +99,8 @@ func TestProgressReporter_TickerExecution(t *testing.T) {
 	mu.Unlock()
 
 	require.GreaterOrEqual(t, count, 2)
-	assert.Equal(t, "Looking for GetUserCall sites. Grep is running.", msgs[0])
+	assert.Equal(t, ProgressPrefix+"Looking for GetUserCall sites. Grep is running.", msgs[0])
+	assert.True(t, IsProgressMessage(msgs[0]))
 
 	// Ensure no more messages sent after stop
 	time.Sleep(30 * time.Millisecond)
@@ -107,6 +108,14 @@ func TestProgressReporter_TickerExecution(t *testing.T) {
 	afterCount := len(sentMessages)
 	mu.Unlock()
 	assert.Equal(t, count, afterCount)
+}
+
+func TestIsProgressMessage(t *testing.T) {
+	assert.True(t, IsProgressMessage("⏳ Looking for files. Grep is running."))
+	assert.True(t, IsProgressMessage("  ⏳ Still working on task...  "))
+	assert.False(t, IsProgressMessage("Looking for files. Grep is running."))
+	assert.False(t, IsProgressMessage("Hello world!"))
+	assert.False(t, IsProgressMessage(""))
 }
 
 func TestProgressReporter_Disabled(t *testing.T) {

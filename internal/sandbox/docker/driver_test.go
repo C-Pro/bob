@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -44,6 +45,10 @@ func TestDockerDriverWithMockServer(t *testing.T) {
 		hostCfg, ok := payload["HostConfig"].(map[string]interface{})
 		assert.True(t, ok)
 		assert.Equal(t, "none", hostCfg["NetworkMode"])
+		assert.Equal(t, float64(64), hostCfg["PidsLimit"])
+		assert.Equal(t, []interface{}{"no-new-privileges"}, hostCfg["SecurityOpt"])
+		assert.Equal(t, []interface{}{"ALL"}, hostCfg["CapDrop"])
+		assert.Equal(t, fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()), payload["User"])
 
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte(`{"Id":"mock-container-abc"}`))
@@ -458,3 +463,272 @@ func TestDockerDriver_AutoPullMissingImage_PullError(t *testing.T) {
 	assert.Contains(t, err.Error(), "pull access denied")
 }
 
+func TestDockerDriver_BoundedOutput(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "mock_docker.sock")
+
+	listener, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+	defer func() { _ = listener.Close() }()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_ping", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+	mux.HandleFunc("/containers/mock-c/exec", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"Id":"exec-big"}`))
+	})
+	mux.HandleFunc("/exec/exec-big/start", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		// Send 2MB of stdout data in chunks
+		chunk := bytes.Repeat([]byte("A"), 64*1024)
+		header := make([]byte, 8)
+		header[0] = 1 // stdout
+		binary.BigEndian.PutUint32(header[4:8], uint32(len(chunk)))
+		for i := 0; i < 32; i++ { // 32 * 64KB = 2MB
+			_, _ = w.Write(header)
+			_, _ = w.Write(chunk)
+		}
+	})
+	mux.HandleFunc("/exec/exec-big/json", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ExitCode":0,"Running":false}`))
+	})
+
+	server := &http.Server{Handler: mux}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	defer func() { _ = server.Close() }()
+
+	driver := NewDriver(Config{
+		SocketPath:    sockPath,
+		AllowedImages: []string{"alpine:latest"},
+	})
+
+	ctx := context.Background()
+	sbx := &sandbox.UserSandbox{
+		UserID:     "user1",
+		Status:     sandbox.StatusRunning,
+		InternalID: "mock-c",
+	}
+
+	res, err := driver.Exec(ctx, sbx, []string{"head", "-c", "2M", "/dev/zero"}, 5*time.Second)
+	require.NoError(t, err)
+	assert.Contains(t, res.Stdout, "[output truncated")
+	assert.LessOrEqual(t, len(res.Stdout), sandbox.DefaultMaxOutputBytes+200)
+}
+
+func TestDockerDriver_ExecTimeoutKill(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "mock_docker.sock")
+
+	listener, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+	defer func() { _ = listener.Close() }()
+
+	var mu sync.Mutex
+	restarted := false
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_ping", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+	mux.HandleFunc("/containers/mock-c/exec", func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		cmdList, _ := payload["Cmd"].([]interface{})
+		execID := "exec-subsequent"
+		if len(cmdList) > 0 && cmdList[0] == "sleep" {
+			execID = "exec-hang"
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = fmt.Fprintf(w, `{"Id":%q}`, execID)
+	})
+	mux.HandleFunc("/exec/exec-hang/start", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		payload := []byte("starting task...")
+		header := make([]byte, 8)
+		header[0] = 1 // stdout
+		binary.BigEndian.PutUint32(header[4:8], uint32(len(payload)))
+		_, _ = w.Write(header)
+		_, _ = w.Write(payload)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	})
+	mux.HandleFunc("/exec/exec-subsequent/start", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		payload := []byte("subsequent output")
+		header := make([]byte, 8)
+		header[0] = 1
+		binary.BigEndian.PutUint32(header[4:8], uint32(len(payload)))
+		_, _ = w.Write(header)
+		_, _ = w.Write(payload)
+	})
+	mux.HandleFunc("/exec/exec-subsequent/json", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ExitCode":0,"Running":false}`))
+	})
+	mux.HandleFunc("/containers/mock-c/restart", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		if r.URL.Query().Get("t") == "0" {
+			restarted = true
+		}
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	server := &http.Server{Handler: mux}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	defer func() { _ = server.Close() }()
+
+	driver := NewDriver(Config{
+		SocketPath:    sockPath,
+		AllowedImages: []string{"alpine:latest"},
+	})
+
+	ctx := context.Background()
+	sbx := &sandbox.UserSandbox{
+		UserID:     "user_timeout",
+		Status:     sandbox.StatusRunning,
+		InternalID: "mock-c",
+	}
+
+	res, err := driver.Exec(ctx, sbx, []string{"sleep", "100"}, 50*time.Millisecond)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	assert.Equal(t, -1, res.ExitCode)
+	assert.Contains(t, res.Stdout, "starting task...")
+	assert.Contains(t, res.Stderr, "command timed out")
+
+	mu.Lock()
+	didRestart := restarted
+	mu.Unlock()
+	assert.True(t, didRestart, "container must be restarted atomically on exec timeout")
+
+	// Verify that a subsequent command succeeds after the timeout container recovery
+	res2, err := driver.Exec(ctx, sbx, []string{"echo", "subsequent"}, 5*time.Second)
+	require.NoError(t, err)
+	require.NotNil(t, res2)
+	assert.Equal(t, 0, res2.ExitCode)
+	assert.Equal(t, "subsequent output", res2.Stdout)
+}
+
+func TestDockerDriver_Destroy_StatusValidation(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "mock_docker.sock")
+
+	listener, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+	defer func() { _ = listener.Close() }()
+
+	deleteStatus := http.StatusInternalServerError
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_ping", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+	mux.HandleFunc("/containers/mock-c", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(deleteStatus)
+		}
+	})
+
+	server := &http.Server{Handler: mux}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	defer func() { _ = server.Close() }()
+
+	driver := NewDriver(Config{
+		SocketPath:    sockPath,
+		AllowedImages: []string{"alpine:latest"},
+	})
+
+	ctx := context.Background()
+	sbx := &sandbox.UserSandbox{
+		UserID:     "user_del",
+		Status:     sandbox.StatusRunning,
+		InternalID: "mock-c",
+	}
+
+	// 1. Delete returns 500 Internal Server Error
+	deleteStatus = http.StatusInternalServerError
+	err = driver.Destroy(ctx, sbx)
+	require.Error(t, err, "destroy must fail if DELETE returns 500")
+	assert.Equal(t, "mock-c", sbx.GetInternalID(), "internal ID must be preserved when destroy fails")
+
+	// 2. Delete returns 204 No Content
+	deleteStatus = http.StatusNoContent
+	err = driver.Destroy(ctx, sbx)
+	require.NoError(t, err, "destroy must succeed if DELETE returns 204")
+	assert.Equal(t, "", sbx.GetInternalID(), "internal ID must be cleared after successful destroy")
+
+	// 3. Delete returns 404 Not Found (idempotent success)
+	sbx.SetInternalID("mock-c-404")
+	deleteStatus = http.StatusNotFound
+	err = driver.Destroy(ctx, sbx)
+	require.NoError(t, err, "destroy must succeed idempotently if DELETE returns 404")
+	assert.Equal(t, "", sbx.GetInternalID(), "internal ID must be cleared after 404 destroy")
+}
+
+func TestDockerDriver_Create_ProxyCleanupOnError(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "mock_docker.sock")
+
+	listener, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+	defer func() { _ = listener.Close() }()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_ping", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+	// Container create fails with 500
+	mux.HandleFunc("/containers/create", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"message":"daemon failure"}`))
+	})
+
+	server := &http.Server{Handler: mux}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	defer func() { _ = server.Close() }()
+
+	driver := NewDriver(Config{
+		SocketPath:    sockPath,
+		AllowedImages: []string{"alpine:latest"},
+	})
+
+	ctx := context.Background()
+	userWorkspace := filepath.Join(tempDir, "user_workspace")
+	require.NoError(t, os.MkdirAll(userWorkspace, 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID:      "user_leak_test",
+		DockerImage: "alpine:latest",
+		Network: sandbox.NetworkPolicy{
+			Mode:         sandbox.NetworkRestricted,
+			AllowedHosts: []string{"example.com"},
+		},
+		Status: sandbox.StatusRunning,
+	}
+
+	err = driver.Create(ctx, sbx, userWorkspace)
+	require.Error(t, err, "Create must fail when daemon returns 500")
+
+	driver.mu.Lock()
+	_, proxyExists := driver.proxies["user_leak_test"]
+	driver.mu.Unlock()
+	assert.False(t, proxyExists, "proxy must not be leaked in driver.proxies on create failure")
+}

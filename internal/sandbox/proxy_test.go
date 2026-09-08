@@ -3,11 +3,13 @@ package sandbox
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -296,7 +298,8 @@ func TestFilteringProxyUnixSocket(t *testing.T) {
 	require.NoError(t, err)
 
 	tempDir := t.TempDir()
-	sockPath := filepath.Join(tempDir, "proxy.sock")
+	sockDir := filepath.Join(tempDir, "sub_proxy_dir")
+	sockPath := filepath.Join(sockDir, "proxy.sock")
 
 	proxy, err := NewFilteringProxyWithConfig(ProxyConfig{
 		Policy: NetworkPolicy{
@@ -313,6 +316,14 @@ func TestFilteringProxyUnixSocket(t *testing.T) {
 	assert.Equal(t, sockPath, proxy.SocketPath())
 	assert.Greater(t, proxy.Port(), 0)
 	assert.FileExists(t, sockPath)
+
+	fi, err := os.Stat(sockPath)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), fi.Mode().Perm())
+
+	dirFi, err := os.Stat(sockDir)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o700), dirFi.Mode().Perm())
 
 	// Test proxying over the Unix domain socket
 	client := &http.Client{
@@ -523,3 +534,264 @@ func TestFilteringProxy_ClientIPAuthorization(t *testing.T) {
 	assert.NotContains(t, rec3.Body.String(), "unauthorized client IP")
 }
 
+func TestFilteringProxy_ZeroAddressBlocked(t *testing.T) {
+	// Proxy with default mandatory blocked CIDRs (using NewFilteringProxy)
+	// Even if 0.0.0.0 or :: is explicitly in AllowedHosts, it must be blocked.
+	proxy, err := NewFilteringProxy(NetworkPolicy{
+		Mode:         NetworkRestricted,
+		AllowedHosts: []string{"0.0.0.0", "::", "example.com"},
+	})
+	require.NoError(t, err)
+	defer func() { _ = proxy.Close() }()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://0.0.0.0:8080/test", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	proxy.handleRequest(rec, req)
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Contains(t, rec.Body.String(), "Access Denied by Sandbox Policy")
+
+	recIPv6 := httptest.NewRecorder()
+	reqIPv6 := httptest.NewRequest(http.MethodGet, "http://[::]:8080/test", nil)
+	reqIPv6.RemoteAddr = "127.0.0.1:12345"
+	proxy.handleRequest(recIPv6, reqIPv6)
+	assert.Equal(t, http.StatusForbidden, recIPv6.Code)
+	assert.Contains(t, recIPv6.Body.String(), "Access Denied by Sandbox Policy")
+}
+
+func TestFilteringProxy_HTTPTransportReused(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("pong"))
+	}))
+	defer backend.Close()
+
+	backendURL, err := url.Parse(backend.URL)
+	require.NoError(t, err)
+
+	proxy, err := NewFilteringProxyWithConfig(ProxyConfig{
+		Policy: NetworkPolicy{
+			Mode:         NetworkRestricted,
+			AllowedHosts: []string{backendURL.Hostname()},
+		},
+		CustomBlocked: []string{}, // allow local httptest server
+	})
+	require.NoError(t, err)
+	defer func() { _ = proxy.Close() }()
+
+	proxyURL, err := url.Parse(proxy.Addr())
+	require.NoError(t, err)
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+		},
+	}
+
+	for i := 0; i < 3; i++ {
+		resp, err := client.Get(backend.URL + "/test")
+		require.NoError(t, err)
+		body, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		require.NoError(t, err)
+		assert.Equal(t, "pong", string(body))
+	}
+}
+
+func TestFilteringProxy_MaxConcurrentTunnels(t *testing.T) {
+	upstream, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = upstream.Close() }()
+
+	go func() {
+		for {
+			conn, err := upstream.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				buf := make([]byte, 1024)
+				for {
+					_, err := c.Read(buf)
+					if err != nil {
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+
+	proxy, err := NewFilteringProxyWithConfig(ProxyConfig{
+		Policy: NetworkPolicy{
+			Mode:         NetworkRestricted,
+			AllowedHosts: []string{"127.0.0.1"},
+		},
+		CustomBlocked: []string{}, // allow 127.0.0.1 in test
+		MaxTunnels:    2,
+	})
+	require.NoError(t, err)
+	defer func() { _ = proxy.Close() }()
+
+	connectToProxy := func() net.Conn {
+		proxyTCP := strings.TrimPrefix(proxy.Addr(), "http://")
+		conn, err := net.Dial("tcp", proxyTCP)
+		require.NoError(t, err)
+		return conn
+	}
+
+	sendConnect := func(conn net.Conn) string {
+		req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", upstream.Addr().String(), upstream.Addr().String())
+		_, err := conn.Write([]byte(req))
+		require.NoError(t, err)
+
+		buf := make([]byte, 1024)
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, err := conn.Read(buf)
+		require.NoError(t, err)
+		return string(buf[:n])
+	}
+
+	// Tunnel 1: should succeed
+	conn1 := connectToProxy()
+	defer func() { _ = conn1.Close() }()
+	resp1 := sendConnect(conn1)
+	assert.Contains(t, resp1, "200 Connection Established")
+
+	// Tunnel 2: should succeed
+	conn2 := connectToProxy()
+	defer func() { _ = conn2.Close() }()
+	resp2 := sendConnect(conn2)
+	assert.Contains(t, resp2, "200 Connection Established")
+
+	// Tunnel 3: should fail with 503 (max tunnels reached)
+	conn3 := connectToProxy()
+	defer func() { _ = conn3.Close() }()
+	resp3 := sendConnect(conn3)
+	assert.Contains(t, resp3, "503 Service Unavailable")
+	assert.Contains(t, resp3, "Too many concurrent CONNECT tunnels")
+
+	// Close tunnel 1, now a new tunnel should succeed
+	_ = conn1.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	conn4 := connectToProxy()
+	defer func() { _ = conn4.Close() }()
+	resp4 := sendConnect(conn4)
+	assert.Contains(t, resp4, "200 Connection Established")
+}
+
+func TestFilteringProxy_TunnelIdleTimeout(t *testing.T) {
+	upstream, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = upstream.Close() }()
+
+	go func() {
+		for {
+			conn, err := upstream.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				buf := make([]byte, 1024)
+				for {
+					_, err := c.Read(buf)
+					if err != nil {
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+
+	proxy, err := NewFilteringProxyWithConfig(ProxyConfig{
+		Policy: NetworkPolicy{
+			Mode:         NetworkRestricted,
+			AllowedHosts: []string{"127.0.0.1"},
+		},
+		CustomBlocked:     []string{}, // allow in test
+		TunnelIdleTimeout: 100 * time.Millisecond,
+	})
+	require.NoError(t, err)
+	defer func() { _ = proxy.Close() }()
+
+	proxyTCP := strings.TrimPrefix(proxy.Addr(), "http://")
+	conn, err := net.Dial("tcp", proxyTCP)
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+
+	req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", upstream.Addr().String(), upstream.Addr().String())
+	_, err = conn.Write([]byte(req))
+	require.NoError(t, err)
+
+	buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+	require.NoError(t, err)
+	assert.Contains(t, string(buf[:n]), "200 Connection Established")
+
+	// Now don't write anything. Read should return EOF or error within ~500ms
+	_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	_, err = conn.Read(buf)
+	require.Error(t, err, "idle tunnel should be closed after idle timeout")
+}
+
+func TestFilteringProxy_TunnelUnidirectionalActive(t *testing.T) {
+	upstream, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = upstream.Close() }()
+
+	streamDone := make(chan struct{})
+	go func() {
+		conn, err := upstream.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		// Stream 5 chunks with 40ms pause between them (total duration ~200ms)
+		// Client sends 0 bytes during this entire time.
+		for i := 0; i < 5; i++ {
+			time.Sleep(40 * time.Millisecond)
+			_, _ = fmt.Fprintf(conn, "chunk-%d\n", i)
+		}
+		close(streamDone)
+	}()
+
+	proxy, err := NewFilteringProxyWithConfig(ProxyConfig{
+		Policy: NetworkPolicy{
+			Mode:         NetworkRestricted,
+			AllowedHosts: []string{"127.0.0.1"},
+		},
+		CustomBlocked:     []string{},
+		TunnelIdleTimeout: 100 * time.Millisecond, // 100ms idle timeout < 200ms transfer time
+	})
+	require.NoError(t, err)
+	defer func() { _ = proxy.Close() }()
+
+	proxyTCP := strings.TrimPrefix(proxy.Addr(), "http://")
+	conn, err := net.Dial("tcp", proxyTCP)
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+
+	req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", upstream.Addr().String(), upstream.Addr().String())
+	_, err = conn.Write([]byte(req))
+	require.NoError(t, err)
+
+	buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+	require.NoError(t, err)
+	assert.Contains(t, string(buf[:n]), "200 Connection Established")
+
+	// Read all 5 chunks from upstream
+	var received []string
+	scanner := bufio.NewScanner(conn)
+	for scanner.Scan() {
+		received = append(received, scanner.Text())
+		if len(received) == 5 {
+			break
+		}
+	}
+	assert.Len(t, received, 5, "all chunks must be received without premature idle timeout")
+	<-streamDone
+}

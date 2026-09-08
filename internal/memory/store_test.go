@@ -349,4 +349,3 @@ func TestDimensionMismatchGracefulFallback(t *testing.T) {
 	require.NotEmpty(t, hits, "search should return results via graceful fallback")
 	assert.Contains(t, hits[0].Content, "Kubernetes")
 }
-

@@ -91,6 +91,34 @@ func (s *UserSandbox) SetInternalID(id string) {
 	s.InternalID = id
 }
 
+// GetWorkspaceDir returns the workspace directory safely under read lock.
+func (s *UserSandbox) GetWorkspaceDir() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.WorkspaceDir
+}
+
+// SetWorkspaceDir sets the workspace directory safely under write lock.
+func (s *UserSandbox) SetWorkspaceDir(dir string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.WorkspaceDir = dir
+}
+
+// GetStatus returns the sandbox status safely under read lock.
+func (s *UserSandbox) GetStatus() SandboxStatus {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Status
+}
+
+// SetStatus sets the sandbox status safely under write lock.
+func (s *UserSandbox) SetStatus(status SandboxStatus) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Status = status
+}
+
 // Clone returns a shallow copy of UserSandbox with its own mutex.
 func (s *UserSandbox) Clone() *UserSandbox {
 	s.mu.RLock()

@@ -19,10 +19,13 @@ import (
 // ProxyConfig specifies configuration options for FilteringProxy.
 type ProxyConfig struct {
 	Policy             NetworkPolicy
-	ListenTCP          string   // TCP bind address (e.g. "127.0.0.1:0" or "0.0.0.0:0"). If empty, defaults to "127.0.0.1:0".
-	SocketPath         string   // Optional path for a Unix domain socket listener.
-	CustomBlocked      []string // Optional test override to bypass defaultMandatoryBlockedCIDRs.
-	AllowedClientCIDRs []string // Optional allowed client CIDRs in addition to loopback.
+	ListenTCP          string        // TCP bind address (e.g. "127.0.0.1:0" or "0.0.0.0:0"). If empty, defaults to "127.0.0.1:0".
+	SocketPath         string        // Optional path for a Unix domain socket listener.
+	CustomBlocked      []string      // Optional test override to bypass defaultMandatoryBlockedCIDRs.
+	AllowedClientCIDRs []string      // Optional allowed client CIDRs in addition to loopback.
+	MaxTunnels         int           // Optional limit on concurrent CONNECT tunnels (default 128).
+	TunnelIdleTimeout  time.Duration // Optional idle timeout for CONNECT tunnels (default 2m).
+	TunnelLifetime     time.Duration // Optional max lifetime for CONNECT tunnels (default 15m).
 }
 
 // FilteringProxy is an in-process HTTP/CONNECT proxy that enforces domain and CIDR whitelisting/blacklisting.
@@ -40,6 +43,9 @@ type FilteringProxy struct {
 	activeConns        map[net.Conn]struct{}
 	allowedClientCIDRs []*net.IPNet
 	httpClient         *http.Client
+	tunnelSem          chan struct{}
+	tunnelIdleTimeout  time.Duration
+	tunnelLifetime     time.Duration
 }
 
 type closeWriter interface {
@@ -50,6 +56,52 @@ func closeWrite(conn net.Conn) {
 	if cw, ok := conn.(closeWriter); ok {
 		_ = cw.CloseWrite()
 	}
+}
+
+type idleTimeoutConn struct {
+	net.Conn
+	peer        net.Conn
+	idleTimeout time.Duration
+}
+
+func (c *idleTimeoutConn) Read(b []byte) (int, error) {
+	if c.idleTimeout > 0 {
+		deadline := time.Now().Add(c.idleTimeout)
+		_ = c.SetReadDeadline(deadline)
+		if c.peer != nil {
+			_ = c.peer.SetReadDeadline(deadline)
+		}
+	}
+	return c.Conn.Read(b)
+}
+
+func (c *idleTimeoutConn) Write(b []byte) (int, error) {
+	if c.idleTimeout > 0 {
+		deadline := time.Now().Add(c.idleTimeout)
+		_ = c.SetWriteDeadline(deadline)
+		if c.peer != nil {
+			_ = c.peer.SetReadDeadline(deadline)
+		}
+	}
+	return c.Conn.Write(b)
+}
+
+func (c *idleTimeoutConn) CloseWrite() error {
+	if cw, ok := c.Conn.(closeWriter); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+type contextKeyDialAddr struct{}
+
+func withDialAddr(ctx context.Context, addr string) context.Context {
+	return context.WithValue(ctx, contextKeyDialAddr{}, addr)
+}
+
+func dialAddrFromContext(ctx context.Context) (string, bool) {
+	addr, ok := ctx.Value(contextKeyDialAddr{}).(string)
+	return addr, ok
 }
 
 // NewFilteringProxy starts an in-process filtering proxy bound to 127.0.0.1 on a free port.
@@ -89,7 +141,7 @@ func NewFilteringProxyWithConfig(cfg ProxyConfig) (*FilteringProxy, error) {
 	var unixLn net.Listener
 	if cfg.SocketPath != "" {
 		_ = os.Remove(cfg.SocketPath)
-		if err := os.MkdirAll(filepath.Dir(cfg.SocketPath), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(cfg.SocketPath), 0o700); err != nil {
 			_ = ln.Close()
 			return nil, fmt.Errorf("failed to create proxy socket directory: %w", err)
 		}
@@ -98,7 +150,7 @@ func NewFilteringProxyWithConfig(cfg ProxyConfig) (*FilteringProxy, error) {
 			_ = ln.Close()
 			return nil, fmt.Errorf("failed to bind proxy unix socket %s: %w", cfg.SocketPath, err)
 		}
-		if err := os.Chmod(cfg.SocketPath, 0o666); err != nil {
+		if err := os.Chmod(cfg.SocketPath, 0o600); err != nil {
 			_ = unixLn.Close()
 			_ = ln.Close()
 			return nil, fmt.Errorf("failed to chmod proxy unix socket %s: %w", cfg.SocketPath, err)
@@ -113,6 +165,33 @@ func NewFilteringProxyWithConfig(cfg ProxyConfig) (*FilteringProxy, error) {
 		}
 	}
 
+	maxTunnels := cfg.MaxTunnels
+	if maxTunnels <= 0 {
+		maxTunnels = 128
+	}
+	tunnelIdle := cfg.TunnelIdleTimeout
+	if tunnelIdle <= 0 {
+		tunnelIdle = 2 * time.Minute
+	}
+	tunnelLife := cfg.TunnelLifetime
+	if tunnelLife <= 0 {
+		tunnelLife = 15 * time.Minute
+	}
+
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if override, ok := dialAddrFromContext(ctx); ok {
+				addr = override
+			}
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		},
+		ResponseHeaderTimeout: 30 * time.Second,
+		IdleConnTimeout:       30 * time.Second,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+	}
+
 	fp := &FilteringProxy{
 		policy:             sanitizedPolicy,
 		listener:           ln,
@@ -122,8 +201,12 @@ func NewFilteringProxyWithConfig(cfg ProxyConfig) (*FilteringProxy, error) {
 		port:               port,
 		activeConns:        make(map[net.Conn]struct{}),
 		allowedClientCIDRs: allowedClientNets,
+		tunnelSem:          make(chan struct{}, maxTunnels),
+		tunnelIdleTimeout:  tunnelIdle,
+		tunnelLifetime:     tunnelLife,
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Transport: tr,
+			Timeout:   60 * time.Second,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
@@ -217,6 +300,12 @@ func (p *FilteringProxy) Close() error {
 	if p.socketPath != "" {
 		if rmErr := os.Remove(p.socketPath); rmErr != nil && !os.IsNotExist(rmErr) && err == nil {
 			err = rmErr
+		}
+		_ = os.Remove(filepath.Dir(p.socketPath))
+	}
+	if p.httpClient != nil {
+		if tr, ok := p.httpClient.Transport.(*http.Transport); ok {
+			tr.CloseIdleConnections()
 		}
 	}
 	return err
@@ -388,6 +477,15 @@ func (p *FilteringProxy) resolveAndValidate(ctx context.Context, host string) (n
 }
 
 func (p *FilteringProxy) handleConnect(w http.ResponseWriter, req *http.Request, targetIP net.IP, port, targetHost string) {
+	select {
+	case p.tunnelSem <- struct{}{}:
+		defer func() { <-p.tunnelSem }()
+	default:
+		p.logAccess(req.RemoteAddr, req.Method, targetHost, req.Proto, http.StatusServiceUnavailable, 0, "BLOCKED", "max concurrent tunnels reached")
+		http.Error(w, "Too many concurrent CONNECT tunnels", http.StatusServiceUnavailable)
+		return
+	}
+
 	targetAddr := net.JoinHostPort(targetIP.String(), port)
 	destConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
 	if err != nil {
@@ -423,7 +521,9 @@ func (p *FilteringProxy) handleConnect(w http.ResponseWriter, req *http.Request,
 		return
 	}
 
-	ctx := req.Context()
+	ctx, cancel := context.WithTimeout(req.Context(), p.tunnelLifetime)
+	defer cancel()
+
 	ctxDone := make(chan struct{})
 	go func() {
 		select {
@@ -435,6 +535,15 @@ func (p *FilteringProxy) handleConnect(w http.ResponseWriter, req *http.Request,
 	}()
 	defer close(ctxDone)
 
+	if p.tunnelIdleTimeout > 0 {
+		initDeadline := time.Now().Add(p.tunnelIdleTimeout)
+		_ = clientConn.SetReadDeadline(initDeadline)
+		_ = destConn.SetReadDeadline(initDeadline)
+	}
+
+	wrappedClient := &idleTimeoutConn{Conn: clientConn, peer: destConn, idleTimeout: p.tunnelIdleTimeout}
+	wrappedDest := &idleTimeoutConn{Conn: destConn, peer: clientConn, idleTimeout: p.tunnelIdleTimeout}
+
 	// Bidirectional tunnel
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -442,14 +551,14 @@ func (p *FilteringProxy) handleConnect(w http.ResponseWriter, req *http.Request,
 
 	go func() {
 		defer wg.Done()
-		n, _ := io.Copy(destConn, clientConn)
+		n, _ := io.Copy(wrappedDest, wrappedClient)
 		atomic.AddInt64(&bytesToDest, n)
 		closeWrite(destConn)
 	}()
 
 	go func() {
 		defer wg.Done()
-		n, _ := io.Copy(clientConn, destConn)
+		n, _ := io.Copy(wrappedClient, wrappedDest)
 		atomic.AddInt64(&bytesToClient, n)
 		closeWrite(clientConn)
 	}()
@@ -473,24 +582,9 @@ func (p *FilteringProxy) handleHTTP(w http.ResponseWriter, req *http.Request, ta
 
 	// Dial verified destination IP directly to eliminate DNS rebinding / TOCTOU
 	targetAddr := net.JoinHostPort(targetIP.String(), port)
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, network, targetAddr)
-		},
-		ResponseHeaderTimeout: 30 * time.Second,
-		IdleConnTimeout:       30 * time.Second,
-	}
+	outReq = outReq.WithContext(withDialAddr(outReq.Context(), targetAddr))
 
-	client := &http.Client{
-		Transport: transport,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-		Timeout: 60 * time.Second,
-	}
-
-	resp, err := client.Do(outReq)
+	resp, err := p.httpClient.Do(outReq)
 	if err != nil {
 		p.logAccess(req.RemoteAddr, req.Method, req.URL.String(), req.Proto, http.StatusBadGateway, 0, "ERROR", err.Error())
 		http.Error(w, fmt.Sprintf("Proxy error: %v", err), http.StatusBadGateway)

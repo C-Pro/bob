@@ -96,7 +96,7 @@ func (d *Driver) Available(ctx context.Context) bool {
 }
 
 // Create spawns an idle sandbox container and initializes user mounts.
-func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorkspaceDir string) error {
+func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorkspaceDir string) (err error) {
 	image := strings.TrimSpace(sbx.DockerImage)
 	if image == "" {
 		if len(d.allowedImages) > 0 {
@@ -119,8 +119,9 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 	if err != nil {
 		return fmt.Errorf("failed to resolve workspace directory: %w", err)
 	}
-	sbx.WorkspaceDir = absWorkspace
+	sbx.SetWorkspaceDir(absWorkspace)
 
+	createdProxy := false
 	if sbx.Network.Mode == sandbox.NetworkRestricted {
 		d.mu.Lock()
 		if existing, ok := d.proxies[sbx.UserID]; ok {
@@ -142,8 +143,21 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 			return fmt.Errorf("failed to start filtering proxy for user %s: %w", sbx.UserID, err)
 		}
 		d.proxies[sbx.UserID] = proxy
+		createdProxy = true
 		d.mu.Unlock()
 	}
+	defer func() {
+		if err != nil && createdProxy {
+			d.mu.Lock()
+			if p, ok := d.proxies[sbx.UserID]; ok {
+				if cErr := p.Close(); cErr != nil {
+					slog.Warn("error closing proxy during create rollback", "user", sbx.UserID, "error", cErr)
+				}
+				delete(d.proxies, sbx.UserID)
+			}
+			d.mu.Unlock()
+		}
+	}()
 
 	var binds []string
 	var wholeWorkspaceMount *sandbox.UserMount
@@ -179,7 +193,11 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 			if err := os.MkdirAll(hostSubpath, 0o755); err != nil {
 				return fmt.Errorf("failed to prepare mount subpath %q: %w", hostSubpath, err)
 			}
-			dest := m.SandboxPath
+			cleanDest, err := sandbox.ValidateSandboxMountPath(m.SandboxPath)
+			if err != nil {
+				return fmt.Errorf("invalid sandbox mount destination %q: %w", m.SandboxPath, err)
+			}
+			dest := cleanDest
 			if dest == "" {
 				dest = filepath.Join(sandbox.DefaultWorkspaceMountPath, m.RelativePath)
 			}
@@ -199,11 +217,15 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 	memBytes := int64(d.memoryLimitMB) * 1024 * 1024
 	nanoCPUs := int64(d.cpuLimit * 1e9)
 
+	pidsLimit := int64(64)
 	hostConfig := map[string]interface{}{
 		"NetworkMode": networkMode,
 		"Binds":       binds,
 		"Memory":      memBytes,
 		"NanoCPUs":    nanoCPUs,
+		"PidsLimit":   pidsLimit,
+		"SecurityOpt": []string{"no-new-privileges"},
+		"CapDrop":     []string{"ALL"},
 	}
 	if sbx.Network.Mode == sandbox.NetworkRestricted {
 		hostConfig["ExtraHosts"] = []string{"host.docker.internal:host-gateway"}
@@ -212,6 +234,7 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 	createPayload := map[string]interface{}{
 		"Image":      image,
 		"Cmd":        []string{"sleep", "infinity"},
+		"User":       fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
 		"WorkingDir": sandbox.DefaultWorkspaceMountPath,
 		"HostConfig": hostConfig,
 	}
@@ -269,7 +292,9 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 	startURL := fmt.Sprintf("http://localhost/containers/%s/start", sbx.GetInternalID())
 	startReq, err := http.NewRequestWithContext(ctx, http.MethodPost, startURL, nil)
 	if err != nil {
-		_ = d.Destroy(ctx, sbx)
+		if dErr := d.Destroy(ctx, sbx); dErr != nil {
+			slog.Warn("failed to cleanup container on start request error", "user", sbx.UserID, "error", dErr)
+		}
 		return fmt.Errorf("failed to build container start request: %w", err)
 	}
 
@@ -380,18 +405,37 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 	if err != nil {
 		if execCtx.Err() != nil {
 			d.killExecProcess(internalID, execID)
+			return &sandbox.ExecResult{
+				ExitCode: -1,
+				Stdout:   "",
+				Stderr:   "command timed out",
+				Duration: time.Since(startTime),
+			}, nil
 		}
 		return nil, fmt.Errorf("failed to start exec: %w", err)
 	}
 	defer func() { _ = startResp.Body.Close() }()
 
-	var stdout, stderr bytes.Buffer
-	err = demuxDockerStream(startResp.Body, &stdout, &stderr)
+	stdout := sandbox.NewBoundedBuffer(sandbox.DefaultMaxOutputBytes)
+	stderr := sandbox.NewBoundedBuffer(sandbox.DefaultMaxOutputBytes)
+	err = demuxDockerStream(startResp.Body, stdout, stderr)
 	duration := time.Since(startTime)
-	if err != nil && !errors.Is(err, io.EOF) {
-		if execCtx.Err() != nil {
-			d.killExecProcess(internalID, execID)
+	if execCtx.Err() != nil {
+		d.killExecProcess(internalID, execID)
+		errStr := stderr.String()
+		if errStr != "" {
+			errStr += "\ncommand timed out"
+		} else {
+			errStr = "command timed out"
 		}
+		return &sandbox.ExecResult{
+			ExitCode: -1,
+			Stdout:   stdout.String(),
+			Stderr:   errStr,
+			Duration: duration,
+		}, nil
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("error reading exec stream: %w", err)
 	}
 
@@ -452,6 +496,10 @@ func (d *Driver) Destroy(ctx context.Context, sbx *sandbox.UserSandbox) error {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("failed to delete container %s: returned status %d", internalID, resp.StatusCode)
+	}
+
 	sbx.SetInternalID("")
 	return nil
 }
@@ -492,57 +540,32 @@ func demuxDockerStream(r io.Reader, stdout, stderr io.Writer) error {
 	}
 }
 
-func (d *Driver) killExecProcess(internalID, execID string) {
-	inspectURL := fmt.Sprintf("http://localhost/exec/%s/json", execID)
-	inspectReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, inspectURL, nil)
-	if err != nil {
+func (d *Driver) killExecProcess(internalID, _ string) {
+	if internalID == "" {
 		return
 	}
-	inspectResp, err := d.client.Do(inspectReq)
-	if err != nil {
-		return
-	}
-	defer func() { _ = inspectResp.Body.Close() }()
+	// Restart the container with t=0 (instant SIGKILL).
+	// This synchronously kills all processes in the container cgroup, waits for exit,
+	// and restarts the container with 'sleep infinity', eliminating race conditions.
+	restartCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-	var inspectResult struct {
-		Running bool `json:"Running"`
-		Pid     int  `json:"Pid"`
-	}
-	if err := json.NewDecoder(inspectResp.Body).Decode(&inspectResult); err != nil {
+	restartURL := fmt.Sprintf("http://localhost/containers/%s/restart?t=0", internalID)
+	req, err := http.NewRequestWithContext(restartCtx, http.MethodPost, restartURL, nil)
+	if err != nil {
+		slog.Error("failed to create container restart request on exec timeout", "container", internalID, "error", err)
 		return
 	}
-	if inspectResult.Running && inspectResult.Pid > 0 {
-		killPayload, err := json.Marshal(map[string]interface{}{
-			"Cmd": []string{"kill", "-9", fmt.Sprintf("%d", inspectResult.Pid)},
-		})
-		if err != nil {
-			return
-		}
-		createURL := fmt.Sprintf("http://localhost/containers/%s/exec", internalID)
-		kReq, err := http.NewRequestWithContext(context.Background(), http.MethodPost, createURL, bytes.NewReader(killPayload))
-		if err != nil {
-			return
-		}
-		kReq.Header.Set("Content-Type", "application/json")
-		kResp, err := d.client.Do(kReq)
-		if err != nil {
-			return
-		}
-		defer func() { _ = kResp.Body.Close() }()
-		var kCreateResult struct {
-			ID string `json:"Id"`
-		}
-		if err := json.NewDecoder(kResp.Body).Decode(&kCreateResult); err == nil && kCreateResult.ID != "" {
-			startURL := fmt.Sprintf("http://localhost/exec/%s/start", kCreateResult.ID)
-			sPayload, _ := json.Marshal(map[string]interface{}{"Detach": true})
-			sReq, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, startURL, bytes.NewReader(sPayload))
-			if sReq != nil {
-				sReq.Header.Set("Content-Type", "application/json")
-				if sResp, err := d.client.Do(sReq); err == nil {
-					_ = sResp.Body.Close()
-				}
-			}
-		}
+
+	resp, err := d.client.Do(req)
+	if err != nil {
+		slog.Error("failed to restart container on exec timeout", "container", internalID, "error", err)
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		slog.Warn("unexpected status restarting container on exec timeout", "container", internalID, "status", resp.StatusCode)
 	}
 }
 
@@ -612,4 +635,3 @@ func (d *Driver) pullImage(ctx context.Context, image string) error {
 	slog.Info("successfully pulled docker image for sandbox", "image", image)
 	return nil
 }
-

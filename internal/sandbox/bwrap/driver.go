@@ -1,7 +1,6 @@
 package bwrap
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -96,7 +95,7 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 	if err := os.MkdirAll(absWorkspace, 0o755); err != nil {
 		return fmt.Errorf("failed to create user workspace directory: %w", err)
 	}
-	sbx.WorkspaceDir = absWorkspace
+	sbx.SetWorkspaceDir(absWorkspace)
 
 	if sbx.Network.Mode == sandbox.NetworkRestricted {
 		d.mu.Lock()
@@ -106,7 +105,11 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 				slog.Warn("failed to close existing bwrap proxy", "user", sbx.UserID, "error", err)
 			}
 		}
-		sockPath := filepath.Join(os.TempDir(), fmt.Sprintf("bob-proxy-%s.sock", sbx.UserID))
+		sockDir, err := os.MkdirTemp("", fmt.Sprintf("bob-proxy-%s-", sbx.UserID))
+		if err != nil {
+			return fmt.Errorf("failed to create proxy socket directory: %w", err)
+		}
+		sockPath := filepath.Join(sockDir, "proxy.sock")
 		proxy, err := sandbox.NewFilteringProxyWithConfig(sandbox.ProxyConfig{
 			Policy:        sbx.Network,
 			ListenTCP:     "127.0.0.1:0",
@@ -175,7 +178,7 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 	)
 
 	// Mount user workspace directory or subdirectories
-	userWorkspaceDir := sbx.WorkspaceDir
+	userWorkspaceDir := sbx.GetWorkspaceDir()
 	if userWorkspaceDir == "" {
 		userWorkspaceDir = filepath.Clean(filepath.Join("./data/sandboxes", sbx.UserID))
 	}
@@ -222,7 +225,11 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 			if err := os.MkdirAll(hostSubpath, 0o755); err != nil {
 				return nil, fmt.Errorf("failed to prepare mount path %q: %w", hostSubpath, err)
 			}
-			sandboxDest := m.SandboxPath
+			cleanDest, err := sandbox.ValidateSandboxMountPath(m.SandboxPath)
+			if err != nil {
+				return nil, fmt.Errorf("invalid sandbox mount destination %q: %w", m.SandboxPath, err)
+			}
+			sandboxDest := cleanDest
 			if sandboxDest == "" {
 				sandboxDest = filepath.Join(sandbox.DefaultWorkspaceMountPath, m.RelativePath)
 			}
@@ -323,32 +330,38 @@ exit $EXIT_CODE
 
 	var bwrapCmd *exec.Cmd
 	if hasSystemdUserScope() {
-		memMB := d.memoryLimitMB
-		if memMB <= 0 {
-			memMB = 512
-		}
-		sysArgs := []string{
-			"--user", "--scope", "-q",
-			"-p", fmt.Sprintf("MemoryMax=%dM", memMB),
-			"-p", "TasksMax=64",
-			"--",
-			d.bwrapPath,
-		}
-		sysArgs = append(sysArgs, args...)
+		sysArgs := buildSystemdArgs(d.memoryLimitMB, d.cpuLimit, d.bwrapPath, args)
 		// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 		bwrapCmd = exec.CommandContext(execCtx, "systemd-run", sysArgs...)
 	} else {
+		slog.Warn("systemd-run --user not available; bwrap running without cgroup resource limits (MemoryMax/TasksMax/CPUQuota)", "user", sbx.UserID)
 		// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 		bwrapCmd = exec.CommandContext(execCtx, d.bwrapPath, args...)
 	}
 
-	var stdout, stderr bytes.Buffer
-	bwrapCmd.Stdout = &stdout
-	bwrapCmd.Stderr = &stderr
+	stdout := sandbox.NewBoundedBuffer(sandbox.DefaultMaxOutputBytes)
+	stderr := sandbox.NewBoundedBuffer(sandbox.DefaultMaxOutputBytes)
+	bwrapCmd.Stdout = stdout
+	bwrapCmd.Stderr = stderr
 
 	startTime := time.Now()
 	err = bwrapCmd.Run()
 	duration := time.Since(startTime)
+
+	if execCtx.Err() != nil {
+		errStr := stderr.String()
+		if errStr != "" {
+			errStr += "\ncommand timed out"
+		} else {
+			errStr = "command timed out"
+		}
+		return &sandbox.ExecResult{
+			ExitCode: -1,
+			Stdout:   stdout.String(),
+			Stderr:   errStr,
+			Duration: duration,
+		}, nil
+	}
 
 	exitCode := 0
 	if err != nil {
@@ -403,3 +416,19 @@ func hasSystemdUserScope() bool {
 	return cmd.Run() == nil
 }
 
+func buildSystemdArgs(memMB int, cpuLimit float64, bwrapPath string, bwrapArgs []string) []string {
+	if memMB <= 0 {
+		memMB = 512
+	}
+	sysArgs := []string{
+		"--user", "--scope", "-q",
+		"-p", fmt.Sprintf("MemoryMax=%dM", memMB),
+		"-p", "TasksMax=64",
+	}
+	if cpuLimit > 0 {
+		sysArgs = append(sysArgs, "-p", fmt.Sprintf("CPUQuota=%d%%", int(cpuLimit*100)))
+	}
+	sysArgs = append(sysArgs, "--", bwrapPath)
+	sysArgs = append(sysArgs, bwrapArgs...)
+	return sysArgs
+}

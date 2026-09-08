@@ -73,4 +73,3 @@ func TestRenderDMPromptWithSandbox(t *testing.T) {
 	assert.Contains(t, prompt, "unconditional destruction in 25 minutes")
 	assert.Contains(t, prompt, "/sandbox destroy")
 }
-

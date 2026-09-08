@@ -85,8 +85,8 @@ func FuzzSandboxExecArgs(f *testing.F) {
 
 // recordingDriver captures the exact command slice passed to Exec for boundary auditing.
 type recordingDriver struct {
-	available  bool
-	lastCmd    []string
+	available   bool
+	lastCmd     []string
 	lastTimeout time.Duration
 }
 

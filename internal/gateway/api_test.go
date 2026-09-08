@@ -222,4 +222,3 @@ func TestFetchFileContent(t *testing.T) {
 	_, _, err = gw.FetchFileContent(context.Background(), "", 100)
 	assert.Error(t, err)
 }
-

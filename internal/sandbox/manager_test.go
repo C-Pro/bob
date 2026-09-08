@@ -18,6 +18,7 @@ type mockDriver struct {
 	createdCount int
 	execCount    int
 	destroyCount int
+	destroyErr   error
 }
 
 func (m *mockDriver) Type() DriverType {
@@ -44,7 +45,7 @@ func (m *mockDriver) Exec(ctx context.Context, sbx *UserSandbox, cmd []string, t
 
 func (m *mockDriver) Destroy(ctx context.Context, sbx *UserSandbox) error {
 	m.destroyCount++
-	return nil
+	return m.destroyErr
 }
 
 func TestManagerLifecycle(t *testing.T) {
@@ -291,3 +292,214 @@ func TestManager_ApproveSandbox_TOCTOURace(t *testing.T) {
 	driver.mu.Unlock()
 }
 
+func TestManager_RequestSandbox_DestroysExpiredRunning(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &config.Config{
+		DataDir:                   tempDir,
+		SandboxEnabled:            true,
+		SandboxDrivers:            []string{"bwrap"},
+		SandboxMaxLifetime:        30 * time.Minute,
+		SandboxDefaultExecTimeout: 1 * time.Minute,
+		SandboxMaxExecTimeout:     10 * time.Minute,
+	}
+	driver := &mockDriver{driverType: DriverBwrap, available: true}
+	mgr := NewManager(cfg, []Driver{driver})
+	defer func() { _ = mgr.Close() }()
+
+	ctx := context.Background()
+
+	// Inject an expired running sandbox (reaper has not collected it yet)
+	mgr.mu.Lock()
+	mgr.sandboxes["user_expired"] = &UserSandbox{
+		UserID:    "user_expired",
+		ChatID:    "chat1",
+		Driver:    DriverBwrap,
+		Status:    StatusRunning,
+		CreatedAt: time.Now().Add(-2 * time.Hour),
+		ExpiresAt: time.Now().Add(-1 * time.Hour),
+	}
+	mgr.mu.Unlock()
+
+	// Requesting a new sandbox must destroy the expired running sandbox rather than leaking it
+	_, err := mgr.RequestSandbox(ctx, "user_expired", "chat1", RequestParams{
+		Driver:      DriverBwrap,
+		NetworkMode: NetworkNone,
+		Reason:      "New request after expiry",
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, driver.destroyCount, "expired running sandbox must be destroyed on new request")
+}
+
+func TestManager_RequestSandbox_ExpiredStatusAllowed(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &config.Config{
+		DataDir:                   tempDir,
+		SandboxEnabled:            true,
+		SandboxDrivers:            []string{"bwrap"},
+		SandboxMaxLifetime:        30 * time.Minute,
+		SandboxDefaultExecTimeout: 1 * time.Minute,
+		SandboxMaxExecTimeout:     10 * time.Minute,
+	}
+	driver := &mockDriver{driverType: DriverBwrap, available: true}
+	mgr := NewManager(cfg, []Driver{driver})
+	defer func() { _ = mgr.Close() }()
+
+	ctx := context.Background()
+
+	// Inject a sandbox in StatusExpired (e.g. pruned by reaper or exec)
+	mgr.mu.Lock()
+	mgr.sandboxes["user_reaped"] = &UserSandbox{
+		UserID:    "user_reaped",
+		ChatID:    "chat1",
+		Driver:    DriverBwrap,
+		Status:    StatusExpired,
+		CreatedAt: time.Now().Add(-2 * time.Hour),
+		ExpiresAt: time.Now().Add(-1 * time.Hour),
+	}
+	mgr.mu.Unlock()
+
+	// Requesting a new sandbox must succeed and replace the expired entry
+	sbx, err := mgr.RequestSandbox(ctx, "user_reaped", "chat1", RequestParams{
+		Driver:      DriverBwrap,
+		NetworkMode: NetworkNone,
+		Reason:      "New request after reaper marked expired",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, StatusPendingApproval, sbx.GetStatus())
+}
+
+func TestManager_Destroy_RetryOnError(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &config.Config{
+		DataDir:                   tempDir,
+		SandboxEnabled:            true,
+		SandboxDrivers:            []string{"bwrap"},
+		SandboxMaxLifetime:        30 * time.Minute,
+		SandboxDefaultExecTimeout: 1 * time.Minute,
+		SandboxMaxExecTimeout:     10 * time.Minute,
+	}
+	driver := &mockDriver{driverType: DriverBwrap, available: true}
+	mgr := NewManager(cfg, []Driver{driver})
+	defer func() { _ = mgr.Close() }()
+
+	ctx := context.Background()
+
+	// Put a running sandbox into manager
+	mgr.mu.Lock()
+	mgr.sandboxes["user_err"] = &UserSandbox{
+		UserID:    "user_err",
+		ChatID:    "chat1",
+		Driver:    DriverBwrap,
+		Status:    StatusRunning,
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(10 * time.Minute),
+	}
+	mgr.mu.Unlock()
+
+	// Simulate driver destroy failure
+	driver.destroyErr = assert.AnError
+	err := mgr.Destroy(ctx, "user_err")
+	require.Error(t, err)
+
+	// Verify sandbox is retained in manager map for retry
+	mgr.mu.Lock()
+	_, exists := mgr.sandboxes["user_err"]
+	mgr.mu.Unlock()
+	assert.True(t, exists, "sandbox must be retained in map when driver.Destroy fails")
+
+	// Retry with successful driver destroy
+	driver.destroyErr = nil
+	err = mgr.Destroy(ctx, "user_err")
+	require.NoError(t, err)
+
+	// Verify sandbox is now removed
+	mgr.mu.Lock()
+	_, exists = mgr.sandboxes["user_err"]
+	mgr.mu.Unlock()
+	assert.False(t, exists, "sandbox must be removed from map when driver.Destroy succeeds")
+}
+
+func TestManager_ApproveAndStatus_Race(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &config.Config{
+		DataDir:                   tempDir,
+		SandboxEnabled:            true,
+		SandboxDrivers:            []string{"bwrap"},
+		SandboxMaxLifetime:        30 * time.Minute,
+		SandboxDefaultExecTimeout: 1 * time.Minute,
+		SandboxMaxExecTimeout:     10 * time.Minute,
+	}
+	driver := &mockDriver{driverType: DriverBwrap, available: true}
+	mgr := NewManager(cfg, []Driver{driver})
+	defer func() { _ = mgr.Close() }()
+
+	ctx := context.Background()
+
+	_, err := mgr.RequestSandbox(ctx, "user_race", "chat1", RequestParams{
+		Driver:      DriverBwrap,
+		NetworkMode: NetworkNone,
+		Reason:      "Race test",
+	})
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			_, _ = mgr.GetStatus("user_race")
+			time.Sleep(1 * time.Millisecond)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		time.Sleep(5 * time.Millisecond)
+		_, _ = mgr.ApproveSandbox(ctx, "user_race")
+	}()
+
+	wg.Wait()
+}
+
+func TestManager_RequestSandbox_InvalidSandboxPath(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &config.Config{
+		DataDir:                   tempDir,
+		SandboxEnabled:            true,
+		SandboxDrivers:            []string{"bwrap"},
+		SandboxMaxLifetime:        30 * time.Minute,
+		SandboxDefaultExecTimeout: 1 * time.Minute,
+		SandboxMaxExecTimeout:     10 * time.Minute,
+	}
+	driver := &mockDriver{driverType: DriverBwrap, available: true}
+	mgr := NewManager(cfg, []Driver{driver})
+	defer func() { _ = mgr.Close() }()
+
+	ctx := context.Background()
+
+	// Attempting to mount onto /etc inside the sandbox must be rejected
+	_, err := mgr.RequestSandbox(ctx, "user_mount", "chat1", RequestParams{
+		Driver:      DriverBwrap,
+		NetworkMode: NetworkNone,
+		Mounts: []UserMount{
+			{RelativePath: "data", SandboxPath: "/etc"},
+		},
+		Reason: "Attempt mount on /etc",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "conflicts with protected system directory")
+
+	// Attempting to mount onto / (root) must be rejected
+	_, err = mgr.RequestSandbox(ctx, "user_mount", "chat1", RequestParams{
+		Driver:      DriverBwrap,
+		NetworkMode: NetworkNone,
+		Mounts: []UserMount{
+			{RelativePath: "data", SandboxPath: "/"},
+		},
+		Reason: "Attempt mount on root",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot be root")
+}

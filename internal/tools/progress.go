@@ -39,6 +39,16 @@ func NewProgressReporter(chatID, task string, sendFunc func(chatID, text string)
 	}
 }
 
+// ProgressPrefix is prepended to periodic progress notifications to distinguish
+// them from conversational model turns in chat UIs and message processors.
+const ProgressPrefix = "⏳ "
+
+// IsProgressMessage reports whether the message content matches a progress notification format.
+func IsProgressMessage(content string) bool {
+	clean := strings.TrimSpace(content)
+	return strings.HasPrefix(clean, ProgressPrefix)
+}
+
 // Start initiates the periodic progress reporting background goroutine.
 func (p *ProgressReporter) Start() {
 	if p == nil || p.disabled || p.sendFunc == nil {
@@ -72,7 +82,7 @@ func (p *ProgressReporter) Start() {
 				current := p.current
 				p.mu.Unlock()
 
-				msg := FormatProgressMessage(task, current)
+				msg := ProgressPrefix + FormatProgressMessage(task, current)
 				if err := p.sendFunc(p.chatID, msg); err != nil {
 					slog.Warn("failed to send progress notification", "chatID", p.chatID, "error", err)
 				}

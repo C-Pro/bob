@@ -638,5 +638,26 @@ func TestExecuteSandboxRequest_NotifierError(t *testing.T) {
 		"reason": "Run tests"
 	}`)
 	assert.ErrorContains(t, err, "failed to send approval card")
-}
 
+	// Verify that the pending sandbox request was rolled back and is not stuck in PendingApproval
+	status, exists := sandboxMgr.GetStatus("user1")
+	assert.False(t, exists, "pending sandbox request must be rolled back on notifier error")
+	assert.Nil(t, status)
+
+	// User must be able to request a new sandbox immediately without being told "already have a pending request"
+	dmCtxSuccess := WithChatSession(ctx, ChatSessionContext{
+		ChatID: "dm_user1",
+		UserID: "user1",
+		IsDM:   true,
+		Notifier: func(chatID, text string) error {
+			return nil
+		},
+		SandboxRequestCreated: &sbxRequested,
+	})
+	_, err = reg.Execute(dmCtxSuccess, "sandbox_request", `{
+		"driver": "bwrap",
+		"network": "none",
+		"reason": "Retry after failure"
+	}`)
+	assert.NoError(t, err, "subsequent request must succeed after rollback")
+}

@@ -54,6 +54,7 @@ type Gateway struct {
 	locationInterval     time.Duration
 	initialLocationDelay time.Duration
 	indexingWg           sync.WaitGroup
+	recentProgress       sync.Map
 }
 
 // NewGateway creates a new Besedka Gateway instance.
@@ -376,6 +377,25 @@ func (g *Gateway) SendMessage(chatID, content string) error {
 	return conn.WriteJSON(clientMsg)
 }
 
+func (g *Gateway) recordProgressMessage(chatID, content string) {
+	key := chatID + "\x00" + content
+	g.recentProgress.Store(key, time.Now())
+}
+
+func (g *Gateway) isRecentProgress(chatID, content string) bool {
+	key := chatID + "\x00" + content
+	val, ok := g.recentProgress.Load(key)
+	if !ok {
+		return false
+	}
+	t, ok := val.(time.Time)
+	if !ok || time.Since(t) > 5*time.Minute {
+		g.recentProgress.Delete(key)
+		return false
+	}
+	return true
+}
+
 // SetLocation sets the server location for periodic location reporting.
 func (g *Gateway) SetLocation(loc *models.Location) {
 	g.mu.Lock()
@@ -526,7 +546,7 @@ func (g *Gateway) CatchupChatMemory(ctx context.Context, chatID string, isDM boo
 			cleanContent := ExtractMessageText(m)
 			extraText, _ := g.processAttachments(ctx, m.Attachments)
 			fullContent := strings.TrimSpace(cleanContent + extraText)
-			if fullContent == "" {
+			if fullContent == "" || (botID != "" && m.UserID == botID && tools.IsProgressMessage(fullContent)) {
 				continue
 			}
 
@@ -552,6 +572,11 @@ func (g *Gateway) CatchupChatMemory(ctx context.Context, chatID string, isDM boo
 			if err := memMgr.IndexMessages(ctx, chatID, isDM, toStore); err != nil {
 				slog.Warn("failed to index historical batch during memory catchup", "chatID", chatID, "error", err)
 				break
+			}
+		} else if len(fetchedMsgs) > 0 {
+			lastReturnedSeq := fetchedMsgs[len(fetchedMsgs)-1].Seq
+			if err := memMgr.SetWatermark(ctx, chatID, isDM, lastReturnedSeq); err != nil {
+				slog.Warn("failed to advance watermark during memory catchup", "chatID", chatID, "error", err)
 			}
 		}
 
@@ -604,7 +629,7 @@ func (g *Gateway) WarmupChat(ctx context.Context, chatID string, lastSeq int64) 
 		cleanContent := ExtractMessageText(m)
 		extraText, images := g.processAttachments(ctx, m.Attachments)
 		fullContent := strings.TrimSpace(cleanContent + extraText)
-		if fullContent == "" && len(images) == 0 {
+		if (fullContent == "" && len(images) == 0) || (botID != "" && m.UserID == botID && tools.IsProgressMessage(fullContent)) {
 			continue
 		}
 
@@ -720,6 +745,10 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 
 	// 1. Handle self-messages from the bot itself (Townhall and DM)
 	if botID != "" && msg.UserID == botID {
+		// Transient progress notifications must never be stored in ring buffer or memory
+		if tools.IsProgressMessage(fullContent) || g.isRecentProgress(msg.ChatID, fullContent) {
+			return nil
+		}
 		entries := g.contextManager.GetOrCreate(msg.ChatID).Entries()
 		// Deduplicate if already appended on outgoing SendMessage
 		isDuplicate := false
@@ -862,8 +891,9 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 	if taskDesc == "" {
 		taskDesc = msg.Content
 	}
-	noProgress := !isDM || userPrefersNoProgress(msg.Content) || (currentTask != "" && userPrefersNoProgress(currentTask))
+	noProgress := !isDM
 	progress := tools.NewProgressReporter(msg.ChatID, taskDesc, func(chatID, text string) error {
+		g.recordProgressMessage(chatID, text)
 		return g.SendMessage(chatID, text)
 	}, 30*time.Second, noProgress)
 	progress.Start()
@@ -918,7 +948,7 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 
 	if err == nil && isDM && sm != nil {
 		if sbx, ok := sm.GetStatus(msg.UserID); ok && sbx != nil && sbx.Status == sandbox.StatusRunning {
-			if !userStatedSandboxPreference(msg.Content) && !strings.Contains(reply, "/sandbox destroy") {
+			if !strings.Contains(reply, "/sandbox destroy") {
 				rem := time.Until(sbx.ExpiresAt).Round(time.Minute)
 				if rem < 0 {
 					rem = 0
@@ -945,53 +975,6 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 	})
 
 	return nil
-}
-
-func userPrefersNoProgress(text string) bool {
-	lower := strings.ToLower(text)
-	phrases := []string{
-		"no progress",
-		"without progress",
-		"don't report progress",
-		"dont report progress",
-		"do not report progress",
-		"quietly",
-		"silently",
-		"silent mode",
-		"no updates",
-		"suppress progress",
-		"skip progress",
-	}
-	for _, p := range phrases {
-		if strings.Contains(lower, p) {
-			return true
-		}
-	}
-	return false
-}
-
-func userStatedSandboxPreference(text string) bool {
-	lower := strings.ToLower(text)
-	phrases := []string{
-		"destroy sandbox",
-		"keep sandbox",
-		"destroy it",
-		"keep it",
-		"leave sandbox",
-		"leave it running",
-		"kill sandbox",
-		"terminate sandbox",
-		"close sandbox",
-		"don't destroy",
-		"dont destroy",
-		"do not destroy",
-	}
-	for _, p := range phrases {
-		if strings.Contains(lower, p) {
-			return true
-		}
-	}
-	return false
 }
 
 // Start listens for incoming WebSocket messages and processes them until context is cancelled.
@@ -1197,10 +1180,6 @@ func (g *Gateway) handleSandboxCommand(ctx context.Context, msg models.Message, 
 	}
 	sm := g.sandboxManager
 	g.mu.Unlock()
-
-	if botID != "" && msg.UserID == botID {
-		return nil // Bot is prohibited from approving or manipulating sandboxes
-	}
 
 	if sm == nil {
 		return g.SendMessage(msg.ChatID, "Sandbox execution is disabled on this server.")

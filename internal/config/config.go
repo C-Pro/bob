@@ -93,6 +93,11 @@ func LoadFromEnv() (*Config, error) {
 	s3PathStyleStr := getEnvOrDefault("S3_PATH_STYLE", "true")
 	s3PathStyle := s3PathStyleStr == "true" || s3PathStyleStr == "1"
 
+	sandboxEnabled, err := getEnvBoolOrDefault("SANDBOX_ENABLED", true)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		BotHandle:                  getEnvOrDefault("BOT_HANDLE", "@bot"),
 		BesedkaURL:                 getEnvOrDefault("BESEDKA_URL", defaultBesedkaURL),
@@ -121,7 +126,7 @@ func LoadFromEnv() (*Config, error) {
 		S3BackupInterval:           backupInterval,
 		S3BackupKeep:               getEnvIntOrDefault("S3_BACKUP_KEEP", 7),
 		S3BackupPrefix:             s3Prefix,
-		SandboxEnabled:             getEnvBoolOrDefault("SANDBOX_ENABLED", true),
+		SandboxEnabled:             sandboxEnabled,
 		SandboxDrivers:             getEnvSliceOrDefault("SANDBOX_DRIVERS", []string{"bwrap", "docker"}),
 		SandboxDockerSocket:        getEnvOrDefault("SANDBOX_DOCKER_SOCKET", "/var/run/docker.sock"),
 		SandboxAllowedImages:       getEnvSliceOrDefault("SANDBOX_ALLOWED_IMAGES", DefaultSandboxAllowedImages),
@@ -239,17 +244,20 @@ func getEnvIntOrDefault(key string, defaultValue int) int {
 	return defaultValue
 }
 
-func getEnvBoolOrDefault(key string, defaultValue bool) bool {
-	if val := strings.TrimSpace(os.Getenv(key)); val != "" {
-		lower := strings.ToLower(val)
-		if lower == "false" || lower == "0" || lower == "no" {
-			return false
-		}
-		if lower == "true" || lower == "1" || lower == "yes" {
-			return true
-		}
+func getEnvBoolOrDefault(key string, defaultValue bool) (bool, error) {
+	val := strings.TrimSpace(os.Getenv(key))
+	if val == "" {
+		return defaultValue, nil
 	}
-	return defaultValue
+	lower := strings.ToLower(val)
+	switch lower {
+	case "true", "1", "yes", "y", "on", "enable", "enabled":
+		return true, nil
+	case "false", "0", "no", "n", "off", "disable", "disabled":
+		return false, nil
+	default:
+		return false, fmt.Errorf("invalid boolean value %q for %s: must be true/false, yes/no, on/off, enabled/disabled, 1/0", val, key)
+	}
 }
 
 func getEnvSliceOrDefault(key string, defaultValue []string) []string {

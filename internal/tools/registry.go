@@ -746,6 +746,7 @@ func (r *Registry) executeSandboxRequest(ctx context.Context, argsJSON string) (
 
 	if session.Notifier != nil {
 		if err := session.Notifier(session.ChatID, card.String()); err != nil {
+			_ = r.sandboxManager.DenySandbox(session.UserID)
 			return "", fmt.Errorf("failed to send approval card: %w", err)
 		}
 	}

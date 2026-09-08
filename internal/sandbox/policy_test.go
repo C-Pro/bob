@@ -73,7 +73,64 @@ func TestValidateMountPath(t *testing.T) {
 
 	_, _, err = ValidateMountPath(workspace, "escaped_link")
 	assert.Error(t, err)
+}
 
+func TestValidateSandboxMountPath(t *testing.T) {
+	// Empty path should be accepted (defaults to /workspace/<rel>)
+	clean, err := ValidateSandboxMountPath("")
+	require.NoError(t, err)
+	assert.Equal(t, "", clean)
+
+	// Valid sandbox paths
+	clean, err = ValidateSandboxMountPath("/workspace/data")
+	require.NoError(t, err)
+	assert.Equal(t, "/workspace/data", clean)
+
+	clean, err = ValidateSandboxMountPath("/mnt/data")
+	require.NoError(t, err)
+	assert.Equal(t, "/mnt/data", clean)
+
+	// Relative paths must be rejected
+	_, err = ValidateSandboxMountPath("workspace/data")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must be an absolute path")
+
+	// Root path must be rejected
+	_, err = ValidateSandboxMountPath("/")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot be root")
+
+	// Critical system directories must be rejected
+	blockedCases := []string{
+		"/etc",
+		"/etc/passwd",
+		"/bin",
+		"/bin/sh",
+		"/sbin",
+		"/usr",
+		"/usr/bin",
+		"/lib",
+		"/lib64",
+		"/dev",
+		"/dev/null",
+		"/proc",
+		"/sys",
+		"/tmp",
+		"/tmp/foo",
+		"/root",
+		"/boot",
+		"/run",
+		"/var",
+	}
+
+	for _, tc := range blockedCases {
+		_, err := ValidateSandboxMountPath(tc)
+		require.Errorf(t, err, "path %q should be rejected", tc)
+		assert.Contains(t, err.Error(), "conflicts with protected system directory")
+	}
+}
+
+func TestValidateNetworkPolicy(t *testing.T) {
 	// Mode Restricted
 	p, err := ValidateNetworkPolicy(NetworkPolicy{
 		Mode:         NetworkRestricted,

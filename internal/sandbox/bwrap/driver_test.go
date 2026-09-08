@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -154,4 +155,82 @@ func TestBwrapDriver_ResolvConf(t *testing.T) {
 	t.Logf("stdout: %q, stderr: %q", res.Stdout, res.Stderr)
 	assert.Equal(t, 0, res.ExitCode, "cat /etc/resolv.conf failed: %s", res.Stderr)
 	assert.NotEmpty(t, res.Stdout)
+}
+
+func TestBwrapDriver_BoundedOutput(t *testing.T) {
+	driver := NewDriver()
+	ctx := context.Background()
+
+	if !driver.Available(ctx) {
+		t.Skip("bwrap not available on host, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	workspace := filepath.Join(tempDir, "user_bounded")
+	require.NoError(t, os.MkdirAll(workspace, 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID: "testuser_bounded",
+		Network: sandbox.NetworkPolicy{
+			Mode: sandbox.NetworkNone,
+		},
+		Status: sandbox.StatusRunning,
+	}
+
+	err := driver.Create(ctx, sbx, workspace)
+	require.NoError(t, err)
+	defer func() { _ = driver.Destroy(ctx, sbx) }()
+
+	// Generate 2MB of output with sh
+	res, err := driver.Exec(ctx, sbx, []string{"sh", "-c", "head -c 2097152 /dev/zero | tr '\\0' 'A'"}, 5*time.Second)
+	require.NoError(t, err)
+	assert.Contains(t, res.Stdout, "[output truncated")
+	assert.LessOrEqual(t, len(res.Stdout), sandbox.DefaultMaxOutputBytes+200)
+}
+
+func TestBwrapDriver_ExecTimeout(t *testing.T) {
+	driver := NewDriver()
+	ctx := context.Background()
+
+	if !driver.Available(ctx) {
+		t.Skip("bwrap not available on host, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	workspace := filepath.Join(tempDir, "user_timeout")
+	require.NoError(t, os.MkdirAll(workspace, 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID: "testuser_timeout",
+		Network: sandbox.NetworkPolicy{
+			Mode: sandbox.NetworkNone,
+		},
+		Status: sandbox.StatusRunning,
+	}
+
+	err := driver.Create(ctx, sbx, workspace)
+	require.NoError(t, err)
+	defer func() { _ = driver.Destroy(ctx, sbx) }()
+
+	res, err := driver.Exec(ctx, sbx, []string{"sleep", "10"}, 50*time.Millisecond)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	assert.Equal(t, -1, res.ExitCode)
+	assert.Contains(t, res.Stderr, "command timed out")
+}
+
+func TestBuildSystemdArgs(t *testing.T) {
+	// Case 1: Default mem, positive cpuLimit
+	args := buildSystemdArgs(0, 1.5, "/usr/bin/bwrap", []string{"--ro-bind", "/usr", "/usr"})
+	assert.Contains(t, args, "MemoryMax=512M")
+	assert.Contains(t, args, "TasksMax=64")
+	assert.Contains(t, args, "CPUQuota=150%")
+	assert.Contains(t, args, "/usr/bin/bwrap")
+	assert.Contains(t, args, "--ro-bind")
+
+	// Case 2: Custom mem, zero cpuLimit
+	args2 := buildSystemdArgs(1024, 0, "/usr/bin/bwrap", []string{"--unshare-all"})
+	assert.Contains(t, args2, "MemoryMax=1024M")
+	assert.Contains(t, args2, "TasksMax=64")
+	assert.NotContains(t, strings.Join(args2, " "), "CPUQuota")
 }
