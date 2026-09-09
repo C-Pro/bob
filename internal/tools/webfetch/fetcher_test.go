@@ -78,4 +78,3 @@ func TestFetchValidation(t *testing.T) {
 	_, err = Fetch(ctx, "http://127.0.0.1:9999", nil)
 	assert.Error(t, err)
 }
-

@@ -284,4 +284,3 @@ func (g *Gateway) FetchFileContent(ctx context.Context, fileID string, maxBytes 
 
 	return data, contentType, nil
 }
-

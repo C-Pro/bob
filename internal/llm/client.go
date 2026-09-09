@@ -440,7 +440,7 @@ func (c *Client) GenerateChatResponseWithToolLoop(
 	// Graceful synthesis step: when maxIterations is reached, request a final completion with tools disabled
 	currentMessages = append(currentMessages, openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleUser,
-		Content: "You have reached the tool execution limit. Please synthesize and provide the best possible response based on all information gathered so far, including original markdown links to sources found in the search results, without calling any more tools.",
+		Content: "You have reached the tool execution limit. Please synthesize and provide the best possible response based on all information gathered so far, including original markdown links to sources found in the search results, without calling any more tools. If any requested actions, scripts, or files could not be completed or executed due to the tool limit, state clearly what was accomplished and what remains to be run; do not claim files were created if they were not.",
 	})
 
 	finalReq := openai.ChatCompletionRequest{
@@ -456,4 +456,3 @@ func (c *Client) GenerateChatResponseWithToolLoop(
 
 	return finalResp.Choices[0].Message.Content, nil
 }
-

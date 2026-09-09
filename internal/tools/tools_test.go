@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +13,7 @@ import (
 
 	"bob/internal/config"
 	"bob/internal/memory"
+	"bob/internal/sandbox"
 	"bob/internal/tools/tavily"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -472,4 +474,190 @@ func TestExecuteRecallMemory_InvalidArgs(t *testing.T) {
 	assert.ErrorContains(t, err, "query cannot be empty")
 }
 
+type mockSandboxDriver struct {
+	available bool
+}
 
+func (m *mockSandboxDriver) Type() sandbox.DriverType {
+	return sandbox.DriverBwrap
+}
+
+func (m *mockSandboxDriver) Available(ctx context.Context) bool {
+	return m.available
+}
+
+func (m *mockSandboxDriver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorkspaceDir string) error {
+	return nil
+}
+
+func (m *mockSandboxDriver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []string, timeout time.Duration) (*sandbox.ExecResult, error) {
+	return &sandbox.ExecResult{
+		ExitCode: 0,
+		Stdout:   "sandbox exec result",
+		Duration: 50 * time.Millisecond,
+	}, nil
+}
+
+func (m *mockSandboxDriver) Destroy(ctx context.Context, sbx *sandbox.UserSandbox) error {
+	return nil
+}
+
+func TestSandboxToolDefinitionsScope(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &config.Config{
+		DataDir:                   tempDir,
+		SandboxEnabled:            true,
+		SandboxDrivers:            []string{"bwrap"},
+		SandboxMaxLifetime:        30 * time.Minute,
+		SandboxDefaultExecTimeout: 1 * time.Minute,
+		SandboxMaxExecTimeout:     10 * time.Minute,
+	}
+
+	mockDriver := &mockSandboxDriver{available: true}
+	sandboxMgr := sandbox.NewManager(cfg, []sandbox.Driver{mockDriver})
+	defer func() { _ = sandboxMgr.Close() }()
+
+	reg := NewRegistry(nil, nil, sandboxMgr)
+
+	// Base ToolDefinitions (or Townhall session) has 3 tools
+	assert.Len(t, reg.ToolDefinitions(), 3)
+	assert.Len(t, reg.ToolDefinitionsForSession(ChatSessionContext{IsDM: false}), 3)
+
+	// DM session has 6 tools (including sandbox_request, sandbox_exec, sandbox_destroy)
+	dmTools := reg.ToolDefinitionsForSession(ChatSessionContext{IsDM: true})
+	assert.Len(t, dmTools, 6)
+
+	names := make([]string, len(dmTools))
+	for i, tool := range dmTools {
+		names[i] = tool.Function.Name
+	}
+	assert.Contains(t, names, "sandbox_request")
+	assert.Contains(t, names, "sandbox_exec")
+	assert.Contains(t, names, "sandbox_destroy")
+}
+
+func TestSandboxToolExecution(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &config.Config{
+		DataDir:                   tempDir,
+		SandboxEnabled:            true,
+		SandboxDrivers:            []string{"bwrap"},
+		SandboxMaxLifetime:        30 * time.Minute,
+		SandboxDefaultExecTimeout: 1 * time.Minute,
+		SandboxMaxExecTimeout:     10 * time.Minute,
+	}
+
+	mockDriver := &mockSandboxDriver{available: true}
+	sandboxMgr := sandbox.NewManager(cfg, []sandbox.Driver{mockDriver})
+	defer func() { _ = sandboxMgr.Close() }()
+
+	reg := NewRegistry(nil, nil, sandboxMgr)
+	ctx := context.Background()
+
+	// 1. Calling from Townhall (non-DM) must fail
+	thCtx := WithChatSession(ctx, ChatSessionContext{
+		ChatID: "townhall",
+		UserID: "user1",
+		IsDM:   false,
+	})
+	_, err := reg.Execute(thCtx, "sandbox_request", `{"driver":"bwrap","reason":"test"}`)
+	assert.ErrorContains(t, err, "strictly available in 1-on-1 direct messages")
+
+	// 2. Calling from DM with UserID
+	var sbxRequested bool
+	dmCtx := WithChatSession(ctx, ChatSessionContext{
+		ChatID:                "dm_user1",
+		UserID:                "user1",
+		IsDM:                  true,
+		SandboxRequestCreated: &sbxRequested,
+	})
+
+	// Request sandbox
+	out, err := reg.Execute(dmCtx, "sandbox_request", `{
+		"driver": "bwrap",
+		"network": "none",
+		"reason": "Run tests and scripts"
+	}`)
+	require.NoError(t, err)
+	assert.True(t, sbxRequested)
+	assert.Contains(t, out, "Sandbox request created and approval card has already been sent")
+	assert.Contains(t, out, "DO NOT generate any conversational message")
+
+	// Exec before approval fails
+	_, err = reg.Execute(dmCtx, "sandbox_exec", `{"command": "echo 1"}`)
+	assert.ErrorContains(t, err, "no active sandbox found")
+
+	// Approve sandbox out-of-band
+	_, err = sandboxMgr.ApproveSandbox(ctx, "user1")
+	require.NoError(t, err)
+
+	// Exec after approval succeeds
+	execOut, err := reg.Execute(dmCtx, "sandbox_exec", `{"command": "echo 1"}`)
+	require.NoError(t, err)
+	assert.Contains(t, execOut, "Exit Code: 0")
+	assert.Contains(t, execOut, "sandbox exec result")
+
+	// Destroy sandbox
+	destroyOut, err := reg.Execute(dmCtx, "sandbox_destroy", `{}`)
+	require.NoError(t, err)
+	assert.Contains(t, destroyOut, "successfully destroyed")
+
+	// Exec after destroy fails
+	_, err = reg.Execute(dmCtx, "sandbox_exec", `{"command": "echo 1"}`)
+	assert.ErrorContains(t, err, "no active sandbox found")
+}
+
+func TestExecuteSandboxRequest_NotifierError(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &config.Config{
+		DataDir:        tempDir,
+		SandboxEnabled: true,
+		SandboxDrivers: []string{"bwrap"},
+	}
+	mockDriver := &mockSandboxDriver{available: true}
+	sandboxMgr := sandbox.NewManager(cfg, []sandbox.Driver{mockDriver})
+	defer func() { _ = sandboxMgr.Close() }()
+
+	reg := NewRegistry(nil, nil, sandboxMgr)
+	ctx := context.Background()
+
+	var sbxRequested bool
+	dmCtx := WithChatSession(ctx, ChatSessionContext{
+		ChatID: "dm_user1",
+		UserID: "user1",
+		IsDM:   true,
+		Notifier: func(chatID, text string) error {
+			return errors.New("network disconnection")
+		},
+		SandboxRequestCreated: &sbxRequested,
+	})
+
+	_, err := reg.Execute(dmCtx, "sandbox_request", `{
+		"driver": "bwrap",
+		"network": "none",
+		"reason": "Run tests"
+	}`)
+	assert.ErrorContains(t, err, "failed to send approval card")
+
+	// Verify that the pending sandbox request was rolled back and is not stuck in PendingApproval
+	status, exists := sandboxMgr.GetStatus("user1")
+	assert.False(t, exists, "pending sandbox request must be rolled back on notifier error")
+	assert.Nil(t, status)
+
+	// User must be able to request a new sandbox immediately without being told "already have a pending request"
+	dmCtxSuccess := WithChatSession(ctx, ChatSessionContext{
+		ChatID: "dm_user1",
+		UserID: "user1",
+		IsDM:   true,
+		Notifier: func(chatID, text string) error {
+			return nil
+		},
+		SandboxRequestCreated: &sbxRequested,
+	})
+	_, err = reg.Execute(dmCtxSuccess, "sandbox_request", `{
+		"driver": "bwrap",
+		"network": "none",
+		"reason": "Retry after failure"
+	}`)
+	assert.NoError(t, err, "subsequent request must succeed after rollback")
+}

@@ -61,3 +61,15 @@ func TestRenderDMPrompt(t *testing.T) {
 	assert.Contains(t, prompt3, "the user")
 	assert.NotContains(t, prompt3, "user-99")
 }
+
+func TestRenderDMPromptWithSandbox(t *testing.T) {
+	bot := models.User{ID: "bot-1", DisplayName: "Bob AI"}
+	user := models.User{ID: "user-1", DisplayName: "Alice"}
+
+	prompt := RenderDMPromptWithSandbox(bot, "@bot", user, 5, true, "25 minutes")
+	assert.Contains(t, prompt, "Bob AI")
+	assert.Contains(t, prompt, "Alice")
+	assert.Contains(t, prompt, "active sandbox")
+	assert.Contains(t, prompt, "unconditional destruction in 25 minutes")
+	assert.Contains(t, prompt, "/sandbox destroy")
+}

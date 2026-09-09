@@ -338,4 +338,3 @@ func TestManager_EvictionHook(t *testing.T) {
 	assert.Equal(t, "User1 Msg 1", calls[0].entries[0].Content)
 	mu.Unlock()
 }
-

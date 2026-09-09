@@ -130,4 +130,22 @@ Support loading skills based on the current task
 
 ### **Phase 13: RAG for knowledge**
 
-Accumulate facts/knowledge/skills and provide RAG search tool to the agent.  
+Accumulate facts/knowledge/skills and provide RAG search tool to the agent.
+
+### **Phase 14: Generalized User Preferences Storage in CortexDB**
+
+Implement a persistent, structured preferences storage layer backed by CortexDB for per-user and per-chat configuration:
+* **Storage Schema:** Durable key-value and typed preference attributes indexed by user ID and chat ID.
+* **Progress Reporting Preferences:** User-level setting to opt out of or customize progress notifications (e.g. `quiet_mode`, `suppress_progress`), replacing ad-hoc text heuristics.
+* **Sandbox Retention Preferences:** Configurable policy for container lifecycles post-task (e.g. `auto_destroy_on_completion: true/false`, custom idle timeouts).
+* **Control Interface:** Explicit command interactions (e.g. `/set preference ...`) and agent tool invocation for querying and mutating preferences safely.
+
+### **Phase 15: Ephemeral Progress Notifications (Besedka Protocol Integration)**
+
+Support first-class transient / ephemeral notification messages in the chat protocol that bypass persistent message storage and memory:
+* **Besedka Protocol Support:** Introduce an ephemeral/transient message attribute (e.g. `transient: true` or `ephemeral: true`) in Besedka WebSocket frames and REST API.
+* **Storage Exclusion:** Besedka server displays progress and status frames in the active chat UI for real-time human feedback, but excludes them from persistent database storage tables.
+* **Memory Ingress Cleanliness:** Eliminates the need for client-side message prefixes (`⏳ `) and in-memory tracking caches (`recentProgress`) in Bob, ensuring historical backfill, warmup, and sequence catch-up operations never ingest transient progress messages into chat context or long-term CortexDB memory.
+* **Agent Integration:** Update Bob's `ProgressReporter` to transmit native ephemeral frames directly.
+
+
