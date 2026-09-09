@@ -59,3 +59,9 @@ func TestBoundedBuffer_ConcurrentWrites(t *testing.T) {
 	assert.True(t, buf.Truncated())
 	assert.True(t, strings.HasSuffix(buf.String(), "[output truncated: exceeded 1000 bytes limit] ..."))
 }
+
+func TestBoundedBuffer_DefaultLimit(t *testing.T) {
+	buf := NewBoundedBuffer(0)
+	assert.Equal(t, DefaultMaxOutputBytes, buf.maxBytes)
+	assert.Equal(t, 32*1024, DefaultMaxOutputBytes)
+}

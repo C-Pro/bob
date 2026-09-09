@@ -263,7 +263,7 @@ func (r *Registry) initToolDefinitions() {
 			Type: openai.ToolTypeFunction,
 			Function: &openai.FunctionDefinition{
 				Name:        "sandbox_exec",
-				Description: "Execute a shell command inside your active sandbox. Output (stdout, stderr, exit code) is returned upon completion. Use non-interactive, one-shot commands only. Provide a short one-line description of what is being run to report progress to the user.",
+				Description: fmt.Sprintf("Execute a shell command inside your active sandbox. Output (stdout, stderr, exit code) is returned upon completion, truncated to a maximum of %dKB per stream. If expected output can be more than %dKB, pipe it to a file when a volume is mounted. Use non-interactive, one-shot commands only. Provide a short one-line description of what is being run to report progress to the user.", sandbox.DefaultMaxOutputBytes/1024, sandbox.DefaultMaxOutputBytes/1024),
 				Parameters:  sandboxExecSchema,
 			},
 		},

@@ -140,3 +140,12 @@ Implement a persistent, structured preferences storage layer backed by CortexDB 
 * **Sandbox Retention Preferences:** Configurable policy for container lifecycles post-task (e.g. `auto_destroy_on_completion: true/false`, custom idle timeouts).
 * **Control Interface:** Explicit command interactions (e.g. `/set preference ...`) and agent tool invocation for querying and mutating preferences safely.
 
+### **Phase 15: Ephemeral Progress Notifications (Besedka Protocol Integration)**
+
+Support first-class transient / ephemeral notification messages in the chat protocol that bypass persistent message storage and memory:
+* **Besedka Protocol Support:** Introduce an ephemeral/transient message attribute (e.g. `transient: true` or `ephemeral: true`) in Besedka WebSocket frames and REST API.
+* **Storage Exclusion:** Besedka server displays progress and status frames in the active chat UI for real-time human feedback, but excludes them from persistent database storage tables.
+* **Memory Ingress Cleanliness:** Eliminates the need for client-side message prefixes (`⏳ `) and in-memory tracking caches (`recentProgress`) in Bob, ensuring historical backfill, warmup, and sequence catch-up operations never ingest transient progress messages into chat context or long-term CortexDB memory.
+* **Agent Integration:** Update Bob's `ProgressReporter` to transmit native ephemeral frames directly.
+
+

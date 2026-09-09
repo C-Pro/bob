@@ -6,8 +6,8 @@ import (
 	"sync"
 )
 
-// DefaultMaxOutputBytes is the default maximum number of bytes captured per output stream (1 MB).
-const DefaultMaxOutputBytes = 1024 * 1024
+// DefaultMaxOutputBytes is the default maximum number of bytes captured per output stream (32 KB).
+const DefaultMaxOutputBytes = 32 * 1024
 
 // BoundedBuffer implements io.Writer and captures at most maxBytes.
 // Excess bytes are silently discarded to prevent memory exhaustion, and
