@@ -12,17 +12,24 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+func createTestSQLiteFile(t *testing.T, path string) {
+	db, err := sql.Open("sqlite", path)
+	require.NoError(t, err)
+	_, err = db.Exec("CREATE TABLE t (id INT);")
+	require.NoError(t, err)
+	_ = db.Close()
+}
+
 func TestDiscoverDBTargets(t *testing.T) {
 	tempDir := t.TempDir()
 
-	// Create test database files on disk
-	f1, err := os.Create(filepath.Join(tempDir, "bob.db"))
-	require.NoError(t, err)
-	_ = f1.Close()
+	// Create valid test SQLite database files on disk
+	createTestSQLiteFile(t, filepath.Join(tempDir, "bob.db"))
+	createTestSQLiteFile(t, filepath.Join(tempDir, "dm_user123.db"))
 
-	f2, err := os.Create(filepath.Join(tempDir, "dm_user123.db"))
+	// Create a non-SQLite .db file (like besedka.db) to test filtering
+	err := os.WriteFile(filepath.Join(tempDir, "besedka.db"), []byte("non-sqlite-boltdb-content"), 0644)
 	require.NoError(t, err)
-	_ = f2.Close()
 
 	// Also create a non-db file to test filtering
 	f3, err := os.Create(filepath.Join(tempDir, "ignore.txt"))

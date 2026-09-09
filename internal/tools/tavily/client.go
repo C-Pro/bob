@@ -224,4 +224,3 @@ func (c *Client) Extract(ctx context.Context, urls ...string) (*ExtractResponse,
 
 	return nil, fmt.Errorf("tavily API request failed after %d retries; last error: %w", c.maxRetries, lastErr)
 }
-

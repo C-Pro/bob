@@ -20,6 +20,22 @@ type DBTarget struct {
 	DB   *sql.DB
 }
 
+// isSQLiteDB checks if a file begins with the standard SQLite header or is an active db.
+func isSQLiteDB(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+
+	var header [16]byte
+	n, err := f.Read(header[:])
+	if err != nil || n < 16 {
+		return false
+	}
+	return string(header[:]) == "SQLite format 3\x00"
+}
+
 // DiscoverDBTargets lists all known and existing SQLite databases in dataDir.
 func DiscoverDBTargets(dataDir string, activeDBs map[string]*sql.DB) ([]DBTarget, error) {
 	if activeDBs == nil {
@@ -39,7 +55,7 @@ func DiscoverDBTargets(dataDir string, activeDBs map[string]*sql.DB) ([]DBTarget
 		}
 	}
 
-	// Scan dataDir for all other *.db files (like dm_*.db)
+	// Scan dataDir for all other SQLite *.db files (like dm_*.db)
 	entries, err := os.ReadDir(dataDir)
 	if err == nil {
 		for _, entry := range entries {
@@ -47,9 +63,15 @@ func DiscoverDBTargets(dataDir string, activeDBs map[string]*sql.DB) ([]DBTarget
 				continue
 			}
 			name := entry.Name()
+			if name == "besedka.db" {
+				continue
+			}
 			if strings.HasSuffix(name, ".db") {
+				p := filepath.Join(dataDir, name)
+				if _, ok := activeDBs[name]; !ok && !isSQLiteDB(p) {
+					continue
+				}
 				if _, exists := targetsMap[name]; !exists {
-					p := filepath.Join(dataDir, name)
 					target := DBTarget{Name: name, Path: p}
 					if db, ok := activeDBs[name]; ok {
 						target.DB = db

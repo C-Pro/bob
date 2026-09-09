@@ -20,6 +20,7 @@
 - **Track: Web Page Fetch Tool Support (`web_fetch`)** (`web-fetch-tool_20260825`) - [Plan](archive/web-fetch-tool_20260825/plan.md) | [Spec](archive/web-fetch-tool_20260825/spec.md)
 - **Track: Images & Attachments in Context** (`images-in-context_20260825`) - [Plan](archive/images-in-context_20260825/plan.md) | [Spec](archive/images-in-context_20260825/spec.md)
 - **Track: SQLite Database Scaffolding & Single-Step Migration** (`sqlite-db_20260828`) - [Plan](archive/sqlite-db_20260828/plan.md) | [Spec](archive/sqlite-db_20260828/spec.md)
+- **Track: Isolated Sandbox Execution Subsystem** (`sandbox-execution_20260906`) - [Plan](archive/sandbox-execution_20260906/plan.md) | [Spec](archive/sandbox-execution_20260906/spec.md)
 
 ---
 

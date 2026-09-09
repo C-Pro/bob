@@ -51,4 +51,3 @@ type ExtractResponse struct {
 	FailedResults []ExtractFailedResult `json:"failed_results,omitempty"`
 	ResponseTime  float64               `json:"response_time,omitempty"`
 }
-

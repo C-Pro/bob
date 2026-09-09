@@ -275,4 +275,3 @@ func TestExtractFailureAfterRetries(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "tavily API request failed after 2 retries")
 }
-

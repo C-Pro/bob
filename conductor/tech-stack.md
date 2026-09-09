@@ -44,4 +44,5 @@
   - **Lexical Fallback:** Graceful fallback to pure FTS5 BM25 search when embedding generation fails or when vector dimensions mismatch.
   - **Vector Regeneration CLI:** Standalone vector migration tool via `cmd/agent -regenerate-vectors` / `-reembed` to batch recompute embeddings (`EmbedBatch`) across all chat databases when switching models.
 - **Database Backup & Object Storage:** Minimal standard-library AWS SigV4 S3 REST client (`internal/objectstore`), Argon2id + AES-256-GCM encryption pipeline with `BOBB` magic header and streaming gzip compression (`internal/backup`), JSON manifest metadata tracking (`manifest.json`), MinIO CI service integration testing.
+- **Sandbox Execution & Network Isolation:** Unprivileged Linux user namespaces (`bubblewrap` / `bwrap`) with host read-only binds and `--unshare-all` network airgapping; pure-Go Docker Engine daemon client over `/var/run/docker.sock` with resource constraints; in-process HTTP/CONNECT proxy (`internal/sandbox/proxy.go`) with single-resolution DNS rebinding / TOCTOU prevention, RFC 7230/9110 hop-by-hop header removal, Unix domain socket loopback forwarding, and mandatory CIDR blocklists.
 

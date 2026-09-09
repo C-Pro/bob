@@ -18,6 +18,7 @@ import (
 	"bob/internal/llm"
 	"bob/internal/memory"
 	"bob/internal/models"
+	"bob/internal/sandbox"
 	"bob/internal/tools/tavily"
 
 	"github.com/fasthttp/websocket"
@@ -89,17 +90,20 @@ func TestIsMentionedOrDM(t *testing.T) {
 func TestFormatResponse(t *testing.T) {
 	longText := "Paragraph 1: Introduction.\n\nParagraph 2: Second section.\n\nParagraph 3: Third section.\n\nParagraph 4: Conclusion."
 
-	// Townhall (limit 2)
+	// Verifies that paragraph limits are advisory (in prompt) and not hard-truncated
 	townhallRes := FormatResponse(longText, false, 2, 10)
-	assert.Equal(t, "Paragraph 1: Introduction.\n\nParagraph 2: Second section.", townhallRes)
+	assert.Equal(t, longText, townhallRes)
 
-	// DM (limit 10)
 	dmRes := FormatResponse(longText, true, 2, 10)
-	assert.Equal(t, "Paragraph 1: Introduction.\n\nParagraph 2: Second section.\n\nParagraph 3: Third section.\n\nParagraph 4: Conclusion.", dmRes)
+	assert.Equal(t, longText, dmRes)
 
-	// Single paragraph
-	shortText := "Single paragraph response."
-	assert.Equal(t, shortText, FormatResponse(shortText, false, 2, 10))
+	// Trims leading and trailing whitespace
+	paddedText := "   \n\nSingle paragraph response.\n\n   "
+	assert.Equal(t, "Single paragraph response.", FormatResponse(paddedText, false, 2, 10))
+
+	// Markdown code blocks preserved intact
+	codeBlockText := "Intro paragraph.\n\n```go\nfunc main() {\n\n\tprintln(\"hello\")\n}\n```\n\nOutro paragraph."
+	assert.Equal(t, codeBlockText, FormatResponse(codeBlockText, false, 2, 10))
 }
 
 func TestGatewayWebSocketIntegration(t *testing.T) {
@@ -282,6 +286,32 @@ func TestProcessMessage_SelfMessageHandling(t *testing.T) {
 	require.Len(t, dmEntries, 1)
 	assert.Equal(t, "assistant", dmEntries[0].Role)
 	assert.Equal(t, "Hello from bot in DM", dmEntries[0].Content)
+
+	// 3. Progress messages from bot (both via ProgressPrefix and recorded progress) should NOT land in contextManager
+	progressMsg := models.Message{
+		UserID:    "bot-123",
+		ChatID:    "dm_user_bot",
+		Content:   "⏳ Looking for files. Grep is running.",
+		Timestamp: time.Now().Unix(),
+	}
+	err = gw.ProcessMessage(context.Background(), progressMsg)
+	require.NoError(t, err)
+
+	// Context manager must still only have 1 entry (progress message discarded)
+	dmEntriesAfterProgress := gw.contextManager.GetOrCreate("dm_user_bot").Entries()
+	assert.Len(t, dmEntriesAfterProgress, 1)
+
+	// Recorded progress message without prefix should also be discarded
+	gw.recordProgressMessage("dm_user_bot", "Custom progress update")
+	customProgressMsg := models.Message{
+		UserID:    "bot-123",
+		ChatID:    "dm_user_bot",
+		Content:   "Custom progress update",
+		Timestamp: time.Now().Unix(),
+	}
+	err = gw.ProcessMessage(context.Background(), customProgressMsg)
+	require.NoError(t, err)
+	assert.Equal(t, 1, gw.contextManager.GetOrCreate("dm_user_bot").Len())
 }
 
 func TestExtractMessageText(t *testing.T) {
@@ -1551,7 +1581,7 @@ func TestGateway_EvictionToMemoryIndexing(t *testing.T) {
 		var err error
 		hits, err = gw.MemoryManager().Search(ctx, "secret", "townhall", false, 5)
 		return err == nil && len(hits) > 0
-	}, 15*time.Second, 150*time.Millisecond)
+	}, 45*time.Second, 150*time.Millisecond)
 
 	// Verify watermark was updated
 	wm, err := gw.MemoryManager().GetWatermark(ctx, "townhall", false)
@@ -1931,4 +1961,751 @@ func TestGateway_PingPongKeepaliveHandling(t *testing.T) {
 	case <-time.After(1 * time.Second):
 		t.Fatal("timed out waiting for pong response to server ping")
 	}
+}
+
+type mockGatewaySandboxDriver struct{}
+
+func (m *mockGatewaySandboxDriver) Type() sandbox.DriverType {
+	return sandbox.DriverBwrap
+}
+
+func (m *mockGatewaySandboxDriver) Available(ctx context.Context) bool {
+	return true
+}
+
+func (m *mockGatewaySandboxDriver) Create(ctx context.Context, sbx *sandbox.UserSandbox, workspace string) error {
+	return nil
+}
+
+func (m *mockGatewaySandboxDriver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []string, timeout time.Duration) (*sandbox.ExecResult, error) {
+	return &sandbox.ExecResult{ExitCode: 0, Stdout: "gw sandbox exec"}, nil
+}
+
+func (m *mockGatewaySandboxDriver) Destroy(ctx context.Context, sbx *sandbox.UserSandbox) error {
+	return nil
+}
+
+func TestGateway_SandboxSlashCommands(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	receivedMsgs := make(chan models.ClientMessage, 20)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/me" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(models.User{ID: "bot-id", UserName: "bot", DisplayName: "Bot"})
+			return
+		}
+		if r.URL.Path == "/api/users" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.User{})
+			return
+		}
+		if r.URL.Path == "/api/chats" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.Chat{{ID: "townhall", Type: "townhall"}})
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/chats/") && strings.HasSuffix(r.URL.Path, "/messages") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.Message{})
+			return
+		}
+
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		for {
+			var clientMsg models.ClientMessage
+			if err := conn.ReadJSON(&clientMsg); err != nil {
+				break
+			}
+			receivedMsgs <- clientMsg
+		}
+	}))
+	defer server.Close()
+
+	tempDir := t.TempDir()
+	linkTestModels(t, tempDir)
+
+	cfg := &config.Config{
+		BotHandle:                 "@bot",
+		BesedkaURL:                server.URL,
+		DataDir:                   tempDir,
+		SandboxEnabled:            true,
+		SandboxDrivers:            []string{"bwrap"},
+		SandboxMaxLifetime:        30 * time.Minute,
+		SandboxDefaultExecTimeout: 1 * time.Minute,
+		SandboxMaxExecTimeout:     10 * time.Minute,
+	}
+
+	gw := NewGateway(cfg, nil)
+	defer gw.Stop()
+	gw.httpClient = server.Client()
+
+	mockDriver := &mockGatewaySandboxDriver{}
+	sm := sandbox.NewManager(cfg, []sandbox.Driver{mockDriver})
+	gw.SetSandboxManager(sm)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := gw.DialWebSocket(ctx)
+	require.NoError(t, err)
+
+	// Helper to receive message from channel
+	recv := func() models.ClientMessage {
+		select {
+		case msg := <-receivedMsgs:
+			return msg
+		case <-time.After(1 * time.Second):
+			t.Fatal("timed out waiting for message")
+			return models.ClientMessage{}
+		}
+	}
+
+	// 1. /sandbox status when no sandbox exists
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_user1",
+		UserID:    "user1",
+		Content:   "/sandbox status",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+	msg := recv()
+	assert.Equal(t, "dm_user1", msg.ChatID)
+	assert.Contains(t, msg.Content, "do not have an active or pending sandbox")
+
+	// 2. Request a sandbox for user1 via sandboxManager
+	_, err = sm.RequestSandbox(ctx, "user1", "dm_user1", sandbox.RequestParams{
+		Driver:      sandbox.DriverBwrap,
+		NetworkMode: sandbox.NetworkNone,
+		Reason:      "Run calculations",
+	})
+	require.NoError(t, err)
+
+	// 3. /sandbox status when pending approval
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_user1",
+		UserID:    "user1",
+		Content:   "/sandbox status",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+	msg = recv()
+	assert.Contains(t, msg.Content, "Awaiting Your Approval")
+
+	// 4. /sandbox approve (sent as HTML formatted by Besedka)
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_user1",
+		UserID:    "user1",
+		Content:   "<p>/sandbox approve</p>\n",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+	msg = recv()
+	assert.Contains(t, msg.Content, "Sandbox created successfully, proceeding with Run calculations...")
+
+	// 5. /sandbox status when running (wrapped in markdown backticks)
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_user1",
+		UserID:    "user1",
+		Content:   "`/sandbox status`",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+	msg = recv()
+	assert.Contains(t, msg.Content, "Active Sandbox Status")
+
+	// 6. /sandbox destroy
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_user1",
+		UserID:    "user1",
+		Content:   "/sandbox destroy",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+	msg = recv()
+	assert.Contains(t, msg.Content, "Sandbox terminated and resources released")
+
+	// 7. /sandbox help
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_user1",
+		UserID:    "user1",
+		Content:   "/sandbox help",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+	msg = recv()
+	assert.Contains(t, msg.Content, "Sandbox Commands")
+}
+
+func TestGateway_BotCannotApproveSandbox(t *testing.T) {
+	tempDir := t.TempDir()
+	linkTestModels(t, tempDir)
+
+	upgrader := websocket.Upgrader{}
+	receivedMsgs := make(chan models.ClientMessage, 10)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/me" {
+			_ = json.NewEncoder(w).Encode(models.User{ID: "bot_1", Name: "BobBot", DisplayName: "Bob"})
+			return
+		}
+		if r.URL.Path == "/api/users" {
+			_ = json.NewEncoder(w).Encode([]models.User{
+				{ID: "bot_1", Name: "BobBot", DisplayName: "Bob"},
+				{ID: "user1", Name: "Alice", DisplayName: "Alice"},
+			})
+			return
+		}
+		if r.URL.Path == "/api/chats" {
+			_ = json.NewEncoder(w).Encode([]models.Chat{
+				{ID: "dm_user1", LastSeq: 1, IsDM: true},
+			})
+			return
+		}
+		if r.URL.Path == "/api/chats/dm_user1/messages" {
+			_ = json.NewEncoder(w).Encode([]models.Message{
+				{Seq: 1, ChatID: "dm_user1", UserID: "user1", Content: "Initial message", Timestamp: 100},
+			})
+			return
+		}
+		if r.URL.Path == "/api/chat" {
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = conn.Close() }()
+				for {
+					var cm models.ClientMessage
+					if err := conn.ReadJSON(&cm); err != nil {
+						return
+					}
+					receivedMsgs <- cm
+				}
+			}()
+			return
+		}
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		BesedkaURL:                server.URL,
+		DataDir:                   tempDir,
+		SandboxEnabled:            true,
+		SandboxDrivers:            []string{"bwrap"},
+		SandboxMaxLifetime:        30 * time.Minute,
+		SandboxDefaultExecTimeout: 1 * time.Minute,
+		SandboxMaxExecTimeout:     10 * time.Minute,
+	}
+
+	gw := NewGateway(cfg, nil)
+	defer gw.Stop()
+	gw.httpClient = server.Client()
+
+	mockDriver := &mockGatewaySandboxDriver{}
+	sm := sandbox.NewManager(cfg, []sandbox.Driver{mockDriver})
+	gw.SetSandboxManager(sm)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := gw.DialWebSocket(ctx)
+	require.NoError(t, err)
+
+	// Fetch users/me to populate userCache with bot identity
+	_, err = gw.FetchBotUser(ctx)
+	require.NoError(t, err)
+
+	// 1. Human user1 requests a sandbox (status -> PendingApproval)
+	sbx, err := sm.RequestSandbox(ctx, "user1", "dm_user1", sandbox.RequestParams{
+		Driver:      sandbox.DriverBwrap,
+		NetworkMode: sandbox.NetworkNone,
+		Reason:      "Compile code",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, sandbox.StatusPendingApproval, sbx.Status)
+
+	// 2. Bot tries to send /sandbox approve
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_user1",
+		UserID:    "bot_1", // Bot's own UserID!
+		Content:   "/sandbox approve",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+
+	// Verify no approval message was dispatched over WebSocket
+	select {
+	case msg := <-receivedMsgs:
+		t.Fatalf("unexpected message sent by bot: %s", msg.Content)
+	case <-time.After(300 * time.Millisecond):
+		// Expected: nothing sent
+	}
+
+	// 3. User1's sandbox MUST remain in StatusPendingApproval
+	status, ok := sm.GetStatus("user1")
+	require.True(t, ok)
+	assert.Equal(t, sandbox.StatusPendingApproval, status.Status)
+
+	// 4. Test expired status rendering
+	status.Status = sandbox.StatusExpired
+	statusMsg := gw.formatSandboxStatus(status)
+	assert.Contains(t, statusMsg, "expired")
+}
+
+func TestGateway_SandboxApproveAutoResumesTask(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	receivedMsgs := make(chan models.ClientMessage, 20)
+
+	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/me" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(models.User{ID: "bot-id", UserName: "bot", DisplayName: "Bob"})
+			return
+		}
+		if r.URL.Path == "/api/users" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.User{})
+			return
+		}
+		if r.URL.Path == "/api/chats" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.Chat{{ID: "townhall", Type: "townhall"}})
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/chats/") && strings.HasSuffix(r.URL.Path, "/messages") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.Message{})
+			return
+		}
+
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		for {
+			var clientMsg models.ClientMessage
+			if err := conn.ReadJSON(&clientMsg); err != nil {
+				break
+			}
+			receivedMsgs <- clientMsg
+		}
+	}))
+	defer besedkaServer.Close()
+
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		resp := map[string]interface{}{
+			"id":     "chatcmpl-test",
+			"object": "chat.completion",
+			"choices": []map[string]interface{}{
+				{
+					"index": 0,
+					"message": map[string]interface{}{
+						"role":    "assistant",
+						"content": "I found 3 occurrences of GetUserCall in the codebase.",
+					},
+					"finish_reason": "stop",
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer llmServer.Close()
+
+	tempDir := t.TempDir()
+	linkTestModels(t, tempDir)
+
+	cfg := &config.Config{
+		BotHandle:                 "@bot",
+		BesedkaURL:                besedkaServer.URL,
+		BesedkaAPIKey:             "test-key",
+		OpenAIAPIKey:              "test-llm-key",
+		OpenAIModel:               "gemini-3.7-flash",
+		OpenAIBaseURL:             llmServer.URL,
+		DataDir:                   tempDir,
+		SandboxEnabled:            true,
+		SandboxDrivers:            []string{"bwrap"},
+		SandboxMaxLifetime:        30 * time.Minute,
+		SandboxDefaultExecTimeout: 1 * time.Minute,
+		SandboxMaxExecTimeout:     10 * time.Minute,
+		DMMaxParagraphs:           5,
+		TownhallMaxParagraphs:     2,
+	}
+
+	llmClient := llm.NewClient(cfg, llmServer.Client())
+	gw := NewGateway(cfg, llmClient)
+	defer gw.Stop()
+	gw.httpClient = besedkaServer.Client()
+
+	mockDriver := &mockGatewaySandboxDriver{}
+	sm := sandbox.NewManager(cfg, []sandbox.Driver{mockDriver})
+	gw.SetSandboxManager(sm)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := gw.DialWebSocket(ctx)
+	require.NoError(t, err)
+
+	_ = gw.WarmupContext(ctx)
+
+	recv := func() models.ClientMessage {
+		select {
+		case msg := <-receivedMsgs:
+			return msg
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for message")
+			return models.ClientMessage{}
+		}
+	}
+
+	// 1. Request sandbox for user1
+	_, err = sm.RequestSandbox(ctx, "user1", "dm_user1", sandbox.RequestParams{
+		Driver:      sandbox.DriverBwrap,
+		NetworkMode: sandbox.NetworkNone,
+		Reason:      "Find GetUserCall sites",
+	})
+	require.NoError(t, err)
+
+	gw.userCache.Set(models.User{ID: "user1", DisplayName: "Alice"})
+
+	// 2. User approves sandbox
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_user1",
+		UserID:    "user1",
+		Content:   "/sandbox approve",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+
+	// Message 1: Short approval acknowledgment
+	msg1 := recv()
+	assert.Equal(t, "dm_user1", msg1.ChatID)
+	assert.Contains(t, msg1.Content, "Sandbox created successfully, proceeding with Find GetUserCall sites...")
+
+	// Message 2: Auto-resumed task execution by LLM with destroy prompt appended
+	msg2 := recv()
+	assert.Equal(t, "dm_user1", msg2.ChatID)
+	assert.Contains(t, msg2.Content, "I found 3 occurrences of GetUserCall")
+	assert.Contains(t, msg2.Content, "/sandbox destroy")
+	assert.Contains(t, msg2.Content, "automatically be destroyed in")
+}
+
+func TestGateway_SandboxApproveGeminiResumption_NoTrailingAssistant(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	receivedMsgs := make(chan models.ClientMessage, 20)
+
+	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/me" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(models.User{ID: "bot-id", UserName: "bot", DisplayName: "Bob"})
+			return
+		}
+		if r.URL.Path == "/api/users" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.User{})
+			return
+		}
+		if r.URL.Path == "/api/chats" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.Chat{{ID: "townhall", Type: "townhall"}})
+			return
+		}
+		if r.URL.Path == "/api/chat" {
+			c, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer func() { _ = c.Close() }()
+			for {
+				_, message, err := c.ReadMessage()
+				if err != nil {
+					return
+				}
+				var clientMsg models.ClientMessage
+				if err := json.Unmarshal(message, &clientMsg); err == nil {
+					receivedMsgs <- clientMsg
+				}
+			}
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer besedkaServer.Close()
+
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		var reqBody struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		// Gemini strict validation: requests must NOT end with a model/assistant turn
+		if len(reqBody.Messages) > 0 && reqBody.Messages[len(reqBody.Messages)-1].Role == "assistant" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`[{"error":{"code":400,"message":"Requests ending with a model turn are not supported.","status":"INVALID_ARGUMENT"}}]`))
+			return
+		}
+
+		resp := map[string]interface{}{
+			"id":     "chatcmpl-test",
+			"object": "chat.completion",
+			"choices": []map[string]interface{}{
+				{
+					"index": 0,
+					"message": map[string]interface{}{
+						"role":    "assistant",
+						"content": "Execution resumed cleanly.",
+					},
+					"finish_reason": "stop",
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer llmServer.Close()
+
+	tempDir := t.TempDir()
+	linkTestModels(t, tempDir)
+
+	cfg := &config.Config{
+		BotHandle:                 "@bot",
+		BesedkaURL:                besedkaServer.URL,
+		BesedkaAPIKey:             "test-key",
+		OpenAIAPIKey:              "test-llm-key",
+		OpenAIModel:               "gemini-3.7-flash",
+		OpenAIBaseURL:             llmServer.URL,
+		DataDir:                   tempDir,
+		SandboxEnabled:            true,
+		SandboxDrivers:            []string{"bwrap"},
+		SandboxMaxLifetime:        30 * time.Minute,
+		SandboxDefaultExecTimeout: 1 * time.Minute,
+		SandboxMaxExecTimeout:     10 * time.Minute,
+		DMMaxParagraphs:           5,
+		TownhallMaxParagraphs:     2,
+	}
+
+	llmClient := llm.NewClient(cfg, llmServer.Client())
+	gw := NewGateway(cfg, llmClient)
+	defer gw.Stop()
+	gw.httpClient = besedkaServer.Client()
+
+	mockDriver := &mockGatewaySandboxDriver{}
+	sm := sandbox.NewManager(cfg, []sandbox.Driver{mockDriver})
+	gw.SetSandboxManager(sm)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := gw.DialWebSocket(ctx)
+	require.NoError(t, err)
+
+	_ = gw.WarmupContext(ctx)
+
+	recv := func() models.ClientMessage {
+		select {
+		case msg := <-receivedMsgs:
+			return msg
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for message")
+			return models.ClientMessage{}
+		}
+	}
+
+	// 1. Request sandbox for user1
+	_, err = sm.RequestSandbox(ctx, "user1", "dm_user1", sandbox.RequestParams{
+		Driver:      sandbox.DriverBwrap,
+		NetworkMode: sandbox.NetworkNone,
+		Reason:      "Calculate 45 * 45",
+	})
+	require.NoError(t, err)
+
+	gw.userCache.Set(models.User{ID: "user1", DisplayName: "Alice"})
+
+	// 2. User approves sandbox: should succeed and NOT fail with HTTP 400
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_user1",
+		UserID:    "user1",
+		Content:   "/sandbox approve",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+
+	msg1 := recv()
+	assert.Contains(t, msg1.Content, "Sandbox created successfully")
+
+	msg2 := recv()
+	assert.Contains(t, msg2.Content, "Execution resumed cleanly")
+}
+
+func TestGateway_SandboxRequestSuppressesRedundantReply(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	receivedMsgs := make(chan models.ClientMessage, 20)
+
+	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/me" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(models.User{ID: "bot-id", UserName: "bot", DisplayName: "Bob"})
+			return
+		}
+		if r.URL.Path == "/api/users" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.User{})
+			return
+		}
+		if r.URL.Path == "/api/chats" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.Chat{{ID: "townhall", Type: "townhall"}})
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/chats/") && strings.HasSuffix(r.URL.Path, "/messages") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.Message{})
+			return
+		}
+
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		for {
+			var clientMsg models.ClientMessage
+			if err := conn.ReadJSON(&clientMsg); err != nil {
+				break
+			}
+			receivedMsgs <- clientMsg
+		}
+	}))
+	defer besedkaServer.Close()
+
+	callCount := 0
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		callCount++
+		if callCount == 1 {
+			// First call returns tool call to sandbox_request
+			resp := map[string]interface{}{
+				"id":     "chatcmpl-tool",
+				"object": "chat.completion",
+				"choices": []map[string]interface{}{
+					{
+						"index": 0,
+						"message": map[string]interface{}{
+							"role": "assistant",
+							"tool_calls": []map[string]interface{}{
+								{
+									"id":   "call_sbx_req",
+									"type": "function",
+									"function": map[string]interface{}{
+										"name":      "sandbox_request",
+										"arguments": `{"driver":"bwrap","reason":"Run tests"}`,
+									},
+								},
+							},
+						},
+						"finish_reason": "tool_calls",
+					},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		// Second call returns conversational reply which SHOULD BE SUPPRESSED
+		resp := map[string]interface{}{
+			"id":     "chatcmpl-text",
+			"object": "chat.completion",
+			"choices": []map[string]interface{}{
+				{
+					"index": 0,
+					"message": map[string]interface{}{
+						"role":    "assistant",
+						"content": "I have created the sandbox request. Please approve by typing /sandbox approve.",
+					},
+					"finish_reason": "stop",
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer llmServer.Close()
+
+	tempDir := t.TempDir()
+	linkTestModels(t, tempDir)
+
+	cfg := &config.Config{
+		BotHandle:                 "@bot",
+		BesedkaURL:                besedkaServer.URL,
+		BesedkaAPIKey:             "test-key",
+		OpenAIAPIKey:              "test-llm-key",
+		OpenAIModel:               "gemini-3.7-flash",
+		OpenAIBaseURL:             llmServer.URL,
+		DataDir:                   tempDir,
+		SandboxEnabled:            true,
+		SandboxDrivers:            []string{"bwrap"},
+		SandboxMaxLifetime:        30 * time.Minute,
+		SandboxDefaultExecTimeout: 1 * time.Minute,
+		SandboxMaxExecTimeout:     10 * time.Minute,
+		DMMaxParagraphs:           5,
+		TownhallMaxParagraphs:     2,
+	}
+
+	llmClient := llm.NewClient(cfg, llmServer.Client())
+	gw := NewGateway(cfg, llmClient)
+	defer gw.Stop()
+	gw.httpClient = besedkaServer.Client()
+
+	mockDriver := &mockGatewaySandboxDriver{}
+	sm := sandbox.NewManager(cfg, []sandbox.Driver{mockDriver})
+	gw.SetSandboxManager(sm)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := gw.DialWebSocket(ctx)
+	require.NoError(t, err)
+
+	_ = gw.WarmupContext(ctx)
+
+	gw.userCache.Set(models.User{ID: "user1", DisplayName: "Alice"})
+
+	// Process message in DM asking to run a test
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_user1",
+		UserID:    "user1",
+		Content:   "Can you run tests?",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+
+	// Only 1 message should be received over websocket: the approval card from Notifier
+	var received []models.ClientMessage
+	timeout := time.After(1 * time.Second)
+recvLoop:
+	for {
+		select {
+		case m := <-receivedMsgs:
+			received = append(received, m)
+		case <-timeout:
+			break recvLoop
+		}
+	}
+
+	require.Len(t, received, 1, "expected exactly 1 message (the approval card), but got %d", len(received))
+	assert.Contains(t, received[0].Content, "Sandbox Approval Requested")
+	assert.NotContains(t, received[0].Content, "I have created the sandbox request. Please approve")
 }

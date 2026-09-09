@@ -528,5 +528,3 @@ func TestGenerateChatResponseWithToolLoop_GeminiThoughtSignaturePreservation(t *
 	assert.Equal(t, "Here is the information about the fire in Lombok.", reply)
 	assert.Equal(t, int32(2), atomic.LoadInt32(&turn))
 }
-
-
