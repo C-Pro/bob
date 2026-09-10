@@ -83,6 +83,8 @@ func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 			AllowedImages: cfg.SandboxAllowedImages,
 			CPULimit:      cfg.SandboxCPULimit,
 			MemoryLimitMB: cfg.SandboxMemoryLimitMB,
+			DataDir:       cfg.DataDir,
+			HostDataDir:   cfg.SandboxHostDataDir,
 		})
 		sandboxManager = sandbox.NewManager(cfg, []sandbox.Driver{bwrapDriver, dockerDriver})
 	}

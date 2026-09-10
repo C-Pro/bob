@@ -28,6 +28,8 @@ type Driver struct {
 	allowedImages []string
 	cpuLimit      float64
 	memoryLimitMB int
+	dataDir       string
+	hostDataDir   string
 	client        *http.Client
 	mu            sync.Mutex
 	proxies       map[string]*sandbox.FilteringProxy // keyed by userID
@@ -39,6 +41,8 @@ type Config struct {
 	AllowedImages []string
 	CPULimit      float64
 	MemoryLimitMB int
+	DataDir       string
+	HostDataDir   string
 }
 
 // NewDriver creates a new Docker Sibling driver.
@@ -63,17 +67,49 @@ func NewDriver(cfg Config) *Driver {
 		DisableKeepAlives: false,
 	}
 
+	hostData := strings.TrimSpace(cfg.HostDataDir)
+	if hostData != "" {
+		hostData = filepath.Clean(hostData)
+	}
+
 	return &Driver{
 		socketPath:    socket,
 		allowedImages: cfg.AllowedImages,
 		cpuLimit:      cpu,
 		memoryLimitMB: mem,
+		dataDir:       strings.TrimSpace(cfg.DataDir),
+		hostDataDir:   hostData,
 		client: &http.Client{
 			Transport: transport,
 			Timeout:   10 * time.Minute,
 		},
 		proxies: make(map[string]*sandbox.FilteringProxy),
 	}
+}
+
+// toHostPath translates a container-local path under dataDir to the corresponding hostDataDir path.
+// If hostDataDir is empty, containerPath is returned unchanged as host and container paths match.
+// If hostDataDir is set, containerPath must be within dataDir, otherwise an error is returned.
+func (d *Driver) toHostPath(containerPath string) (string, error) {
+	if d.hostDataDir == "" {
+		return containerPath, nil
+	}
+	if d.dataDir == "" {
+		return "", errors.New("host data directory is configured but data directory is empty")
+	}
+	absData, err := filepath.Abs(d.dataDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve data directory %q: %w", d.dataDir, err)
+	}
+	absPath, err := filepath.Abs(containerPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve container path %q: %w", containerPath, err)
+	}
+	rel, err := filepath.Rel(absData, absPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path %q is outside data directory %q and cannot be mapped to host data directory %q", containerPath, d.dataDir, d.hostDataDir)
+	}
+	return filepath.Join(d.hostDataDir, rel), nil
 }
 
 // Type returns the driver type.
@@ -183,7 +219,11 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 		if wholeWorkspaceMount.ReadOnly {
 			mode = "ro"
 		}
-		binds = append(binds, fmt.Sprintf("%s:%s:%s", absWorkspace, sandbox.DefaultWorkspaceMountPath, mode))
+		hostMountSource, err := d.toHostPath(absWorkspace)
+		if err != nil {
+			return fmt.Errorf("failed to resolve host path for workspace: %w", err)
+		}
+		binds = append(binds, fmt.Sprintf("%s:%s:%s", hostMountSource, sandbox.DefaultWorkspaceMountPath, mode))
 	} else {
 		for _, m := range subMounts {
 			hostSubpath, _, err := sandbox.ValidateMountPath(absWorkspace, m.RelativePath)
@@ -205,7 +245,11 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 			if m.ReadOnly {
 				mode = "ro"
 			}
-			binds = append(binds, fmt.Sprintf("%s:%s:%s", hostSubpath, dest, mode))
+			hostMountSource, err := d.toHostPath(hostSubpath)
+			if err != nil {
+				return fmt.Errorf("failed to resolve host path for mount %q: %w", m.RelativePath, err)
+			}
+			binds = append(binds, fmt.Sprintf("%s:%s:%s", hostMountSource, dest, mode))
 		}
 	}
 

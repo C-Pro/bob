@@ -53,6 +53,7 @@ type Config struct {
 	SandboxMaxExecTimeout      time.Duration
 	SandboxCPULimit            float64
 	SandboxMemoryLimitMB       int
+	SandboxHostDataDir         string
 }
 
 // DefaultSandboxAllowedImages defines standard safe container images.
@@ -136,6 +137,11 @@ func LoadFromEnv() (*Config, error) {
 		SandboxMaxExecTimeout:      getEnvDurationOrDefault("SANDBOX_MAX_EXEC_TIMEOUT", 10*time.Minute),
 		SandboxCPULimit:            getEnvFloatOrDefault("SANDBOX_CPU_LIMIT", 1.0),
 		SandboxMemoryLimitMB:       getEnvIntOrDefault("SANDBOX_MEMORY_LIMIT_MB", 512),
+		SandboxHostDataDir:         getEnvOrDefault("SANDBOX_HOST_DATA_DIR", ""),
+	}
+
+	if cfg.SandboxHostDataDir != "" {
+		cfg.SandboxHostDataDir = filepath.Clean(cfg.SandboxHostDataDir)
 	}
 
 	// Normalize bot handle to ensure it starts with @
@@ -223,6 +229,9 @@ func (c *Config) Validate(requireAPIKey bool) error {
 		}
 		if c.SandboxMemoryLimitMB <= 0 {
 			return errors.New("SANDBOX_MEMORY_LIMIT_MB must be greater than 0")
+		}
+		if c.SandboxHostDataDir != "" && !filepath.IsAbs(c.SandboxHostDataDir) {
+			return errors.New("SANDBOX_HOST_DATA_DIR must be an absolute path")
 		}
 	}
 	return nil
