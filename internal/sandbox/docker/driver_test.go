@@ -732,3 +732,175 @@ func TestDockerDriver_Create_ProxyCleanupOnError(t *testing.T) {
 	driver.mu.Unlock()
 	assert.False(t, proxyExists, "proxy must not be leaked in driver.proxies on create failure")
 }
+
+func TestToHostPath(t *testing.T) {
+	tempDir := t.TempDir()
+	containerDataDir := filepath.Join(tempDir, "container", "data")
+	hostDataDir := filepath.Join(tempDir, "host", "data")
+	require.NoError(t, os.MkdirAll(containerDataDir, 0o755))
+
+	d := NewDriver(Config{
+		DataDir:     containerDataDir,
+		HostDataDir: hostDataDir,
+	})
+
+	// Subpath under dataDir translates to hostDataDir
+	containerSub := filepath.Join(containerDataDir, "sandboxes", "user123")
+	expectedHostSub := filepath.Join(hostDataDir, "sandboxes", "user123")
+	res, err := d.toHostPath(containerSub)
+	require.NoError(t, err)
+	assert.Equal(t, expectedHostSub, res)
+
+	// Nested subpath under dataDir translates properly
+	nestedSub := filepath.Join(containerDataDir, "sandboxes", "user123", "code", "file.txt")
+	expectedNestedHost := filepath.Join(hostDataDir, "sandboxes", "user123", "code", "file.txt")
+	res, err = d.toHostPath(nestedSub)
+	require.NoError(t, err)
+	assert.Equal(t, expectedNestedHost, res)
+
+	// Root of dataDir translates to root of hostDataDir
+	res, err = d.toHostPath(containerDataDir)
+	require.NoError(t, err)
+	assert.Equal(t, hostDataDir, res)
+
+	// Path outside dataDir returns an error when HostDataDir is set
+	outsidePath := filepath.Join(tempDir, "other", "sandboxes")
+	_, err = d.toHostPath(outsidePath)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "outside data directory")
+
+	// When HostDataDir is empty, paths are returned unchanged without error
+	dNoHost := NewDriver(Config{
+		DataDir:     containerDataDir,
+		HostDataDir: "",
+	})
+	res, err = dNoHost.toHostPath(containerSub)
+	require.NoError(t, err)
+	assert.Equal(t, containerSub, res)
+
+	// When DataDir is empty but HostDataDir is set, an error is returned
+	dNoData := NewDriver(Config{
+		DataDir:     "",
+		HostDataDir: hostDataDir,
+	})
+	_, err = dNoData.toHostPath(containerSub)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "data directory is empty")
+}
+
+func TestDockerDriver_HostDataDirBinds(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "mock_docker.sock")
+
+	containerDataDir := filepath.Join(tempDir, "container", "data")
+	hostDataDir := filepath.Join(tempDir, "host", "data")
+	require.NoError(t, os.MkdirAll(containerDataDir, 0o755))
+
+	listener, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+	defer func() { _ = listener.Close() }()
+
+	var lastBinds []interface{}
+	var bindsMu sync.Mutex
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_ping", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+	mux.HandleFunc("/containers/create", func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		hostCfg := payload["HostConfig"].(map[string]interface{})
+		bindsMu.Lock()
+		if bindsRaw, ok := hostCfg["Binds"].([]interface{}); ok {
+			lastBinds = bindsRaw
+		} else {
+			lastBinds = nil
+		}
+		bindsMu.Unlock()
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"Id":"mock-container-binds"}`))
+	})
+	mux.HandleFunc("/containers/mock-container-binds/start", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/containers/mock-container-binds", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusNoContent)
+		}
+	})
+
+	server := &http.Server{Handler: mux}
+	go func() { _ = server.Serve(listener) }()
+	defer func() { _ = server.Close() }()
+
+	driver := NewDriver(Config{
+		SocketPath:    sockPath,
+		AllowedImages: []string{"alpine:latest"},
+		DataDir:       containerDataDir,
+		HostDataDir:   hostDataDir,
+	})
+
+	ctx := context.Background()
+	userWorkspace := filepath.Join(containerDataDir, "sandboxes", "user_binds")
+	require.NoError(t, os.MkdirAll(userWorkspace, 0o755))
+
+	// 1. Whole workspace mount ('.')
+	sbxWhole := &sandbox.UserSandbox{
+		UserID:      "user_binds",
+		DockerImage: "alpine:latest",
+		Network:     sandbox.NetworkPolicy{Mode: sandbox.NetworkNone},
+		Mounts: []sandbox.UserMount{
+			{RelativePath: ".", ReadOnly: false},
+		},
+		Status: sandbox.StatusRunning,
+	}
+	err = driver.Create(ctx, sbxWhole, userWorkspace)
+	require.NoError(t, err)
+
+	bindsMu.Lock()
+	require.Len(t, lastBinds, 1)
+	expectedWholeHostBind := fmt.Sprintf("%s:%s:rw", filepath.Join(hostDataDir, "sandboxes", "user_binds"), sandbox.DefaultWorkspaceMountPath)
+	assert.Equal(t, expectedWholeHostBind, lastBinds[0])
+	bindsMu.Unlock()
+	_ = driver.Destroy(ctx, sbxWhole)
+
+	// 2. Subpath mount ('project')
+	subDir := filepath.Join(userWorkspace, "project")
+	require.NoError(t, os.MkdirAll(subDir, 0o755))
+
+	sbxSub := &sandbox.UserSandbox{
+		UserID:      "user_binds",
+		DockerImage: "alpine:latest",
+		Network:     sandbox.NetworkPolicy{Mode: sandbox.NetworkNone},
+		Mounts: []sandbox.UserMount{
+			{RelativePath: "project", ReadOnly: true},
+		},
+		Status: sandbox.StatusRunning,
+	}
+	err = driver.Create(ctx, sbxSub, userWorkspace)
+	require.NoError(t, err)
+
+	bindsMu.Lock()
+	require.Len(t, lastBinds, 1)
+	expectedSubHostBind := fmt.Sprintf("%s:%s:ro", filepath.Join(hostDataDir, "sandboxes", "user_binds", "project"), filepath.Join(sandbox.DefaultWorkspaceMountPath, "project"))
+	assert.Equal(t, expectedSubHostBind, lastBinds[0])
+	bindsMu.Unlock()
+	_ = driver.Destroy(ctx, sbxSub)
+
+	// 3. Workspace outside dataDir returns error during Create
+	outsideWorkspace := filepath.Join(tempDir, "outside", "workspace")
+	sbxOutside := &sandbox.UserSandbox{
+		UserID:      "user_outside",
+		DockerImage: "alpine:latest",
+		Network:     sandbox.NetworkPolicy{Mode: sandbox.NetworkNone},
+		Mounts: []sandbox.UserMount{
+			{RelativePath: ".", ReadOnly: false},
+		},
+		Status: sandbox.StatusRunning,
+	}
+	err = driver.Create(ctx, sbxOutside, outsideWorkspace)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to resolve host path for workspace")
+}

@@ -50,6 +50,7 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	_ = os.Unsetenv("SANDBOX_MAX_EXEC_TIMEOUT")
 	_ = os.Unsetenv("SANDBOX_CPU_LIMIT")
 	_ = os.Unsetenv("SANDBOX_MEMORY_LIMIT_MB")
+	_ = os.Unsetenv("SANDBOX_HOST_DATA_DIR")
 
 	cfg, err := LoadFromEnv()
 	require.NoError(t, err)
@@ -83,6 +84,7 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	assert.Equal(t, 10*time.Minute, cfg.SandboxMaxExecTimeout)
 	assert.Equal(t, 1.0, cfg.SandboxCPULimit)
 	assert.Equal(t, 512, cfg.SandboxMemoryLimitMB)
+	assert.Equal(t, "", cfg.SandboxHostDataDir)
 }
 
 func TestLoadFromEnvStandardOpenAI(t *testing.T) {
@@ -378,4 +380,46 @@ func TestLoadFromEnv_SandboxEnabledParsing(t *testing.T) {
 	_, err := LoadFromEnv()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid boolean value \"invalid_value\" for SANDBOX_ENABLED")
+}
+
+func TestLoadFromEnv_SandboxHostDataDir(t *testing.T) {
+	t.Setenv("SANDBOX_HOST_DATA_DIR", "/var/besedka-data/bob/")
+	cfg, err := LoadFromEnv()
+	require.NoError(t, err)
+	assert.Equal(t, "/var/besedka-data/bob", cfg.SandboxHostDataDir)
+}
+
+func TestConfig_Validate_SandboxHostDataDir(t *testing.T) {
+	baseCfg := Config{
+		OpenAIAPIKey:               "test-key",
+		BesedkaURL:                 "http://127.0.0.1:8080",
+		TownhallMaxParagraphs:      2,
+		DMMaxParagraphs:            10,
+		MsgRingBufferSize:          100,
+		SandboxEnabled:             true,
+		SandboxDrivers:             []string{"docker"},
+		SandboxAllowedNetworkModes: []string{"none"},
+		SandboxMaxLifetime:         30 * time.Minute,
+		SandboxDefaultExecTimeout:  1 * time.Minute,
+		SandboxMaxExecTimeout:      10 * time.Minute,
+		SandboxCPULimit:            1.0,
+		SandboxMemoryLimitMB:       512,
+	}
+
+	// Valid absolute path passes validation
+	cfgValid := baseCfg
+	cfgValid.SandboxHostDataDir = "/tmp/besedka-data/opt/besedka/bob"
+	require.NoError(t, cfgValid.Validate(true))
+
+	// Empty path passes validation
+	cfgEmpty := baseCfg
+	cfgEmpty.SandboxHostDataDir = ""
+	require.NoError(t, cfgEmpty.Validate(true))
+
+	// Relative path fails validation
+	cfgInvalid := baseCfg
+	cfgInvalid.SandboxHostDataDir = "relative/path"
+	err := cfgInvalid.Validate(true)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "SANDBOX_HOST_DATA_DIR must be an absolute path")
 }
