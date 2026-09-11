@@ -244,6 +244,7 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 	args = append(args, "--chdir", sandbox.DefaultWorkspaceMountPath)
 
 	var proxySockPath string
+	var fwdBinary string
 	if sbx.Network.Mode == sandbox.NetworkRestricted {
 		d.mu.Lock()
 		proxy := d.proxies[sbx.UserID]
@@ -251,6 +252,13 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 		if proxy != nil && proxy.SocketPath() != "" {
 			proxySockPath = proxy.SocketPath()
 			args = append(args, "--dir", "/run", "--bind", proxySockPath, "/run/proxy.sock")
+
+			fwd, err := sandbox.EnsureForwarderBinary("")
+			if err != nil {
+				return nil, fmt.Errorf("failed to ensure forwarder binary: %w", err)
+			}
+			fwdBinary = fwd
+			args = append(args, "--dir", "/run/proxy", "--ro-bind", fwdBinary, "/run/proxy/fwd")
 		}
 	}
 
@@ -284,45 +292,8 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 	}
 
 	// Append command
-	if proxySockPath != "" {
-		forwarderScript := `
-if command -v socat >/dev/null 2>&1; then
-    socat TCP-LISTEN:18080,bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:/run/proxy.sock </dev/null >/dev/null 2>&1 &
-    FWD_PID=$!
-elif command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import socket,threading
-def p(a,b):
- try:
-  while 1:
-   d=a.recv(4096)
-   if not d:break
-   b.sendall(d)
-  except:pass
- finally:
-  try:a.close();b.close()
-  except:pass
-s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
-s.bind(("127.0.0.1",18080))
-s.listen(16)
-while 1:
- c,_=s.accept()
- u=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
- u.connect("/run/proxy.sock")
- threading.Thread(target=p,args=(c,u),daemon=True).start()
- threading.Thread(target=p,args=(u,c),daemon=True).start()
-' </dev/null >/dev/null 2>&1 &
-    FWD_PID=$!
-fi
-sleep 0.05
-"$@"
-EXIT_CODE=$?
-if [ -n "$FWD_PID" ]; then
-    kill -9 $FWD_PID 2>/dev/null || true
-fi
-exit $EXIT_CODE
-`
-		args = append(args, "/bin/sh", "-c", forwarderScript, "--")
+	if fwdBinary != "" {
+		args = append(args, "/run/proxy/fwd", "-tcp", "127.0.0.1:18080", "-sock", "/run/proxy.sock", "--")
 		args = append(args, cmd...)
 	} else {
 		args = append(args, cmd...)

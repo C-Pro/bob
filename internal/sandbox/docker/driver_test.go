@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -300,10 +301,23 @@ func TestDockerDriver_NetworkRestrictedProxyReachability(t *testing.T) {
 
 	// Verify HostConfig
 	require.NotNil(t, capturedCreateHostConfig)
-	assert.Equal(t, "bridge", capturedCreateHostConfig["NetworkMode"])
-	extraHosts, ok := capturedCreateHostConfig["ExtraHosts"].([]interface{})
+	assert.Equal(t, "none", capturedCreateHostConfig["NetworkMode"])
+	assert.Nil(t, capturedCreateHostConfig["ExtraHosts"])
+
+	binds, ok := capturedCreateHostConfig["Binds"].([]interface{})
 	require.True(t, ok)
-	assert.Contains(t, extraHosts, "host.docker.internal:host-gateway")
+	var hasFwdBind, hasProxyBind bool
+	for _, b := range binds {
+		str, _ := b.(string)
+		if strings.HasSuffix(str, ":/run/proxy/fwd:ro") {
+			hasFwdBind = true
+		}
+		if strings.HasSuffix(str, ":/run/proxy:rw") {
+			hasProxyBind = true
+		}
+	}
+	assert.True(t, hasFwdBind, "expected /run/proxy/fwd:ro bind mount")
+	assert.True(t, hasProxyBind, "expected /run/proxy:rw bind mount")
 
 	// Execute command
 	res, err := driver.Exec(ctx, sbx, []string{"echo", "test"}, 5*time.Second)
@@ -315,17 +329,17 @@ func TestDockerDriver_NetworkRestrictedProxyReachability(t *testing.T) {
 	assert.Contains(t, capturedExecEnv, "HOME="+sandbox.DefaultWorkspaceMountPath)
 	assert.Contains(t, capturedExecEnv, "PWD="+sandbox.DefaultWorkspaceMountPath)
 
-	var hasHttpProxy, hasHostDockerInternal bool
+	var hasHttpProxy, hasLoopbackProxy bool
 	for _, envVar := range capturedExecEnv {
 		if strings.HasPrefix(envVar, "HTTP_PROXY=") {
 			hasHttpProxy = true
-			if strings.Contains(envVar, "host.docker.internal:") {
-				hasHostDockerInternal = true
+			if strings.Contains(envVar, "127.0.0.1:18080") {
+				hasLoopbackProxy = true
 			}
 		}
 	}
 	assert.True(t, hasHttpProxy, "expected HTTP_PROXY in exec env")
-	assert.True(t, hasHostDockerInternal, "expected HTTP_PROXY to point to host.docker.internal")
+	assert.True(t, hasLoopbackProxy, "expected HTTP_PROXY to point to loopback forwarder 127.0.0.1:18080")
 }
 
 func TestDockerDriver_AutoPullMissingImage_Success(t *testing.T) {
@@ -903,4 +917,65 @@ func TestDockerDriver_HostDataDirBinds(t *testing.T) {
 	err = driver.Create(ctx, sbxOutside, outsideWorkspace)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to resolve host path for workspace")
+}
+
+func TestDockerDriver_RealDocker_NetworkRestrictedAirgap(t *testing.T) {
+	ctx := context.Background()
+	driver := NewDriver(Config{
+		SocketPath:    "/var/run/docker.sock",
+		AllowedImages: []string{"alpine:latest"},
+		CPULimit:      1.0,
+		MemoryLimitMB: 256,
+		DataDir:       t.TempDir(),
+	})
+
+	if !driver.Available(ctx) {
+		t.Skip("Docker daemon is not available on host, skipping test")
+	}
+
+	driver.SetCustomBlockedCIDRs([]string{"169.254.0.0/16"})
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("docker-restricted-airgap-ok"))
+	}))
+	defer backend.Close()
+
+	backendURL, err := url.Parse(backend.URL)
+	require.NoError(t, err)
+
+	tempDir := t.TempDir()
+	workspace := filepath.Join(tempDir, "user_restr_real")
+	require.NoError(t, os.MkdirAll(workspace, 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID:      "testuser_real_restr",
+		DockerImage: "alpine:latest",
+		Network: sandbox.NetworkPolicy{
+			Mode:         sandbox.NetworkRestricted,
+			AllowedHosts: []string{backendURL.Hostname()},
+			BlockedHosts: []string{"forbidden.com"},
+		},
+		Status: sandbox.StatusRunning,
+	}
+
+	err = driver.Create(ctx, sbx, workspace)
+	require.NoError(t, err)
+	defer func() { _ = driver.Destroy(ctx, sbx) }()
+
+	// 1. Raw socket attempt to external IP fails with network unreachable error
+	res, err := driver.Exec(ctx, sbx, []string{"nc", "-w", "1", "1.1.1.1", "80"}, 5*time.Second)
+	require.NoError(t, err)
+	assert.NotEqual(t, 0, res.ExitCode, "direct connection to external IP should fail in airgap: %s", res.Stderr)
+
+	// 2. Allowed domain through loopback proxy forwarder succeeds
+	res, err = driver.Exec(ctx, sbx, []string{"wget", "-q", "-O", "-", backend.URL + "/data"}, 10*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, 0, res.ExitCode, "wget output: stdout=%s stderr=%s", res.Stdout, res.Stderr)
+	assert.Contains(t, res.Stdout, "docker-restricted-airgap-ok")
+
+	// 3. Blocked domain is rejected by proxy
+	res, err = driver.Exec(ctx, sbx, []string{"wget", "-q", "-O", "-", "http://forbidden.com/data"}, 5*time.Second)
+	require.NoError(t, err)
+	assert.NotEqual(t, 0, res.ExitCode, "forbidden host should be blocked")
 }

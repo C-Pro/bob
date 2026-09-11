@@ -1,8 +1,12 @@
-.PHONY: all check test test-go lint-go semgrep osv-scanner docker-build
+.PHONY: all check test test-go lint-go semgrep osv-scanner docker-build build-fwd
 
 all: check
 
-check: lint-go test-go semgrep osv-scanner
+build-fwd:
+	mkdir -p bin
+	CGO_ENABLED=0 GOOS=linux GOARCH=$(shell go env GOARCH) go build -ldflags="-w -s" -o bin/bob-proxy-fwd ./cmd/bob-proxy-fwd
+
+check: build-fwd lint-go test-go semgrep osv-scanner
 
 lint-go:
 	docker run --rm \
@@ -16,7 +20,7 @@ lint-go:
 		golangci/golangci-lint:latest \
 		golangci-lint run
 
-test: test-go
+test: build-fwd test-go
 
 test-go:
 	GOEXPERIMENT=simd go test -v -covermode=atomic -coverprofile=coverage.out -race ./...

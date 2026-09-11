@@ -32,7 +32,8 @@ type Driver struct {
 	hostDataDir   string
 	client        *http.Client
 	mu            sync.Mutex
-	proxies       map[string]*sandbox.FilteringProxy // keyed by userID
+	proxies            map[string]*sandbox.FilteringProxy // keyed by userID
+	customBlockedCIDRs []string
 }
 
 // Config provides configuration parameters for the Docker driver.
@@ -117,6 +118,13 @@ func (d *Driver) Type() sandbox.DriverType {
 	return sandbox.DriverDocker
 }
 
+// SetCustomBlockedCIDRs sets custom blocked CIDRs for testing.
+func (d *Driver) SetCustomBlockedCIDRs(cidrs []string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.customBlockedCIDRs = cidrs
+}
+
 // Available pings the Docker daemon to check if the Unix socket is functional.
 func (d *Driver) Available(ctx context.Context) bool {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost/_ping", nil)
@@ -158,29 +166,51 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 	sbx.SetWorkspaceDir(absWorkspace)
 
 	createdProxy := false
+	var restrictedBinds []string
 	if sbx.Network.Mode == sandbox.NetworkRestricted {
+		fwdBinary, err := sandbox.EnsureForwarderBinary(d.dataDir)
+		if err != nil {
+			return fmt.Errorf("failed to ensure proxy forwarder binary: %w", err)
+		}
+		hostFwdPath, err := d.toHostPath(fwdBinary)
+		if err != nil {
+			return fmt.Errorf("failed to resolve host path for forwarder binary: %w", err)
+		}
+
+		proxyDir := filepath.Join(absWorkspace, ".proxy")
+		if err := os.MkdirAll(proxyDir, 0o700); err != nil {
+			return fmt.Errorf("failed to create proxy directory: %w", err)
+		}
+		hostProxyDir, err := d.toHostPath(proxyDir)
+		if err != nil {
+			return fmt.Errorf("failed to resolve host path for proxy directory: %w", err)
+		}
+		sockPath := filepath.Join(proxyDir, "proxy.sock")
+
 		d.mu.Lock()
 		if existing, ok := d.proxies[sbx.UserID]; ok {
 			if err := existing.Close(); err != nil {
 				slog.Warn("failed to close existing proxy", "user", sbx.UserID, "error", err)
 			}
 		}
-		listenTCP := "0.0.0.0:0"
-		if bridgeIP := getDockerBridgeIP(); bridgeIP != "" {
-			listenTCP = bridgeIP + ":0"
-		}
 		proxy, err := sandbox.NewFilteringProxyWithConfig(sandbox.ProxyConfig{
-			Policy:             sbx.Network,
-			ListenTCP:          listenTCP,
-			AllowedClientCIDRs: []string{"172.16.0.0/12"},
+			Policy:        sbx.Network,
+			SocketPath:    sockPath,
+			CustomBlocked: d.customBlockedCIDRs,
 		})
 		if err != nil {
 			d.mu.Unlock()
 			return fmt.Errorf("failed to start filtering proxy for user %s: %w", sbx.UserID, err)
 		}
+		_ = os.Chmod(sockPath, 0o666)
 		d.proxies[sbx.UserID] = proxy
 		createdProxy = true
 		d.mu.Unlock()
+
+		restrictedBinds = append(restrictedBinds,
+			fmt.Sprintf("%s:/run/proxy/fwd:ro", hostFwdPath),
+			fmt.Sprintf("%s:/run/proxy:rw", hostProxyDir),
+		)
 	}
 	defer func() {
 		if err != nil && createdProxy {
@@ -253,8 +283,10 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 		}
 	}
 
+	binds = append(binds, restrictedBinds...)
+
 	networkMode := "none"
-	if sbx.Network.Mode == sandbox.NetworkFull || sbx.Network.Mode == sandbox.NetworkRestricted {
+	if sbx.Network.Mode == sandbox.NetworkFull {
 		networkMode = "bridge"
 	}
 
@@ -271,13 +303,20 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 		"SecurityOpt": []string{"no-new-privileges"},
 		"CapDrop":     []string{"ALL"},
 	}
+
+	containerCmd := []string{"sleep", "infinity"}
 	if sbx.Network.Mode == sandbox.NetworkRestricted {
-		hostConfig["ExtraHosts"] = []string{"host.docker.internal:host-gateway"}
+		containerCmd = []string{
+			"/run/proxy/fwd",
+			"-daemon",
+			"-tcp", "127.0.0.1:18080",
+			"-sock", "/run/proxy/proxy.sock",
+		}
 	}
 
 	createPayload := map[string]interface{}{
 		"Image":      image,
-		"Cmd":        []string{"sleep", "infinity"},
+		"Cmd":        containerCmd,
 		"User":       fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
 		"WorkingDir": sandbox.DefaultWorkspaceMountPath,
 		"HostConfig": hostConfig,
@@ -378,20 +417,15 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 		"PWD="+sandbox.DefaultWorkspaceMountPath,
 	)
 	if sbx.Network.Mode == sandbox.NetworkRestricted {
-		d.mu.Lock()
-		proxy := d.proxies[sbx.UserID]
-		d.mu.Unlock()
-		if proxy != nil {
-			proxyAddr := fmt.Sprintf("http://host.docker.internal:%d", proxy.Port())
-			env = append(env,
-				"http_proxy="+proxyAddr,
-				"https_proxy="+proxyAddr,
-				"HTTP_PROXY="+proxyAddr,
-				"HTTPS_PROXY="+proxyAddr,
-				"all_proxy="+proxyAddr,
-				"ALL_PROXY="+proxyAddr,
-			)
-		}
+		proxyAddr := "http://127.0.0.1:18080"
+		env = append(env,
+			"http_proxy="+proxyAddr,
+			"https_proxy="+proxyAddr,
+			"HTTP_PROXY="+proxyAddr,
+			"HTTPS_PROXY="+proxyAddr,
+			"all_proxy="+proxyAddr,
+			"ALL_PROXY="+proxyAddr,
+		)
 	}
 
 	// 1. Create exec instance
@@ -611,20 +645,6 @@ func (d *Driver) killExecProcess(internalID, _ string) {
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
 		slog.Warn("unexpected status restarting container on exec timeout", "container", internalID, "status", resp.StatusCode)
 	}
-}
-
-func getDockerBridgeIP() string {
-	if iface, err := net.InterfaceByName("docker0"); err == nil {
-		addrs, err := iface.Addrs()
-		if err == nil {
-			for _, addr := range addrs {
-				if ipNet, ok := addr.(*net.IPNet); ok && ipNet.IP.To4() != nil {
-					return ipNet.IP.String()
-				}
-			}
-		}
-	}
-	return ""
 }
 
 // pullImage streams and downloads a docker image from registry using Docker Engine API.
