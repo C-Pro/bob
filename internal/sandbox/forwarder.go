@@ -13,7 +13,7 @@ import (
 	"sync"
 )
 
-var forwarderMu sync.Mutex
+var forwarderMu sync.RWMutex
 
 func copyFile(src, dst string, mode os.FileMode) error {
 	in, err := os.Open(src)
@@ -22,37 +22,73 @@ func copyFile(src, dst string, mode os.FileMode) error {
 	}
 	defer func() { _ = in.Close() }()
 
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+	dstDir := filepath.Dir(dst)
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		return err
 	}
 
-	tmpDst := dst + ".tmp"
-	out, err := os.OpenFile(tmpDst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	tmpFile, err := os.CreateTemp(dstDir, ".bob-proxy-fwd-*.tmp")
 	if err != nil {
 		return err
 	}
-
-	if _, err := io.Copy(out, in); err != nil {
-		_ = out.Close()
+	tmpDst := tmpFile.Name()
+	defer func() {
+		_ = tmpFile.Close()
 		_ = os.Remove(tmpDst)
+	}()
+
+	if err := tmpFile.Chmod(mode); err != nil {
 		return err
 	}
 
-	if err := out.Close(); err != nil {
-		_ = os.Remove(tmpDst)
+	if _, err := io.Copy(tmpFile, in); err != nil {
+		return err
+	}
+
+	if err := tmpFile.Close(); err != nil {
 		return err
 	}
 
 	return os.Rename(tmpDst, dst)
 }
 
+func isBuildAllowed() bool {
+	if os.Getenv("BOB_ALLOW_RUNTIME_BUILD") == "0" {
+		return false
+	}
+	if os.Getenv("BOB_ALLOW_RUNTIME_BUILD") == "1" || os.Getenv("ENV") == "development" {
+		return true
+	}
+	for _, arg := range os.Args {
+		if strings.HasPrefix(arg, "-test.") {
+			return true
+		}
+	}
+	return false
+}
+
+func findRepoRoot() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return ""
+}
+
 // EnsureForwarderBinary locates or prepares the bob-proxy-fwd binary inside dataDir/bin.
 // It ensures the returned binary exists under dataDir (for sibling Docker toHostPath compatibility),
 // is statically built for Linux, and has executable permissions.
 func EnsureForwarderBinary(dataDir string) (string, error) {
-	forwarderMu.Lock()
-	defer forwarderMu.Unlock()
-
 	cleanDataDir := strings.TrimSpace(dataDir)
 	if cleanDataDir == "" {
 		cleanDataDir = "./data"
@@ -64,9 +100,44 @@ func EnsureForwarderBinary(dataDir string) (string, error) {
 
 	targetPath := filepath.Join(absDataDir, "bin", "bob-proxy-fwd")
 
-	if fi, err := os.Stat(targetPath); err == nil && !fi.IsDir() {
-		_ = os.Chmod(targetPath, 0o755)
-		return targetPath, nil
+	// Fast-path: check cache under read lock
+	forwarderMu.RLock()
+	if fi, err := os.Stat(targetPath); err == nil && !fi.IsDir() && fi.Size() > 0 {
+		custom := strings.TrimSpace(os.Getenv("SANDBOX_PROXY_FWD_PATH"))
+		if custom == "" {
+			if fi.Mode()&0o111 != 0 {
+				forwarderMu.RUnlock()
+				return targetPath, nil
+			}
+		} else if customFi, err := os.Stat(custom); err == nil && !customFi.IsDir() {
+			if !customFi.ModTime().After(fi.ModTime()) && customFi.Size() == fi.Size() && fi.Mode()&0o111 != 0 {
+				forwarderMu.RUnlock()
+				return targetPath, nil
+			}
+		}
+	}
+	forwarderMu.RUnlock()
+
+	forwarderMu.Lock()
+	defer forwarderMu.Unlock()
+
+	// Double-checked locking after acquiring write lock
+	if fi, err := os.Stat(targetPath); err == nil && !fi.IsDir() && fi.Size() > 0 {
+		custom := strings.TrimSpace(os.Getenv("SANDBOX_PROXY_FWD_PATH"))
+		if custom == "" {
+			if chmodErr := os.Chmod(targetPath, 0o755); chmodErr != nil {
+				slog.Warn("failed to chmod cached forwarder binary", "path", targetPath, "error", chmodErr)
+			}
+			return targetPath, nil
+		}
+		if customFi, err := os.Stat(custom); err == nil && !customFi.IsDir() {
+			if !customFi.ModTime().After(fi.ModTime()) && customFi.Size() == fi.Size() {
+				if chmodErr := os.Chmod(targetPath, 0o755); chmodErr != nil {
+					slog.Warn("failed to chmod cached forwarder binary", "path", targetPath, "error", chmodErr)
+				}
+				return targetPath, nil
+			}
+		}
 	}
 
 	// 1. Check custom environment override
@@ -77,20 +148,14 @@ func EnsureForwarderBinary(dataDir string) (string, error) {
 				return "", fmt.Errorf("failed to resolve custom forwarder path %q: %w", custom, err)
 			}
 			if err := copyFile(absCustom, targetPath, 0o755); err != nil {
-				slog.Warn("failed to copy custom forwarder to dataDir, using original", "source", absCustom, "error", err)
-				return absCustom, nil
+				return "", fmt.Errorf("failed to copy custom forwarder to dataDir: %w", err)
 			}
 			return targetPath, nil
 		}
 	}
 
-	// 2. Check candidate search paths for pre-built binary
+	// 2. Check candidate search paths for pre-built binary (trusted paths only)
 	var candidates []string
-
-	// Current working directory bin/
-	candidates = append(candidates, filepath.Join("bin", "bob-proxy-fwd"))
-
-	// Beside current running executable
 	if execPath, err := os.Executable(); err == nil {
 		execDir := filepath.Dir(execPath)
 		candidates = append(candidates,
@@ -111,29 +176,36 @@ func EnsureForwarderBinary(dataDir string) (string, error) {
 		}
 	}
 
-	// 3. Fallback: Compile on-demand if Go toolchain is available (e.g. dev or test environment)
-	goPath, err := exec.LookPath("go")
-	if err == nil && goPath != "" {
-		if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
-			return "", fmt.Errorf("failed to create forwarder bin directory: %w", err)
-		}
-
-		cmd := exec.Command(goPath, "build", "-ldflags=-w -s", "-o", targetPath, "bob/cmd/bob-proxy-fwd")
-		cmd.Env = append(os.Environ(),
-			"CGO_ENABLED=0",
-			"GOOS=linux",
-			"GOARCH="+runtime.GOARCH,
-		)
-		var stderr strings.Builder
-		cmd.Stderr = &stderr
-
-		if buildErr := cmd.Run(); buildErr == nil {
-			if err := os.Chmod(targetPath, 0o755); err != nil {
-				return "", fmt.Errorf("failed to chmod compiled forwarder %q: %w", targetPath, err)
+	// 3. Fallback: Compile on-demand if Go toolchain is available in dev or test environment
+	if isBuildAllowed() {
+		goPath, err := exec.LookPath("go")
+		if err == nil && goPath != "" {
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+				return "", fmt.Errorf("failed to create forwarder bin directory: %w", err)
 			}
-			return targetPath, nil
-		} else {
-			slog.Warn("failed to compile bob-proxy-fwd on demand", "error", buildErr, "details", stderr.String())
+
+			repoRoot := findRepoRoot()
+			buildPkg := "./cmd/bob-proxy-fwd"
+			cmd := exec.Command(goPath, "build", "-mod=vendor", "-ldflags=-w -s", "-o", targetPath, buildPkg)
+			if repoRoot != "" {
+				cmd.Dir = repoRoot
+			}
+			cmd.Env = append(os.Environ(),
+				"CGO_ENABLED=0",
+				"GOOS=linux",
+				"GOARCH="+runtime.GOARCH,
+			)
+			var stderr strings.Builder
+			cmd.Stderr = &stderr
+
+			if buildErr := cmd.Run(); buildErr == nil {
+				if err := os.Chmod(targetPath, 0o755); err != nil {
+					return "", fmt.Errorf("failed to chmod compiled forwarder %q: %w", targetPath, err)
+				}
+				return targetPath, nil
+			} else {
+				slog.Warn("failed to compile bob-proxy-fwd on demand", "error", buildErr, "details", stderr.String())
+			}
 		}
 	}
 
