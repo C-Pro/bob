@@ -1,0 +1,8 @@
+{
+  "track_id": "docker-restricted-net_20260911",
+  "type": "feature",
+  "status": "completed",
+  "created_at": "2026-09-11T20:33:00Z",
+  "updated_at": "2026-09-11T20:54:00Z",
+  "description": "Restricted docker network."
+}
