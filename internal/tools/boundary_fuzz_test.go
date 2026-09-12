@@ -48,7 +48,7 @@ func FuzzSandboxExecArgs(f *testing.F) {
 	}
 
 	mock := &mockSandboxDriver{available: true}
-	mgr := sandbox.NewManager(cfg, []sandbox.Driver{mock})
+	mgr := sandbox.NewManager(cfg.SandboxConfig(), []sandbox.Driver{mock})
 	defer func() { _ = mgr.Close() }()
 
 	reg := NewRegistry(nil, nil, mgr)
@@ -130,7 +130,7 @@ func TestSandboxExec_DirectShellInvocation_Defect(t *testing.T) {
 	}
 
 	driver := &recordingDriver{available: true}
-	mgr := sandbox.NewManager(cfg, []sandbox.Driver{driver})
+	mgr := sandbox.NewManager(cfg.SandboxConfig(), []sandbox.Driver{driver})
 	defer func() { _ = mgr.Close() }()
 
 	ctx := context.Background()
@@ -184,7 +184,7 @@ func TestSandboxExec_TimeoutBoundaryClamping(t *testing.T) {
 	}
 
 	driver := &recordingDriver{available: true}
-	mgr := sandbox.NewManager(cfg, []sandbox.Driver{driver})
+	mgr := sandbox.NewManager(cfg.SandboxConfig(), []sandbox.Driver{driver})
 	defer func() { _ = mgr.Close() }()
 
 	ctx := context.Background()
@@ -263,7 +263,7 @@ func TestSandboxTool_ScopeAndPermissionBoundaries(t *testing.T) {
 	}
 
 	driver := &recordingDriver{available: true}
-	mgr := sandbox.NewManager(cfg, []sandbox.Driver{driver})
+	mgr := sandbox.NewManager(cfg.SandboxConfig(), []sandbox.Driver{driver})
 	defer func() { _ = mgr.Close() }()
 
 	reg := NewRegistry(nil, nil, mgr)

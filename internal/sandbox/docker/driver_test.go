@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -208,6 +209,7 @@ func TestDockerDriver_NetworkRestrictedProxyReachability(t *testing.T) {
 	defer func() { _ = listener.Close() }()
 
 	var capturedCreateHostConfig map[string]interface{}
+	var capturedCreateCmd []interface{}
 	var capturedExecEnv []string
 	var capturedExecWorkingDir string
 
@@ -221,6 +223,7 @@ func TestDockerDriver_NetworkRestrictedProxyReachability(t *testing.T) {
 		var payload map[string]interface{}
 		_ = json.NewDecoder(r.Body).Decode(&payload)
 		capturedCreateHostConfig, _ = payload["HostConfig"].(map[string]interface{})
+		capturedCreateCmd, _ = payload["Cmd"].([]interface{})
 
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte(`{"Id":"mock-restr-container"}`))
@@ -273,11 +276,13 @@ func TestDockerDriver_NetworkRestrictedProxyReachability(t *testing.T) {
 	}()
 	defer func() { _ = server.Close() }()
 
+	dataDir := filepath.Join(tempDir, "data")
 	driver := NewDriver(Config{
 		SocketPath:    sockPath,
 		AllowedImages: []string{"alpine:latest"},
 		CPULimit:      1.0,
 		MemoryLimitMB: 512,
+		DataDir:       dataDir,
 	})
 
 	ctx := context.Background()
@@ -300,10 +305,42 @@ func TestDockerDriver_NetworkRestrictedProxyReachability(t *testing.T) {
 
 	// Verify HostConfig
 	require.NotNil(t, capturedCreateHostConfig)
-	assert.Equal(t, "bridge", capturedCreateHostConfig["NetworkMode"])
-	extraHosts, ok := capturedCreateHostConfig["ExtraHosts"].([]interface{})
+	assert.Equal(t, "none", capturedCreateHostConfig["NetworkMode"])
+	assert.Nil(t, capturedCreateHostConfig["ExtraHosts"])
+	assert.Equal(t, true, capturedCreateHostConfig["Init"])
+
+	// Verify Cmd (Defect 1 & Scenario 2)
+	expectedCmd := []interface{}{
+		"/run/proxy/fwd",
+		"-daemon",
+		"-tcp",
+		"127.0.0.1:18080",
+		"-sock",
+		"/run/proxy/proxy.sock",
+	}
+	assert.Equal(t, expectedCmd, capturedCreateCmd)
+
+	binds, ok := capturedCreateHostConfig["Binds"].([]interface{})
 	require.True(t, ok)
-	assert.Contains(t, extraHosts, "host.docker.internal:host-gateway")
+	var hasProxyBind bool
+	expectedProxyPrefix := driver.getProxyDir(sbx.UserID)
+	for _, b := range binds {
+		str, _ := b.(string)
+		assert.False(t, strings.HasSuffix(str, ":/run/proxy/fwd:ro"), "overlapping /run/proxy/fwd bind mount must not be used")
+		if strings.HasSuffix(str, ":/run/proxy:ro") && strings.HasPrefix(str, expectedProxyPrefix) {
+			hasProxyBind = true
+		}
+	}
+	assert.True(t, hasProxyBind, "expected single /run/proxy:ro bind mount under dataDir")
+
+	// Verify that the forwarder binary exists and is executable in the proxy directory on host
+	fwdFi, err := os.Stat(filepath.Join(expectedProxyPrefix, "fwd"))
+	require.NoError(t, err)
+	assert.True(t, fwdFi.Mode()&0o111 != 0, "forwarder binary must be executable")
+
+	// Ensure workspace is not contaminated with .proxy
+	_, statErr := os.Stat(filepath.Join(userWorkspace, ".proxy"))
+	assert.True(t, os.IsNotExist(statErr), "user workspace should not contain .proxy directory")
 
 	// Execute command
 	res, err := driver.Exec(ctx, sbx, []string{"echo", "test"}, 5*time.Second)
@@ -315,18 +352,64 @@ func TestDockerDriver_NetworkRestrictedProxyReachability(t *testing.T) {
 	assert.Contains(t, capturedExecEnv, "HOME="+sandbox.DefaultWorkspaceMountPath)
 	assert.Contains(t, capturedExecEnv, "PWD="+sandbox.DefaultWorkspaceMountPath)
 
-	var hasHttpProxy, hasHostDockerInternal bool
+	var hasHttpProxy, hasLoopbackProxy, hasNoProxy, hasNoProxyUpper bool
 	for _, envVar := range capturedExecEnv {
 		if strings.HasPrefix(envVar, "HTTP_PROXY=") {
 			hasHttpProxy = true
-			if strings.Contains(envVar, "host.docker.internal:") {
-				hasHostDockerInternal = true
+			if strings.Contains(envVar, "127.0.0.1:18080") {
+				hasLoopbackProxy = true
 			}
+		}
+		if envVar == "no_proxy=localhost,127.0.0.1" {
+			hasNoProxy = true
+		}
+		if envVar == "NO_PROXY=localhost,127.0.0.1" {
+			hasNoProxyUpper = true
 		}
 	}
 	assert.True(t, hasHttpProxy, "expected HTTP_PROXY in exec env")
-	assert.True(t, hasHostDockerInternal, "expected HTTP_PROXY to point to host.docker.internal")
+	assert.True(t, hasLoopbackProxy, "expected HTTP_PROXY to point to loopback forwarder 127.0.0.1:18080")
+	assert.True(t, hasNoProxy, "expected no_proxy=localhost,127.0.0.1 in exec env")
+	assert.True(t, hasNoProxyUpper, "expected NO_PROXY=localhost,127.0.0.1 in exec env")
 }
+
+func TestDockerDriver_Create_ForwarderBinaryMissing(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "mock_docker_fwd_missing.sock")
+
+	listener, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+	defer func() { _ = listener.Close() }()
+
+	driver := NewDriver(Config{
+		SocketPath:    sockPath,
+		AllowedImages: []string{"alpine:latest"},
+		DataDir:       filepath.Join(tempDir, "data"),
+		ProxyFwdPath:  filepath.Join(tempDir, "nonexistent", "bob-proxy-fwd"),
+	})
+
+	ctx := context.Background()
+	userWorkspace := filepath.Join(tempDir, "workspace")
+	require.NoError(t, os.MkdirAll(userWorkspace, 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID:      "testuser_fwd_missing",
+		DockerImage: "alpine:latest",
+		Network: sandbox.NetworkPolicy{
+			Mode: sandbox.NetworkRestricted,
+		},
+		Status: sandbox.StatusRunning,
+	}
+
+	err = driver.Create(ctx, sbx, userWorkspace)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to ensure proxy forwarder binary")
+
+	driver.mu.Lock()
+	defer driver.mu.Unlock()
+	assert.Nil(t, driver.proxies[sbx.UserID], "no proxy should be stored on failure")
+}
+
 
 func TestDockerDriver_AutoPullMissingImage_Success(t *testing.T) {
 	tempDir := t.TempDir()
@@ -611,7 +694,7 @@ func TestDockerDriver_ExecTimeoutKill(t *testing.T) {
 	mu.Lock()
 	didRestart := restarted
 	mu.Unlock()
-	assert.True(t, didRestart, "container must be restarted atomically on exec timeout")
+	assert.False(t, didRestart, "container must not be restarted when targeted kill succeeds")
 
 	// Verify that a subsequent command succeeds after the timeout container recovery
 	res2, err := driver.Exec(ctx, sbx, []string{"echo", "subsequent"}, 5*time.Second)
@@ -769,7 +852,7 @@ func TestToHostPath(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "outside data directory")
 
-	// When HostDataDir is empty, paths are returned unchanged without error
+	// When HostDataDir is empty, paths are resolved to absolute host paths without error
 	dNoHost := NewDriver(Config{
 		DataDir:     containerDataDir,
 		HostDataDir: "",
@@ -777,6 +860,18 @@ func TestToHostPath(t *testing.T) {
 	res, err = dNoHost.toHostPath(containerSub)
 	require.NoError(t, err)
 	assert.Equal(t, containerSub, res)
+
+	// Relative path is resolved to absolute
+	relPath := filepath.Join("data", "proxies", "user1")
+	res, err = dNoHost.toHostPath(relPath)
+	require.NoError(t, err)
+	expectedAbs, _ := filepath.Abs(relPath)
+	assert.Equal(t, expectedAbs, res)
+	assert.True(t, filepath.IsAbs(res))
+
+	// getProxyDir always returns absolute path
+	proxyDir := dNoHost.getProxyDir("user1")
+	assert.True(t, filepath.IsAbs(proxyDir))
 
 	// When DataDir is empty but HostDataDir is set, an error is returned
 	dNoData := NewDriver(Config{
@@ -904,3 +999,656 @@ func TestDockerDriver_HostDataDirBinds(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to resolve host path for workspace")
 }
+
+func TestDockerDriver_RealDocker_NetworkRestrictedAirgap(t *testing.T) {
+	ctx := context.Background()
+	driver := NewDriver(Config{
+		SocketPath:    "/var/run/docker.sock",
+		AllowedImages: []string{"alpine:latest"},
+		CPULimit:      1.0,
+		MemoryLimitMB: 256,
+		DataDir:       t.TempDir(),
+	})
+
+	if !driver.Available(ctx) {
+		t.Skip("Docker daemon is not available on host, skipping test")
+	}
+
+	driver.SetCustomBlockedCIDRs([]string{"169.254.0.0/16"})
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("docker-restricted-airgap-ok"))
+	}))
+	defer backend.Close()
+
+	backendURL, err := url.Parse(backend.URL)
+	require.NoError(t, err)
+
+	tempDir := t.TempDir()
+	workspace := filepath.Join(tempDir, "user_restr_real")
+	require.NoError(t, os.MkdirAll(workspace, 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID:      "testuser_real_restr",
+		DockerImage: "alpine:latest",
+		Network: sandbox.NetworkPolicy{
+			Mode:         sandbox.NetworkRestricted,
+			AllowedHosts: []string{backendURL.Hostname()},
+			BlockedHosts: []string{"forbidden.com"},
+		},
+		Status: sandbox.StatusRunning,
+	}
+
+	err = driver.Create(ctx, sbx, workspace)
+	require.NoError(t, err)
+	defer func() { _ = driver.Destroy(ctx, sbx) }()
+
+	// 1. Raw socket attempt to external IP fails with network unreachable error
+	res, err := driver.Exec(ctx, sbx, []string{"nc", "-w", "1", "1.1.1.1", "80"}, 5*time.Second)
+	require.NoError(t, err)
+	assert.NotEqual(t, 0, res.ExitCode, "direct connection to external IP should fail in airgap: %s", res.Stderr)
+
+	// 2. Allowed domain through loopback proxy forwarder succeeds
+	res, err = driver.Exec(ctx, sbx, []string{"wget", "-q", "-O", "-", backend.URL + "/data"}, 10*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, 0, res.ExitCode, "wget output: stdout=%s stderr=%s", res.Stdout, res.Stderr)
+	assert.Contains(t, res.Stdout, "docker-restricted-airgap-ok")
+
+	// 3. Blocked domain is rejected by proxy
+	res, err = driver.Exec(ctx, sbx, []string{"wget", "-q", "-O", "-", "http://forbidden.com/data"}, 5*time.Second)
+	require.NoError(t, err)
+	assert.NotEqual(t, 0, res.ExitCode, "forbidden host should be blocked")
+
+	// 4. In-container no_proxy / NO_PROXY environment variables are set (Finding F7)
+	res, err = driver.Exec(ctx, sbx, []string{"sh", "-c", "echo $no_proxy $NO_PROXY"}, 5*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, 0, res.ExitCode)
+	assert.Contains(t, res.Stdout, "localhost,127.0.0.1 localhost,127.0.0.1")
+}
+
+func TestDockerDriver_RealDocker_NetworkRestricted_HTTPSConnect(t *testing.T) {
+	ctx := context.Background()
+	driver := NewDriver(Config{
+		SocketPath:    "/var/run/docker.sock",
+		AllowedImages: []string{"alpine:latest"},
+		CPULimit:      1.0,
+		MemoryLimitMB: 256,
+		DataDir:       t.TempDir(),
+	})
+
+	if !driver.Available(ctx) {
+		t.Skip("Docker daemon is not available on host, skipping test")
+	}
+
+	driver.SetCustomBlockedCIDRs([]string{"169.254.0.0/16"})
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte("https-connect-ok")); err != nil {
+			t.Logf("Failed to write response: %v", err)
+		}
+	}))
+	defer backend.Close()
+
+	backendURL, err := url.Parse(backend.URL)
+	require.NoError(t, err)
+
+	workspace := filepath.Join(t.TempDir(), "user_https_real")
+	require.NoError(t, os.MkdirAll(workspace, 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID:      "testuser_real_https",
+		DockerImage: "alpine:latest",
+		Network: sandbox.NetworkPolicy{
+			Mode:         sandbox.NetworkRestricted,
+			AllowedHosts: []string{backendURL.Hostname()},
+		},
+		Status: sandbox.StatusRunning,
+	}
+
+	err = driver.Create(ctx, sbx, workspace)
+	require.NoError(t, err)
+	defer func() {
+		if destroyErr := driver.Destroy(ctx, sbx); destroyErr != nil {
+			t.Logf("Failed to destroy sandbox: %v", destroyErr)
+		}
+	}()
+
+	connectScript := fmt.Sprintf(
+		"(printf 'CONNECT %s:%s HTTP/1.1\\r\\nHost: %s:%s\\r\\n\\r\\nGET /secure-data HTTP/1.1\\r\\nHost: %s\\r\\nConnection: close\\r\\n\\r\\n'; sleep 1) | nc -w 5 127.0.0.1 18080",
+		backendURL.Hostname(), backendURL.Port(),
+		backendURL.Hostname(), backendURL.Port(),
+		backendURL.Hostname(),
+	)
+
+	res, err := driver.Exec(ctx, sbx, []string{"sh", "-c", connectScript}, 10*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, 0, res.ExitCode, "exec output: stdout=%s stderr=%s", res.Stdout, res.Stderr)
+	assert.Contains(t, res.Stdout, "200 Connection Established")
+	assert.Contains(t, res.Stdout, "https-connect-ok")
+}
+
+func TestDockerDriver_RealDocker_NetworkRestricted_DomainResolution(t *testing.T) {
+	ctx := context.Background()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte("mock-domain-airgap-ok")); err != nil {
+			t.Logf("Failed to write mock response: %v", err)
+		}
+	}))
+	defer backend.Close()
+
+	backendURL, err := url.Parse(backend.URL)
+	require.NoError(t, err)
+	backendPort := backendURL.Port()
+
+	dnsPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() {
+		if closeErr := dnsPC.Close(); closeErr != nil {
+			t.Logf("Failed to close dnsPC: %v", closeErr)
+		}
+	}()
+
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			n, clientAddr, err := dnsPC.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if n < 12 {
+				continue
+			}
+			qnameEnd := 12
+			for qnameEnd < n && buf[qnameEnd] != 0 {
+				qnameEnd += int(buf[qnameEnd]) + 1
+			}
+			qnameEnd++
+			if qnameEnd+4 > n {
+				continue
+			}
+			qtype := binary.BigEndian.Uint16(buf[qnameEnd : qnameEnd+2])
+
+			qLen := qnameEnd + 4
+			if qtype == 1 { // A record
+				resp := make([]byte, qLen+16)
+				copy(resp[:qLen], buf[:qLen])
+				resp[2] = 0x81 // QR=1, RD=1
+				resp[3] = 0x80 // RA=1, RCODE=0
+				resp[4] = 0x00
+				resp[5] = 0x01 // QDCOUNT = 1
+				resp[6] = 0x00
+				resp[7] = 0x01 // ANCOUNT = 1
+				resp[8] = 0x00
+				resp[9] = 0x00 // NSCOUNT = 0
+				resp[10] = 0x00
+				resp[11] = 0x00 // ARCOUNT = 0
+				resp[qLen] = 0xc0
+				resp[qLen+1] = 0x0c
+				resp[qLen+2] = 0x00
+				resp[qLen+3] = 0x01 // Type A
+				resp[qLen+4] = 0x00
+				resp[qLen+5] = 0x01 // Class IN
+				resp[qLen+6] = 0x00
+				resp[qLen+7] = 0x00
+				resp[qLen+8] = 0x00
+				resp[qLen+9] = 0x3c // TTL 60
+				resp[qLen+10] = 0x00
+				resp[qLen+11] = 0x04
+				copy(resp[qLen+12:qLen+16], net.IPv4(127, 0, 0, 1).To4())
+				if _, writeErr := dnsPC.WriteTo(resp[:qLen+16], clientAddr); writeErr != nil {
+					return
+				}
+			} else { // Other types (AAAA): empty NOERROR
+				resp := make([]byte, qLen)
+				copy(resp[:qLen], buf[:qLen])
+				resp[2] = 0x81
+				resp[3] = 0x80
+				resp[4] = 0x00
+				resp[5] = 0x01 // QDCOUNT = 1
+				resp[6] = 0x00
+				resp[7] = 0x00 // ANCOUNT = 0
+				resp[8] = 0x00
+				resp[9] = 0x00
+				resp[10] = 0x00
+				resp[11] = 0x00
+				if _, writeErr := dnsPC.WriteTo(resp[:qLen], clientAddr); writeErr != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	mockResolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "udp", dnsPC.LocalAddr().String())
+		},
+	}
+
+	driver := NewDriver(Config{
+		SocketPath:    "/var/run/docker.sock",
+		AllowedImages: []string{"alpine:latest"},
+		CPULimit:      1.0,
+		MemoryLimitMB: 256,
+		DataDir:       t.TempDir(),
+		Resolver:      mockResolver,
+	})
+
+	if !driver.Available(ctx) {
+		t.Skip("Docker daemon is not available on host, skipping test")
+	}
+
+	driver.SetCustomBlockedCIDRs([]string{"169.254.0.0/16"})
+
+	workspace := filepath.Join(t.TempDir(), "user_domain_real")
+	require.NoError(t, os.MkdirAll(workspace, 0o755))
+
+	const domain = "mock.sandbox.local"
+	sbx := &sandbox.UserSandbox{
+		UserID:      "testuser_real_domain",
+		DockerImage: "alpine:latest",
+		Network: sandbox.NetworkPolicy{
+			Mode:         sandbox.NetworkRestricted,
+			AllowedHosts: []string{domain},
+		},
+		Status: sandbox.StatusRunning,
+	}
+
+	err = driver.Create(ctx, sbx, workspace)
+	require.NoError(t, err)
+	defer func() {
+		if destroyErr := driver.Destroy(ctx, sbx); destroyErr != nil {
+			t.Logf("Failed to destroy sandbox: %v", destroyErr)
+		}
+	}()
+
+	targetURL := fmt.Sprintf("http://%s:%s/data", domain, backendPort)
+	res, err := driver.Exec(ctx, sbx, []string{"wget", "-q", "-O", "-", targetURL}, 10*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, 0, res.ExitCode, "wget output: stdout=%s stderr=%s", res.Stdout, res.Stderr)
+	assert.Contains(t, res.Stdout, "mock-domain-airgap-ok")
+}
+
+func TestDockerDriver_RealDocker_NetworkRestricted_ConcurrentExec(t *testing.T) {
+	ctx := context.Background()
+	driver := NewDriver(Config{
+		SocketPath:    "/var/run/docker.sock",
+		AllowedImages: []string{"alpine:latest"},
+		CPULimit:      1.0,
+		MemoryLimitMB: 256,
+		DataDir:       t.TempDir(),
+	})
+
+	if !driver.Available(ctx) {
+		t.Skip("Docker daemon is not available on host, skipping test")
+	}
+
+	driver.SetCustomBlockedCIDRs([]string{"169.254.0.0/16"})
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte("concurrent-exec-ok")); err != nil {
+			t.Logf("Failed to write response: %v", err)
+		}
+	}))
+	defer backend.Close()
+
+	backendURL, err := url.Parse(backend.URL)
+	require.NoError(t, err)
+
+	workspace := filepath.Join(t.TempDir(), "user_concurrent_real")
+	require.NoError(t, os.MkdirAll(workspace, 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID:      "testuser_real_concurrent",
+		DockerImage: "alpine:latest",
+		Network: sandbox.NetworkPolicy{
+			Mode:         sandbox.NetworkRestricted,
+			AllowedHosts: []string{backendURL.Hostname()},
+		},
+		Status: sandbox.StatusRunning,
+	}
+
+	err = driver.Create(ctx, sbx, workspace)
+	require.NoError(t, err)
+	defer func() {
+		if destroyErr := driver.Destroy(ctx, sbx); destroyErr != nil {
+			t.Logf("Failed to destroy sandbox: %v", destroyErr)
+		}
+	}()
+
+	const concurrency = 10
+	errCh := make(chan error, concurrency)
+	var wg sync.WaitGroup
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, err := driver.Exec(ctx, sbx, []string{"wget", "-q", "-O", "-", backend.URL + "/data"}, 10*time.Second)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if res.ExitCode != 0 {
+				errCh <- fmt.Errorf("unexpected exit code %d: %s", res.ExitCode, res.Stderr)
+				return
+			}
+			if !strings.Contains(res.Stdout, "concurrent-exec-ok") {
+				errCh <- fmt.Errorf("unexpected stdout: %s", res.Stdout)
+				return
+			}
+			errCh <- nil
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		assert.NoError(t, err)
+	}
+}
+
+
+func TestDockerDriver_Destroy_ProxySocketCleanup(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "docker.sock")
+	listener, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_ping", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+	mux.HandleFunc("/containers/create", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"Id":"mock-cleanup-container"}`))
+	})
+	mux.HandleFunc("/containers/mock-cleanup-container/start", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/containers/mock-cleanup-container", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusNoContent)
+		}
+	})
+
+	server := &http.Server{Handler: mux}
+	go func() { _ = server.Serve(listener) }()
+	defer func() { _ = server.Close() }()
+
+	dataDir := filepath.Join(tempDir, "data")
+	driver := NewDriver(Config{
+		SocketPath:    sockPath,
+		AllowedImages: []string{"alpine:latest"},
+		DataDir:       dataDir,
+	})
+
+	ctx := context.Background()
+	userWorkspace := filepath.Join(tempDir, "user_workspace")
+	require.NoError(t, os.MkdirAll(userWorkspace, 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID:      "user_cleanup_test",
+		DockerImage: "alpine:latest",
+		Network: sandbox.NetworkPolicy{
+			Mode:         sandbox.NetworkRestricted,
+			AllowedHosts: []string{"api.github.com"},
+		},
+		Status: sandbox.StatusRunning,
+	}
+
+	err = driver.Create(ctx, sbx, userWorkspace)
+	require.NoError(t, err)
+
+	expectedProxyDir := driver.getProxyDir(sbx.UserID)
+	expectedSocket := filepath.Join(expectedProxyDir, "proxy.sock")
+
+	_, err = os.Stat(expectedSocket)
+	require.NoError(t, err, "proxy socket should exist after Create()")
+
+	err = driver.Destroy(ctx, sbx)
+	require.NoError(t, err)
+
+	_, err = os.Stat(expectedSocket)
+	assert.True(t, os.IsNotExist(err), "proxy.sock should be removed after Destroy()")
+
+	_, err = os.Stat(expectedProxyDir)
+	assert.True(t, os.IsNotExist(err), "proxy directory should be removed after Destroy()")
+}
+
+func TestDockerDriver_Create_ExistingProxyDirectory(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "docker.sock")
+	listener, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_ping", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+	mux.HandleFunc("/containers/create", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"Id":"mock-exist-container"}`))
+	})
+	mux.HandleFunc("/containers/mock-exist-container/start", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/containers/mock-exist-container", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusNoContent)
+		}
+	})
+
+	server := &http.Server{Handler: mux}
+	go func() { _ = server.Serve(listener) }()
+	defer func() { _ = server.Close() }()
+
+	dataDir := filepath.Join(tempDir, "data")
+	driver := NewDriver(Config{
+		SocketPath:    sockPath,
+		AllowedImages: []string{"alpine:latest"},
+		DataDir:       dataDir,
+	})
+
+	ctx := context.Background()
+	userWorkspace := filepath.Join(tempDir, "user_workspace")
+	require.NoError(t, os.MkdirAll(userWorkspace, 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID:      "user_stale_proxy_test",
+		DockerImage: "alpine:latest",
+		Network: sandbox.NetworkPolicy{
+			Mode:         sandbox.NetworkRestricted,
+			AllowedHosts: []string{"api.github.com"},
+		},
+		Status: sandbox.StatusRunning,
+	}
+
+	// Pre-create dirty/stale proxy socket simulating a dirty crash
+	staleProxyDir := driver.getProxyDir(sbx.UserID)
+	require.NoError(t, os.MkdirAll(staleProxyDir, 0o755))
+	staleSock := filepath.Join(staleProxyDir, "proxy.sock")
+	require.NoError(t, os.WriteFile(staleSock, []byte("stale dead socket"), 0o660))
+
+	err = driver.Create(ctx, sbx, userWorkspace)
+	require.NoError(t, err, "Create() should succeed and overwrite stale proxy socket cleanly")
+	defer func() { _ = driver.Destroy(ctx, sbx) }()
+
+	fi, err := os.Stat(staleSock)
+	require.NoError(t, err)
+	assert.Equal(t, os.ModeSocket, fi.Mode()&os.ModeSocket)
+}
+
+func TestDockerDriver_Config_CustomBlockedCIDRs(t *testing.T) {
+	customCIDRs := []string{"10.0.0.0/8", "192.168.1.0/24"}
+	driver := NewDriver(Config{
+		CustomBlockedCIDRs: customCIDRs,
+	})
+	assert.Equal(t, customCIDRs, driver.customBlockedCIDRs)
+}
+
+func TestDockerDriver_Config_ForwarderPort(t *testing.T) {
+	driver := NewDriver(Config{
+		ForwarderPort: 19090,
+	})
+	assert.Equal(t, 19090, driver.forwarderPort)
+
+	driverDefault := NewDriver(Config{})
+	assert.Equal(t, sandbox.DefaultForwarderPort, driverDefault.forwarderPort)
+}
+
+func TestDockerDriver_Exec_NoProxyWhenProxyNil(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "mock_docker.sock")
+	listener, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+
+	var capturedExecEnv []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_ping", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+	mux.HandleFunc("/containers/test-container-id/exec", func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		if envList, ok := payload["Env"].([]interface{}); ok {
+			for _, e := range envList {
+				if s, ok := e.(string); ok {
+					capturedExecEnv = append(capturedExecEnv, s)
+				}
+			}
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]string{"Id": "exec-id-123"})
+	})
+	mux.HandleFunc("/exec/exec-id-123/start", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/exec/exec-id-123/json", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"Running": false, "ExitCode": 0})
+	})
+
+	server := &http.Server{Handler: mux}
+	go func() { _ = server.Serve(listener) }()
+	defer func() { _ = server.Close() }()
+
+	driver := NewDriver(Config{
+		SocketPath: sockPath,
+	})
+
+	sbx := &sandbox.UserSandbox{
+		UserID: "user_no_proxy",
+		Network: sandbox.NetworkPolicy{
+			Mode: sandbox.NetworkRestricted,
+		},
+		Status: sandbox.StatusRunning,
+	}
+	sbx.SetInternalID("test-container-id")
+
+	_, err = driver.Exec(context.Background(), sbx, []string{"echo", "hi"}, 5*time.Second)
+	require.NoError(t, err)
+
+	for _, envVar := range capturedExecEnv {
+		assert.False(t, strings.HasPrefix(envVar, "http_proxy="), "http_proxy should not be set when proxy is nil")
+		assert.False(t, strings.HasPrefix(envVar, "HTTP_PROXY="), "HTTP_PROXY should not be set when proxy is nil")
+	}
+}
+
+func TestDockerDriver_GetProxyDir_LongUserID_HostDataDir(t *testing.T) {
+	tempDir := t.TempDir()
+	dataDir := filepath.Join(tempDir, "container_data")
+	hostDataDir := filepath.Join(tempDir, "host_data")
+	require.NoError(t, os.MkdirAll(dataDir, 0o755))
+	require.NoError(t, os.MkdirAll(hostDataDir, 0o755))
+
+	driver := NewDriver(Config{
+		DataDir:     dataDir,
+		HostDataDir: hostDataDir,
+	})
+
+	longSpecialUserID := "org/team/subgroup/user-with-very-long-id-" + strings.Repeat("x", 120)
+	proxyDir := driver.getProxyDir(longSpecialUserID)
+	require.NotEmpty(t, proxyDir)
+
+	// Ensure proxyDir is within dataDir so toHostPath succeeds
+	hostPath, err := driver.toHostPath(proxyDir)
+	require.NoError(t, err, "toHostPath must succeed for long userID with HostDataDir configured")
+	assert.True(t, strings.HasPrefix(hostPath, hostDataDir), "mapped host path must be inside hostDataDir")
+
+	// Verify socket path length
+	sockPath := filepath.Join(proxyDir, "proxy.sock")
+	assert.True(t, len(sockPath) < 108, "proxy.sock path must be < 108 characters")
+}
+
+func TestDockerDriver_RealDocker_ConcurrentExec_OneTimeoutOneSucceeds(t *testing.T) {
+	ctx := context.Background()
+	driver := NewDriver(Config{
+		SocketPath:    "/var/run/docker.sock",
+		AllowedImages: []string{"alpine:latest"},
+		CPULimit:      1.0,
+		MemoryLimitMB: 256,
+		DataDir:       t.TempDir(),
+	})
+
+	if !driver.Available(ctx) {
+		t.Skip("Docker daemon is not available on host, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	workspace := filepath.Join(tempDir, "user_concurrent_timeout")
+	require.NoError(t, os.MkdirAll(workspace, 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID:      "user_conc_timeout",
+		DockerImage: "alpine:latest",
+		Network: sandbox.NetworkPolicy{
+			Mode: sandbox.NetworkNone,
+		},
+		Status: sandbox.StatusRunning,
+	}
+
+	err := driver.Create(ctx, sbx, workspace)
+	require.NoError(t, err)
+	defer func() { _ = driver.Destroy(ctx, sbx) }()
+
+	var wg sync.WaitGroup
+	var resTimeout, resSuccess *sandbox.ExecResult
+	var errTimeout, errSuccess error
+
+	wg.Add(2)
+
+	// Exec 1: sleep 10 with 500ms timeout -> should time out and be killed
+	go func() {
+		defer wg.Done()
+		resTimeout, errTimeout = driver.Exec(ctx, sbx, []string{"sleep", "10"}, 500*time.Millisecond)
+	}()
+
+	// Exec 2: sleep 1 with 5s timeout -> should succeed concurrently without being killed by Exec 1
+	go func() {
+		defer wg.Done()
+		time.Sleep(100 * time.Millisecond) // ensure Exec 1 starts first
+		resSuccess, errSuccess = driver.Exec(ctx, sbx, []string{"sleep", "1"}, 5*time.Second)
+	}()
+
+	wg.Wait()
+
+	require.NoError(t, errTimeout)
+	require.NotNil(t, resTimeout)
+	assert.Equal(t, -1, resTimeout.ExitCode)
+	assert.Contains(t, resTimeout.Stderr, "command timed out")
+
+	require.NoError(t, errSuccess)
+	require.NotNil(t, resSuccess)
+	assert.Equal(t, 0, resSuccess.ExitCode, "concurrent exec must succeed and not be killed by timeout of another exec")
+}
+

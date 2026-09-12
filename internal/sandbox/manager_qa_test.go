@@ -7,8 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"bob/internal/config"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -68,14 +66,14 @@ func (r *recordingQADriver) Destroy(ctx context.Context, sbx *UserSandbox) error
 // rollback on driver creation failure, driver availability checks, and multi-tenant isolation.
 func TestManager_EdgeCasesAndErrorHandling(t *testing.T) {
 	tempDir := t.TempDir()
-	cfg := &config.Config{
-		DataDir:                    tempDir,
-		SandboxEnabled:             true,
-		SandboxDrivers:             []string{"bwrap", "docker"},
-		SandboxAllowedNetworkModes: []string{"none", "restricted"},
-		SandboxMaxLifetime:         30 * time.Minute,
-		SandboxDefaultExecTimeout:  1 * time.Minute,
-		SandboxMaxExecTimeout:      10 * time.Minute,
+	cfg := Config{
+		DataDir:             tempDir,
+		Enabled:             true,
+		Drivers:             []string{"bwrap", "docker"},
+		AllowedNetworkModes: []string{"none", "restricted"},
+		MaxLifetime:         30 * time.Minute,
+		DefaultExecTimeout:  1 * time.Minute,
+		MaxExecTimeout:      10 * time.Minute,
 	}
 
 	ctx := context.Background()
@@ -170,12 +168,12 @@ func TestManager_EdgeCasesAndErrorHandling(t *testing.T) {
 		// 1. Requested timeout 0 -> clamped to DefaultExecTimeout (1 minute)
 		_, err = mgr.Exec(ctx, "user_clamp", []string{"echo"}, 0)
 		require.NoError(t, err)
-		assert.Equal(t, cfg.SandboxDefaultExecTimeout, driver.lastTimeout)
+		assert.Equal(t, cfg.DefaultExecTimeout, driver.lastTimeout)
 
 		// 2. Requested timeout negative -> clamped to DefaultExecTimeout (1 minute)
 		_, err = mgr.Exec(ctx, "user_clamp", []string{"echo"}, -10*time.Second)
 		require.NoError(t, err)
-		assert.Equal(t, cfg.SandboxDefaultExecTimeout, driver.lastTimeout)
+		assert.Equal(t, cfg.DefaultExecTimeout, driver.lastTimeout)
 
 		// 3. Requested timeout < 5s (e.g. 1s) -> clamped to minimum 5s
 		_, err = mgr.Exec(ctx, "user_clamp", []string{"echo"}, 1*time.Second)
@@ -185,7 +183,7 @@ func TestManager_EdgeCasesAndErrorHandling(t *testing.T) {
 		// 4. Requested timeout > MaxExecTimeout (e.g. 2 hours) -> clamped to MaxExecTimeout (10 minutes)
 		_, err = mgr.Exec(ctx, "user_clamp", []string{"echo"}, 2*time.Hour)
 		require.NoError(t, err)
-		assert.Equal(t, cfg.SandboxMaxExecTimeout, driver.lastTimeout)
+		assert.Equal(t, cfg.MaxExecTimeout, driver.lastTimeout)
 
 		// 5. In-range timeout preserved
 		_, err = mgr.Exec(ctx, "user_clamp", []string{"echo"}, 3*time.Minute)
