@@ -209,6 +209,7 @@ func TestDockerDriver_NetworkRestrictedProxyReachability(t *testing.T) {
 	defer func() { _ = listener.Close() }()
 
 	var capturedCreateHostConfig map[string]interface{}
+	var capturedCreateCmd []interface{}
 	var capturedExecEnv []string
 	var capturedExecWorkingDir string
 
@@ -222,6 +223,7 @@ func TestDockerDriver_NetworkRestrictedProxyReachability(t *testing.T) {
 		var payload map[string]interface{}
 		_ = json.NewDecoder(r.Body).Decode(&payload)
 		capturedCreateHostConfig, _ = payload["HostConfig"].(map[string]interface{})
+		capturedCreateCmd, _ = payload["Cmd"].([]interface{})
 
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte(`{"Id":"mock-restr-container"}`))
@@ -307,6 +309,17 @@ func TestDockerDriver_NetworkRestrictedProxyReachability(t *testing.T) {
 	assert.Nil(t, capturedCreateHostConfig["ExtraHosts"])
 	assert.Equal(t, true, capturedCreateHostConfig["Init"])
 
+	// Verify Cmd (Defect 1 & Scenario 2)
+	expectedCmd := []interface{}{
+		"/run/proxy/fwd",
+		"-daemon",
+		"-tcp",
+		"127.0.0.1:18080",
+		"-sock",
+		"/run/proxy/proxy.sock",
+	}
+	assert.Equal(t, expectedCmd, capturedCreateCmd)
+
 	binds, ok := capturedCreateHostConfig["Binds"].([]interface{})
 	require.True(t, ok)
 	var hasFwdBind, hasProxyBind bool
@@ -357,6 +370,45 @@ func TestDockerDriver_NetworkRestrictedProxyReachability(t *testing.T) {
 	assert.True(t, hasNoProxy, "expected no_proxy=localhost,127.0.0.1 in exec env")
 	assert.True(t, hasNoProxyUpper, "expected NO_PROXY=localhost,127.0.0.1 in exec env")
 }
+
+func TestDockerDriver_Create_ForwarderBinaryMissing(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "mock_docker_fwd_missing.sock")
+
+	listener, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+	defer func() { _ = listener.Close() }()
+
+	driver := NewDriver(Config{
+		SocketPath:    sockPath,
+		AllowedImages: []string{"alpine:latest"},
+		DataDir:       filepath.Join(tempDir, "data"),
+	})
+
+	t.Setenv("SANDBOX_PROXY_FWD_PATH", filepath.Join(tempDir, "nonexistent", "bob-proxy-fwd"))
+
+	ctx := context.Background()
+	userWorkspace := filepath.Join(tempDir, "workspace")
+	require.NoError(t, os.MkdirAll(userWorkspace, 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID:      "testuser_fwd_missing",
+		DockerImage: "alpine:latest",
+		Network: sandbox.NetworkPolicy{
+			Mode: sandbox.NetworkRestricted,
+		},
+		Status: sandbox.StatusRunning,
+	}
+
+	err = driver.Create(ctx, sbx, userWorkspace)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to ensure proxy forwarder binary")
+
+	driver.mu.Lock()
+	defer driver.mu.Unlock()
+	assert.Nil(t, driver.proxies[sbx.UserID], "no proxy should be stored on failure")
+}
+
 
 func TestDockerDriver_AutoPullMissingImage_Success(t *testing.T) {
 	tempDir := t.TempDir()
