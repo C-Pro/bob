@@ -136,6 +136,89 @@ func TestEnsureForwarderBinary_InvalidCustomEnv(t *testing.T) {
 	assert.Contains(t, err.Error(), "custom forwarder binary")
 }
 
+func TestEnsureForwarderBinary_CandidateSearch(t *testing.T) {
+	t.Setenv("SANDBOX_PROXY_FWD_PATH", "")
+	t.Setenv("BOB_ALLOW_RUNTIME_BUILD", "0")
+
+	execPath, err := os.Executable()
+	require.NoError(t, err)
+	execDir := filepath.Dir(execPath)
+
+	testCases := []struct {
+		name    string
+		subDir  string
+		binName string
+	}{
+		{
+			name:    "AdjacentToExecutable",
+			subDir:  "",
+			binName: "bob-proxy-fwd",
+		},
+		{
+			name:    "InBinSubdirectory",
+			subDir:  "bin",
+			binName: "bob-proxy-fwd",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			targetDir := execDir
+			if tc.subDir != "" {
+				targetDir = filepath.Join(execDir, tc.subDir)
+			}
+
+			// If testing subDir, ensure adjacent candidate does not shadow it
+			if tc.subDir != "" {
+				adjacentPath := filepath.Join(execDir, "bob-proxy-fwd")
+				if adjData, adjErr := os.ReadFile(adjacentPath); adjErr == nil {
+					require.NoError(t, os.Remove(adjacentPath))
+					t.Cleanup(func() {
+						assert.NoError(t, os.WriteFile(adjacentPath, adjData, 0o755))
+					})
+				}
+			}
+
+			_, statDirErr := os.Stat(targetDir)
+			dirExisted := statDirErr == nil
+			require.NoError(t, os.MkdirAll(targetDir, 0o755))
+
+			candPath := filepath.Join(targetDir, tc.binName)
+			origContent, statFileErr := os.ReadFile(candPath)
+			fileExisted := statFileErr == nil
+
+			t.Cleanup(func() {
+				if fileExisted {
+					assert.NoError(t, os.WriteFile(candPath, origContent, 0o755))
+				} else {
+					assert.NoError(t, os.Remove(candPath))
+				}
+				if !dirExisted && tc.subDir != "" {
+					assert.NoError(t, os.Remove(targetDir))
+				}
+			})
+
+			payload := []byte("candidate-fwd-" + tc.name)
+			require.NoError(t, os.WriteFile(candPath, payload, 0o755))
+
+			tempDataDir := t.TempDir()
+			res, err := EnsureForwarderBinary(tempDataDir)
+			require.NoError(t, err)
+
+			expected := filepath.Join(tempDataDir, "bin", "bob-proxy-fwd")
+			assert.Equal(t, expected, res)
+
+			data, err := os.ReadFile(res)
+			require.NoError(t, err)
+			assert.Equal(t, payload, data)
+
+			info, err := os.Stat(res)
+			require.NoError(t, err)
+			assert.Equal(t, os.FileMode(0o755), info.Mode().Perm())
+		})
+	}
+}
+
 func TestCopyFile_AtomicAndSecure(t *testing.T) {
 	tempDir := t.TempDir()
 	src := filepath.Join(tempDir, "src.txt")
