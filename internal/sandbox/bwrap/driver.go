@@ -165,6 +165,82 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 	execCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	args, err := d.buildArgs(sbx, cmd)
+	if err != nil {
+		return nil, err
+	}
+
+	var bwrapCmd *exec.Cmd
+	if hasSystemdUserScope() {
+		sysArgs := buildSystemdArgs(d.memoryLimitMB, d.cpuLimit, d.bwrapPath, args)
+		// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
+		bwrapCmd = exec.CommandContext(execCtx, "systemd-run", sysArgs...)
+	} else {
+		slog.Warn("systemd-run --user not available; bwrap running without cgroup resource limits (MemoryMax/TasksMax/CPUQuota)", "user", sbx.UserID)
+		// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
+		bwrapCmd = exec.CommandContext(execCtx, d.bwrapPath, args...)
+	}
+
+	stdout := sandbox.NewBoundedBuffer(sandbox.DefaultMaxOutputBytes)
+	stderr := sandbox.NewBoundedBuffer(sandbox.DefaultMaxOutputBytes)
+	bwrapCmd.Stdout = stdout
+	bwrapCmd.Stderr = stderr
+
+	startTime := time.Now()
+	err = bwrapCmd.Run()
+	duration := time.Since(startTime)
+
+	if execCtx.Err() != nil {
+		errStr := stderr.String()
+		if errStr != "" {
+			errStr += "\ncommand timed out"
+		} else {
+			errStr = "command timed out"
+		}
+		return &sandbox.ExecResult{
+			ExitCode: -1,
+			Stdout:   stdout.String(),
+			Stderr:   errStr,
+			Duration: duration,
+		}, nil
+	}
+
+	exitCode := 0
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+				exitCode = status.ExitStatus()
+			} else {
+				exitCode = 1
+			}
+		} else {
+			return nil, fmt.Errorf("bwrap execution failed: %w", err)
+		}
+	}
+
+	return &sandbox.ExecResult{
+		ExitCode: exitCode,
+		Stdout:   stdout.String(),
+		Stderr:   stderr.String(),
+		Duration: duration,
+	}, nil
+}
+
+// Destroy cleans up resources and shuts down filtering proxies associated with the user.
+func (d *Driver) Destroy(ctx context.Context, sbx *sandbox.UserSandbox) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if proxy, ok := d.proxies[sbx.UserID]; ok {
+		if err := proxy.Close(); err != nil {
+			slog.Warn("failed to close bwrap filtering proxy on destroy", "user", sbx.UserID, "error", err)
+		}
+		delete(d.proxies, sbx.UserID)
+	}
+	return nil
+}
+
+func (d *Driver) buildArgs(sbx *sandbox.UserSandbox, cmd []string) ([]string, error) {
 	args := []string{
 		"--die-with-parent",
 	}
@@ -326,74 +402,7 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 		args = append(args, cmd...)
 	}
 
-	var bwrapCmd *exec.Cmd
-	if hasSystemdUserScope() {
-		sysArgs := buildSystemdArgs(d.memoryLimitMB, d.cpuLimit, d.bwrapPath, args)
-		// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
-		bwrapCmd = exec.CommandContext(execCtx, "systemd-run", sysArgs...)
-	} else {
-		slog.Warn("systemd-run --user not available; bwrap running without cgroup resource limits (MemoryMax/TasksMax/CPUQuota)", "user", sbx.UserID)
-		// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
-		bwrapCmd = exec.CommandContext(execCtx, d.bwrapPath, args...)
-	}
-
-	stdout := sandbox.NewBoundedBuffer(sandbox.DefaultMaxOutputBytes)
-	stderr := sandbox.NewBoundedBuffer(sandbox.DefaultMaxOutputBytes)
-	bwrapCmd.Stdout = stdout
-	bwrapCmd.Stderr = stderr
-
-	startTime := time.Now()
-	err = bwrapCmd.Run()
-	duration := time.Since(startTime)
-
-	if execCtx.Err() != nil {
-		errStr := stderr.String()
-		if errStr != "" {
-			errStr += "\ncommand timed out"
-		} else {
-			errStr = "command timed out"
-		}
-		return &sandbox.ExecResult{
-			ExitCode: -1,
-			Stdout:   stdout.String(),
-			Stderr:   errStr,
-			Duration: duration,
-		}, nil
-	}
-
-	exitCode := 0
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
-				exitCode = status.ExitStatus()
-			} else {
-				exitCode = 1
-			}
-		} else {
-			return nil, fmt.Errorf("bwrap execution failed: %w", err)
-		}
-	}
-
-	return &sandbox.ExecResult{
-		ExitCode: exitCode,
-		Stdout:   stdout.String(),
-		Stderr:   stderr.String(),
-		Duration: duration,
-	}, nil
-}
-
-// Destroy cleans up resources and shuts down filtering proxies associated with the user.
-func (d *Driver) Destroy(ctx context.Context, sbx *sandbox.UserSandbox) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if proxy, ok := d.proxies[sbx.UserID]; ok {
-		if err := proxy.Close(); err != nil {
-			slog.Warn("failed to close bwrap filtering proxy on destroy", "user", sbx.UserID, "error", err)
-		}
-		delete(d.proxies, sbx.UserID)
-	}
-	return nil
+	return args, nil
 }
 
 func (d *Driver) mountNetFiles(args *[]string) {

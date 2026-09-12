@@ -2,6 +2,7 @@ package bwrap
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -304,4 +305,92 @@ func TestBwrapDriver_Config_DataDir_And_ForwarderBinaryCache(t *testing.T) {
 	fwdPath2, err := driver.getForwarderBinary()
 	require.NoError(t, err)
 	assert.Equal(t, fwdPath, fwdPath2)
+}
+
+func TestBwrapDriver_BuildArgs_NetworkRestricted(t *testing.T) {
+	tempDir := t.TempDir()
+	driver := NewDriverWithConfig(Config{
+		DataDir: filepath.Join(tempDir, "data"),
+	})
+
+	sbx := &sandbox.UserSandbox{
+		UserID: "testuser_buildargs",
+		Network: sandbox.NetworkPolicy{
+			Mode: sandbox.NetworkRestricted,
+		},
+	}
+	sbx.SetWorkspaceDir(filepath.Join(tempDir, "workspace"))
+
+	mockProxy, err := sandbox.NewFilteringProxyWithConfig(sandbox.ProxyConfig{
+		Policy:     sbx.Network,
+		ListenTCP:  "none",
+		SocketPath: filepath.Join(tempDir, "proxy.sock"),
+	})
+	require.NoError(t, err)
+	defer func() { _ = mockProxy.Close() }()
+
+	driver.mu.Lock()
+	driver.proxies[sbx.UserID] = mockProxy
+	driver.mu.Unlock()
+
+	args, err := driver.buildArgs(sbx, []string{"echo", "hi"})
+	require.NoError(t, err)
+
+	// Verify isolation flags
+	assert.Contains(t, args, "--unshare-all")
+	assert.Contains(t, args, "--dir")
+	assert.Contains(t, args, "/run/proxy")
+	assert.Contains(t, args, "/run/proxy.sock")
+	assert.Contains(t, args, "/run/proxy/fwd")
+
+	// Verify environment variables
+	assert.Contains(t, args, "http_proxy")
+	assert.Contains(t, args, fmt.Sprintf("http://127.0.0.1:%d", driver.forwarderPort))
+	assert.Contains(t, args, "no_proxy")
+	assert.Contains(t, args, "localhost,127.0.0.1")
+
+	expectedSuffix := []string{
+		"/run/proxy/fwd",
+		"-tcp", fmt.Sprintf("127.0.0.1:%d", driver.forwarderPort),
+		"-sock", "/run/proxy.sock",
+		"--",
+		"echo", "hi",
+	}
+	require.True(t, len(args) >= len(expectedSuffix))
+	assert.Equal(t, expectedSuffix, args[len(args)-len(expectedSuffix):])
+}
+
+func TestBwrapDriver_Exec_EnsureForwarderBinaryFailure(t *testing.T) {
+	tempDir := t.TempDir()
+	driver := NewDriverWithConfig(Config{
+		DataDir: filepath.Join(tempDir, "data"),
+	})
+	driver.bwrapPath = "/bin/true"
+
+	sbx := &sandbox.UserSandbox{
+		UserID: "testuser_fail_fwd",
+		Network: sandbox.NetworkPolicy{
+			Mode: sandbox.NetworkRestricted,
+		},
+	}
+	sbx.SetWorkspaceDir(filepath.Join(tempDir, "workspace"))
+
+	mockProxy, err := sandbox.NewFilteringProxyWithConfig(sandbox.ProxyConfig{
+		Policy:     sbx.Network,
+		ListenTCP:  "none",
+		SocketPath: filepath.Join(tempDir, "proxy.sock"),
+	})
+	require.NoError(t, err)
+	defer func() { _ = mockProxy.Close() }()
+
+	driver.mu.Lock()
+	driver.proxies[sbx.UserID] = mockProxy
+	driver.mu.Unlock()
+
+	t.Setenv("SANDBOX_PROXY_FWD_PATH", filepath.Join(tempDir, "nonexistent", "fwd"))
+
+	res, err := driver.Exec(context.Background(), sbx, []string{"echo", "hi"}, 5*time.Second)
+	require.Error(t, err)
+	assert.Nil(t, res)
+	assert.Contains(t, err.Error(), "failed to ensure forwarder binary")
 }
