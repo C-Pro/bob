@@ -795,3 +795,78 @@ func TestFilteringProxy_TunnelUnidirectionalActive(t *testing.T) {
 	assert.Len(t, received, 5, "all chunks must be received without premature idle timeout")
 	<-streamDone
 }
+
+func TestFilteringProxy_DisabledTCPListener(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("unix only ok"))
+	}))
+	defer backend.Close()
+
+	backendURL, err := url.Parse(backend.URL)
+	require.NoError(t, err)
+
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "proxy.sock")
+
+	// 1. Explicit ListenTCP: "none"
+	proxy, err := NewFilteringProxyWithConfig(ProxyConfig{
+		Policy: NetworkPolicy{
+			Mode:         NetworkRestricted,
+			AllowedHosts: []string{backendURL.Hostname()},
+		},
+		ListenTCP:     "none",
+		SocketPath:    sockPath,
+		CustomBlocked: []string{"169.254.0.0/16"},
+	})
+	require.NoError(t, err)
+	defer func() { _ = proxy.Close() }()
+
+	assert.Equal(t, 0, proxy.Port())
+	assert.Equal(t, "", proxy.Addr())
+	assert.Equal(t, "", proxy.HostPort())
+	assert.Equal(t, sockPath, proxy.SocketPath())
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return net.Dial("unix", sockPath)
+			},
+		},
+	}
+	resp, err := client.Get(backend.URL)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "unix only ok", string(body))
+
+	// 2. Implicit skip when SocketPath is provided and ListenTCP is empty
+	sockPath2 := filepath.Join(tempDir, "proxy2.sock")
+	proxy2, err := NewFilteringProxyWithConfig(ProxyConfig{
+		Policy: NetworkPolicy{
+			Mode:         NetworkRestricted,
+			AllowedHosts: []string{backendURL.Hostname()},
+		},
+		SocketPath:    sockPath2,
+		CustomBlocked: []string{"169.254.0.0/16"},
+	})
+	require.NoError(t, err)
+	defer func() { _ = proxy2.Close() }()
+
+	assert.Equal(t, 0, proxy2.Port())
+	assert.Equal(t, "", proxy2.Addr())
+	assert.Equal(t, sockPath2, proxy2.SocketPath())
+
+	// 3. Error when both TCP is disabled and SocketPath is empty
+	_, err = NewFilteringProxyWithConfig(ProxyConfig{
+		Policy: NetworkPolicy{
+			Mode: NetworkRestricted,
+		},
+		ListenTCP: "none",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "neither TCP nor Unix socket listener is configured")
+}
+

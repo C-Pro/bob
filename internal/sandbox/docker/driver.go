@@ -202,6 +202,7 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 		}
 		proxy, err := sandbox.NewFilteringProxyWithConfig(sandbox.ProxyConfig{
 			Policy:        sbx.Network,
+			ListenTCP:     "none",
 			SocketPath:    sockPath,
 			CustomBlocked: d.customBlockedCIDRs,
 		})
