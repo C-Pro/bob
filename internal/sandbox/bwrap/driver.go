@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -20,10 +21,12 @@ type Driver struct {
 	bwrapPath          string
 	cpuLimit           float64
 	memoryLimitMB      int
+	dataDir            string
+	forwarderBinary    string
+	forwarderPort      int
 	mu                 sync.Mutex
 	proxies            map[string]*sandbox.FilteringProxy // keyed by userID
 	customBlockedCIDRs []string
-	forwarderPort      int
 }
 
 // Config provides configuration parameters for the Bubblewrap driver.
@@ -32,6 +35,7 @@ type Config struct {
 	MemoryLimitMB      int
 	CustomBlockedCIDRs []string
 	ForwarderPort      int
+	DataDir            string
 }
 
 // NewDriver creates a new Bubblewrap driver with default limits.
@@ -54,14 +58,33 @@ func NewDriverWithConfig(cfg Config) *Driver {
 	if fwdPort <= 0 {
 		fwdPort = sandbox.DefaultForwarderPort
 	}
+	dataDir := strings.TrimSpace(cfg.DataDir)
+	if dataDir == "" {
+		dataDir = "./data"
+	}
 	return &Driver{
 		bwrapPath:          path,
 		cpuLimit:           cpu,
 		memoryLimitMB:      mem,
+		dataDir:            dataDir,
 		customBlockedCIDRs: cfg.CustomBlockedCIDRs,
 		forwarderPort:      fwdPort,
 		proxies:            make(map[string]*sandbox.FilteringProxy),
 	}
+}
+
+func (d *Driver) getForwarderBinary() (string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.forwarderBinary != "" {
+		return d.forwarderBinary, nil
+	}
+	fwd, err := sandbox.EnsureForwarderBinary(d.dataDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to ensure forwarder binary: %w", err)
+	}
+	d.forwarderBinary = fwd
+	return d.forwarderBinary, nil
 }
 
 // Type returns the driver type.
@@ -100,6 +123,9 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 	sbx.SetWorkspaceDir(absWorkspace)
 
 	if sbx.Network.Mode == sandbox.NetworkRestricted {
+		if _, err := d.getForwarderBinary(); err != nil {
+			return fmt.Errorf("failed to ensure forwarder binary for user %s: %w", sbx.UserID, err)
+		}
 		d.mu.Lock()
 		defer d.mu.Unlock()
 		if existing, ok := d.proxies[sbx.UserID]; ok {
@@ -255,9 +281,9 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 			proxySockPath = proxy.SocketPath()
 			args = append(args, "--dir", "/run", "--bind", proxySockPath, "/run/proxy.sock")
 
-			fwd, err := sandbox.EnsureForwarderBinary("")
+			fwd, err := d.getForwarderBinary()
 			if err != nil {
-				return nil, fmt.Errorf("failed to ensure forwarder binary: %w", err)
+				return nil, err
 			}
 			fwdBinary = fwd
 			args = append(args, "--dir", "/run/proxy", "--ro-bind", fwdBinary, "/run/proxy/fwd")

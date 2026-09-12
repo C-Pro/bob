@@ -77,6 +77,7 @@ func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 		bwrapDriver := bwrap.NewDriverWithConfig(bwrap.Config{
 			CPULimit:      cfg.SandboxCPULimit,
 			MemoryLimitMB: cfg.SandboxMemoryLimitMB,
+			DataDir:       cfg.DataDir,
 		})
 		dockerDriver := docker.NewDriver(docker.Config{
 			SocketPath:    cfg.SandboxDockerSocket,

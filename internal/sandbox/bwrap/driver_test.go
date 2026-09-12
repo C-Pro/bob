@@ -287,3 +287,21 @@ func TestBwrapDriver_Exec_NoProxyWhenProxyNil(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "http_proxy=\n", res.Stdout)
 }
+
+func TestBwrapDriver_Config_DataDir_And_ForwarderBinaryCache(t *testing.T) {
+	tempDataDir := t.TempDir()
+	driver := NewDriverWithConfig(Config{
+		DataDir: tempDataDir,
+	})
+	assert.Equal(t, tempDataDir, driver.dataDir)
+
+	fwdPath, err := driver.getForwarderBinary()
+	require.NoError(t, err)
+	assert.NotEmpty(t, fwdPath)
+	assert.Equal(t, fwdPath, driver.forwarderBinary)
+
+	// Calling again should return cached path without re-resolving
+	fwdPath2, err := driver.getForwarderBinary()
+	require.NoError(t, err)
+	assert.Equal(t, fwdPath, fwdPath2)
+}
