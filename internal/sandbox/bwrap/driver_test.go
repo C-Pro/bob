@@ -234,3 +234,11 @@ func TestBuildSystemdArgs(t *testing.T) {
 	assert.Contains(t, args2, "TasksMax=64")
 	assert.NotContains(t, strings.Join(args2, " "), "CPUQuota")
 }
+
+func TestBwrapDriver_Config_CustomBlockedCIDRs(t *testing.T) {
+	customCIDRs := []string{"10.0.0.0/8", "192.168.1.0/24"}
+	driver := NewDriverWithConfig(Config{
+		CustomBlockedCIDRs: customCIDRs,
+	})
+	assert.Equal(t, customCIDRs, driver.customBlockedCIDRs)
+}

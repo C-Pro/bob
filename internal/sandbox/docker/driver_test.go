@@ -1120,3 +1120,10 @@ func TestDockerDriver_Create_ExistingProxyDirectory(t *testing.T) {
 	assert.Equal(t, os.ModeSocket, fi.Mode()&os.ModeSocket)
 }
 
+func TestDockerDriver_Config_CustomBlockedCIDRs(t *testing.T) {
+	customCIDRs := []string{"10.0.0.0/8", "192.168.1.0/24"}
+	driver := NewDriver(Config{
+		CustomBlockedCIDRs: customCIDRs,
+	})
+	assert.Equal(t, customCIDRs, driver.customBlockedCIDRs)
+}

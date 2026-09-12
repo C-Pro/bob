@@ -26,26 +26,27 @@ import (
 // Driver implements sandbox.Driver using the Docker Engine API over Unix socket.
 // It is 100% pure Go and CGO-free, requiring no 3rd-party Docker SDK dependencies.
 type Driver struct {
-	socketPath    string
-	allowedImages []string
-	cpuLimit      float64
-	memoryLimitMB int
-	dataDir       string
-	hostDataDir   string
-	client        *http.Client
-	mu            sync.Mutex
+	socketPath         string
+	allowedImages      []string
+	cpuLimit           float64
+	memoryLimitMB      int
+	dataDir            string
+	hostDataDir        string
+	client             *http.Client
+	mu                 sync.Mutex
 	proxies            map[string]*sandbox.FilteringProxy // keyed by userID
 	customBlockedCIDRs []string
 }
 
 // Config provides configuration parameters for the Docker driver.
 type Config struct {
-	SocketPath    string
-	AllowedImages []string
-	CPULimit      float64
-	MemoryLimitMB int
-	DataDir       string
-	HostDataDir   string
+	SocketPath         string
+	AllowedImages      []string
+	CPULimit           float64
+	MemoryLimitMB      int
+	DataDir            string
+	HostDataDir        string
+	CustomBlockedCIDRs []string
 }
 
 // NewDriver creates a new Docker Sibling driver.
@@ -76,12 +77,13 @@ func NewDriver(cfg Config) *Driver {
 	}
 
 	return &Driver{
-		socketPath:    socket,
-		allowedImages: cfg.AllowedImages,
-		cpuLimit:      cpu,
-		memoryLimitMB: mem,
-		dataDir:       strings.TrimSpace(cfg.DataDir),
-		hostDataDir:   hostData,
+		socketPath:         socket,
+		allowedImages:      cfg.AllowedImages,
+		cpuLimit:           cpu,
+		memoryLimitMB:      mem,
+		dataDir:            strings.TrimSpace(cfg.DataDir),
+		hostDataDir:        hostData,
+		customBlockedCIDRs: cfg.CustomBlockedCIDRs,
 		client: &http.Client{
 			Transport: transport,
 			Timeout:   10 * time.Minute,
@@ -118,13 +120,6 @@ func (d *Driver) toHostPath(containerPath string) (string, error) {
 // Type returns the driver type.
 func (d *Driver) Type() sandbox.DriverType {
 	return sandbox.DriverDocker
-}
-
-// SetCustomBlockedCIDRs sets custom blocked CIDRs for testing.
-func (d *Driver) SetCustomBlockedCIDRs(cidrs []string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.customBlockedCIDRs = cidrs
 }
 
 // Available pings the Docker daemon to check if the Unix socket is functional.
@@ -725,4 +720,3 @@ func (d *Driver) getProxyDir(userID string) string {
 	}
 	return candidate
 }
-

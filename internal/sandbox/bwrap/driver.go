@@ -27,15 +27,9 @@ type Driver struct {
 
 // Config provides configuration parameters for the Bubblewrap driver.
 type Config struct {
-	CPULimit      float64
-	MemoryLimitMB int
-}
-
-// SetCustomBlockedCIDRs overrides default mandatory blocked CIDRs for testing.
-func (d *Driver) SetCustomBlockedCIDRs(cidrs []string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.customBlockedCIDRs = cidrs
+	CPULimit           float64
+	MemoryLimitMB      int
+	CustomBlockedCIDRs []string
 }
 
 // NewDriver creates a new Bubblewrap driver with default limits.
@@ -55,10 +49,11 @@ func NewDriverWithConfig(cfg Config) *Driver {
 		cpu = 1.0
 	}
 	return &Driver{
-		bwrapPath:     path,
-		cpuLimit:      cpu,
-		memoryLimitMB: mem,
-		proxies:       make(map[string]*sandbox.FilteringProxy),
+		bwrapPath:          path,
+		cpuLimit:           cpu,
+		memoryLimitMB:      mem,
+		customBlockedCIDRs: cfg.CustomBlockedCIDRs,
+		proxies:            make(map[string]*sandbox.FilteringProxy),
 	}
 }
 
