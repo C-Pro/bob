@@ -119,12 +119,21 @@ func TestEnsureForwarderBinary_CacheInvalidation(t *testing.T) {
 
 func TestEnsureForwarderBinary_BuildDisabled_NotFound(t *testing.T) {
 	tempDataDir := t.TempDir()
-	t.Setenv("SANDBOX_PROXY_FWD_PATH", "/nonexistent/path/never_exists")
+	t.Setenv("SANDBOX_PROXY_FWD_PATH", "")
 	t.Setenv("BOB_ALLOW_RUNTIME_BUILD", "0")
 
 	_, err := EnsureForwarderBinary(tempDataDir)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "bob-proxy-fwd binary not found and cannot be built")
+}
+
+func TestEnsureForwarderBinary_InvalidCustomEnv(t *testing.T) {
+	tempDataDir := t.TempDir()
+	t.Setenv("SANDBOX_PROXY_FWD_PATH", "/nonexistent/path/never_exists")
+
+	_, err := EnsureForwarderBinary(tempDataDir)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "custom forwarder binary")
 }
 
 func TestCopyFile_AtomicAndSecure(t *testing.T) {

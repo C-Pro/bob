@@ -37,11 +37,11 @@ func copyFile(src, dst string, mode os.FileMode) error {
 		_ = os.Remove(tmpDst)
 	}()
 
-	if err := tmpFile.Chmod(mode); err != nil {
+	if _, err := io.Copy(tmpFile, in); err != nil {
 		return err
 	}
 
-	if _, err := io.Copy(tmpFile, in); err != nil {
+	if err := tmpFile.Chmod(mode); err != nil {
 		return err
 	}
 
@@ -85,6 +85,40 @@ func findRepoRoot() string {
 	return ""
 }
 
+func resolveSourceBinary() (string, os.FileInfo, error) {
+	if custom := strings.TrimSpace(os.Getenv("SANDBOX_PROXY_FWD_PATH")); custom != "" {
+		absCustom, err := filepath.Abs(custom)
+		if err != nil {
+			return "", nil, fmt.Errorf("failed to resolve custom forwarder path %q: %w", custom, err)
+		}
+		fi, err := os.Stat(absCustom)
+		if err != nil {
+			return "", nil, fmt.Errorf("custom forwarder binary %q not found: %w", absCustom, err)
+		}
+		if fi.IsDir() {
+			return "", nil, fmt.Errorf("custom forwarder path %q is a directory", absCustom)
+		}
+		return absCustom, fi, nil
+	}
+
+	if execPath, err := os.Executable(); err == nil {
+		execDir := filepath.Dir(execPath)
+		candidates := []string{
+			filepath.Join(execDir, "bob-proxy-fwd"),
+			filepath.Join(execDir, "bin", "bob-proxy-fwd"),
+		}
+		for _, cand := range candidates {
+			if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
+				if absCand, err := filepath.Abs(cand); err == nil {
+					return absCand, fi, nil
+				}
+			}
+		}
+	}
+
+	return "", nil, nil
+}
+
 // EnsureForwarderBinary locates or prepares the bob-proxy-fwd binary inside dataDir/bin.
 // It ensures the returned binary exists under dataDir (for sibling Docker toHostPath compatibility),
 // is statically built for Linux, and has executable permissions.
@@ -100,21 +134,28 @@ func EnsureForwarderBinary(dataDir string) (string, error) {
 
 	targetPath := filepath.Join(absDataDir, "bin", "bob-proxy-fwd")
 
-	// Fast-path: check cache under read lock
-	forwarderMu.RLock()
-	if fi, err := os.Stat(targetPath); err == nil && !fi.IsDir() && fi.Size() > 0 {
-		custom := strings.TrimSpace(os.Getenv("SANDBOX_PROXY_FWD_PATH"))
-		if custom == "" {
-			if fi.Mode()&0o111 != 0 {
-				forwarderMu.RUnlock()
-				return targetPath, nil
-			}
-		} else if customFi, err := os.Stat(custom); err == nil && !customFi.IsDir() {
-			if !customFi.ModTime().After(fi.ModTime()) && customFi.Size() == fi.Size() && fi.Mode()&0o111 != 0 {
-				forwarderMu.RUnlock()
-				return targetPath, nil
+	sourcePath, sourceFi, err := resolveSourceBinary()
+	if err != nil {
+		return "", err
+	}
+
+	isCacheValid := func(targetFi os.FileInfo) bool {
+		if targetFi == nil || targetFi.IsDir() || targetFi.Size() <= 0 {
+			return false
+		}
+		if sourceFi != nil {
+			if sourceFi.ModTime().After(targetFi.ModTime()) || sourceFi.Size() != targetFi.Size() {
+				return false
 			}
 		}
+		return true
+	}
+
+	// Fast-path: check cache under read lock
+	forwarderMu.RLock()
+	if fi, err := os.Stat(targetPath); err == nil && isCacheValid(fi) && fi.Mode()&0o111 != 0 {
+		forwarderMu.RUnlock()
+		return targetPath, nil
 	}
 	forwarderMu.RUnlock()
 
@@ -122,61 +163,24 @@ func EnsureForwarderBinary(dataDir string) (string, error) {
 	defer forwarderMu.Unlock()
 
 	// Double-checked locking after acquiring write lock
-	if fi, err := os.Stat(targetPath); err == nil && !fi.IsDir() && fi.Size() > 0 {
-		custom := strings.TrimSpace(os.Getenv("SANDBOX_PROXY_FWD_PATH"))
-		if custom == "" {
+	if fi, err := os.Stat(targetPath); err == nil && isCacheValid(fi) {
+		if fi.Mode()&0o111 == 0 {
 			if chmodErr := os.Chmod(targetPath, 0o755); chmodErr != nil {
 				slog.Warn("failed to chmod cached forwarder binary", "path", targetPath, "error", chmodErr)
 			}
-			return targetPath, nil
 		}
-		if customFi, err := os.Stat(custom); err == nil && !customFi.IsDir() {
-			if !customFi.ModTime().After(fi.ModTime()) && customFi.Size() == fi.Size() {
-				if chmodErr := os.Chmod(targetPath, 0o755); chmodErr != nil {
-					slog.Warn("failed to chmod cached forwarder binary", "path", targetPath, "error", chmodErr)
-				}
-				return targetPath, nil
-			}
-		}
+		return targetPath, nil
 	}
 
-	// 1. Check custom environment override
-	if custom := strings.TrimSpace(os.Getenv("SANDBOX_PROXY_FWD_PATH")); custom != "" {
-		if fi, err := os.Stat(custom); err == nil && !fi.IsDir() {
-			absCustom, err := filepath.Abs(custom)
-			if err != nil {
-				return "", fmt.Errorf("failed to resolve custom forwarder path %q: %w", custom, err)
-			}
-			if err := copyFile(absCustom, targetPath, 0o755); err != nil {
-				return "", fmt.Errorf("failed to copy custom forwarder to dataDir: %w", err)
-			}
-			return targetPath, nil
+	// 1. Copy from resolved source if available
+	if sourcePath != "" {
+		if err := copyFile(sourcePath, targetPath, 0o755); err != nil {
+			return "", fmt.Errorf("failed to copy forwarder binary from %q to %q: %w", sourcePath, targetPath, err)
 		}
+		return targetPath, nil
 	}
 
-	// 2. Check candidate search paths for pre-built binary (trusted paths only)
-	var candidates []string
-	if execPath, err := os.Executable(); err == nil {
-		execDir := filepath.Dir(execPath)
-		candidates = append(candidates,
-			filepath.Join(execDir, "bob-proxy-fwd"),
-			filepath.Join(execDir, "bin", "bob-proxy-fwd"),
-		)
-	}
-
-	for _, cand := range candidates {
-		if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
-			absCand, err := filepath.Abs(cand)
-			if err != nil {
-				continue
-			}
-			if err := copyFile(absCand, targetPath, 0o755); err == nil {
-				return targetPath, nil
-			}
-		}
-	}
-
-	// 3. Fallback: Compile on-demand if Go toolchain is available in dev or test environment
+	// 2. Fallback: Compile on-demand if Go toolchain is available in dev or test environment
 	if isBuildAllowed() {
 		goPath, err := exec.LookPath("go")
 		if err == nil && goPath != "" {
