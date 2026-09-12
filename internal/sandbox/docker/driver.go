@@ -434,6 +434,8 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 			"HTTPS_PROXY="+proxyAddr,
 			"all_proxy="+proxyAddr,
 			"ALL_PROXY="+proxyAddr,
+			"no_proxy=localhost,127.0.0.1",
+			"NO_PROXY=localhost,127.0.0.1",
 		)
 	}
 

@@ -337,7 +337,7 @@ func TestDockerDriver_NetworkRestrictedProxyReachability(t *testing.T) {
 	assert.Contains(t, capturedExecEnv, "HOME="+sandbox.DefaultWorkspaceMountPath)
 	assert.Contains(t, capturedExecEnv, "PWD="+sandbox.DefaultWorkspaceMountPath)
 
-	var hasHttpProxy, hasLoopbackProxy bool
+	var hasHttpProxy, hasLoopbackProxy, hasNoProxy, hasNoProxyUpper bool
 	for _, envVar := range capturedExecEnv {
 		if strings.HasPrefix(envVar, "HTTP_PROXY=") {
 			hasHttpProxy = true
@@ -345,9 +345,17 @@ func TestDockerDriver_NetworkRestrictedProxyReachability(t *testing.T) {
 				hasLoopbackProxy = true
 			}
 		}
+		if envVar == "no_proxy=localhost,127.0.0.1" {
+			hasNoProxy = true
+		}
+		if envVar == "NO_PROXY=localhost,127.0.0.1" {
+			hasNoProxyUpper = true
+		}
 	}
 	assert.True(t, hasHttpProxy, "expected HTTP_PROXY in exec env")
 	assert.True(t, hasLoopbackProxy, "expected HTTP_PROXY to point to loopback forwarder 127.0.0.1:18080")
+	assert.True(t, hasNoProxy, "expected no_proxy=localhost,127.0.0.1 in exec env")
+	assert.True(t, hasNoProxyUpper, "expected NO_PROXY=localhost,127.0.0.1 in exec env")
 }
 
 func TestDockerDriver_AutoPullMissingImage_Success(t *testing.T) {
@@ -986,6 +994,12 @@ func TestDockerDriver_RealDocker_NetworkRestrictedAirgap(t *testing.T) {
 	res, err = driver.Exec(ctx, sbx, []string{"wget", "-q", "-O", "-", "http://forbidden.com/data"}, 5*time.Second)
 	require.NoError(t, err)
 	assert.NotEqual(t, 0, res.ExitCode, "forbidden host should be blocked")
+
+	// 4. In-container no_proxy / NO_PROXY environment variables are set (Finding F7)
+	res, err = driver.Exec(ctx, sbx, []string{"sh", "-c", "echo $no_proxy $NO_PROXY"}, 5*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, 0, res.ExitCode)
+	assert.Contains(t, res.Stdout, "localhost,127.0.0.1 localhost,127.0.0.1")
 }
 
 func TestDockerDriver_Destroy_ProxySocketCleanup(t *testing.T) {

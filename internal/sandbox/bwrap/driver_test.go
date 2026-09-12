@@ -104,8 +104,8 @@ func TestBwrap_NetworkRestrictedAirgap(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = driver.Destroy(ctx, sbx) }()
 
-	// 2. Allowed domain through proxy forwarder succeeds
-	res, err := driver.Exec(ctx, sbx, []string{"curl", "-s", backend.URL + "/data"}, 10*time.Second)
+	// 2. Allowed domain through proxy forwarder succeeds (explicitly bypass no_proxy for 127.0.0.1 test backend)
+	res, err := driver.Exec(ctx, sbx, []string{"curl", "--noproxy", "", "-s", backend.URL + "/data"}, 10*time.Second)
 	require.NoError(t, err)
 	assert.Equal(t, 0, res.ExitCode, "curl output: stdout=%s stderr=%s", res.Stdout, res.Stderr)
 	assert.Contains(t, res.Stdout, "restricted-airgap-ok")
@@ -124,6 +124,18 @@ func TestBwrap_NetworkRestrictedAirgap(t *testing.T) {
 	res, err = driver.Exec(ctx, sbx, []string{"curl", "-s", "-w", "%{http_code}", "-o", "/dev/null", "http://forbidden.com"}, 5*time.Second)
 	require.NoError(t, err)
 	assert.Equal(t, "403", res.Stdout)
+
+	// 5. Verify no_proxy / NO_PROXY environment variables are set
+	envRes, err := driver.Exec(ctx, sbx, []string{"sh", "-c", "echo $no_proxy $NO_PROXY"}, 5*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, 0, envRes.ExitCode)
+	assert.Contains(t, envRes.Stdout, "localhost,127.0.0.1 localhost,127.0.0.1")
+
+	// 6. In-sandbox local server is accessible directly via loopback without proxy rejection (Finding F7)
+	localRes, err := driver.Exec(ctx, sbx, []string{"sh", "-c", "python3 -m http.server 34567 --bind 127.0.0.1 >/dev/null 2>&1 & PID=$!; sleep 0.3; curl -s http://127.0.0.1:34567/; kill $PID 2>/dev/null || true"}, 5*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, 0, localRes.ExitCode)
+	assert.Contains(t, localRes.Stdout, "Directory listing")
 }
 
 func TestBwrapDriver_ResolvConf(t *testing.T) {

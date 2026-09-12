@@ -283,6 +283,8 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 			"--setenv", "HTTPS_PROXY", proxyAddr,
 			"--setenv", "all_proxy", proxyAddr,
 			"--setenv", "ALL_PROXY", proxyAddr,
+			"--setenv", "no_proxy", "localhost,127.0.0.1",
+			"--setenv", "NO_PROXY", "localhost,127.0.0.1",
 		)
 	}
 
