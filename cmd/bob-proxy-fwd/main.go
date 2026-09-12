@@ -235,6 +235,10 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	}
 
 	cmdArgs := fs.Args()
+	if *daemonMode && len(cmdArgs) > 0 {
+		_, _ = fmt.Fprintln(stderr, "cannot specify command arguments in daemon mode")
+		return 2
+	}
 	isDaemon := *daemonMode || len(cmdArgs) == 0
 
 	lc := net.ListenConfig{}
@@ -270,7 +274,11 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 
 	runErr := cmd.Run()
 	cancelFwd()
-	<-errCh
+	fwdErr := <-errCh
+	if fwdErr != nil && !errors.Is(fwdErr, net.ErrClosed) && !errors.Is(fwdErr, context.Canceled) {
+		slog.Error("forwarder error in wrapper mode", "error", fwdErr)
+		_, _ = fmt.Fprintf(stderr, "forwarder error: %v\n", fwdErr)
+	}
 
 	if runErr != nil {
 		var exitErr *exec.ExitError
@@ -278,6 +286,10 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 			return exitErr.ExitCode()
 		}
 		_, _ = fmt.Fprintf(stderr, "failed to execute %s: %v\n", cmdArgs[0], runErr)
+		return 1
+	}
+
+	if fwdErr != nil && !errors.Is(fwdErr, net.ErrClosed) && !errors.Is(fwdErr, context.Canceled) {
 		return 1
 	}
 

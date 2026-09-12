@@ -561,6 +561,38 @@ func TestBridge_IdleTimeout(t *testing.T) {
 	}
 }
 
+func TestRun_ErrorCodes(t *testing.T) {
+	ctx := context.Background()
 
+	// 14a: Invalid flag -> Expect exit code 2
+	var stdout, stderr bytes.Buffer
+	code := run(ctx, []string{"-badflag"}, nil, &stdout, &stderr)
+	assert.Equal(t, 2, code)
 
+	// 14b: Bind already used TCP port -> Expect exit code 1
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = ln.Close() }()
 
+	stderr.Reset()
+	code = run(ctx, []string{"-tcp", ln.Addr().String(), "-daemon"}, nil, &stdout, &stderr)
+	assert.Equal(t, 1, code)
+	assert.Contains(t, stderr.String(), "failed to bind TCP listener")
+
+	// 14c: In wrapper mode, non-existent binary -> Expect exit code 1
+	freePortLn, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	freeAddr := freePortLn.Addr().String()
+	_ = freePortLn.Close()
+
+	stderr.Reset()
+	code = run(ctx, []string{"-tcp", freeAddr, "--", "nonexistent_binary_12345"}, nil, &stdout, &stderr)
+	assert.Equal(t, 1, code)
+	assert.Contains(t, stderr.String(), "failed to execute nonexistent_binary_12345")
+
+	// 14d: -daemon with trailing command args -> Expect exit code 2 (Finding F11)
+	stderr.Reset()
+	code = run(ctx, []string{"-daemon", "echo", "hello"}, nil, &stdout, &stderr)
+	assert.Equal(t, 2, code)
+	assert.Contains(t, stderr.String(), "cannot specify command arguments in daemon mode")
+}
