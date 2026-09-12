@@ -322,19 +322,21 @@ func TestDockerDriver_NetworkRestrictedProxyReachability(t *testing.T) {
 
 	binds, ok := capturedCreateHostConfig["Binds"].([]interface{})
 	require.True(t, ok)
-	var hasFwdBind, hasProxyBind bool
+	var hasProxyBind bool
 	expectedProxyPrefix := driver.getProxyDir(sbx.UserID)
 	for _, b := range binds {
 		str, _ := b.(string)
-		if strings.HasSuffix(str, ":/run/proxy/fwd:ro") {
-			hasFwdBind = true
-		}
+		assert.False(t, strings.HasSuffix(str, ":/run/proxy/fwd:ro"), "overlapping /run/proxy/fwd bind mount must not be used")
 		if strings.HasSuffix(str, ":/run/proxy:ro") && strings.HasPrefix(str, expectedProxyPrefix) {
 			hasProxyBind = true
 		}
 	}
-	assert.True(t, hasFwdBind, "expected /run/proxy/fwd:ro bind mount")
-	assert.True(t, hasProxyBind, "expected /run/proxy:ro bind mount under dataDir")
+	assert.True(t, hasProxyBind, "expected single /run/proxy:ro bind mount under dataDir")
+
+	// Verify that the forwarder binary exists and is executable in the proxy directory on host
+	fwdFi, err := os.Stat(filepath.Join(expectedProxyPrefix, "fwd"))
+	require.NoError(t, err)
+	assert.True(t, fwdFi.Mode()&0o111 != 0, "forwarder binary must be executable")
 
 	// Ensure workspace is not contaminated with .proxy
 	_, statErr := os.Stat(filepath.Join(userWorkspace, ".proxy"))
@@ -383,9 +385,8 @@ func TestDockerDriver_Create_ForwarderBinaryMissing(t *testing.T) {
 		SocketPath:    sockPath,
 		AllowedImages: []string{"alpine:latest"},
 		DataDir:       filepath.Join(tempDir, "data"),
+		ProxyFwdPath:  filepath.Join(tempDir, "nonexistent", "bob-proxy-fwd"),
 	})
-
-	t.Setenv("SANDBOX_PROXY_FWD_PATH", filepath.Join(tempDir, "nonexistent", "bob-proxy-fwd"))
 
 	ctx := context.Background()
 	userWorkspace := filepath.Join(tempDir, "workspace")
@@ -693,7 +694,7 @@ func TestDockerDriver_ExecTimeoutKill(t *testing.T) {
 	mu.Lock()
 	didRestart := restarted
 	mu.Unlock()
-	assert.True(t, didRestart, "container must be restarted atomically on exec timeout")
+	assert.False(t, didRestart, "container must not be restarted when targeted kill succeeds")
 
 	// Verify that a subsequent command succeeds after the timeout container recovery
 	res2, err := driver.Exec(ctx, sbx, []string{"echo", "subsequent"}, 5*time.Second)
@@ -851,7 +852,7 @@ func TestToHostPath(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "outside data directory")
 
-	// When HostDataDir is empty, paths are returned unchanged without error
+	// When HostDataDir is empty, paths are resolved to absolute host paths without error
 	dNoHost := NewDriver(Config{
 		DataDir:     containerDataDir,
 		HostDataDir: "",
@@ -859,6 +860,18 @@ func TestToHostPath(t *testing.T) {
 	res, err = dNoHost.toHostPath(containerSub)
 	require.NoError(t, err)
 	assert.Equal(t, containerSub, res)
+
+	// Relative path is resolved to absolute
+	relPath := filepath.Join("data", "proxies", "user1")
+	res, err = dNoHost.toHostPath(relPath)
+	require.NoError(t, err)
+	expectedAbs, _ := filepath.Abs(relPath)
+	assert.Equal(t, expectedAbs, res)
+	assert.True(t, filepath.IsAbs(res))
+
+	// getProxyDir always returns absolute path
+	proxyDir := dNoHost.getProxyDir("user1")
+	assert.True(t, filepath.IsAbs(proxyDir))
 
 	// When DataDir is empty but HostDataDir is set, an error is returned
 	dNoData := NewDriver(Config{
@@ -1550,3 +1563,92 @@ func TestDockerDriver_Exec_NoProxyWhenProxyNil(t *testing.T) {
 		assert.False(t, strings.HasPrefix(envVar, "HTTP_PROXY="), "HTTP_PROXY should not be set when proxy is nil")
 	}
 }
+
+func TestDockerDriver_GetProxyDir_LongUserID_HostDataDir(t *testing.T) {
+	tempDir := t.TempDir()
+	dataDir := filepath.Join(tempDir, "container_data")
+	hostDataDir := filepath.Join(tempDir, "host_data")
+	require.NoError(t, os.MkdirAll(dataDir, 0o755))
+	require.NoError(t, os.MkdirAll(hostDataDir, 0o755))
+
+	driver := NewDriver(Config{
+		DataDir:     dataDir,
+		HostDataDir: hostDataDir,
+	})
+
+	longSpecialUserID := "org/team/subgroup/user-with-very-long-id-" + strings.Repeat("x", 120)
+	proxyDir := driver.getProxyDir(longSpecialUserID)
+	require.NotEmpty(t, proxyDir)
+
+	// Ensure proxyDir is within dataDir so toHostPath succeeds
+	hostPath, err := driver.toHostPath(proxyDir)
+	require.NoError(t, err, "toHostPath must succeed for long userID with HostDataDir configured")
+	assert.True(t, strings.HasPrefix(hostPath, hostDataDir), "mapped host path must be inside hostDataDir")
+
+	// Verify socket path length
+	sockPath := filepath.Join(proxyDir, "proxy.sock")
+	assert.True(t, len(sockPath) < 108, "proxy.sock path must be < 108 characters")
+}
+
+func TestDockerDriver_RealDocker_ConcurrentExec_OneTimeoutOneSucceeds(t *testing.T) {
+	ctx := context.Background()
+	driver := NewDriver(Config{
+		SocketPath:    "/var/run/docker.sock",
+		AllowedImages: []string{"alpine:latest"},
+		CPULimit:      1.0,
+		MemoryLimitMB: 256,
+		DataDir:       t.TempDir(),
+	})
+
+	if !driver.Available(ctx) {
+		t.Skip("Docker daemon is not available on host, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	workspace := filepath.Join(tempDir, "user_concurrent_timeout")
+	require.NoError(t, os.MkdirAll(workspace, 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID:      "user_conc_timeout",
+		DockerImage: "alpine:latest",
+		Network: sandbox.NetworkPolicy{
+			Mode: sandbox.NetworkNone,
+		},
+		Status: sandbox.StatusRunning,
+	}
+
+	err := driver.Create(ctx, sbx, workspace)
+	require.NoError(t, err)
+	defer func() { _ = driver.Destroy(ctx, sbx) }()
+
+	var wg sync.WaitGroup
+	var resTimeout, resSuccess *sandbox.ExecResult
+	var errTimeout, errSuccess error
+
+	wg.Add(2)
+
+	// Exec 1: sleep 10 with 500ms timeout -> should time out and be killed
+	go func() {
+		defer wg.Done()
+		resTimeout, errTimeout = driver.Exec(ctx, sbx, []string{"sleep", "10"}, 500*time.Millisecond)
+	}()
+
+	// Exec 2: sleep 1 with 5s timeout -> should succeed concurrently without being killed by Exec 1
+	go func() {
+		defer wg.Done()
+		time.Sleep(100 * time.Millisecond) // ensure Exec 1 starts first
+		resSuccess, errSuccess = driver.Exec(ctx, sbx, []string{"sleep", "1"}, 5*time.Second)
+	}()
+
+	wg.Wait()
+
+	require.NoError(t, errTimeout)
+	require.NotNil(t, resTimeout)
+	assert.Equal(t, -1, resTimeout.ExitCode)
+	assert.Contains(t, resTimeout.Stderr, "command timed out")
+
+	require.NoError(t, errSuccess)
+	require.NotNil(t, resSuccess)
+	assert.Equal(t, 0, resSuccess.ExitCode, "concurrent exec must succeed and not be killed by timeout of another exec")
+}
+

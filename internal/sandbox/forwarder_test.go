@@ -1,6 +1,10 @@
 package sandbox
 
 import (
+	"bytes"
+	"compress/gzip"
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -19,7 +23,7 @@ func TestEnsureForwarderBinary_ExistingTarget(t *testing.T) {
 	targetPath := filepath.Join(binDir, "bob-proxy-fwd")
 	require.NoError(t, os.WriteFile(targetPath, []byte("#!/bin/sh\nexit 0\n"), 0o644))
 
-	res, err := EnsureForwarderBinary(tempDataDir)
+	res, err := EnsureForwarderBinary(ForwarderConfig{DataDir: tempDataDir})
 	require.NoError(t, err)
 	assert.Equal(t, targetPath, res)
 
@@ -28,15 +32,16 @@ func TestEnsureForwarderBinary_ExistingTarget(t *testing.T) {
 	assert.Equal(t, os.FileMode(0o755), info.Mode().Perm())
 }
 
-func TestEnsureForwarderBinary_CustomEnvOverride(t *testing.T) {
+func TestEnsureForwarderBinary_CustomPath(t *testing.T) {
 	tempDir := t.TempDir()
 	customPath := filepath.Join(tempDir, "custom-fwd")
 	require.NoError(t, os.WriteFile(customPath, []byte("custom-binary-payload"), 0o755))
 
-	t.Setenv("SANDBOX_PROXY_FWD_PATH", customPath)
-
 	tempDataDir := filepath.Join(tempDir, "data")
-	res, err := EnsureForwarderBinary(tempDataDir)
+	res, err := EnsureForwarderBinary(ForwarderConfig{
+		DataDir:      tempDataDir,
+		ProxyFwdPath: customPath,
+	})
 	require.NoError(t, err)
 
 	expectedTarget := filepath.Join(tempDataDir, "bin", "bob-proxy-fwd")
@@ -47,13 +52,69 @@ func TestEnsureForwarderBinary_CustomEnvOverride(t *testing.T) {
 	assert.Equal(t, []byte("custom-binary-payload"), content)
 }
 
+func TestEnsureForwarderBinary_Embedded(t *testing.T) {
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	_, err := gw.Write([]byte("#!/bin/sh\necho embedded\n"))
+	require.NoError(t, err)
+	require.NoError(t, gw.Close())
+
+	origReader := readEmbeddedForwarder
+	readEmbeddedForwarder = func() ([]byte, error) {
+		return buf.Bytes(), nil
+	}
+	t.Cleanup(func() {
+		readEmbeddedForwarder = origReader
+	})
+
+	tempDataDir := t.TempDir()
+	res, err := EnsureForwarderBinary(ForwarderConfig{
+		DataDir:           tempDataDir,
+		AllowRuntimeBuild: BoolPtr(false),
+	})
+	require.NoError(t, err)
+
+	expectedTarget := filepath.Join(tempDataDir, "bin", "bob-proxy-fwd")
+	assert.Equal(t, expectedTarget, res)
+
+	content, err := os.ReadFile(res)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("#!/bin/sh\necho embedded\n"), content)
+
+	info, err := os.Stat(res)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o755), info.Mode().Perm())
+
+	hashPath := res + ".sha256"
+	hashContent, err := os.ReadFile(hashPath)
+	require.NoError(t, err)
+	expectedHash := fmt.Sprintf("%x\n", sha256.Sum256(buf.Bytes()))
+	assert.Equal(t, expectedHash, string(hashContent))
+
+	// Fast path cache hit
+	res2, err := EnsureForwarderBinary(ForwarderConfig{
+		DataDir:           tempDataDir,
+		AllowRuntimeBuild: BoolPtr(false),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, expectedTarget, res2)
+}
+
 func TestEnsureForwarderBinary_CompileOnDemand(t *testing.T) {
+	origReader := readEmbeddedForwarder
+	readEmbeddedForwarder = func() ([]byte, error) {
+		return nil, os.ErrNotExist
+	}
+	t.Cleanup(func() {
+		readEmbeddedForwarder = origReader
+	})
+
 	tempDataDir := t.TempDir()
 
-	// Clear custom env
-	t.Setenv("SANDBOX_PROXY_FWD_PATH", "")
-
-	res, err := EnsureForwarderBinary(tempDataDir)
+	res, err := EnsureForwarderBinary(ForwarderConfig{
+		DataDir:           tempDataDir,
+		AllowRuntimeBuild: BoolPtr(true),
+	})
 	require.NoError(t, err)
 
 	expectedTarget := filepath.Join(tempDataDir, "bin", "bob-proxy-fwd")
@@ -67,7 +128,6 @@ func TestEnsureForwarderBinary_CompileOnDemand(t *testing.T) {
 
 func TestEnsureForwarderBinary_Concurrency(t *testing.T) {
 	tempDataDir := t.TempDir()
-	t.Setenv("SANDBOX_PROXY_FWD_PATH", "")
 
 	const numGoroutines = 20
 	var wg sync.WaitGroup
@@ -79,7 +139,10 @@ func TestEnsureForwarderBinary_Concurrency(t *testing.T) {
 	for i := 0; i < numGoroutines; i++ {
 		go func(idx int) {
 			defer wg.Done()
-			results[idx], errorsList[idx] = EnsureForwarderBinary(tempDataDir)
+			results[idx], errorsList[idx] = EnsureForwarderBinary(ForwarderConfig{
+				DataDir:           tempDataDir,
+				AllowRuntimeBuild: BoolPtr(true),
+			})
 		}(i)
 	}
 
@@ -97,10 +160,12 @@ func TestEnsureForwarderBinary_CacheInvalidation(t *testing.T) {
 	customPath := filepath.Join(tempDir, "custom-fwd")
 	require.NoError(t, os.WriteFile(customPath, []byte("version-1"), 0o755))
 
-	t.Setenv("SANDBOX_PROXY_FWD_PATH", customPath)
 	tempDataDir := filepath.Join(tempDir, "data")
 
-	res1, err := EnsureForwarderBinary(tempDataDir)
+	res1, err := EnsureForwarderBinary(ForwarderConfig{
+		DataDir:      tempDataDir,
+		ProxyFwdPath: customPath,
+	})
 	require.NoError(t, err)
 	content1, err := os.ReadFile(res1)
 	require.NoError(t, err)
@@ -110,7 +175,10 @@ func TestEnsureForwarderBinary_CacheInvalidation(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	require.NoError(t, os.WriteFile(customPath, []byte("version-2-updated"), 0o755))
 
-	res2, err := EnsureForwarderBinary(tempDataDir)
+	res2, err := EnsureForwarderBinary(ForwarderConfig{
+		DataDir:      tempDataDir,
+		ProxyFwdPath: customPath,
+	})
 	require.NoError(t, err)
 	content2, err := os.ReadFile(res2)
 	require.NoError(t, err)
@@ -118,27 +186,43 @@ func TestEnsureForwarderBinary_CacheInvalidation(t *testing.T) {
 }
 
 func TestEnsureForwarderBinary_BuildDisabled_NotFound(t *testing.T) {
-	tempDataDir := t.TempDir()
-	t.Setenv("SANDBOX_PROXY_FWD_PATH", "")
-	t.Setenv("BOB_ALLOW_RUNTIME_BUILD", "0")
+	origReader := readEmbeddedForwarder
+	readEmbeddedForwarder = func() ([]byte, error) {
+		return nil, os.ErrNotExist
+	}
+	t.Cleanup(func() {
+		readEmbeddedForwarder = origReader
+	})
 
-	_, err := EnsureForwarderBinary(tempDataDir)
+	tempDataDir := t.TempDir()
+
+	_, err := EnsureForwarderBinary(ForwarderConfig{
+		DataDir:           tempDataDir,
+		AllowRuntimeBuild: BoolPtr(false),
+	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "bob-proxy-fwd binary not found and cannot be built")
 }
 
-func TestEnsureForwarderBinary_InvalidCustomEnv(t *testing.T) {
+func TestEnsureForwarderBinary_InvalidCustomPath(t *testing.T) {
 	tempDataDir := t.TempDir()
-	t.Setenv("SANDBOX_PROXY_FWD_PATH", "/nonexistent/path/never_exists")
 
-	_, err := EnsureForwarderBinary(tempDataDir)
+	_, err := EnsureForwarderBinary(ForwarderConfig{
+		DataDir:      tempDataDir,
+		ProxyFwdPath: "/nonexistent/path/never_exists",
+	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "custom forwarder binary")
 }
 
 func TestEnsureForwarderBinary_CandidateSearch(t *testing.T) {
-	t.Setenv("SANDBOX_PROXY_FWD_PATH", "")
-	t.Setenv("BOB_ALLOW_RUNTIME_BUILD", "0")
+	origReader := readEmbeddedForwarder
+	readEmbeddedForwarder = func() ([]byte, error) {
+		return nil, os.ErrNotExist
+	}
+	t.Cleanup(func() {
+		readEmbeddedForwarder = origReader
+	})
 
 	execPath, err := os.Executable()
 	require.NoError(t, err)
@@ -202,7 +286,10 @@ func TestEnsureForwarderBinary_CandidateSearch(t *testing.T) {
 			require.NoError(t, os.WriteFile(candPath, payload, 0o755))
 
 			tempDataDir := t.TempDir()
-			res, err := EnsureForwarderBinary(tempDataDir)
+			res, err := EnsureForwarderBinary(ForwarderConfig{
+				DataDir:           tempDataDir,
+				AllowRuntimeBuild: BoolPtr(false),
+			})
 			require.NoError(t, err)
 
 			expected := filepath.Join(tempDataDir, "bin", "bob-proxy-fwd")
@@ -219,13 +306,26 @@ func TestEnsureForwarderBinary_CandidateSearch(t *testing.T) {
 	}
 }
 
+func TestEnsureForwarderBinaryPath_Helper(t *testing.T) {
+	tempDataDir := t.TempDir()
+	binDir := filepath.Join(tempDataDir, "bin")
+	require.NoError(t, os.MkdirAll(binDir, 0o755))
+
+	targetPath := filepath.Join(binDir, "bob-proxy-fwd")
+	require.NoError(t, os.WriteFile(targetPath, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+
+	res, err := EnsureForwarderBinaryPath(tempDataDir)
+	require.NoError(t, err)
+	assert.Equal(t, targetPath, res)
+}
+
 func TestCopyFile_AtomicAndSecure(t *testing.T) {
 	tempDir := t.TempDir()
 	src := filepath.Join(tempDir, "src.txt")
 	dst := filepath.Join(tempDir, "sub", "dst.txt")
 
 	require.NoError(t, os.WriteFile(src, []byte("secure-payload"), 0o600))
-	err := copyFile(src, dst, 0o755)
+	err := CopyFile(src, dst, 0o755)
 	require.NoError(t, err)
 
 	content, err := os.ReadFile(dst)

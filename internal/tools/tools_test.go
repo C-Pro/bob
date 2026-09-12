@@ -514,7 +514,7 @@ func TestSandboxToolDefinitionsScope(t *testing.T) {
 	}
 
 	mockDriver := &mockSandboxDriver{available: true}
-	sandboxMgr := sandbox.NewManager(cfg, []sandbox.Driver{mockDriver})
+	sandboxMgr := sandbox.NewManager(cfg.SandboxConfig(), []sandbox.Driver{mockDriver})
 	defer func() { _ = sandboxMgr.Close() }()
 
 	reg := NewRegistry(nil, nil, sandboxMgr)
@@ -548,7 +548,7 @@ func TestSandboxToolExecution(t *testing.T) {
 	}
 
 	mockDriver := &mockSandboxDriver{available: true}
-	sandboxMgr := sandbox.NewManager(cfg, []sandbox.Driver{mockDriver})
+	sandboxMgr := sandbox.NewManager(cfg.SandboxConfig(), []sandbox.Driver{mockDriver})
 	defer func() { _ = sandboxMgr.Close() }()
 
 	reg := NewRegistry(nil, nil, sandboxMgr)
@@ -615,7 +615,7 @@ func TestExecuteSandboxRequest_NotifierError(t *testing.T) {
 		SandboxDrivers: []string{"bwrap"},
 	}
 	mockDriver := &mockSandboxDriver{available: true}
-	sandboxMgr := sandbox.NewManager(cfg, []sandbox.Driver{mockDriver})
+	sandboxMgr := sandbox.NewManager(cfg.SandboxConfig(), []sandbox.Driver{mockDriver})
 	defer func() { _ = sandboxMgr.Close() }()
 
 	reg := NewRegistry(nil, nil, sandboxMgr)

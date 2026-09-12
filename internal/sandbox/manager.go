@@ -11,8 +11,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"bob/internal/config"
 )
 
 // RequestParams contains the parameters requested by an agent for creating a sandbox.
@@ -29,7 +27,7 @@ type RequestParams struct {
 // Manager orchestrates user sandboxes, enforces the 1-sandbox-per-user limit,
 // handles user approval transitions, and cleans up expired sessions.
 type Manager struct {
-	cfg       *config.Config
+	cfg       Config
 	drivers   map[DriverType]Driver
 	sandboxes map[string]*UserSandbox // Keyed strictly by UserID
 	mu        sync.Mutex
@@ -38,7 +36,7 @@ type Manager struct {
 }
 
 // NewManager creates a new Sandbox Manager and registers configured drivers.
-func NewManager(cfg *config.Config, drivers []Driver) *Manager {
+func NewManager(cfg Config, drivers []Driver) *Manager {
 	driverMap := make(map[DriverType]Driver)
 	for _, d := range drivers {
 		driverMap[d.Type()] = d
@@ -95,7 +93,7 @@ func (m *Manager) Close() error {
 // AvailableDrivers returns a list of driver types that are currently available and operational.
 func (m *Manager) AvailableDrivers(ctx context.Context) []DriverType {
 	var available []DriverType
-	for _, driverName := range m.cfg.SandboxDrivers {
+	for _, driverName := range m.cfg.Drivers {
 		dt := DriverType(strings.TrimSpace(driverName))
 		if d, ok := m.drivers[dt]; ok && d.Available(ctx) {
 			available = append(available, dt)
@@ -106,8 +104,8 @@ func (m *Manager) AvailableDrivers(ctx context.Context) []DriverType {
 
 // AllowedNetworkModes returns the configured permitted network modes.
 func (m *Manager) AllowedNetworkModes() []string {
-	if m.cfg != nil && len(m.cfg.SandboxAllowedNetworkModes) > 0 {
-		return m.cfg.SandboxAllowedNetworkModes
+	if len(m.cfg.AllowedNetworkModes) > 0 {
+		return m.cfg.AllowedNetworkModes
 	}
 	return []string{string(NetworkNone), string(NetworkRestricted)}
 }
@@ -132,7 +130,7 @@ func (m *Manager) UserWorkspaceDir(userID string) (string, error) {
 
 // RequestSandbox creates a pending sandbox request awaiting explicit human user approval.
 func (m *Manager) RequestSandbox(ctx context.Context, userID, chatID string, params RequestParams) (*UserSandbox, error) {
-	if !m.cfg.SandboxEnabled {
+	if !m.cfg.Enabled {
 		return nil, errors.New("sandbox execution is disabled by configuration")
 	}
 	if strings.TrimSpace(userID) == "" {
@@ -188,7 +186,7 @@ func (m *Manager) RequestSandbox(ctx context.Context, userID, chatID string, par
 
 	// Validate driver
 	available := false
-	for _, driverName := range m.cfg.SandboxDrivers {
+	for _, driverName := range m.cfg.Drivers {
 		if DriverType(strings.TrimSpace(driverName)) == params.Driver {
 			if d, ok := m.drivers[params.Driver]; ok && d.Available(ctx) {
 				available = true
@@ -202,7 +200,7 @@ func (m *Manager) RequestSandbox(ctx context.Context, userID, chatID string, par
 
 	// Validate image if docker driver
 	if params.Driver == DriverDocker {
-		if err := ValidateImage(params.DockerImage, m.cfg.SandboxAllowedImages); err != nil {
+		if err := ValidateImage(params.DockerImage, m.cfg.AllowedImages); err != nil {
 			return nil, err
 		}
 	}
@@ -232,8 +230,8 @@ func (m *Manager) RequestSandbox(ctx context.Context, userID, chatID string, par
 
 	// Calculate lifetime
 	lifetime := time.Duration(params.LifetimeMinutes) * time.Minute
-	if lifetime <= 0 || lifetime > m.cfg.SandboxMaxLifetime {
-		lifetime = m.cfg.SandboxMaxLifetime
+	if lifetime <= 0 || lifetime > m.cfg.MaxLifetime {
+		lifetime = m.cfg.MaxLifetime
 	}
 
 	now := time.Now()
@@ -367,13 +365,13 @@ func (m *Manager) Exec(ctx context.Context, userID string, cmd []string, request
 	// Clamp execution timeout
 	execTimeout := requestedTimeout
 	if execTimeout <= 0 {
-		execTimeout = m.cfg.SandboxDefaultExecTimeout
+		execTimeout = m.cfg.DefaultExecTimeout
 	}
 	if execTimeout < 5*time.Second {
 		execTimeout = 5 * time.Second
 	}
-	if execTimeout > m.cfg.SandboxMaxExecTimeout {
-		execTimeout = m.cfg.SandboxMaxExecTimeout
+	if execTimeout > m.cfg.MaxExecTimeout {
+		execTimeout = m.cfg.MaxExecTimeout
 	}
 
 	return driver.Exec(ctx, sbx, cmd, execTimeout)

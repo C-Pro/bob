@@ -1,0 +1,1 @@
+# This directory holds embedded assets for the sandbox package, such as bob-proxy-fwd.gz.

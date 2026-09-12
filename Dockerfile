@@ -15,8 +15,11 @@ COPY . .
 ARG TARGETOS
 ARG TARGETARCH
 ENV GOEXPERIMENT=simd
+RUN mkdir -p bin internal/sandbox/embedded && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -mod=vendor -ldflags="-w -s" -o bin/bob-proxy-fwd ./cmd/bob-proxy-fwd && \
+    gzip -c -9 bin/bob-proxy-fwd > internal/sandbox/embedded/bob-proxy-fwd.gz
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -mod=vendor -ldflags="-w -s" -o agent ./cmd/agent
-RUN mkdir -p /data/bin && CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -mod=vendor -ldflags="-w -s" -o /data/bin/bob-proxy-fwd ./cmd/bob-proxy-fwd && chmod 0755 /data/bin/bob-proxy-fwd && chown -R appuser:appuser /data
+RUN mkdir -p /data/bin && cp bin/bob-proxy-fwd /data/bin/bob-proxy-fwd && chmod 0755 /data/bin/bob-proxy-fwd && chown -R appuser:appuser /data
 
 # Final stage
 FROM scratch

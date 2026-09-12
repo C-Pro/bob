@@ -2,6 +2,8 @@ package bwrap
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -22,8 +24,11 @@ type Driver struct {
 	cpuLimit           float64
 	memoryLimitMB      int
 	dataDir            string
+	proxyFwdPath       string
+	allowRuntimeBuild  *bool
 	forwarderBinary    string
 	forwarderPort      int
+	fwdMu              sync.Mutex
 	mu                 sync.Mutex
 	proxies            map[string]*sandbox.FilteringProxy // keyed by userID
 	customBlockedCIDRs []string
@@ -36,6 +41,8 @@ type Config struct {
 	CustomBlockedCIDRs []string
 	ForwarderPort      int
 	DataDir            string
+	ProxyFwdPath       string
+	AllowRuntimeBuild  *bool
 }
 
 // NewDriver creates a new Bubblewrap driver with default limits.
@@ -67,6 +74,8 @@ func NewDriverWithConfig(cfg Config) *Driver {
 		cpuLimit:           cpu,
 		memoryLimitMB:      mem,
 		dataDir:            dataDir,
+		proxyFwdPath:       cfg.ProxyFwdPath,
+		allowRuntimeBuild:  cfg.AllowRuntimeBuild,
 		customBlockedCIDRs: cfg.CustomBlockedCIDRs,
 		forwarderPort:      fwdPort,
 		proxies:            make(map[string]*sandbox.FilteringProxy),
@@ -74,12 +83,16 @@ func NewDriverWithConfig(cfg Config) *Driver {
 }
 
 func (d *Driver) getForwarderBinary() (string, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.fwdMu.Lock()
+	defer d.fwdMu.Unlock()
 	if d.forwarderBinary != "" {
 		return d.forwarderBinary, nil
 	}
-	fwd, err := sandbox.EnsureForwarderBinary(d.dataDir)
+	fwd, err := sandbox.EnsureForwarderBinary(sandbox.ForwarderConfig{
+		DataDir:           d.dataDir,
+		ProxyFwdPath:      d.proxyFwdPath,
+		AllowRuntimeBuild: d.allowRuntimeBuild,
+	})
 	if err != nil {
 		return "", fmt.Errorf("failed to ensure forwarder binary: %w", err)
 	}
@@ -126,14 +139,9 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 		if _, err := d.getForwarderBinary(); err != nil {
 			return fmt.Errorf("failed to ensure forwarder binary for user %s: %w", sbx.UserID, err)
 		}
-		d.mu.Lock()
-		defer d.mu.Unlock()
-		if existing, ok := d.proxies[sbx.UserID]; ok {
-			if err := existing.Close(); err != nil {
-				slog.Warn("failed to close existing bwrap proxy", "user", sbx.UserID, "error", err)
-			}
-		}
-		sockDir, err := os.MkdirTemp("", fmt.Sprintf("bob-proxy-%s-", sbx.UserID))
+
+		h := sha256.Sum256([]byte(sbx.UserID))
+		sockDir, err := os.MkdirTemp("", fmt.Sprintf("bob-p-%s-", hex.EncodeToString(h[:4])))
 		if err != nil {
 			return fmt.Errorf("failed to create proxy socket directory: %w", err)
 		}
@@ -145,9 +153,18 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 			CustomBlocked: d.customBlockedCIDRs,
 		})
 		if err != nil {
+			_ = os.RemoveAll(sockDir)
 			return fmt.Errorf("failed to start filtering proxy for user %s: %w", sbx.UserID, err)
 		}
+
+		d.mu.Lock()
+		if existing, ok := d.proxies[sbx.UserID]; ok {
+			if err := existing.Close(); err != nil {
+				slog.Warn("failed to close existing bwrap proxy", "user", sbx.UserID, "error", err)
+			}
+		}
 		d.proxies[sbx.UserID] = proxy
+		d.mu.Unlock()
 	}
 
 	return nil

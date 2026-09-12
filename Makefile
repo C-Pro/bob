@@ -3,8 +3,9 @@
 all: check
 
 build-fwd:
-	mkdir -p bin
+	mkdir -p bin internal/sandbox/embedded
 	CGO_ENABLED=0 GOOS=linux GOARCH=$(shell go env GOARCH) go build -ldflags="-w -s" -o bin/bob-proxy-fwd ./cmd/bob-proxy-fwd
+	gzip -c -9 bin/bob-proxy-fwd > internal/sandbox/embedded/bob-proxy-fwd.gz
 
 check: build-fwd lint-go test-go semgrep osv-scanner
 

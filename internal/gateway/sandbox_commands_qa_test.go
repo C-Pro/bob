@@ -88,7 +88,7 @@ func setupGatewayQATestEnvironment(t *testing.T) (*Gateway, *sandbox.Manager, ch
 	gw.httpClient = server.Client()
 
 	mockDriver := &mockGatewaySandboxDriver{}
-	sm := sandbox.NewManager(cfg, []sandbox.Driver{mockDriver})
+	sm := sandbox.NewManager(cfg.SandboxConfig(), []sandbox.Driver{mockDriver})
 	gw.SetSandboxManager(sm)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -391,7 +391,7 @@ func TestGateway_SandboxStatusCommand(t *testing.T) {
 	t.Run("status with expired sandbox", func(t *testing.T) {
 		shortCfg := *gw.cfg
 		shortCfg.SandboxMaxLifetime = 20 * time.Millisecond
-		shortSM := sandbox.NewManager(&shortCfg, []sandbox.Driver{&mockGatewaySandboxDriver{}})
+		shortSM := sandbox.NewManager(shortCfg.SandboxConfig(), []sandbox.Driver{&mockGatewaySandboxDriver{}})
 		defer func() { _ = shortSM.Close() }()
 
 		gw.SetSandboxManager(shortSM)

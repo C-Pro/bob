@@ -363,7 +363,8 @@ func TestBwrapDriver_BuildArgs_NetworkRestricted(t *testing.T) {
 func TestBwrapDriver_Exec_EnsureForwarderBinaryFailure(t *testing.T) {
 	tempDir := t.TempDir()
 	driver := NewDriverWithConfig(Config{
-		DataDir: filepath.Join(tempDir, "data"),
+		DataDir:      filepath.Join(tempDir, "data"),
+		ProxyFwdPath: filepath.Join(tempDir, "nonexistent", "fwd"),
 	})
 	driver.bwrapPath = "/bin/true"
 
@@ -387,10 +388,69 @@ func TestBwrapDriver_Exec_EnsureForwarderBinaryFailure(t *testing.T) {
 	driver.proxies[sbx.UserID] = mockProxy
 	driver.mu.Unlock()
 
-	t.Setenv("SANDBOX_PROXY_FWD_PATH", filepath.Join(tempDir, "nonexistent", "fwd"))
-
 	res, err := driver.Exec(context.Background(), sbx, []string{"echo", "hi"}, 5*time.Second)
 	require.Error(t, err)
 	assert.Nil(t, res)
 	assert.Contains(t, err.Error(), "failed to ensure forwarder binary")
 }
+
+func TestBwrapDriver_Create_LongAndSpecialUserID(t *testing.T) {
+	tempDir := t.TempDir()
+	driver := NewDriverWithConfig(Config{
+		DataDir: filepath.Join(tempDir, "data"),
+	})
+	driver.bwrapPath = "/bin/true"
+
+	fwdPath := filepath.Join(tempDir, "data", "bin", "bob-proxy-fwd")
+	require.NoError(t, os.MkdirAll(filepath.Dir(fwdPath), 0o755))
+	require.NoError(t, os.WriteFile(fwdPath, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID: "team/special/user-with-very-long-id-" + strings.Repeat("a", 100),
+		Network: sandbox.NetworkPolicy{
+			Mode: sandbox.NetworkRestricted,
+		},
+	}
+	workspace := filepath.Join(tempDir, "workspace")
+
+	ctx := context.Background()
+	err := driver.Create(ctx, sbx, workspace)
+	require.NoError(t, err)
+	defer func() { _ = driver.Destroy(ctx, sbx) }()
+
+	driver.mu.Lock()
+	p := driver.proxies[sbx.UserID]
+	driver.mu.Unlock()
+	require.NotNil(t, p)
+	assert.FileExists(t, p.SocketPath())
+}
+
+func TestBwrapDriver_GetForwarderBinary_DoesNotBlockMu(t *testing.T) {
+	tempDir := t.TempDir()
+	driver := NewDriverWithConfig(Config{
+		DataDir: filepath.Join(tempDir, "data"),
+	})
+	driver.bwrapPath = "/bin/true"
+
+	fwdPath := filepath.Join(tempDir, "data", "bin", "bob-proxy-fwd")
+	require.NoError(t, os.MkdirAll(filepath.Dir(fwdPath), 0o755))
+	require.NoError(t, os.WriteFile(fwdPath, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+
+	// Acquire fwdMu and verify d.mu operations (like Available) are unblocked
+	driver.fwdMu.Lock()
+	done := make(chan bool, 1)
+	go func() {
+		// Available acquires d.mu; it should not block on fwdMu
+		_ = driver.Available(context.Background())
+		done <- true
+	}()
+
+	select {
+	case <-done:
+		// success: Available did not block
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("driver.Available() blocked while fwdMu was held")
+	}
+	driver.fwdMu.Unlock()
+}
+

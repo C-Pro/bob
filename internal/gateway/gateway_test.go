@@ -2046,7 +2046,7 @@ func TestGateway_SandboxSlashCommands(t *testing.T) {
 	gw.httpClient = server.Client()
 
 	mockDriver := &mockGatewaySandboxDriver{}
-	sm := sandbox.NewManager(cfg, []sandbox.Driver{mockDriver})
+	sm := sandbox.NewManager(cfg.SandboxConfig(), []sandbox.Driver{mockDriver})
 	gw.SetSandboxManager(sm)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -2208,7 +2208,7 @@ func TestGateway_BotCannotApproveSandbox(t *testing.T) {
 	gw.httpClient = server.Client()
 
 	mockDriver := &mockGatewaySandboxDriver{}
-	sm := sandbox.NewManager(cfg, []sandbox.Driver{mockDriver})
+	sm := sandbox.NewManager(cfg.SandboxConfig(), []sandbox.Driver{mockDriver})
 	gw.SetSandboxManager(sm)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -2346,7 +2346,7 @@ func TestGateway_SandboxApproveAutoResumesTask(t *testing.T) {
 	gw.httpClient = besedkaServer.Client()
 
 	mockDriver := &mockGatewaySandboxDriver{}
-	sm := sandbox.NewManager(cfg, []sandbox.Driver{mockDriver})
+	sm := sandbox.NewManager(cfg.SandboxConfig(), []sandbox.Driver{mockDriver})
 	gw.SetSandboxManager(sm)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -2503,7 +2503,7 @@ func TestGateway_SandboxApproveGeminiResumption_NoTrailingAssistant(t *testing.T
 	gw.httpClient = besedkaServer.Client()
 
 	mockDriver := &mockGatewaySandboxDriver{}
-	sm := sandbox.NewManager(cfg, []sandbox.Driver{mockDriver})
+	sm := sandbox.NewManager(cfg.SandboxConfig(), []sandbox.Driver{mockDriver})
 	gw.SetSandboxManager(sm)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -2670,7 +2670,7 @@ func TestGateway_SandboxRequestSuppressesRedundantReply(t *testing.T) {
 	gw.httpClient = besedkaServer.Client()
 
 	mockDriver := &mockGatewaySandboxDriver{}
-	sm := sandbox.NewManager(cfg, []sandbox.Driver{mockDriver})
+	sm := sandbox.NewManager(cfg.SandboxConfig(), []sandbox.Driver{mockDriver})
 	gw.SetSandboxManager(sm)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

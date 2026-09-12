@@ -32,6 +32,8 @@ type Driver struct {
 	memoryLimitMB      int
 	dataDir            string
 	hostDataDir        string
+	proxyFwdPath       string
+	allowRuntimeBuild  *bool
 	client             *http.Client
 	mu                 sync.Mutex
 	proxies            map[string]*sandbox.FilteringProxy // keyed by userID
@@ -48,6 +50,8 @@ type Config struct {
 	MemoryLimitMB      int
 	DataDir            string
 	HostDataDir        string
+	ProxyFwdPath       string
+	AllowRuntimeBuild  *bool
 	CustomBlockedCIDRs []string
 	ForwarderPort      int
 	Resolver           *net.Resolver
@@ -92,6 +96,8 @@ func NewDriver(cfg Config) *Driver {
 		memoryLimitMB:      mem,
 		dataDir:            strings.TrimSpace(cfg.DataDir),
 		hostDataDir:        hostData,
+		proxyFwdPath:       cfg.ProxyFwdPath,
+		allowRuntimeBuild:  cfg.AllowRuntimeBuild,
 		customBlockedCIDRs: cfg.CustomBlockedCIDRs,
 		forwarderPort:      fwdPort,
 		resolver:           cfg.Resolver,
@@ -104,11 +110,15 @@ func NewDriver(cfg Config) *Driver {
 }
 
 // toHostPath translates a container-local path under dataDir to the corresponding hostDataDir path.
-// If hostDataDir is empty, containerPath is returned unchanged as host and container paths match.
+// If hostDataDir is empty, containerPath is resolved to an absolute host path.
 // If hostDataDir is set, containerPath must be within dataDir, otherwise an error is returned.
 func (d *Driver) toHostPath(containerPath string) (string, error) {
+	absContainerPath, err := filepath.Abs(containerPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve container path %q: %w", containerPath, err)
+	}
 	if d.hostDataDir == "" {
-		return containerPath, nil
+		return absContainerPath, nil
 	}
 	if d.dataDir == "" {
 		return "", errors.New("host data directory is configured but data directory is empty")
@@ -117,11 +127,7 @@ func (d *Driver) toHostPath(containerPath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to resolve data directory %q: %w", d.dataDir, err)
 	}
-	absPath, err := filepath.Abs(containerPath)
-	if err != nil {
-		return "", fmt.Errorf("failed to resolve container path %q: %w", containerPath, err)
-	}
-	rel, err := filepath.Rel(absData, absPath)
+	rel, err := filepath.Rel(absData, absContainerPath)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("path %q is outside data directory %q and cannot be mapped to host data directory %q", containerPath, d.dataDir, d.hostDataDir)
 	}
@@ -176,23 +182,28 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 	createdProxy := false
 	var restrictedBinds []string
 	if sbx.Network.Mode == sandbox.NetworkRestricted {
-		fwdBinary, err := sandbox.EnsureForwarderBinary(d.dataDir)
+		fwdBinary, err := sandbox.EnsureForwarderBinary(sandbox.ForwarderConfig{
+			DataDir:           d.dataDir,
+			ProxyFwdPath:      d.proxyFwdPath,
+			AllowRuntimeBuild: d.allowRuntimeBuild,
+		})
 		if err != nil {
 			return fmt.Errorf("failed to ensure proxy forwarder binary: %w", err)
-		}
-		hostFwdPath, err := d.toHostPath(fwdBinary)
-		if err != nil {
-			return fmt.Errorf("failed to resolve host path for forwarder binary: %w", err)
 		}
 
 		proxyDir := d.getProxyDir(sbx.UserID)
 		if err := os.MkdirAll(proxyDir, 0o755); err != nil {
 			return fmt.Errorf("failed to create proxy directory: %w", err)
 		}
-		// Create empty placeholder for /run/proxy/fwd so runc can mount hostFwdPath into read-only /run/proxy
-		fwdPlaceholder := filepath.Join(proxyDir, "fwd")
-		if err := os.WriteFile(fwdPlaceholder, nil, 0o755); err != nil {
-			return fmt.Errorf("failed to create forwarder mountpoint placeholder: %w", err)
+		// Hardlink or copy real forwarder binary into proxyDir/fwd so a single bind mount
+		// /run/proxy:ro contains both the forwarder binary and unix domain socket without
+		// fragile overlapping mounts.
+		fwdDest := filepath.Join(proxyDir, "fwd")
+		_ = os.Remove(fwdDest)
+		if err := os.Link(fwdBinary, fwdDest); err != nil {
+			if err := sandbox.CopyFile(fwdBinary, fwdDest, 0o755); err != nil {
+				return fmt.Errorf("failed to prepare forwarder binary in proxy directory: %w", err)
+			}
 		}
 		hostProxyDir, err := d.toHostPath(proxyDir)
 		if err != nil {
@@ -227,7 +238,6 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 		d.mu.Unlock()
 
 		restrictedBinds = append(restrictedBinds,
-			fmt.Sprintf("%s:/run/proxy/fwd:ro", hostFwdPath),
 			fmt.Sprintf("%s:/run/proxy:ro", hostProxyDir),
 		)
 	}
@@ -432,10 +442,14 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 	execCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	h := sha256.Sum256([]byte(fmt.Sprintf("%s-%d", sbx.UserID, time.Now().UnixNano())))
+	execToken := hex.EncodeToString(h[:8])
+
 	var env []string
 	env = append(env,
 		"HOME="+sandbox.DefaultWorkspaceMountPath,
 		"PWD="+sandbox.DefaultWorkspaceMountPath,
+		"BOB_EXEC_TOKEN="+execToken,
 	)
 	if sbx.Network.Mode == sandbox.NetworkRestricted {
 		d.mu.Lock()
@@ -510,7 +524,7 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 	startResp, err := d.client.Do(startReq)
 	if err != nil {
 		if execCtx.Err() != nil {
-			d.killExecProcess(internalID, execID)
+			d.killExecProcess(internalID, execToken)
 			return &sandbox.ExecResult{
 				ExitCode: -1,
 				Stdout:   "",
@@ -527,7 +541,7 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 	err = demuxDockerStream(startResp.Body, stdout, stderr)
 	duration := time.Since(startTime)
 	if execCtx.Err() != nil {
-		d.killExecProcess(internalID, execID)
+		d.killExecProcess(internalID, execToken)
 		errStr := stderr.String()
 		if errStr != "" {
 			errStr += "\ncommand timed out"
@@ -649,13 +663,53 @@ func demuxDockerStream(r io.Reader, stdout, stderr io.Writer) error {
 	}
 }
 
-func (d *Driver) killExecProcess(internalID, _ string) {
+func (d *Driver) killExecProcess(internalID, execToken string) {
 	if internalID == "" {
 		return
 	}
-	// Restart the container with t=0 (instant SIGKILL).
-	// This synchronously kills all processes in the container cgroup, waits for exit,
-	// and restarts the container with 'sleep infinity', eliminating race conditions.
+
+	// 1. Attempt targeted kill of the specific exec process group via BOB_EXEC_TOKEN.
+	// This preserves PID 1 (e.g. forwarder daemon) and any concurrent exec instances.
+	if execToken != "" {
+		killCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		killCmd := fmt.Sprintf(`for e in /proc/[0-9]*/environ; do if grep -q "BOB_EXEC_TOKEN=%s" "$e" 2>/dev/null; then p="${e%%%%/environ}"; p="${p#/proc/}"; kill -9 "-$p" 2>/dev/null || kill -9 "$p" 2>/dev/null; fi; done`, execToken)
+		execPayload, err := json.Marshal(map[string]interface{}{
+			"AttachStdout": false,
+			"AttachStderr": false,
+			"Cmd":          []string{"sh", "-c", killCmd},
+		})
+		if err == nil {
+			createURL := fmt.Sprintf("http://localhost/containers/%s/exec", internalID)
+			req, err := http.NewRequestWithContext(killCtx, http.MethodPost, createURL, bytes.NewReader(execPayload))
+			if err == nil {
+				req.Header.Set("Content-Type", "application/json")
+				resp, err := d.client.Do(req)
+				if err == nil {
+					defer func() { _ = resp.Body.Close() }()
+					var createResult struct {
+						ID string `json:"Id"`
+					}
+					if err := json.NewDecoder(resp.Body).Decode(&createResult); err == nil && createResult.ID != "" {
+						startURL := fmt.Sprintf("http://localhost/exec/%s/start", createResult.ID)
+						startPayload, _ := json.Marshal(map[string]interface{}{"Detach": true})
+						sReq, err := http.NewRequestWithContext(killCtx, http.MethodPost, startURL, bytes.NewReader(startPayload))
+						if err == nil {
+							sReq.Header.Set("Content-Type", "application/json")
+							if sResp, err := d.client.Do(sReq); err == nil {
+								_ = sResp.Body.Close()
+								return
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Fallback: Restart the container if targeted kill failed or was not possible.
+	slog.Warn("targeted exec kill failed; restarting container", "container", internalID)
 	restartCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -732,14 +786,24 @@ func (d *Driver) pullImage(ctx context.Context, image string) error {
 }
 
 func (d *Driver) getProxyDir(userID string) string {
-	candidate := filepath.Join(d.dataDir, "proxies", userID)
-	if len(filepath.Join(candidate, "proxy.sock")) < 104 {
+	h := sha256.Sum256([]byte(userID))
+	hashStr := hex.EncodeToString(h[:2])
+
+	absData := d.dataDir
+	if abs, err := filepath.Abs(d.dataDir); err == nil {
+		absData = abs
+	}
+
+	candidate := filepath.Join(absData, "proxies", userID)
+	if !strings.Contains(userID, "/") && !strings.Contains(userID, "\\") && len(filepath.Join(candidate, "proxy.sock")) < 104 {
 		return candidate
 	}
-	h := sha256.Sum256([]byte(userID))
-	shortPath := filepath.Join(d.dataDir, "p", hex.EncodeToString(h[:4]))
-	if len(filepath.Join(shortPath, "proxy.sock")) < 104 {
+	shortPath := filepath.Join(absData, "p", hashStr)
+	if len(filepath.Join(shortPath, "proxy.sock")) < 108 {
 		return shortPath
 	}
-	return filepath.Join(os.TempDir(), "b-p", hex.EncodeToString(h[:4]))
+	if d.hostDataDir == "" {
+		return filepath.Join(os.TempDir(), "b-p", hashStr)
+	}
+	return shortPath
 }
