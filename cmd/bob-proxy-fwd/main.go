@@ -16,28 +16,81 @@ import (
 	"time"
 )
 
+const (
+	maxConcurrentConns = 128
+)
+
+var (
+	defaultDialTimeout = 10 * time.Second
+	defaultIdleTimeout = 2 * time.Minute
+)
+
 type closeWriter interface {
 	CloseWrite() error
 }
 
-func bridge(client net.Conn, upstream net.Conn) {
+type idleTimeoutConn struct {
+	net.Conn
+	peer        net.Conn
+	idleTimeout time.Duration
+}
+
+func (c *idleTimeoutConn) Read(b []byte) (int, error) {
+	if c.idleTimeout > 0 {
+		deadline := time.Now().Add(c.idleTimeout)
+		_ = c.SetReadDeadline(deadline)
+		if c.peer != nil {
+			_ = c.peer.SetReadDeadline(deadline)
+		}
+	}
+	return c.Conn.Read(b)
+}
+
+func (c *idleTimeoutConn) Write(b []byte) (int, error) {
+	if c.idleTimeout > 0 {
+		deadline := time.Now().Add(c.idleTimeout)
+		_ = c.SetWriteDeadline(deadline)
+		if c.peer != nil {
+			_ = c.peer.SetReadDeadline(deadline)
+		}
+	}
+	return c.Conn.Write(b)
+}
+
+func (c *idleTimeoutConn) CloseWrite() error {
+	if cw, ok := c.Conn.(closeWriter); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+func bridge(client net.Conn, upstream net.Conn, idleTimeout time.Duration) {
+	if idleTimeout > 0 {
+		initDeadline := time.Now().Add(idleTimeout)
+		_ = client.SetDeadline(initDeadline)
+		_ = upstream.SetDeadline(initDeadline)
+	}
+
+	wrappedClient := &idleTimeoutConn{Conn: client, peer: upstream, idleTimeout: idleTimeout}
+	wrappedUpstream := &idleTimeoutConn{Conn: upstream, peer: client, idleTimeout: idleTimeout}
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	pipe := func(dst, src net.Conn) {
+	pipe := func(dst io.Writer, src io.Reader, dstConn net.Conn) {
 		defer wg.Done()
 		if _, err := io.Copy(dst, src); err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.EOF) {
 			slog.Debug("bridge copy error", "error", err)
 		}
-		if cw, ok := dst.(closeWriter); ok {
+		if cw, ok := dstConn.(closeWriter); ok {
 			_ = cw.CloseWrite()
 		} else {
-			_ = dst.Close()
+			_ = dstConn.Close()
 		}
 	}
 
-	go pipe(upstream, client)
-	go pipe(client, upstream)
+	go pipe(wrappedUpstream, wrappedClient, upstream)
+	go pipe(wrappedClient, wrappedUpstream, client)
 
 	wg.Wait()
 	_ = client.Close()
@@ -61,24 +114,29 @@ func isTemporaryAcceptError(err error) bool {
 func serveForwarder(ctx context.Context, ln net.Listener, sockPath string) error {
 	var connsMu sync.Mutex
 	activeConns := make(map[net.Conn]struct{})
+	sem := make(chan struct{}, maxConcurrentConns)
+	var fwdWg sync.WaitGroup
 
 	go func() {
 		<-ctx.Done()
 		_ = ln.Close()
 
 		connsMu.Lock()
-		for c := range activeConns {
-			_ = c.Close()
+		if len(activeConns) > 0 {
+			for c := range activeConns {
+				_ = c.Close()
+			}
 		}
 		connsMu.Unlock()
 	}()
 
 	var tempDelay time.Duration
+acceptLoop:
 	for {
 		client, err := ln.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
-				return nil
+				break acceptLoop
 			}
 			if isTemporaryAcceptError(err) {
 				if tempDelay == 0 {
@@ -92,28 +150,39 @@ func serveForwarder(ctx context.Context, ln net.Listener, sockPath string) error
 				slog.Warn("temporary forwarder accept error, backing off", "error", err, "delay", tempDelay)
 				select {
 				case <-ctx.Done():
-					return nil
+					break acceptLoop
 				case <-time.After(tempDelay):
 				}
 				continue
 			}
+			fwdWg.Wait()
 			return fmt.Errorf("accept error: %w", err)
 		}
 		tempDelay = 0
+
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			_ = client.Close()
+			break acceptLoop
+		}
 
 		connsMu.Lock()
 		activeConns[client] = struct{}{}
 		connsMu.Unlock()
 
+		fwdWg.Add(1)
 		go func(c net.Conn) {
 			defer func() {
+				<-sem
+				fwdWg.Done()
 				connsMu.Lock()
 				delete(activeConns, c)
 				connsMu.Unlock()
 			}()
 
 			var dialer net.Dialer
-			dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			dialCtx, cancel := context.WithTimeout(ctx, defaultDialTimeout)
 			defer cancel()
 
 			upstream, err := dialer.DialContext(dialCtx, "unix", sockPath)
@@ -123,9 +192,12 @@ func serveForwarder(ctx context.Context, ln net.Listener, sockPath string) error
 				return
 			}
 
-			bridge(c, upstream)
+			bridge(c, upstream, defaultIdleTimeout)
 		}(client)
 	}
+
+	fwdWg.Wait()
+	return nil
 }
 
 func startReaper(ctx context.Context) {

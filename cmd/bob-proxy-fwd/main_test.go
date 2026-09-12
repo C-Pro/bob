@@ -349,4 +349,218 @@ func TestServeForwarder_FatalAcceptError(t *testing.T) {
 	assert.Contains(t, err.Error(), "accept error")
 }
 
+func TestServeForwarder_UnixSocketNotFound(t *testing.T) {
+	tempDir := t.TempDir()
+	nonexistentSock := filepath.Join(tempDir, "nonexistent.sock")
+
+	tcpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fwdDone := make(chan error, 1)
+	go func() {
+		fwdDone <- serveForwarder(ctx, tcpLn, nonexistentSock)
+	}()
+
+	client, err := net.Dial("tcp", tcpLn.Addr().String())
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	// Client read should immediately return EOF because unix socket dial failed
+	buf := make([]byte, 16)
+	n, err := client.Read(buf)
+	assert.Equal(t, 0, n)
+	assert.ErrorIs(t, err, io.EOF)
+
+	cancel()
+	err = <-fwdDone
+	assert.NoError(t, err)
+}
+
+func TestBridge_UpstreamAbruptClose(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "abrupt.sock")
+
+	unixLn, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+	defer func() { _ = unixLn.Close() }()
+
+	serverAccepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := unixLn.Accept()
+		if err == nil {
+			serverAccepted <- conn
+		}
+	}()
+
+	tcpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fwdDone := make(chan error, 1)
+	go func() {
+		fwdDone <- serveForwarder(ctx, tcpLn, sockPath)
+	}()
+
+	client, err := net.Dial("tcp", tcpLn.Addr().String())
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	serverConn := <-serverAccepted
+	_, err = client.Write([]byte("hello"))
+	require.NoError(t, err)
+
+	buf := make([]byte, 5)
+	_, err = io.ReadFull(serverConn, buf)
+	require.NoError(t, err)
+
+	// Server abruptly closes connection
+	_ = serverConn.Close()
+
+	// Client reading from forwarder should receive EOF
+	n, err := client.Read(buf)
+	assert.Equal(t, 0, n)
+	assert.ErrorIs(t, err, io.EOF)
+
+	cancel()
+	err = <-fwdDone
+	assert.NoError(t, err)
+}
+
+func TestBridge_HalfClosedConnection(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "halfclosed.sock")
+
+	unixLn, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+	defer func() { _ = unixLn.Close() }()
+
+	go func() {
+		conn, err := unixLn.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		req, err := io.ReadAll(conn)
+		if err != nil {
+			return
+		}
+		if string(req) == "PING_REQUEST" {
+			_, _ = conn.Write([]byte("PONG_RESPONSE"))
+		}
+	}()
+
+	tcpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fwdDone := make(chan error, 1)
+	go func() {
+		fwdDone <- serveForwarder(ctx, tcpLn, sockPath)
+	}()
+
+	clientConn, err := net.Dial("tcp", tcpLn.Addr().String())
+	require.NoError(t, err)
+	defer func() { _ = clientConn.Close() }()
+
+	tcpClient, ok := clientConn.(*net.TCPConn)
+	require.True(t, ok)
+
+	_, err = tcpClient.Write([]byte("PING_REQUEST"))
+	require.NoError(t, err)
+	err = tcpClient.CloseWrite()
+	require.NoError(t, err)
+
+	resp, err := io.ReadAll(tcpClient)
+	require.NoError(t, err)
+	assert.Equal(t, "PONG_RESPONSE", string(resp))
+
+	cancel()
+	err = <-fwdDone
+	assert.NoError(t, err)
+}
+
+func TestServeForwarder_DialTimeout(t *testing.T) {
+	origTimeout := defaultDialTimeout
+	defaultDialTimeout = 50 * time.Millisecond
+	defer func() { defaultDialTimeout = origTimeout }()
+
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "stall.sock")
+
+	// Create raw unix socket with backlog 1
+	fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	require.NoError(t, err)
+	defer func() { _ = syscall.Close(fd) }()
+
+	sa := &syscall.SockaddrUnix{Name: sockPath}
+	err = syscall.Bind(fd, sa)
+	require.NoError(t, err)
+	err = syscall.Listen(fd, 1)
+	require.NoError(t, err)
+
+	// Fill backlog with non-blocking connects so next connect blocks
+	for i := 0; i < 5; i++ {
+		connFd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+		if err == nil {
+			defer func(f int) { _ = syscall.Close(f) }(connFd)
+			_ = syscall.SetNonblock(connFd, true)
+			_ = syscall.Connect(connFd, sa)
+		}
+	}
+
+	tcpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fwdDone := make(chan error, 1)
+	go func() {
+		fwdDone <- serveForwarder(ctx, tcpLn, sockPath)
+	}()
+
+	client, err := net.Dial("tcp", tcpLn.Addr().String())
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	// Client should receive EOF when dialer times out and closes client connection
+	buf := make([]byte, 16)
+	_ = client.SetReadDeadline(time.Now().Add(1 * time.Second))
+	n, err := client.Read(buf)
+	assert.Equal(t, 0, n)
+	assert.ErrorIs(t, err, io.EOF)
+
+	cancel()
+	err = <-fwdDone
+	assert.NoError(t, err)
+}
+
+func TestBridge_IdleTimeout(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer func() { _ = c1.Close(); _ = c2.Close() }()
+
+	done := make(chan struct{})
+	go func() {
+		bridge(c1, c2, 50*time.Millisecond)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Succeeded: bridge returned after idle timeout
+	case <-time.After(2 * time.Second):
+		t.Fatal("bridge did not time out on idle connection")
+	}
+}
+
+
+
 

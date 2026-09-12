@@ -569,7 +569,9 @@ func (d *Driver) Destroy(ctx context.Context, sbx *sandbox.UserSandbox) error {
 		delete(d.proxies, sbx.UserID)
 	}
 	d.mu.Unlock()
-	_ = os.RemoveAll(d.getProxyDir(sbx.UserID))
+	if d.dataDir != "" {
+		_ = os.RemoveAll(d.getProxyDir(sbx.UserID))
+	}
 
 	internalID := sbx.GetInternalID()
 	if internalID == "" {
@@ -718,7 +720,7 @@ func (d *Driver) getProxyDir(userID string) string {
 	candidate := filepath.Join(d.dataDir, "proxies", userID)
 	if len(filepath.Join(candidate, "proxy.sock")) >= 104 {
 		h := sha256.Sum256([]byte(userID))
-		return filepath.Join(d.dataDir, "p", hex.EncodeToString(h[:4]))
+		return filepath.Join(d.dataDir, "p", hex.EncodeToString(h[:8]))
 	}
 	return candidate
 }
