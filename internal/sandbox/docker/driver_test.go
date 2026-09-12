@@ -1141,3 +1141,71 @@ func TestDockerDriver_Config_CustomBlockedCIDRs(t *testing.T) {
 	})
 	assert.Equal(t, customCIDRs, driver.customBlockedCIDRs)
 }
+
+func TestDockerDriver_Config_ForwarderPort(t *testing.T) {
+	driver := NewDriver(Config{
+		ForwarderPort: 19090,
+	})
+	assert.Equal(t, 19090, driver.forwarderPort)
+
+	driverDefault := NewDriver(Config{})
+	assert.Equal(t, sandbox.DefaultForwarderPort, driverDefault.forwarderPort)
+}
+
+func TestDockerDriver_Exec_NoProxyWhenProxyNil(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "mock_docker.sock")
+	listener, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+
+	var capturedExecEnv []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_ping", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+	mux.HandleFunc("/containers/test-container-id/exec", func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		if envList, ok := payload["Env"].([]interface{}); ok {
+			for _, e := range envList {
+				if s, ok := e.(string); ok {
+					capturedExecEnv = append(capturedExecEnv, s)
+				}
+			}
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]string{"Id": "exec-id-123"})
+	})
+	mux.HandleFunc("/exec/exec-id-123/start", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/exec/exec-id-123/json", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"Running": false, "ExitCode": 0})
+	})
+
+	server := &http.Server{Handler: mux}
+	go func() { _ = server.Serve(listener) }()
+	defer func() { _ = server.Close() }()
+
+	driver := NewDriver(Config{
+		SocketPath: sockPath,
+	})
+
+	sbx := &sandbox.UserSandbox{
+		UserID: "user_no_proxy",
+		Network: sandbox.NetworkPolicy{
+			Mode: sandbox.NetworkRestricted,
+		},
+		Status: sandbox.StatusRunning,
+	}
+	sbx.SetInternalID("test-container-id")
+
+	_, err = driver.Exec(context.Background(), sbx, []string{"echo", "hi"}, 5*time.Second)
+	require.NoError(t, err)
+
+	for _, envVar := range capturedExecEnv {
+		assert.False(t, strings.HasPrefix(envVar, "http_proxy="), "http_proxy should not be set when proxy is nil")
+		assert.False(t, strings.HasPrefix(envVar, "HTTP_PROXY="), "HTTP_PROXY should not be set when proxy is nil")
+	}
+}

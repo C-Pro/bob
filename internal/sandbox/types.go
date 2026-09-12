@@ -18,6 +18,9 @@ const (
 // where the user workspace is mounted and set as the working directory across all drivers.
 const DefaultWorkspaceMountPath = "/workspace"
 
+// DefaultForwarderPort defines the default loopback TCP port for bob-proxy-fwd.
+const DefaultForwarderPort = 18080
+
 // NetworkMode defines the network isolation level.
 type NetworkMode string
 

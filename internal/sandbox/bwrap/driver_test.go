@@ -254,3 +254,36 @@ func TestBwrapDriver_Config_CustomBlockedCIDRs(t *testing.T) {
 	})
 	assert.Equal(t, customCIDRs, driver.customBlockedCIDRs)
 }
+
+func TestBwrapDriver_Config_ForwarderPort(t *testing.T) {
+	driver := NewDriverWithConfig(Config{
+		ForwarderPort: 19090,
+	})
+	assert.Equal(t, 19090, driver.forwarderPort)
+
+	driverDefault := NewDriver()
+	assert.Equal(t, sandbox.DefaultForwarderPort, driverDefault.forwarderPort)
+}
+
+func TestBwrapDriver_Exec_NoProxyWhenProxyNil(t *testing.T) {
+	driver := NewDriver()
+	if !driver.Available(context.Background()) {
+		t.Skip("bwrap not available")
+	}
+
+	tempDir := t.TempDir()
+	workspace := filepath.Join(tempDir, "workspace")
+	require.NoError(t, os.MkdirAll(workspace, 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID: "user_bwrap_no_proxy",
+		Network: sandbox.NetworkPolicy{
+			Mode: sandbox.NetworkRestricted,
+		},
+		Status: sandbox.StatusRunning,
+	}
+	// Note: driver.proxies[sbx.UserID] is nil (Create was not run)
+	res, err := driver.Exec(context.Background(), sbx, []string{"sh", "-c", "echo http_proxy=$http_proxy"}, 5*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, "http_proxy=\n", res.Stdout)
+}

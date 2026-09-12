@@ -23,6 +23,7 @@ type Driver struct {
 	mu                 sync.Mutex
 	proxies            map[string]*sandbox.FilteringProxy // keyed by userID
 	customBlockedCIDRs []string
+	forwarderPort      int
 }
 
 // Config provides configuration parameters for the Bubblewrap driver.
@@ -30,6 +31,7 @@ type Config struct {
 	CPULimit           float64
 	MemoryLimitMB      int
 	CustomBlockedCIDRs []string
+	ForwarderPort      int
 }
 
 // NewDriver creates a new Bubblewrap driver with default limits.
@@ -48,11 +50,16 @@ func NewDriverWithConfig(cfg Config) *Driver {
 	if cpu <= 0 {
 		cpu = 1.0
 	}
+	fwdPort := cfg.ForwarderPort
+	if fwdPort <= 0 {
+		fwdPort = sandbox.DefaultForwarderPort
+	}
 	return &Driver{
 		bwrapPath:          path,
 		cpuLimit:           cpu,
 		memoryLimitMB:      mem,
 		customBlockedCIDRs: cfg.CustomBlockedCIDRs,
+		forwarderPort:      fwdPort,
 		proxies:            make(map[string]*sandbox.FilteringProxy),
 	}
 }
@@ -267,30 +274,27 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 	)
 
 	if sbx.Network.Mode == sandbox.NetworkRestricted {
-		proxyAddr := "http://127.0.0.1:18080"
-		if proxySockPath == "" {
-			d.mu.Lock()
-			proxy := d.proxies[sbx.UserID]
-			d.mu.Unlock()
-			if proxy != nil {
-				proxyAddr = proxy.Addr()
-			}
+		d.mu.Lock()
+		proxy := d.proxies[sbx.UserID]
+		d.mu.Unlock()
+		if proxy != nil {
+			proxyAddr := fmt.Sprintf("http://127.0.0.1:%d", d.forwarderPort)
+			args = append(args,
+				"--setenv", "http_proxy", proxyAddr,
+				"--setenv", "https_proxy", proxyAddr,
+				"--setenv", "HTTP_PROXY", proxyAddr,
+				"--setenv", "HTTPS_PROXY", proxyAddr,
+				"--setenv", "all_proxy", proxyAddr,
+				"--setenv", "ALL_PROXY", proxyAddr,
+				"--setenv", "no_proxy", "localhost,127.0.0.1",
+				"--setenv", "NO_PROXY", "localhost,127.0.0.1",
+			)
 		}
-		args = append(args,
-			"--setenv", "http_proxy", proxyAddr,
-			"--setenv", "https_proxy", proxyAddr,
-			"--setenv", "HTTP_PROXY", proxyAddr,
-			"--setenv", "HTTPS_PROXY", proxyAddr,
-			"--setenv", "all_proxy", proxyAddr,
-			"--setenv", "ALL_PROXY", proxyAddr,
-			"--setenv", "no_proxy", "localhost,127.0.0.1",
-			"--setenv", "NO_PROXY", "localhost,127.0.0.1",
-		)
 	}
 
 	// Append command
 	if fwdBinary != "" {
-		args = append(args, "/run/proxy/fwd", "-tcp", "127.0.0.1:18080", "-sock", "/run/proxy.sock", "--")
+		args = append(args, "/run/proxy/fwd", "-tcp", fmt.Sprintf("127.0.0.1:%d", d.forwarderPort), "-sock", "/run/proxy.sock", "--")
 		args = append(args, cmd...)
 	} else {
 		args = append(args, cmd...)

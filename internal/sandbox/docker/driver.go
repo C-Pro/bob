@@ -36,6 +36,7 @@ type Driver struct {
 	mu                 sync.Mutex
 	proxies            map[string]*sandbox.FilteringProxy // keyed by userID
 	customBlockedCIDRs []string
+	forwarderPort      int
 }
 
 // Config provides configuration parameters for the Docker driver.
@@ -47,6 +48,7 @@ type Config struct {
 	DataDir            string
 	HostDataDir        string
 	CustomBlockedCIDRs []string
+	ForwarderPort      int
 }
 
 // NewDriver creates a new Docker Sibling driver.
@@ -76,6 +78,11 @@ func NewDriver(cfg Config) *Driver {
 		hostData = filepath.Clean(hostData)
 	}
 
+	fwdPort := cfg.ForwarderPort
+	if fwdPort <= 0 {
+		fwdPort = sandbox.DefaultForwarderPort
+	}
+
 	return &Driver{
 		socketPath:         socket,
 		allowedImages:      cfg.AllowedImages,
@@ -84,6 +91,7 @@ func NewDriver(cfg Config) *Driver {
 		dataDir:            strings.TrimSpace(cfg.DataDir),
 		hostDataDir:        hostData,
 		customBlockedCIDRs: cfg.CustomBlockedCIDRs,
+		forwarderPort:      fwdPort,
 		client: &http.Client{
 			Transport: transport,
 			Timeout:   10 * time.Minute,
@@ -318,7 +326,7 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 		containerCmd = []string{
 			"/run/proxy/fwd",
 			"-daemon",
-			"-tcp", "127.0.0.1:18080",
+			"-tcp", fmt.Sprintf("127.0.0.1:%d", d.forwarderPort),
 			"-sock", "/run/proxy/proxy.sock",
 		}
 	}
@@ -426,17 +434,22 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 		"PWD="+sandbox.DefaultWorkspaceMountPath,
 	)
 	if sbx.Network.Mode == sandbox.NetworkRestricted {
-		proxyAddr := "http://127.0.0.1:18080"
-		env = append(env,
-			"http_proxy="+proxyAddr,
-			"https_proxy="+proxyAddr,
-			"HTTP_PROXY="+proxyAddr,
-			"HTTPS_PROXY="+proxyAddr,
-			"all_proxy="+proxyAddr,
-			"ALL_PROXY="+proxyAddr,
-			"no_proxy=localhost,127.0.0.1",
-			"NO_PROXY=localhost,127.0.0.1",
-		)
+		d.mu.Lock()
+		proxy := d.proxies[sbx.UserID]
+		d.mu.Unlock()
+		if proxy != nil {
+			proxyAddr := fmt.Sprintf("http://127.0.0.1:%d", d.forwarderPort)
+			env = append(env,
+				"http_proxy="+proxyAddr,
+				"https_proxy="+proxyAddr,
+				"HTTP_PROXY="+proxyAddr,
+				"HTTPS_PROXY="+proxyAddr,
+				"all_proxy="+proxyAddr,
+				"ALL_PROXY="+proxyAddr,
+				"no_proxy=localhost,127.0.0.1",
+				"NO_PROXY=localhost,127.0.0.1",
+			)
+		}
 	}
 
 	// 1. Create exec instance

@@ -153,4 +153,3 @@ func TestCopyFile_AtomicAndSecure(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, os.FileMode(0o755), fi.Mode().Perm())
 }
-

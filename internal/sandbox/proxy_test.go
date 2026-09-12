@@ -869,4 +869,3 @@ func TestFilteringProxy_DisabledTCPListener(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "neither TCP nor Unix socket listener is configured")
 }
-
