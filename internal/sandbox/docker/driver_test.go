@@ -274,11 +274,13 @@ func TestDockerDriver_NetworkRestrictedProxyReachability(t *testing.T) {
 	}()
 	defer func() { _ = server.Close() }()
 
+	dataDir := filepath.Join(tempDir, "data")
 	driver := NewDriver(Config{
 		SocketPath:    sockPath,
 		AllowedImages: []string{"alpine:latest"},
 		CPULimit:      1.0,
 		MemoryLimitMB: 512,
+		DataDir:       dataDir,
 	})
 
 	ctx := context.Background()
@@ -308,17 +310,22 @@ func TestDockerDriver_NetworkRestrictedProxyReachability(t *testing.T) {
 	binds, ok := capturedCreateHostConfig["Binds"].([]interface{})
 	require.True(t, ok)
 	var hasFwdBind, hasProxyBind bool
+	expectedProxyPrefix := driver.getProxyDir(sbx.UserID)
 	for _, b := range binds {
 		str, _ := b.(string)
 		if strings.HasSuffix(str, ":/run/proxy/fwd:ro") {
 			hasFwdBind = true
 		}
-		if strings.HasSuffix(str, ":/run/proxy:rw") {
+		if strings.HasSuffix(str, ":/run/proxy:ro") && strings.HasPrefix(str, expectedProxyPrefix) {
 			hasProxyBind = true
 		}
 	}
 	assert.True(t, hasFwdBind, "expected /run/proxy/fwd:ro bind mount")
-	assert.True(t, hasProxyBind, "expected /run/proxy:rw bind mount")
+	assert.True(t, hasProxyBind, "expected /run/proxy:ro bind mount under dataDir")
+
+	// Ensure workspace is not contaminated with .proxy
+	_, statErr := os.Stat(filepath.Join(userWorkspace, ".proxy"))
+	assert.True(t, os.IsNotExist(statErr), "user workspace should not contain .proxy directory")
 
 	// Execute command
 	res, err := driver.Exec(ctx, sbx, []string{"echo", "test"}, 5*time.Second)
@@ -980,3 +987,136 @@ func TestDockerDriver_RealDocker_NetworkRestrictedAirgap(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotEqual(t, 0, res.ExitCode, "forbidden host should be blocked")
 }
+
+func TestDockerDriver_Destroy_ProxySocketCleanup(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "docker.sock")
+	listener, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_ping", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+	mux.HandleFunc("/containers/create", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"Id":"mock-cleanup-container"}`))
+	})
+	mux.HandleFunc("/containers/mock-cleanup-container/start", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/containers/mock-cleanup-container", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusNoContent)
+		}
+	})
+
+	server := &http.Server{Handler: mux}
+	go func() { _ = server.Serve(listener) }()
+	defer func() { _ = server.Close() }()
+
+	dataDir := filepath.Join(tempDir, "data")
+	driver := NewDriver(Config{
+		SocketPath:    sockPath,
+		AllowedImages: []string{"alpine:latest"},
+		DataDir:       dataDir,
+	})
+
+	ctx := context.Background()
+	userWorkspace := filepath.Join(tempDir, "user_workspace")
+	require.NoError(t, os.MkdirAll(userWorkspace, 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID:      "user_cleanup_test",
+		DockerImage: "alpine:latest",
+		Network: sandbox.NetworkPolicy{
+			Mode:         sandbox.NetworkRestricted,
+			AllowedHosts: []string{"api.github.com"},
+		},
+		Status: sandbox.StatusRunning,
+	}
+
+	err = driver.Create(ctx, sbx, userWorkspace)
+	require.NoError(t, err)
+
+	expectedProxyDir := driver.getProxyDir(sbx.UserID)
+	expectedSocket := filepath.Join(expectedProxyDir, "proxy.sock")
+
+	_, err = os.Stat(expectedSocket)
+	require.NoError(t, err, "proxy socket should exist after Create()")
+
+	err = driver.Destroy(ctx, sbx)
+	require.NoError(t, err)
+
+	_, err = os.Stat(expectedSocket)
+	assert.True(t, os.IsNotExist(err), "proxy.sock should be removed after Destroy()")
+
+	_, err = os.Stat(expectedProxyDir)
+	assert.True(t, os.IsNotExist(err), "proxy directory should be removed after Destroy()")
+}
+
+func TestDockerDriver_Create_ExistingProxyDirectory(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "docker.sock")
+	listener, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_ping", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+	mux.HandleFunc("/containers/create", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"Id":"mock-exist-container"}`))
+	})
+	mux.HandleFunc("/containers/mock-exist-container/start", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/containers/mock-exist-container", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusNoContent)
+		}
+	})
+
+	server := &http.Server{Handler: mux}
+	go func() { _ = server.Serve(listener) }()
+	defer func() { _ = server.Close() }()
+
+	dataDir := filepath.Join(tempDir, "data")
+	driver := NewDriver(Config{
+		SocketPath:    sockPath,
+		AllowedImages: []string{"alpine:latest"},
+		DataDir:       dataDir,
+	})
+
+	ctx := context.Background()
+	userWorkspace := filepath.Join(tempDir, "user_workspace")
+	require.NoError(t, os.MkdirAll(userWorkspace, 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID:      "user_stale_proxy_test",
+		DockerImage: "alpine:latest",
+		Network: sandbox.NetworkPolicy{
+			Mode:         sandbox.NetworkRestricted,
+			AllowedHosts: []string{"api.github.com"},
+		},
+		Status: sandbox.StatusRunning,
+	}
+
+	// Pre-create dirty/stale proxy socket simulating a dirty crash
+	staleProxyDir := driver.getProxyDir(sbx.UserID)
+	require.NoError(t, os.MkdirAll(staleProxyDir, 0o755))
+	staleSock := filepath.Join(staleProxyDir, "proxy.sock")
+	require.NoError(t, os.WriteFile(staleSock, []byte("stale dead socket"), 0o660))
+
+	err = driver.Create(ctx, sbx, userWorkspace)
+	require.NoError(t, err, "Create() should succeed and overwrite stale proxy socket cleanly")
+	defer func() { _ = driver.Destroy(ctx, sbx) }()
+
+	fi, err := os.Stat(staleSock)
+	require.NoError(t, err)
+	assert.Equal(t, os.ModeSocket, fi.Mode()&os.ModeSocket)
+}
+

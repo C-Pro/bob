@@ -3,7 +3,9 @@ package docker
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -177,9 +179,14 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 			return fmt.Errorf("failed to resolve host path for forwarder binary: %w", err)
 		}
 
-		proxyDir := filepath.Join(absWorkspace, ".proxy")
-		if err := os.MkdirAll(proxyDir, 0o700); err != nil {
+		proxyDir := d.getProxyDir(sbx.UserID)
+		if err := os.MkdirAll(proxyDir, 0o755); err != nil {
 			return fmt.Errorf("failed to create proxy directory: %w", err)
+		}
+		// Create empty placeholder for /run/proxy/fwd so runc can mount hostFwdPath into read-only /run/proxy
+		fwdPlaceholder := filepath.Join(proxyDir, "fwd")
+		if err := os.WriteFile(fwdPlaceholder, nil, 0o755); err != nil {
+			return fmt.Errorf("failed to create forwarder mountpoint placeholder: %w", err)
 		}
 		hostProxyDir, err := d.toHostPath(proxyDir)
 		if err != nil {
@@ -202,14 +209,18 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 			d.mu.Unlock()
 			return fmt.Errorf("failed to start filtering proxy for user %s: %w", sbx.UserID, err)
 		}
-		_ = os.Chmod(sockPath, 0o666)
+		if err := os.Chmod(sockPath, 0o660); err != nil {
+			_ = proxy.Close()
+			d.mu.Unlock()
+			return fmt.Errorf("failed to chmod proxy socket: %w", err)
+		}
 		d.proxies[sbx.UserID] = proxy
 		createdProxy = true
 		d.mu.Unlock()
 
 		restrictedBinds = append(restrictedBinds,
 			fmt.Sprintf("%s:/run/proxy/fwd:ro", hostFwdPath),
-			fmt.Sprintf("%s:/run/proxy:rw", hostProxyDir),
+			fmt.Sprintf("%s:/run/proxy:ro", hostProxyDir),
 		)
 	}
 	defer func() {
@@ -222,6 +233,7 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 				delete(d.proxies, sbx.UserID)
 			}
 			d.mu.Unlock()
+			_ = os.RemoveAll(d.getProxyDir(sbx.UserID))
 		}
 	}()
 
@@ -557,6 +569,7 @@ func (d *Driver) Destroy(ctx context.Context, sbx *sandbox.UserSandbox) error {
 		delete(d.proxies, sbx.UserID)
 	}
 	d.mu.Unlock()
+	_ = os.RemoveAll(d.getProxyDir(sbx.UserID))
 
 	internalID := sbx.GetInternalID()
 	if internalID == "" {
@@ -700,3 +713,13 @@ func (d *Driver) pullImage(ctx context.Context, image string) error {
 	slog.Info("successfully pulled docker image for sandbox", "image", image)
 	return nil
 }
+
+func (d *Driver) getProxyDir(userID string) string {
+	candidate := filepath.Join(d.dataDir, "proxies", userID)
+	if len(filepath.Join(candidate, "proxy.sock")) >= 104 {
+		h := sha256.Sum256([]byte(userID))
+		return filepath.Join(d.dataDir, "p", hex.EncodeToString(h[:4]))
+	}
+	return candidate
+}
+
