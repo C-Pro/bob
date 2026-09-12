@@ -113,6 +113,7 @@ func isTemporaryAcceptError(err error) bool {
 
 func serveForwarder(ctx context.Context, ln net.Listener, sockPath string) error {
 	var connsMu sync.Mutex
+	// nosemgrep: trailofbits.go.iterate-over-empty-map.iterate-over-empty-map
 	activeConns := make(map[net.Conn]struct{})
 	sem := make(chan struct{}, maxConcurrentConns)
 	var fwdWg sync.WaitGroup
@@ -122,10 +123,8 @@ func serveForwarder(ctx context.Context, ln net.Listener, sockPath string) error
 		_ = ln.Close()
 
 		connsMu.Lock()
-		if len(activeConns) > 0 {
-			for c := range activeConns {
-				_ = c.Close()
-			}
+		for c := range activeConns {
+			_ = c.Close()
 		}
 		connsMu.Unlock()
 	}()
@@ -267,6 +266,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		errCh <- serveForwarder(fwdCtx, ln, *sockPath)
 	}()
 
+	// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
