@@ -248,3 +248,105 @@ func TestStartReaper(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond)
 }
 
+type mockTemporaryListener struct {
+	net.Listener
+	mu         sync.Mutex
+	errorCount int
+	maxErrors  int
+	closed     bool
+}
+
+func (m *mockTemporaryListener) Accept() (net.Conn, error) {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil, net.ErrClosed
+	}
+	if m.errorCount < m.maxErrors {
+		m.errorCount++
+		m.mu.Unlock()
+		return nil, syscall.EMFILE
+	}
+	m.mu.Unlock()
+	return m.Listener.Accept()
+}
+
+func (m *mockTemporaryListener) Close() error {
+	m.mu.Lock()
+	m.closed = true
+	m.mu.Unlock()
+	return m.Listener.Close()
+}
+
+func TestServeForwarder_TemporaryAcceptError(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "echo.sock")
+
+	unixLn, wg := startMockUnixEchoServer(t, sockPath)
+	defer func() {
+		_ = unixLn.Close()
+		wg.Wait()
+	}()
+
+	realTCP, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	mockLn := &mockTemporaryListener{
+		Listener:  realTCP,
+		maxErrors: 2,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fwdErrCh := make(chan error, 1)
+	go func() {
+		fwdErrCh <- serveForwarder(ctx, mockLn, sockPath)
+	}()
+
+	// Connect client - should succeed after temporary error retries
+	client, err := net.Dial("tcp", realTCP.Addr().String())
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	_, err = client.Write([]byte("ping"))
+	require.NoError(t, err)
+
+	buf := make([]byte, 4)
+	_, err = io.ReadFull(client, buf)
+	require.NoError(t, err)
+	assert.Equal(t, "ping", string(buf))
+
+	cancel()
+	_ = mockLn.Close()
+	err = <-fwdErrCh
+	assert.NoError(t, err)
+}
+
+type mockFatalListener struct {
+	net.Listener
+}
+
+func (m *mockFatalListener) Accept() (net.Conn, error) {
+	return nil, fmt.Errorf("fatal non-temporary hardware error")
+}
+
+func TestServeForwarder_FatalAcceptError(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "echo.sock")
+
+	realTCP, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = realTCP.Close() }()
+
+	mockLn := &mockFatalListener{Listener: realTCP}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err = serveForwarder(ctx, mockLn, sockPath)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "accept error")
+}
+
+

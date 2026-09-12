@@ -44,6 +44,20 @@ func bridge(client net.Conn, upstream net.Conn) {
 	_ = upstream.Close()
 }
 
+func isTemporaryAcceptError(err error) bool {
+	if errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) ||
+		errors.Is(err, syscall.ECONNABORTED) || errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ENOBUFS) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		//nolint:staticcheck // Temporary is used for legacy net.Error compatibility
+		return netErr.Timeout() || netErr.Temporary()
+	}
+	return false
+}
+
 func serveForwarder(ctx context.Context, ln net.Listener, sockPath string) error {
 	var connsMu sync.Mutex
 	activeConns := make(map[net.Conn]struct{})
@@ -59,14 +73,33 @@ func serveForwarder(ctx context.Context, ln net.Listener, sockPath string) error
 		connsMu.Unlock()
 	}()
 
+	var tempDelay time.Duration
 	for {
 		client, err := ln.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
 				return nil
 			}
+			if isTemporaryAcceptError(err) {
+				if tempDelay == 0 {
+					tempDelay = 5 * time.Millisecond
+				} else {
+					tempDelay *= 2
+				}
+				if max := 1 * time.Second; tempDelay > max {
+					tempDelay = max
+				}
+				slog.Warn("temporary forwarder accept error, backing off", "error", err, "delay", tempDelay)
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(tempDelay):
+				}
+				continue
+			}
 			return fmt.Errorf("accept error: %w", err)
 		}
+		tempDelay = 0
 
 		connsMu.Lock()
 		activeConns[client] = struct{}{}
