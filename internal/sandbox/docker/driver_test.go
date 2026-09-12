@@ -303,6 +303,7 @@ func TestDockerDriver_NetworkRestrictedProxyReachability(t *testing.T) {
 	require.NotNil(t, capturedCreateHostConfig)
 	assert.Equal(t, "none", capturedCreateHostConfig["NetworkMode"])
 	assert.Nil(t, capturedCreateHostConfig["ExtraHosts"])
+	assert.Equal(t, true, capturedCreateHostConfig["Init"])
 
 	binds, ok := capturedCreateHostConfig["Binds"].([]interface{})
 	require.True(t, ok)

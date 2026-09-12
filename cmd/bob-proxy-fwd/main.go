@@ -95,6 +95,28 @@ func serveForwarder(ctx context.Context, ln net.Listener, sockPath string) error
 	}
 }
 
+func startReaper(ctx context.Context) {
+	sigCh := make(chan os.Signal, 32)
+	signal.Notify(sigCh, syscall.SIGCHLD)
+	go func() {
+		defer signal.Stop(sigCh)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-sigCh:
+				for {
+					var status syscall.WaitStatus
+					pid, err := syscall.Wait4(-1, &status, syscall.WNOHANG, nil)
+					if pid <= 0 || err != nil {
+						break
+					}
+				}
+			}
+		}
+	}()
+}
+
 func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("bob-proxy-fwd", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -120,6 +142,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 
 	if isDaemon {
 		slog.Info("starting proxy forwarder daemon", "tcp", ln.Addr().String(), "socket", *sockPath)
+		startReaper(ctx)
 		if err := serveForwarder(ctx, ln, *sockPath); err != nil {
 			_, _ = fmt.Fprintf(stderr, "forwarder error: %v\n", err)
 			return 1

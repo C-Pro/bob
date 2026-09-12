@@ -302,6 +302,7 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 		"PidsLimit":   pidsLimit,
 		"SecurityOpt": []string{"no-new-privileges"},
 		"CapDrop":     []string{"ALL"},
+		"Init":        true,
 	}
 
 	containerCmd := []string{"sleep", "infinity"}

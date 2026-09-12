@@ -7,8 +7,10 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -229,3 +231,20 @@ func TestRun_WrapperMode(t *testing.T) {
 
 	assert.Equal(t, 42, code)
 }
+
+func TestStartReaper(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	startReaper(ctx)
+
+	cmd := exec.Command("true")
+	err := cmd.Start()
+	require.NoError(t, err)
+
+	pid := cmd.Process.Pid
+	require.Eventually(t, func() bool {
+		return syscall.Kill(pid, 0) != nil
+	}, 2*time.Second, 10*time.Millisecond)
+}
+
