@@ -26,6 +26,7 @@ type ProxyConfig struct {
 	MaxTunnels         int           // Optional limit on concurrent CONNECT tunnels (default 128).
 	TunnelIdleTimeout  time.Duration // Optional idle timeout for CONNECT tunnels (default 2m).
 	TunnelLifetime     time.Duration // Optional max lifetime for CONNECT tunnels (default 15m).
+	Resolver           *net.Resolver // Optional custom DNS resolver (defaults to net.DefaultResolver).
 }
 
 // FilteringProxy is an in-process HTTP/CONNECT proxy that enforces domain and CIDR whitelisting/blacklisting.
@@ -46,6 +47,7 @@ type FilteringProxy struct {
 	tunnelSem          chan struct{}
 	tunnelIdleTimeout  time.Duration
 	tunnelLifetime     time.Duration
+	resolver           *net.Resolver
 }
 
 type closeWriter interface {
@@ -222,6 +224,7 @@ func NewFilteringProxyWithConfig(cfg ProxyConfig) (*FilteringProxy, error) {
 		tunnelSem:          make(chan struct{}, maxTunnels),
 		tunnelIdleTimeout:  tunnelIdle,
 		tunnelLifetime:     tunnelLifetime,
+		resolver:           cfg.Resolver,
 		httpClient: &http.Client{
 			Transport: tr,
 			Timeout:   60 * time.Second,
@@ -450,7 +453,11 @@ func (p *FilteringProxy) resolveAndValidate(ctx context.Context, host string) (n
 	} else {
 		lookupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
-		resolved, err := net.DefaultResolver.LookupIP(lookupCtx, "ip", cleanHost)
+		resolver := p.resolver
+		if resolver == nil {
+			resolver = net.DefaultResolver
+		}
+		resolved, err := resolver.LookupIP(lookupCtx, "ip", cleanHost)
 		if err != nil {
 			return nil, fmt.Errorf("failed to resolve host %q: %w", cleanHost, err)
 		}
@@ -525,7 +532,7 @@ func (p *FilteringProxy) handleConnect(w http.ResponseWriter, req *http.Request,
 		return
 	}
 
-	clientConn, _, err := hijacker.Hijack()
+	clientConn, rw, err := hijacker.Hijack()
 	if err != nil {
 		p.logAccess(req.RemoteAddr, req.Method, targetHost, req.Proto, http.StatusServiceUnavailable, 0, "ERROR", err.Error())
 		http.Error(w, fmt.Sprintf("Hijacking failed: %v", err), http.StatusServiceUnavailable)
@@ -542,6 +549,18 @@ func (p *FilteringProxy) handleConnect(w http.ResponseWriter, req *http.Request,
 	if err != nil {
 		p.logAccess(req.RemoteAddr, req.Method, targetHost, req.Proto, http.StatusBadGateway, 0, "ERROR", err.Error())
 		return
+	}
+
+	if rw != nil && rw.Reader.Buffered() > 0 {
+		buffered := make([]byte, rw.Reader.Buffered())
+		if _, readErr := io.ReadFull(rw, buffered); readErr != nil {
+			p.logAccess(req.RemoteAddr, req.Method, targetHost, req.Proto, http.StatusBadGateway, 0, "ERROR", readErr.Error())
+			return
+		}
+		if _, writeErr := destConn.Write(buffered); writeErr != nil {
+			p.logAccess(req.RemoteAddr, req.Method, targetHost, req.Proto, http.StatusBadGateway, 0, "ERROR", writeErr.Error())
+			return
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(req.Context(), p.tunnelLifetime)

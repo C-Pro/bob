@@ -1054,6 +1054,295 @@ func TestDockerDriver_RealDocker_NetworkRestrictedAirgap(t *testing.T) {
 	assert.Contains(t, res.Stdout, "localhost,127.0.0.1 localhost,127.0.0.1")
 }
 
+func TestDockerDriver_RealDocker_NetworkRestricted_HTTPSConnect(t *testing.T) {
+	ctx := context.Background()
+	driver := NewDriver(Config{
+		SocketPath:    "/var/run/docker.sock",
+		AllowedImages: []string{"alpine:latest"},
+		CPULimit:      1.0,
+		MemoryLimitMB: 256,
+		DataDir:       t.TempDir(),
+	})
+
+	if !driver.Available(ctx) {
+		t.Skip("Docker daemon is not available on host, skipping test")
+	}
+
+	driver.SetCustomBlockedCIDRs([]string{"169.254.0.0/16"})
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte("https-connect-ok")); err != nil {
+			t.Logf("Failed to write response: %v", err)
+		}
+	}))
+	defer backend.Close()
+
+	backendURL, err := url.Parse(backend.URL)
+	require.NoError(t, err)
+
+	workspace := filepath.Join(t.TempDir(), "user_https_real")
+	require.NoError(t, os.MkdirAll(workspace, 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID:      "testuser_real_https",
+		DockerImage: "alpine:latest",
+		Network: sandbox.NetworkPolicy{
+			Mode:         sandbox.NetworkRestricted,
+			AllowedHosts: []string{backendURL.Hostname()},
+		},
+		Status: sandbox.StatusRunning,
+	}
+
+	err = driver.Create(ctx, sbx, workspace)
+	require.NoError(t, err)
+	defer func() {
+		if destroyErr := driver.Destroy(ctx, sbx); destroyErr != nil {
+			t.Logf("Failed to destroy sandbox: %v", destroyErr)
+		}
+	}()
+
+	connectScript := fmt.Sprintf(
+		"(printf 'CONNECT %s:%s HTTP/1.1\\r\\nHost: %s:%s\\r\\n\\r\\nGET /secure-data HTTP/1.1\\r\\nHost: %s\\r\\nConnection: close\\r\\n\\r\\n'; sleep 1) | nc -w 5 127.0.0.1 18080",
+		backendURL.Hostname(), backendURL.Port(),
+		backendURL.Hostname(), backendURL.Port(),
+		backendURL.Hostname(),
+	)
+
+	res, err := driver.Exec(ctx, sbx, []string{"sh", "-c", connectScript}, 10*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, 0, res.ExitCode, "exec output: stdout=%s stderr=%s", res.Stdout, res.Stderr)
+	assert.Contains(t, res.Stdout, "200 Connection Established")
+	assert.Contains(t, res.Stdout, "https-connect-ok")
+}
+
+func TestDockerDriver_RealDocker_NetworkRestricted_DomainResolution(t *testing.T) {
+	ctx := context.Background()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte("mock-domain-airgap-ok")); err != nil {
+			t.Logf("Failed to write mock response: %v", err)
+		}
+	}))
+	defer backend.Close()
+
+	backendURL, err := url.Parse(backend.URL)
+	require.NoError(t, err)
+	backendPort := backendURL.Port()
+
+	dnsPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() {
+		if closeErr := dnsPC.Close(); closeErr != nil {
+			t.Logf("Failed to close dnsPC: %v", closeErr)
+		}
+	}()
+
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			n, clientAddr, err := dnsPC.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if n < 12 {
+				continue
+			}
+			qnameEnd := 12
+			for qnameEnd < n && buf[qnameEnd] != 0 {
+				qnameEnd += int(buf[qnameEnd]) + 1
+			}
+			qnameEnd++
+			if qnameEnd+4 > n {
+				continue
+			}
+			qtype := binary.BigEndian.Uint16(buf[qnameEnd : qnameEnd+2])
+
+			qLen := qnameEnd + 4
+			if qtype == 1 { // A record
+				resp := make([]byte, qLen+16)
+				copy(resp[:qLen], buf[:qLen])
+				resp[2] = 0x81 // QR=1, RD=1
+				resp[3] = 0x80 // RA=1, RCODE=0
+				resp[4] = 0x00
+				resp[5] = 0x01 // QDCOUNT = 1
+				resp[6] = 0x00
+				resp[7] = 0x01 // ANCOUNT = 1
+				resp[8] = 0x00
+				resp[9] = 0x00 // NSCOUNT = 0
+				resp[10] = 0x00
+				resp[11] = 0x00 // ARCOUNT = 0
+				resp[qLen] = 0xc0
+				resp[qLen+1] = 0x0c
+				resp[qLen+2] = 0x00
+				resp[qLen+3] = 0x01 // Type A
+				resp[qLen+4] = 0x00
+				resp[qLen+5] = 0x01 // Class IN
+				resp[qLen+6] = 0x00
+				resp[qLen+7] = 0x00
+				resp[qLen+8] = 0x00
+				resp[qLen+9] = 0x3c // TTL 60
+				resp[qLen+10] = 0x00
+				resp[qLen+11] = 0x04
+				copy(resp[qLen+12:qLen+16], net.IPv4(127, 0, 0, 1).To4())
+				if _, writeErr := dnsPC.WriteTo(resp[:qLen+16], clientAddr); writeErr != nil {
+					return
+				}
+			} else { // Other types (AAAA): empty NOERROR
+				resp := make([]byte, qLen)
+				copy(resp[:qLen], buf[:qLen])
+				resp[2] = 0x81
+				resp[3] = 0x80
+				resp[4] = 0x00
+				resp[5] = 0x01 // QDCOUNT = 1
+				resp[6] = 0x00
+				resp[7] = 0x00 // ANCOUNT = 0
+				resp[8] = 0x00
+				resp[9] = 0x00
+				resp[10] = 0x00
+				resp[11] = 0x00
+				if _, writeErr := dnsPC.WriteTo(resp[:qLen], clientAddr); writeErr != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	mockResolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "udp", dnsPC.LocalAddr().String())
+		},
+	}
+
+	driver := NewDriver(Config{
+		SocketPath:    "/var/run/docker.sock",
+		AllowedImages: []string{"alpine:latest"},
+		CPULimit:      1.0,
+		MemoryLimitMB: 256,
+		DataDir:       t.TempDir(),
+		Resolver:      mockResolver,
+	})
+
+	if !driver.Available(ctx) {
+		t.Skip("Docker daemon is not available on host, skipping test")
+	}
+
+	driver.SetCustomBlockedCIDRs([]string{"169.254.0.0/16"})
+
+	workspace := filepath.Join(t.TempDir(), "user_domain_real")
+	require.NoError(t, os.MkdirAll(workspace, 0o755))
+
+	const domain = "mock.sandbox.local"
+	sbx := &sandbox.UserSandbox{
+		UserID:      "testuser_real_domain",
+		DockerImage: "alpine:latest",
+		Network: sandbox.NetworkPolicy{
+			Mode:         sandbox.NetworkRestricted,
+			AllowedHosts: []string{domain},
+		},
+		Status: sandbox.StatusRunning,
+	}
+
+	err = driver.Create(ctx, sbx, workspace)
+	require.NoError(t, err)
+	defer func() {
+		if destroyErr := driver.Destroy(ctx, sbx); destroyErr != nil {
+			t.Logf("Failed to destroy sandbox: %v", destroyErr)
+		}
+	}()
+
+	targetURL := fmt.Sprintf("http://%s:%s/data", domain, backendPort)
+	res, err := driver.Exec(ctx, sbx, []string{"wget", "-q", "-O", "-", targetURL}, 10*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, 0, res.ExitCode, "wget output: stdout=%s stderr=%s", res.Stdout, res.Stderr)
+	assert.Contains(t, res.Stdout, "mock-domain-airgap-ok")
+}
+
+func TestDockerDriver_RealDocker_NetworkRestricted_ConcurrentExec(t *testing.T) {
+	ctx := context.Background()
+	driver := NewDriver(Config{
+		SocketPath:    "/var/run/docker.sock",
+		AllowedImages: []string{"alpine:latest"},
+		CPULimit:      1.0,
+		MemoryLimitMB: 256,
+		DataDir:       t.TempDir(),
+	})
+
+	if !driver.Available(ctx) {
+		t.Skip("Docker daemon is not available on host, skipping test")
+	}
+
+	driver.SetCustomBlockedCIDRs([]string{"169.254.0.0/16"})
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte("concurrent-exec-ok")); err != nil {
+			t.Logf("Failed to write response: %v", err)
+		}
+	}))
+	defer backend.Close()
+
+	backendURL, err := url.Parse(backend.URL)
+	require.NoError(t, err)
+
+	workspace := filepath.Join(t.TempDir(), "user_concurrent_real")
+	require.NoError(t, os.MkdirAll(workspace, 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID:      "testuser_real_concurrent",
+		DockerImage: "alpine:latest",
+		Network: sandbox.NetworkPolicy{
+			Mode:         sandbox.NetworkRestricted,
+			AllowedHosts: []string{backendURL.Hostname()},
+		},
+		Status: sandbox.StatusRunning,
+	}
+
+	err = driver.Create(ctx, sbx, workspace)
+	require.NoError(t, err)
+	defer func() {
+		if destroyErr := driver.Destroy(ctx, sbx); destroyErr != nil {
+			t.Logf("Failed to destroy sandbox: %v", destroyErr)
+		}
+	}()
+
+	const concurrency = 10
+	errCh := make(chan error, concurrency)
+	var wg sync.WaitGroup
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, err := driver.Exec(ctx, sbx, []string{"wget", "-q", "-O", "-", backend.URL + "/data"}, 10*time.Second)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if res.ExitCode != 0 {
+				errCh <- fmt.Errorf("unexpected exit code %d: %s", res.ExitCode, res.Stderr)
+				return
+			}
+			if !strings.Contains(res.Stdout, "concurrent-exec-ok") {
+				errCh <- fmt.Errorf("unexpected stdout: %s", res.Stdout)
+				return
+			}
+			errCh <- nil
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		assert.NoError(t, err)
+	}
+}
+
+
 func TestDockerDriver_Destroy_ProxySocketCleanup(t *testing.T) {
 	tempDir := t.TempDir()
 	sockPath := filepath.Join(tempDir, "docker.sock")

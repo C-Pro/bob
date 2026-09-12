@@ -37,6 +37,7 @@ type Driver struct {
 	proxies            map[string]*sandbox.FilteringProxy // keyed by userID
 	customBlockedCIDRs []string
 	forwarderPort      int
+	resolver           *net.Resolver
 }
 
 // Config provides configuration parameters for the Docker driver.
@@ -49,6 +50,7 @@ type Config struct {
 	HostDataDir        string
 	CustomBlockedCIDRs []string
 	ForwarderPort      int
+	Resolver           *net.Resolver
 }
 
 // NewDriver creates a new Docker Sibling driver.
@@ -92,6 +94,7 @@ func NewDriver(cfg Config) *Driver {
 		hostDataDir:        hostData,
 		customBlockedCIDRs: cfg.CustomBlockedCIDRs,
 		forwarderPort:      fwdPort,
+		resolver:           cfg.Resolver,
 		client: &http.Client{
 			Transport: transport,
 			Timeout:   10 * time.Minute,
@@ -208,6 +211,7 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 			ListenTCP:     "none",
 			SocketPath:    sockPath,
 			CustomBlocked: d.customBlockedCIDRs,
+			Resolver:      d.resolver,
 		})
 		if err != nil {
 			d.mu.Unlock()
@@ -729,9 +733,13 @@ func (d *Driver) pullImage(ctx context.Context, image string) error {
 
 func (d *Driver) getProxyDir(userID string) string {
 	candidate := filepath.Join(d.dataDir, "proxies", userID)
-	if len(filepath.Join(candidate, "proxy.sock")) >= 104 {
-		h := sha256.Sum256([]byte(userID))
-		return filepath.Join(d.dataDir, "p", hex.EncodeToString(h[:8]))
+	if len(filepath.Join(candidate, "proxy.sock")) < 104 {
+		return candidate
 	}
-	return candidate
+	h := sha256.Sum256([]byte(userID))
+	shortPath := filepath.Join(d.dataDir, "p", hex.EncodeToString(h[:4]))
+	if len(filepath.Join(shortPath, "proxy.sock")) < 104 {
+		return shortPath
+	}
+	return filepath.Join(os.TempDir(), "b-p", hex.EncodeToString(h[:4]))
 }
