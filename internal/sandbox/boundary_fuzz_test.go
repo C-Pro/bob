@@ -12,8 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"bob/internal/config"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -46,7 +44,7 @@ func FuzzUserWorkspaceDir(f *testing.F) {
 	}
 
 	tempDir := f.TempDir()
-	cfg := &config.Config{
+	cfg := Config{
 		DataDir: tempDir,
 	}
 	mgr := &Manager{cfg: cfg}
@@ -202,7 +200,7 @@ func FuzzValidateMountPath(f *testing.F) {
 // in UserWorkspaceDir are rejected.
 func TestUserWorkspaceDir_PathTraversalPrevention(t *testing.T) {
 	tempDir := t.TempDir()
-	cfg := &config.Config{
+	cfg := Config{
 		DataDir: filepath.Join(tempDir, "data"),
 	}
 	mgr := &Manager{cfg: cfg}
@@ -366,13 +364,13 @@ func TestFilteringProxy_LANClientIPAuthorization(t *testing.T) {
 // before driver.Create() completes, leaving Status == StatusPendingApproval.
 func TestApproveSandbox_StateRaceCondition(t *testing.T) {
 	tempDir := t.TempDir()
-	cfg := &config.Config{
-		DataDir:                   tempDir,
-		SandboxEnabled:            true,
-		SandboxDrivers:            []string{"bwrap"},
-		SandboxMaxLifetime:        30 * time.Minute,
-		SandboxDefaultExecTimeout: 1 * time.Minute,
-		SandboxMaxExecTimeout:     10 * time.Minute,
+	cfg := Config{
+		DataDir:            tempDir,
+		Enabled:            true,
+		Drivers:            []string{"bwrap"},
+		MaxLifetime:        30 * time.Minute,
+		DefaultExecTimeout: 1 * time.Minute,
+		MaxExecTimeout:     10 * time.Minute,
 	}
 
 	createStarted := make(chan struct{})

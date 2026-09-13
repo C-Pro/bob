@@ -19,13 +19,14 @@ import (
 // ProxyConfig specifies configuration options for FilteringProxy.
 type ProxyConfig struct {
 	Policy             NetworkPolicy
-	ListenTCP          string        // TCP bind address (e.g. "127.0.0.1:0" or "0.0.0.0:0"). If empty, defaults to "127.0.0.1:0".
+	ListenTCP          string        // TCP bind address (e.g. "127.0.0.1:0"). If empty and SocketPath is set, or if "none", TCP listener is disabled. If empty and SocketPath is empty, defaults to "127.0.0.1:0".
 	SocketPath         string        // Optional path for a Unix domain socket listener.
 	CustomBlocked      []string      // Optional test override to bypass defaultMandatoryBlockedCIDRs.
 	AllowedClientCIDRs []string      // Optional allowed client CIDRs in addition to loopback.
 	MaxTunnels         int           // Optional limit on concurrent CONNECT tunnels (default 128).
 	TunnelIdleTimeout  time.Duration // Optional idle timeout for CONNECT tunnels (default 2m).
 	TunnelLifetime     time.Duration // Optional max lifetime for CONNECT tunnels (default 15m).
+	Resolver           *net.Resolver // Optional custom DNS resolver (defaults to net.DefaultResolver).
 }
 
 // FilteringProxy is an in-process HTTP/CONNECT proxy that enforces domain and CIDR whitelisting/blacklisting.
@@ -46,6 +47,7 @@ type FilteringProxy struct {
 	tunnelSem          chan struct{}
 	tunnelIdleTimeout  time.Duration
 	tunnelLifetime     time.Duration
+	resolver           *net.Resolver
 }
 
 type closeWriter interface {
@@ -123,36 +125,54 @@ func NewFilteringProxyWithConfig(cfg ProxyConfig) (*FilteringProxy, error) {
 		return nil, fmt.Errorf("invalid proxy network policy: %w", err)
 	}
 
-	bindTCP := cfg.ListenTCP
-	if bindTCP == "" {
-		bindTCP = "127.0.0.1:0"
+	skipTCP := cfg.ListenTCP == "none" || (cfg.ListenTCP == "" && cfg.SocketPath != "")
+	if skipTCP && cfg.SocketPath == "" {
+		return nil, errors.New("cannot create filtering proxy: neither TCP nor Unix socket listener is configured")
 	}
 
-	ln, err := net.Listen("tcp", bindTCP)
-	if err != nil {
-		return nil, fmt.Errorf("failed to bind filtering proxy listener: %w", err)
-	}
-
+	var ln net.Listener
 	var port int
-	if tcpAddr, ok := ln.Addr().(*net.TCPAddr); ok {
-		port = tcpAddr.Port
+	var addr string
+	if !skipTCP {
+		bindTCP := cfg.ListenTCP
+		if bindTCP == "" {
+			bindTCP = "127.0.0.1:0"
+		}
+
+		var err error
+		ln, err = net.Listen("tcp", bindTCP)
+		if err != nil {
+			return nil, fmt.Errorf("failed to bind filtering proxy listener: %w", err)
+		}
+
+		if tcpAddr, ok := ln.Addr().(*net.TCPAddr); ok {
+			port = tcpAddr.Port
+		}
+		addr = ln.Addr().String()
 	}
 
 	var unixLn net.Listener
 	if cfg.SocketPath != "" {
 		_ = os.Remove(cfg.SocketPath)
 		if err := os.MkdirAll(filepath.Dir(cfg.SocketPath), 0o700); err != nil {
-			_ = ln.Close()
+			if ln != nil {
+				_ = ln.Close()
+			}
 			return nil, fmt.Errorf("failed to create proxy socket directory: %w", err)
 		}
+		var err error
 		unixLn, err = net.Listen("unix", cfg.SocketPath)
 		if err != nil {
-			_ = ln.Close()
+			if ln != nil {
+				_ = ln.Close()
+			}
 			return nil, fmt.Errorf("failed to bind proxy unix socket %s: %w", cfg.SocketPath, err)
 		}
 		if err := os.Chmod(cfg.SocketPath, 0o600); err != nil {
 			_ = unixLn.Close()
-			_ = ln.Close()
+			if ln != nil {
+				_ = ln.Close()
+			}
 			return nil, fmt.Errorf("failed to chmod proxy unix socket %s: %w", cfg.SocketPath, err)
 		}
 	}
@@ -173,9 +193,9 @@ func NewFilteringProxyWithConfig(cfg ProxyConfig) (*FilteringProxy, error) {
 	if tunnelIdle <= 0 {
 		tunnelIdle = 2 * time.Minute
 	}
-	tunnelLife := cfg.TunnelLifetime
-	if tunnelLife <= 0 {
-		tunnelLife = 15 * time.Minute
+	tunnelLifetime := cfg.TunnelLifetime
+	if tunnelLifetime <= 0 {
+		tunnelLifetime = 15 * time.Minute
 	}
 
 	tr := &http.Transport{
@@ -196,14 +216,15 @@ func NewFilteringProxyWithConfig(cfg ProxyConfig) (*FilteringProxy, error) {
 		policy:             sanitizedPolicy,
 		listener:           ln,
 		unixListener:       unixLn,
-		addr:               ln.Addr().String(),
+		addr:               addr,
 		socketPath:         cfg.SocketPath,
 		port:               port,
 		activeConns:        make(map[net.Conn]struct{}),
 		allowedClientCIDRs: allowedClientNets,
 		tunnelSem:          make(chan struct{}, maxTunnels),
 		tunnelIdleTimeout:  tunnelIdle,
-		tunnelLifetime:     tunnelLife,
+		tunnelLifetime:     tunnelLifetime,
+		resolver:           cfg.Resolver,
 		httpClient: &http.Client{
 			Transport: tr,
 			Timeout:   60 * time.Second,
@@ -219,11 +240,13 @@ func NewFilteringProxyWithConfig(cfg ProxyConfig) (*FilteringProxy, error) {
 		WriteTimeout: 60 * time.Second,
 	}
 
-	go func() {
-		if err := fp.server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("filtering proxy TCP server error", "error", err)
-		}
-	}()
+	if ln != nil {
+		go func() {
+			if err := fp.server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				slog.Error("filtering proxy TCP server error", "error", err)
+			}
+		}()
+	}
 
 	if unixLn != nil {
 		go func() {
@@ -238,6 +261,9 @@ func NewFilteringProxyWithConfig(cfg ProxyConfig) (*FilteringProxy, error) {
 
 // Addr returns the proxy address, e.g. "http://127.0.0.1:45678".
 func (p *FilteringProxy) Addr() string {
+	if p.addr == "" {
+		return ""
+	}
 	return "http://" + p.addr
 }
 
@@ -427,7 +453,11 @@ func (p *FilteringProxy) resolveAndValidate(ctx context.Context, host string) (n
 	} else {
 		lookupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
-		resolved, err := net.DefaultResolver.LookupIP(lookupCtx, "ip", cleanHost)
+		resolver := p.resolver
+		if resolver == nil {
+			resolver = net.DefaultResolver
+		}
+		resolved, err := resolver.LookupIP(lookupCtx, "ip", cleanHost)
 		if err != nil {
 			return nil, fmt.Errorf("failed to resolve host %q: %w", cleanHost, err)
 		}
@@ -502,7 +532,7 @@ func (p *FilteringProxy) handleConnect(w http.ResponseWriter, req *http.Request,
 		return
 	}
 
-	clientConn, _, err := hijacker.Hijack()
+	clientConn, rw, err := hijacker.Hijack()
 	if err != nil {
 		p.logAccess(req.RemoteAddr, req.Method, targetHost, req.Proto, http.StatusServiceUnavailable, 0, "ERROR", err.Error())
 		http.Error(w, fmt.Sprintf("Hijacking failed: %v", err), http.StatusServiceUnavailable)
@@ -519,6 +549,18 @@ func (p *FilteringProxy) handleConnect(w http.ResponseWriter, req *http.Request,
 	if err != nil {
 		p.logAccess(req.RemoteAddr, req.Method, targetHost, req.Proto, http.StatusBadGateway, 0, "ERROR", err.Error())
 		return
+	}
+
+	if rw != nil && rw.Reader.Buffered() > 0 {
+		buffered := make([]byte, rw.Reader.Buffered())
+		if _, readErr := io.ReadFull(rw, buffered); readErr != nil {
+			p.logAccess(req.RemoteAddr, req.Method, targetHost, req.Proto, http.StatusBadGateway, 0, "ERROR", readErr.Error())
+			return
+		}
+		if _, writeErr := destConn.Write(buffered); writeErr != nil {
+			p.logAccess(req.RemoteAddr, req.Method, targetHost, req.Proto, http.StatusBadGateway, 0, "ERROR", writeErr.Error())
+			return
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(req.Context(), p.tunnelLifetime)

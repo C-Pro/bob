@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"bob/internal/sandbox"
 )
 
 // DefaultUserAgent is the standard User-Agent header used for outgoing HTTP requests.
@@ -54,13 +56,15 @@ type Config struct {
 	SandboxCPULimit            float64
 	SandboxMemoryLimitMB       int
 	SandboxHostDataDir         string
+	SandboxProxyFwdPath        string
+	SandboxAllowRuntimeBuild   *bool
 }
 
 // DefaultSandboxAllowedImages defines standard safe container images.
-var DefaultSandboxAllowedImages = []string{"alpine:latest", "golang:alpine", "python:3.11-slim", "node:20-slim"}
+var DefaultSandboxAllowedImages = sandbox.DefaultSandboxAllowedImages
 
 // DefaultSandboxAllowedNetworkModes defines standard safe network modes (full is disabled by default).
-var DefaultSandboxAllowedNetworkModes = []string{"none", "restricted"}
+var DefaultSandboxAllowedNetworkModes = sandbox.DefaultSandboxAllowedNetworkModes
 
 // S3Enabled reports whether object-storage backup is configured.
 func (c *Config) S3Enabled() bool {
@@ -95,6 +99,18 @@ func LoadFromEnv() (*Config, error) {
 	s3PathStyle := s3PathStyleStr == "true" || s3PathStyleStr == "1"
 
 	sandboxEnabled, err := getEnvBoolOrDefault("SANDBOX_ENABLED", true)
+	if err != nil {
+		return nil, err
+	}
+
+	defaultRuntimeBuild := os.Getenv("ENV") == "development"
+	for _, arg := range os.Args {
+		if strings.HasPrefix(arg, "-test.") {
+			defaultRuntimeBuild = true
+			break
+		}
+	}
+	sandboxAllowRuntimeBuild, err := getEnvBoolOrDefault("BOB_ALLOW_RUNTIME_BUILD", defaultRuntimeBuild)
 	if err != nil {
 		return nil, err
 	}
@@ -138,6 +154,8 @@ func LoadFromEnv() (*Config, error) {
 		SandboxCPULimit:            getEnvFloatOrDefault("SANDBOX_CPU_LIMIT", 1.0),
 		SandboxMemoryLimitMB:       getEnvIntOrDefault("SANDBOX_MEMORY_LIMIT_MB", 512),
 		SandboxHostDataDir:         getEnvOrDefault("SANDBOX_HOST_DATA_DIR", ""),
+		SandboxProxyFwdPath:        getEnvOrDefault("SANDBOX_PROXY_FWD_PATH", ""),
+		SandboxAllowRuntimeBuild:   &sandboxAllowRuntimeBuild,
 	}
 
 	if cfg.SandboxHostDataDir != "" {
@@ -166,6 +184,26 @@ func LoadFromEnv() (*Config, error) {
 // DBPath returns the joined path to a SQLite database file inside DataDir.
 func (c *Config) DBPath(filename string) string {
 	return filepath.Join(c.DataDir, filename)
+}
+
+// SandboxConfig derives a sandbox.Config from the application Config.
+func (c *Config) SandboxConfig() sandbox.Config {
+	return sandbox.Config{
+		Enabled:             c.SandboxEnabled,
+		Drivers:             c.SandboxDrivers,
+		DockerSocket:        c.SandboxDockerSocket,
+		AllowedImages:       c.SandboxAllowedImages,
+		AllowedNetworkModes: c.SandboxAllowedNetworkModes,
+		MaxLifetime:         c.SandboxMaxLifetime,
+		DefaultExecTimeout:  c.SandboxDefaultExecTimeout,
+		MaxExecTimeout:      c.SandboxMaxExecTimeout,
+		CPULimit:            c.SandboxCPULimit,
+		MemoryLimitMB:       c.SandboxMemoryLimitMB,
+		DataDir:             c.DataDir,
+		HostDataDir:         c.SandboxHostDataDir,
+		ProxyFwdPath:        c.SandboxProxyFwdPath,
+		AllowRuntimeBuild:   c.SandboxAllowRuntimeBuild,
+	}
 }
 
 // Validate checks required fields for runtime readiness.
@@ -202,37 +240,9 @@ func (c *Config) Validate(requireAPIKey bool) error {
 			return errors.New("S3_BACKUP_KEEP must be greater than 0")
 		}
 	}
-	if c.SandboxEnabled {
-		if len(c.SandboxDrivers) == 0 {
-			return errors.New("SANDBOX_DRIVERS cannot be empty when sandbox is enabled")
-		}
-		if len(c.SandboxAllowedNetworkModes) == 0 {
-			return errors.New("SANDBOX_ALLOWED_NETWORK_MODES cannot be empty when sandbox is enabled")
-		}
-		for _, m := range c.SandboxAllowedNetworkModes {
-			lower := strings.ToLower(strings.TrimSpace(m))
-			if lower != "none" && lower != "restricted" && lower != "full" {
-				return fmt.Errorf("invalid network mode in SANDBOX_ALLOWED_NETWORK_MODES: %s", m)
-			}
-		}
-		if c.SandboxMaxLifetime <= 0 {
-			return errors.New("SANDBOX_MAX_LIFETIME must be greater than 0")
-		}
-		if c.SandboxDefaultExecTimeout <= 0 {
-			return errors.New("SANDBOX_DEFAULT_EXEC_TIMEOUT must be greater than 0")
-		}
-		if c.SandboxMaxExecTimeout < c.SandboxDefaultExecTimeout {
-			return errors.New("SANDBOX_MAX_EXEC_TIMEOUT cannot be less than SANDBOX_DEFAULT_EXEC_TIMEOUT")
-		}
-		if c.SandboxCPULimit <= 0 {
-			return errors.New("SANDBOX_CPU_LIMIT must be greater than 0")
-		}
-		if c.SandboxMemoryLimitMB <= 0 {
-			return errors.New("SANDBOX_MEMORY_LIMIT_MB must be greater than 0")
-		}
-		if c.SandboxHostDataDir != "" && !filepath.IsAbs(c.SandboxHostDataDir) {
-			return errors.New("SANDBOX_HOST_DATA_DIR must be an absolute path")
-		}
+	sbxCfg := c.SandboxConfig()
+	if err := sbxCfg.Validate(); err != nil {
+		return err
 	}
 	return nil
 }

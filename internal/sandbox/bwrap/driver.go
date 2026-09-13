@@ -2,12 +2,15 @@ package bwrap
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -20,6 +23,12 @@ type Driver struct {
 	bwrapPath          string
 	cpuLimit           float64
 	memoryLimitMB      int
+	dataDir            string
+	proxyFwdPath       string
+	allowRuntimeBuild  *bool
+	forwarderBinary    string
+	forwarderPort      int
+	fwdMu              sync.Mutex
 	mu                 sync.Mutex
 	proxies            map[string]*sandbox.FilteringProxy // keyed by userID
 	customBlockedCIDRs []string
@@ -27,15 +36,13 @@ type Driver struct {
 
 // Config provides configuration parameters for the Bubblewrap driver.
 type Config struct {
-	CPULimit      float64
-	MemoryLimitMB int
-}
-
-// SetCustomBlockedCIDRs overrides default mandatory blocked CIDRs for testing.
-func (d *Driver) SetCustomBlockedCIDRs(cidrs []string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.customBlockedCIDRs = cidrs
+	CPULimit           float64
+	MemoryLimitMB      int
+	CustomBlockedCIDRs []string
+	ForwarderPort      int
+	DataDir            string
+	ProxyFwdPath       string
+	AllowRuntimeBuild  *bool
 }
 
 // NewDriver creates a new Bubblewrap driver with default limits.
@@ -54,12 +61,43 @@ func NewDriverWithConfig(cfg Config) *Driver {
 	if cpu <= 0 {
 		cpu = 1.0
 	}
-	return &Driver{
-		bwrapPath:     path,
-		cpuLimit:      cpu,
-		memoryLimitMB: mem,
-		proxies:       make(map[string]*sandbox.FilteringProxy),
+	fwdPort := cfg.ForwarderPort
+	if fwdPort <= 0 {
+		fwdPort = sandbox.DefaultForwarderPort
 	}
+	dataDir := strings.TrimSpace(cfg.DataDir)
+	if dataDir == "" {
+		dataDir = "./data"
+	}
+	return &Driver{
+		bwrapPath:          path,
+		cpuLimit:           cpu,
+		memoryLimitMB:      mem,
+		dataDir:            dataDir,
+		proxyFwdPath:       cfg.ProxyFwdPath,
+		allowRuntimeBuild:  cfg.AllowRuntimeBuild,
+		customBlockedCIDRs: cfg.CustomBlockedCIDRs,
+		forwarderPort:      fwdPort,
+		proxies:            make(map[string]*sandbox.FilteringProxy),
+	}
+}
+
+func (d *Driver) getForwarderBinary() (string, error) {
+	d.fwdMu.Lock()
+	defer d.fwdMu.Unlock()
+	if d.forwarderBinary != "" {
+		return d.forwarderBinary, nil
+	}
+	fwd, err := sandbox.EnsureForwarderBinary(sandbox.ForwarderConfig{
+		DataDir:           d.dataDir,
+		ProxyFwdPath:      d.proxyFwdPath,
+		AllowRuntimeBuild: d.allowRuntimeBuild,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to ensure forwarder binary: %w", err)
+	}
+	d.forwarderBinary = fwd
+	return d.forwarderBinary, nil
 }
 
 // Type returns the driver type.
@@ -98,28 +136,35 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 	sbx.SetWorkspaceDir(absWorkspace)
 
 	if sbx.Network.Mode == sandbox.NetworkRestricted {
-		d.mu.Lock()
-		defer d.mu.Unlock()
-		if existing, ok := d.proxies[sbx.UserID]; ok {
-			if err := existing.Close(); err != nil {
-				slog.Warn("failed to close existing bwrap proxy", "user", sbx.UserID, "error", err)
-			}
+		if _, err := d.getForwarderBinary(); err != nil {
+			return fmt.Errorf("failed to ensure forwarder binary for user %s: %w", sbx.UserID, err)
 		}
-		sockDir, err := os.MkdirTemp("", fmt.Sprintf("bob-proxy-%s-", sbx.UserID))
+
+		h := sha256.Sum256([]byte(sbx.UserID))
+		sockDir, err := os.MkdirTemp("", fmt.Sprintf("bob-p-%s-", hex.EncodeToString(h[:4])))
 		if err != nil {
 			return fmt.Errorf("failed to create proxy socket directory: %w", err)
 		}
 		sockPath := filepath.Join(sockDir, "proxy.sock")
 		proxy, err := sandbox.NewFilteringProxyWithConfig(sandbox.ProxyConfig{
 			Policy:        sbx.Network,
-			ListenTCP:     "127.0.0.1:0",
+			ListenTCP:     "none",
 			SocketPath:    sockPath,
 			CustomBlocked: d.customBlockedCIDRs,
 		})
 		if err != nil {
+			_ = os.RemoveAll(sockDir)
 			return fmt.Errorf("failed to start filtering proxy for user %s: %w", sbx.UserID, err)
 		}
+
+		d.mu.Lock()
+		if existing, ok := d.proxies[sbx.UserID]; ok {
+			if err := existing.Close(); err != nil {
+				slog.Warn("failed to close existing bwrap proxy", "user", sbx.UserID, "error", err)
+			}
+		}
 		d.proxies[sbx.UserID] = proxy
+		d.mu.Unlock()
 	}
 
 	return nil
@@ -137,6 +182,82 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 	execCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	args, err := d.buildArgs(sbx, cmd)
+	if err != nil {
+		return nil, err
+	}
+
+	var bwrapCmd *exec.Cmd
+	if hasSystemdUserScope() {
+		sysArgs := buildSystemdArgs(d.memoryLimitMB, d.cpuLimit, d.bwrapPath, args)
+		// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
+		bwrapCmd = exec.CommandContext(execCtx, "systemd-run", sysArgs...)
+	} else {
+		slog.Warn("systemd-run --user not available; bwrap running without cgroup resource limits (MemoryMax/TasksMax/CPUQuota)", "user", sbx.UserID)
+		// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
+		bwrapCmd = exec.CommandContext(execCtx, d.bwrapPath, args...)
+	}
+
+	stdout := sandbox.NewBoundedBuffer(sandbox.DefaultMaxOutputBytes)
+	stderr := sandbox.NewBoundedBuffer(sandbox.DefaultMaxOutputBytes)
+	bwrapCmd.Stdout = stdout
+	bwrapCmd.Stderr = stderr
+
+	startTime := time.Now()
+	err = bwrapCmd.Run()
+	duration := time.Since(startTime)
+
+	if execCtx.Err() != nil {
+		errStr := stderr.String()
+		if errStr != "" {
+			errStr += "\ncommand timed out"
+		} else {
+			errStr = "command timed out"
+		}
+		return &sandbox.ExecResult{
+			ExitCode: -1,
+			Stdout:   stdout.String(),
+			Stderr:   errStr,
+			Duration: duration,
+		}, nil
+	}
+
+	exitCode := 0
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+				exitCode = status.ExitStatus()
+			} else {
+				exitCode = 1
+			}
+		} else {
+			return nil, fmt.Errorf("bwrap execution failed: %w", err)
+		}
+	}
+
+	return &sandbox.ExecResult{
+		ExitCode: exitCode,
+		Stdout:   stdout.String(),
+		Stderr:   stderr.String(),
+		Duration: duration,
+	}, nil
+}
+
+// Destroy cleans up resources and shuts down filtering proxies associated with the user.
+func (d *Driver) Destroy(ctx context.Context, sbx *sandbox.UserSandbox) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if proxy, ok := d.proxies[sbx.UserID]; ok {
+		if err := proxy.Close(); err != nil {
+			slog.Warn("failed to close bwrap filtering proxy on destroy", "user", sbx.UserID, "error", err)
+		}
+		delete(d.proxies, sbx.UserID)
+	}
+	return nil
+}
+
+func (d *Driver) buildArgs(sbx *sandbox.UserSandbox, cmd []string) ([]string, error) {
 	args := []string{
 		"--die-with-parent",
 	}
@@ -244,6 +365,7 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 	args = append(args, "--chdir", sandbox.DefaultWorkspaceMountPath)
 
 	var proxySockPath string
+	var fwdBinary string
 	if sbx.Network.Mode == sandbox.NetworkRestricted {
 		d.mu.Lock()
 		proxy := d.proxies[sbx.UserID]
@@ -251,6 +373,13 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 		if proxy != nil && proxy.SocketPath() != "" {
 			proxySockPath = proxy.SocketPath()
 			args = append(args, "--dir", "/run", "--bind", proxySockPath, "/run/proxy.sock")
+
+			fwd, err := d.getForwarderBinary()
+			if err != nil {
+				return nil, err
+			}
+			fwdBinary = fwd
+			args = append(args, "--dir", "/run/proxy", "--ro-bind", fwdBinary, "/run/proxy/fwd")
 		}
 	}
 
@@ -264,138 +393,33 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 	)
 
 	if sbx.Network.Mode == sandbox.NetworkRestricted {
-		proxyAddr := "http://127.0.0.1:18080"
-		if proxySockPath == "" {
-			d.mu.Lock()
-			proxy := d.proxies[sbx.UserID]
-			d.mu.Unlock()
-			if proxy != nil {
-				proxyAddr = proxy.Addr()
-			}
+		d.mu.Lock()
+		proxy := d.proxies[sbx.UserID]
+		d.mu.Unlock()
+		if proxy != nil {
+			proxyAddr := fmt.Sprintf("http://127.0.0.1:%d", d.forwarderPort)
+			args = append(args,
+				"--setenv", "http_proxy", proxyAddr,
+				"--setenv", "https_proxy", proxyAddr,
+				"--setenv", "HTTP_PROXY", proxyAddr,
+				"--setenv", "HTTPS_PROXY", proxyAddr,
+				"--setenv", "all_proxy", proxyAddr,
+				"--setenv", "ALL_PROXY", proxyAddr,
+				"--setenv", "no_proxy", "localhost,127.0.0.1",
+				"--setenv", "NO_PROXY", "localhost,127.0.0.1",
+			)
 		}
-		args = append(args,
-			"--setenv", "http_proxy", proxyAddr,
-			"--setenv", "https_proxy", proxyAddr,
-			"--setenv", "HTTP_PROXY", proxyAddr,
-			"--setenv", "HTTPS_PROXY", proxyAddr,
-			"--setenv", "all_proxy", proxyAddr,
-			"--setenv", "ALL_PROXY", proxyAddr,
-		)
 	}
 
 	// Append command
-	if proxySockPath != "" {
-		forwarderScript := `
-if command -v socat >/dev/null 2>&1; then
-    socat TCP-LISTEN:18080,bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:/run/proxy.sock </dev/null >/dev/null 2>&1 &
-    FWD_PID=$!
-elif command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import socket,threading
-def p(a,b):
- try:
-  while 1:
-   d=a.recv(4096)
-   if not d:break
-   b.sendall(d)
-  except:pass
- finally:
-  try:a.close();b.close()
-  except:pass
-s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
-s.bind(("127.0.0.1",18080))
-s.listen(16)
-while 1:
- c,_=s.accept()
- u=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
- u.connect("/run/proxy.sock")
- threading.Thread(target=p,args=(c,u),daemon=True).start()
- threading.Thread(target=p,args=(u,c),daemon=True).start()
-' </dev/null >/dev/null 2>&1 &
-    FWD_PID=$!
-fi
-sleep 0.05
-"$@"
-EXIT_CODE=$?
-if [ -n "$FWD_PID" ]; then
-    kill -9 $FWD_PID 2>/dev/null || true
-fi
-exit $EXIT_CODE
-`
-		args = append(args, "/bin/sh", "-c", forwarderScript, "--")
+	if fwdBinary != "" {
+		args = append(args, "/run/proxy/fwd", "-tcp", fmt.Sprintf("127.0.0.1:%d", d.forwarderPort), "-sock", "/run/proxy.sock", "--")
 		args = append(args, cmd...)
 	} else {
 		args = append(args, cmd...)
 	}
 
-	var bwrapCmd *exec.Cmd
-	if hasSystemdUserScope() {
-		sysArgs := buildSystemdArgs(d.memoryLimitMB, d.cpuLimit, d.bwrapPath, args)
-		// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
-		bwrapCmd = exec.CommandContext(execCtx, "systemd-run", sysArgs...)
-	} else {
-		slog.Warn("systemd-run --user not available; bwrap running without cgroup resource limits (MemoryMax/TasksMax/CPUQuota)", "user", sbx.UserID)
-		// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
-		bwrapCmd = exec.CommandContext(execCtx, d.bwrapPath, args...)
-	}
-
-	stdout := sandbox.NewBoundedBuffer(sandbox.DefaultMaxOutputBytes)
-	stderr := sandbox.NewBoundedBuffer(sandbox.DefaultMaxOutputBytes)
-	bwrapCmd.Stdout = stdout
-	bwrapCmd.Stderr = stderr
-
-	startTime := time.Now()
-	err = bwrapCmd.Run()
-	duration := time.Since(startTime)
-
-	if execCtx.Err() != nil {
-		errStr := stderr.String()
-		if errStr != "" {
-			errStr += "\ncommand timed out"
-		} else {
-			errStr = "command timed out"
-		}
-		return &sandbox.ExecResult{
-			ExitCode: -1,
-			Stdout:   stdout.String(),
-			Stderr:   errStr,
-			Duration: duration,
-		}, nil
-	}
-
-	exitCode := 0
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
-				exitCode = status.ExitStatus()
-			} else {
-				exitCode = 1
-			}
-		} else {
-			return nil, fmt.Errorf("bwrap execution failed: %w", err)
-		}
-	}
-
-	return &sandbox.ExecResult{
-		ExitCode: exitCode,
-		Stdout:   stdout.String(),
-		Stderr:   stderr.String(),
-		Duration: duration,
-	}, nil
-}
-
-// Destroy cleans up resources and shuts down filtering proxies associated with the user.
-func (d *Driver) Destroy(ctx context.Context, sbx *sandbox.UserSandbox) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if proxy, ok := d.proxies[sbx.UserID]; ok {
-		if err := proxy.Close(); err != nil {
-			slog.Warn("failed to close bwrap filtering proxy on destroy", "user", sbx.UserID, "error", err)
-		}
-		delete(d.proxies, sbx.UserID)
-	}
-	return nil
+	return args, nil
 }
 
 func (d *Driver) mountNetFiles(args *[]string) {

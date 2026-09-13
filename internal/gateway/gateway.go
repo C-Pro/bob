@@ -74,19 +74,25 @@ func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 
 	var sandboxManager *sandbox.Manager
 	if cfg.SandboxEnabled {
+		sbxCfg := cfg.SandboxConfig()
 		bwrapDriver := bwrap.NewDriverWithConfig(bwrap.Config{
-			CPULimit:      cfg.SandboxCPULimit,
-			MemoryLimitMB: cfg.SandboxMemoryLimitMB,
+			CPULimit:          sbxCfg.CPULimit,
+			MemoryLimitMB:     sbxCfg.MemoryLimitMB,
+			DataDir:           sbxCfg.DataDir,
+			ProxyFwdPath:      sbxCfg.ProxyFwdPath,
+			AllowRuntimeBuild: sbxCfg.AllowRuntimeBuild,
 		})
 		dockerDriver := docker.NewDriver(docker.Config{
-			SocketPath:    cfg.SandboxDockerSocket,
-			AllowedImages: cfg.SandboxAllowedImages,
-			CPULimit:      cfg.SandboxCPULimit,
-			MemoryLimitMB: cfg.SandboxMemoryLimitMB,
-			DataDir:       cfg.DataDir,
-			HostDataDir:   cfg.SandboxHostDataDir,
+			SocketPath:        sbxCfg.DockerSocket,
+			AllowedImages:     sbxCfg.AllowedImages,
+			CPULimit:          sbxCfg.CPULimit,
+			MemoryLimitMB:     sbxCfg.MemoryLimitMB,
+			DataDir:           sbxCfg.DataDir,
+			HostDataDir:       sbxCfg.HostDataDir,
+			ProxyFwdPath:      sbxCfg.ProxyFwdPath,
+			AllowRuntimeBuild: sbxCfg.AllowRuntimeBuild,
 		})
-		sandboxManager = sandbox.NewManager(cfg, []sandbox.Driver{bwrapDriver, dockerDriver})
+		sandboxManager = sandbox.NewManager(sbxCfg, []sandbox.Driver{bwrapDriver, dockerDriver})
 	}
 
 	toolsRegistry := tools.NewRegistry(tavilyClient, memoryManager, sandboxManager)
@@ -789,6 +795,13 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 
 	// 4. Determine trigger condition
 	shouldProcess, _ := IsMentionedOrDM(g.cfg.BotHandle, msg.ChatID, msg.Content)
+	if !shouldProcess && msg.ChatID == "townhall" {
+		if strings.EqualFold(g.cfg.BotHandle, "@bob") {
+			shouldProcess, _ = IsMentionedOrDM("@bot", msg.ChatID, msg.Content)
+		} else if strings.EqualFold(g.cfg.BotHandle, "@bot") {
+			shouldProcess, _ = IsMentionedOrDM("@bob", msg.ChatID, msg.Content)
+		}
+	}
 
 	// 5. Append incoming user message to ring buffer (backfill chat history if buffer was uninitialized)
 	rb := g.contextManager.GetOrCreate(msg.ChatID)

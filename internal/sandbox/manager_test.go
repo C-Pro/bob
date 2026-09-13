@@ -6,8 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"bob/internal/config"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -50,14 +48,14 @@ func (m *mockDriver) Destroy(ctx context.Context, sbx *UserSandbox) error {
 
 func TestManagerLifecycle(t *testing.T) {
 	tempDir := t.TempDir()
-	cfg := &config.Config{
-		DataDir:                   tempDir,
-		SandboxEnabled:            true,
-		SandboxDrivers:            []string{"bwrap", "docker"},
-		SandboxAllowedImages:      []string{"alpine:latest"},
-		SandboxMaxLifetime:        30 * time.Minute,
-		SandboxDefaultExecTimeout: 1 * time.Minute,
-		SandboxMaxExecTimeout:     10 * time.Minute,
+	cfg := Config{
+		DataDir:            tempDir,
+		Enabled:            true,
+		Drivers:            []string{"bwrap", "docker"},
+		AllowedImages:      []string{"alpine:latest"},
+		MaxLifetime:        30 * time.Minute,
+		DefaultExecTimeout: 1 * time.Minute,
+		MaxExecTimeout:     10 * time.Minute,
 	}
 
 	mockBwrap := &mockDriver{driverType: DriverBwrap, available: true}
@@ -141,13 +139,13 @@ func TestManagerLifecycle(t *testing.T) {
 
 func TestManagerExpiration(t *testing.T) {
 	tempDir := t.TempDir()
-	cfg := &config.Config{
-		DataDir:                   tempDir,
-		SandboxEnabled:            true,
-		SandboxDrivers:            []string{"bwrap"},
-		SandboxMaxLifetime:        100 * time.Millisecond,
-		SandboxDefaultExecTimeout: 1 * time.Minute,
-		SandboxMaxExecTimeout:     10 * time.Minute,
+	cfg := Config{
+		DataDir:            tempDir,
+		Enabled:            true,
+		Drivers:            []string{"bwrap"},
+		MaxLifetime:        100 * time.Millisecond,
+		DefaultExecTimeout: 1 * time.Minute,
+		MaxExecTimeout:     10 * time.Minute,
 	}
 
 	mockBwrap := &mockDriver{driverType: DriverBwrap, available: true}
@@ -182,14 +180,14 @@ func TestManagerExpiration(t *testing.T) {
 
 func TestManagerNetworkModesValidation(t *testing.T) {
 	tempDir := t.TempDir()
-	cfg := &config.Config{
-		DataDir:                    tempDir,
-		SandboxEnabled:             true,
-		SandboxDrivers:             []string{"bwrap"},
-		SandboxAllowedNetworkModes: []string{"none", "restricted"},
-		SandboxMaxLifetime:         30 * time.Minute,
-		SandboxDefaultExecTimeout:  1 * time.Minute,
-		SandboxMaxExecTimeout:      10 * time.Minute,
+	cfg := Config{
+		DataDir:             tempDir,
+		Enabled:             true,
+		Drivers:             []string{"bwrap"},
+		AllowedNetworkModes: []string{"none", "restricted"},
+		MaxLifetime:         30 * time.Minute,
+		DefaultExecTimeout:  1 * time.Minute,
+		MaxExecTimeout:      10 * time.Minute,
 	}
 
 	mockBwrap := &mockDriver{driverType: DriverBwrap, available: true}
@@ -248,13 +246,13 @@ func (s *slowMockDriver) Create(ctx context.Context, sbx *UserSandbox, workspace
 
 func TestManager_ApproveSandbox_TOCTOURace(t *testing.T) {
 	tempDir := t.TempDir()
-	cfg := &config.Config{
-		DataDir:                   tempDir,
-		SandboxEnabled:            true,
-		SandboxDrivers:            []string{"bwrap"},
-		SandboxMaxLifetime:        30 * time.Minute,
-		SandboxDefaultExecTimeout: 1 * time.Minute,
-		SandboxMaxExecTimeout:     10 * time.Minute,
+	cfg := Config{
+		DataDir:            tempDir,
+		Enabled:            true,
+		Drivers:            []string{"bwrap"},
+		MaxLifetime:        30 * time.Minute,
+		DefaultExecTimeout: 1 * time.Minute,
+		MaxExecTimeout:     10 * time.Minute,
 	}
 	driver := &slowMockDriver{mockDriver: mockDriver{driverType: DriverBwrap, available: true}}
 	mgr := NewManager(cfg, []Driver{driver})
@@ -294,13 +292,13 @@ func TestManager_ApproveSandbox_TOCTOURace(t *testing.T) {
 
 func TestManager_RequestSandbox_DestroysExpiredRunning(t *testing.T) {
 	tempDir := t.TempDir()
-	cfg := &config.Config{
-		DataDir:                   tempDir,
-		SandboxEnabled:            true,
-		SandboxDrivers:            []string{"bwrap"},
-		SandboxMaxLifetime:        30 * time.Minute,
-		SandboxDefaultExecTimeout: 1 * time.Minute,
-		SandboxMaxExecTimeout:     10 * time.Minute,
+	cfg := Config{
+		DataDir:            tempDir,
+		Enabled:            true,
+		Drivers:            []string{"bwrap"},
+		MaxLifetime:        30 * time.Minute,
+		DefaultExecTimeout: 1 * time.Minute,
+		MaxExecTimeout:     10 * time.Minute,
 	}
 	driver := &mockDriver{driverType: DriverBwrap, available: true}
 	mgr := NewManager(cfg, []Driver{driver})
@@ -333,13 +331,13 @@ func TestManager_RequestSandbox_DestroysExpiredRunning(t *testing.T) {
 
 func TestManager_RequestSandbox_ExpiredStatusAllowed(t *testing.T) {
 	tempDir := t.TempDir()
-	cfg := &config.Config{
-		DataDir:                   tempDir,
-		SandboxEnabled:            true,
-		SandboxDrivers:            []string{"bwrap"},
-		SandboxMaxLifetime:        30 * time.Minute,
-		SandboxDefaultExecTimeout: 1 * time.Minute,
-		SandboxMaxExecTimeout:     10 * time.Minute,
+	cfg := Config{
+		DataDir:            tempDir,
+		Enabled:            true,
+		Drivers:            []string{"bwrap"},
+		MaxLifetime:        30 * time.Minute,
+		DefaultExecTimeout: 1 * time.Minute,
+		MaxExecTimeout:     10 * time.Minute,
 	}
 	driver := &mockDriver{driverType: DriverBwrap, available: true}
 	mgr := NewManager(cfg, []Driver{driver})
@@ -371,13 +369,13 @@ func TestManager_RequestSandbox_ExpiredStatusAllowed(t *testing.T) {
 
 func TestManager_Destroy_RetryOnError(t *testing.T) {
 	tempDir := t.TempDir()
-	cfg := &config.Config{
-		DataDir:                   tempDir,
-		SandboxEnabled:            true,
-		SandboxDrivers:            []string{"bwrap"},
-		SandboxMaxLifetime:        30 * time.Minute,
-		SandboxDefaultExecTimeout: 1 * time.Minute,
-		SandboxMaxExecTimeout:     10 * time.Minute,
+	cfg := Config{
+		DataDir:            tempDir,
+		Enabled:            true,
+		Drivers:            []string{"bwrap"},
+		MaxLifetime:        30 * time.Minute,
+		DefaultExecTimeout: 1 * time.Minute,
+		MaxExecTimeout:     10 * time.Minute,
 	}
 	driver := &mockDriver{driverType: DriverBwrap, available: true}
 	mgr := NewManager(cfg, []Driver{driver})
@@ -422,13 +420,13 @@ func TestManager_Destroy_RetryOnError(t *testing.T) {
 
 func TestManager_ApproveAndStatus_Race(t *testing.T) {
 	tempDir := t.TempDir()
-	cfg := &config.Config{
-		DataDir:                   tempDir,
-		SandboxEnabled:            true,
-		SandboxDrivers:            []string{"bwrap"},
-		SandboxMaxLifetime:        30 * time.Minute,
-		SandboxDefaultExecTimeout: 1 * time.Minute,
-		SandboxMaxExecTimeout:     10 * time.Minute,
+	cfg := Config{
+		DataDir:            tempDir,
+		Enabled:            true,
+		Drivers:            []string{"bwrap"},
+		MaxLifetime:        30 * time.Minute,
+		DefaultExecTimeout: 1 * time.Minute,
+		MaxExecTimeout:     10 * time.Minute,
 	}
 	driver := &mockDriver{driverType: DriverBwrap, available: true}
 	mgr := NewManager(cfg, []Driver{driver})
@@ -465,13 +463,13 @@ func TestManager_ApproveAndStatus_Race(t *testing.T) {
 
 func TestManager_RequestSandbox_InvalidSandboxPath(t *testing.T) {
 	tempDir := t.TempDir()
-	cfg := &config.Config{
-		DataDir:                   tempDir,
-		SandboxEnabled:            true,
-		SandboxDrivers:            []string{"bwrap"},
-		SandboxMaxLifetime:        30 * time.Minute,
-		SandboxDefaultExecTimeout: 1 * time.Minute,
-		SandboxMaxExecTimeout:     10 * time.Minute,
+	cfg := Config{
+		DataDir:            tempDir,
+		Enabled:            true,
+		Drivers:            []string{"bwrap"},
+		MaxLifetime:        30 * time.Minute,
+		DefaultExecTimeout: 1 * time.Minute,
+		MaxExecTimeout:     10 * time.Minute,
 	}
 	driver := &mockDriver{driverType: DriverBwrap, available: true}
 	mgr := NewManager(cfg, []Driver{driver})

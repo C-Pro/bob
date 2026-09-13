@@ -15,3 +15,6 @@ secret.*
 *.test
 bob_agent
 .agents
+bin/
+/bob-proxy-fwd
+internal/sandbox/embedded/*.gz
