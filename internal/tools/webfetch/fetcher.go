@@ -6,12 +6,44 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"net"
 	"net/http"
 	"strings"
 	"time"
 
 	"bob/internal/config"
 )
+
+// FetchError represents an error during web fetch.
+type FetchError struct {
+	StatusCode int
+	Err        error
+}
+
+func (e *FetchError) Error() string {
+	if e.StatusCode > 0 {
+		return fmt.Sprintf("fetch HTTP %d: %v", e.StatusCode, e.Err)
+	}
+	return fmt.Sprintf("fetch error: %v", e.Err)
+}
+
+func (e *FetchError) Unwrap() error {
+	return e.Err
+}
+
+// IsRetryable reports whether the fetch error indicates a temporary failure eligible for retry.
+func (e *FetchError) IsRetryable() bool {
+	if e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500 {
+		return true
+	}
+	if e.Err != nil {
+		var netErr net.Error
+		if errors.As(e.Err, &netErr) && netErr.Timeout() {
+			return true
+		}
+	}
+	return false
+}
 
 // MaxContentSize is the maximum size (16KB) for fetched and returned text.
 const MaxContentSize = 16 * 1024
@@ -52,7 +84,7 @@ func Fetch(ctx context.Context, targetURL string, client *http.Client) (*FetchRe
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetch error: %w", err)
+		return nil, &FetchError{Err: err}
 	}
 	defer func() {
 		_ = resp.Body.Close()
@@ -67,7 +99,7 @@ func Fetch(ctx context.Context, targetURL string, client *http.Client) (*FetchRe
 	limitReader := io.LimitReader(resp.Body, MaxContentSize+1)
 	buf, err := io.ReadAll(limitReader)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return nil, &FetchError{StatusCode: resp.StatusCode, Err: fmt.Errorf("failed to read response body: %w", err)}
 	}
 
 	truncated := false

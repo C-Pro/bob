@@ -8,6 +8,53 @@ create table schema_version(
 create unique index schema_version_uk on schema_version(is_current)
   where is_current = 1;
 
+create table fsm_runs (
+  id text primary key,
+  chat_id text not null,
+  user_id text not null,
+  fsm_type text not null,
+  status text not null,
+  current_state text not null,
+  iteration integer not null default 0,
+  max_iterations integer not null default 20,
+  context_json text not null,
+  result_json text,
+  error_text text,
+  resume_at integer,
+  created_at integer not null,
+  updated_at integer not null
+);
+
+create index idx_fsm_runs_active
+  on fsm_runs(status, resume_at)
+  where status in ('PENDING', 'RUNNING', 'WAITING');
+
+create index idx_fsm_runs_chat_status
+  on fsm_runs(chat_id, status, updated_at);
+
+create table fsm_steps (
+  id text primary key,
+  run_id text not null,
+  iteration integer not null,
+  step_index integer not null,
+  tool_name text not null,
+  tool_call_id text not null,
+  args_json text not null,
+  result_json text,
+  execution_mode text not null,
+  status text not null,
+  attempt integer not null default 0,
+  max_attempts integer not null default 3,
+  timeout_seconds integer not null default 30,
+  started_at integer,
+  completed_at integer,
+  error_text text,
+  foreign key(run_id) references fsm_runs(id) on delete cascade
+);
+
+create index idx_fsm_steps_run_iter
+  on fsm_steps(run_id, iteration, step_index);
+
 -- Insert current schema version. This should be increased every time changes are made
 -- to schema.tmpl and migrate.tmpl
 insert into schema_version(version, description, is_current)

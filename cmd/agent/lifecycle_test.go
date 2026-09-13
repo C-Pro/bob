@@ -18,6 +18,7 @@ import (
 
 	"bob/internal/backup"
 	"bob/internal/objectstore"
+	"bob/internal/store"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -37,7 +38,7 @@ func TestServiceDatabaseLifecycle(t *testing.T) {
 	buildOut, err := buildCmd.CombinedOutput()
 	require.NoError(t, err, "failed to build agent binary: %s", string(buildOut))
 
-	t.Run("Fresh start with no db creates db at v1", func(t *testing.T) {
+	t.Run("Fresh start with no db creates db at current version", func(t *testing.T) {
 		dataDir := filepath.Join(t.TempDir(), "data")
 		dbFile := filepath.Join(dataDir, "bob.db")
 		assert.NoFileExists(t, dbFile)
@@ -67,7 +68,7 @@ func TestServiceDatabaseLifecycle(t *testing.T) {
 		var v int
 		err = db.QueryRow("select version from schema_version where is_current=1").Scan(&v)
 		require.NoError(t, err)
-		assert.Equal(t, 1, v)
+		assert.Equal(t, store.CurrentVersion(), v)
 	})
 
 	t.Run("Start with db at v-2 fails startup with version mismatch", func(t *testing.T) {

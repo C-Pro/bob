@@ -23,6 +23,9 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	_ = os.Unsetenv("TOWNHALL_MAX_PARAGRAPHS")
 	_ = os.Unsetenv("DM_MAX_PARAGRAPHS")
 	_ = os.Unsetenv("MSG_RING_BUFFER_SIZE")
+	_ = os.Unsetenv("TOWNHALL_TOOL_MAX_ITERATIONS")
+	_ = os.Unsetenv("DM_TOOL_MAX_ITERATIONS")
+	_ = os.Unsetenv("FSM_RETENTION_DAYS")
 	_ = os.Unsetenv("TAVILY_API_KEY")
 	_ = os.Unsetenv("TAVILY_BASE_URL")
 	_ = os.Unsetenv("DATA_DIR")
@@ -65,6 +68,9 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	assert.Equal(t, 2, cfg.TownhallMaxParagraphs)
 	assert.Equal(t, 10, cfg.DMMaxParagraphs)
 	assert.Equal(t, 100, cfg.MsgRingBufferSize)
+	assert.Equal(t, 10, cfg.TownhallToolMaxIterations)
+	assert.Equal(t, 20, cfg.DMToolMaxIterations)
+	assert.Equal(t, 7, cfg.FSMRetentionDays)
 	assert.Equal(t, "./data", cfg.DataDir)
 	assert.Equal(t, "", cfg.EmbeddingModel)
 	assert.Equal(t, "bf16", cfg.EmbeddingPrecision)
@@ -422,4 +428,48 @@ func TestConfig_Validate_SandboxHostDataDir(t *testing.T) {
 	err := cfgInvalid.Validate(true)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "SANDBOX_HOST_DATA_DIR must be an absolute path")
+}
+
+func TestLoadFromEnv_FSMConfig(t *testing.T) {
+	t.Setenv("TOWNHALL_TOOL_MAX_ITERATIONS", "15")
+	t.Setenv("DM_TOOL_MAX_ITERATIONS", "25")
+	t.Setenv("FSM_RETENTION_DAYS", "14")
+
+	cfg, err := LoadFromEnv()
+	require.NoError(t, err)
+	assert.Equal(t, 15, cfg.TownhallToolMaxIterations)
+	assert.Equal(t, 25, cfg.DMToolMaxIterations)
+	assert.Equal(t, 14, cfg.FSMRetentionDays)
+}
+
+func TestConfig_Validate_FSMConfig(t *testing.T) {
+	baseCfg := Config{
+		OpenAIAPIKey:          "test-key",
+		BesedkaURL:            "http://127.0.0.1:8080",
+		TownhallMaxParagraphs: 2,
+		DMMaxParagraphs:       10,
+		MsgRingBufferSize:     100,
+		SandboxEnabled:        false,
+	}
+	require.NoError(t, baseCfg.Validate(true))
+	assert.Equal(t, 10, baseCfg.TownhallToolMaxIterations)
+	assert.Equal(t, 20, baseCfg.DMToolMaxIterations)
+	assert.Equal(t, 7, baseCfg.FSMRetentionDays)
+
+	// Explicit values are preserved
+	customCfg := Config{
+		OpenAIAPIKey:              "test-key",
+		BesedkaURL:                "http://127.0.0.1:8080",
+		TownhallMaxParagraphs:     2,
+		DMMaxParagraphs:           10,
+		MsgRingBufferSize:         100,
+		TownhallToolMaxIterations: 15,
+		DMToolMaxIterations:       30,
+		FSMRetentionDays:          14,
+		SandboxEnabled:            false,
+	}
+	require.NoError(t, customCfg.Validate(true))
+	assert.Equal(t, 15, customCfg.TownhallToolMaxIterations)
+	assert.Equal(t, 30, customCfg.DMToolMaxIterations)
+	assert.Equal(t, 14, customCfg.FSMRetentionDays)
 }

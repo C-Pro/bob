@@ -2,6 +2,7 @@ package webfetch
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -77,4 +78,24 @@ func TestFetchValidation(t *testing.T) {
 	cancel()
 	_, err = Fetch(ctx, "http://127.0.0.1:9999", nil)
 	assert.Error(t, err)
+
+	var fetchErr *FetchError
+	require.True(t, errors.As(err, &fetchErr))
+}
+
+func TestFetchError(t *testing.T) {
+	err429 := &FetchError{StatusCode: 429}
+	assert.Equal(t, "fetch HTTP 429: <nil>", err429.Error())
+	assert.True(t, err429.IsRetryable())
+
+	err503 := &FetchError{StatusCode: 503}
+	assert.True(t, err503.IsRetryable())
+
+	err404 := &FetchError{StatusCode: 404}
+	assert.False(t, err404.IsRetryable())
+
+	underlying := errors.New("underlying network failure")
+	errWrap := &FetchError{Err: underlying}
+	assert.Equal(t, underlying, errWrap.Unwrap())
+	assert.Equal(t, "fetch error: underlying network failure", errWrap.Error())
 }

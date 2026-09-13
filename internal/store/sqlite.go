@@ -58,8 +58,8 @@ func NewSQLiteStore(fname string, init bool) (*SQLiteStorage, error) {
 		return nil, fmt.Errorf("failed to Ping the database %q: %w", fname, err)
 	}
 
-	// Configure SQLite pragmas for concurrency and durability
-	if _, err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;"); err != nil {
+	// Configure SQLite pragmas for concurrency, durability, and incremental space reclamation
+	if _, err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA auto_vacuum = INCREMENTAL;"); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to configure sqlite pragmas: %w", err)
 	}
@@ -133,30 +133,78 @@ func (s *SQLiteStorage) GetSchemaVersion(ctx context.Context) (int, error) {
 	return v, nil
 }
 
-func (s *SQLiteStorage) initSchema() error {
+// EnsureDBSchema ensures SQLite pragmas are set and either initializes the schema or migrates it to the current version.
+func EnsureDBSchema(ctx context.Context, db *sql.DB) error {
+	if db == nil {
+		return fmt.Errorf("database connection is nil")
+	}
+
+	if _, err := db.ExecContext(ctx, "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA auto_vacuum = INCREMENTAL;"); err != nil {
+		return fmt.Errorf("failed to configure sqlite pragmas: %w", err)
+	}
+
+	var tableCount int
+	err := db.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='schema_version'").Scan(&tableCount)
+	if err != nil {
+		return fmt.Errorf("failed to check schema_version table: %w", err)
+	}
+
+	if tableCount == 0 {
+		return executeSchema(ctx, db)
+	}
+
+	var v int
+	if err := db.QueryRowContext(ctx, "SELECT version FROM schema_version WHERE is_current=1").Scan(&v); err != nil {
+		return fmt.Errorf("failed to get schema version: %w", err)
+	}
+
+	switch v {
+	case version.Version:
+		return nil
+	case version.Version - 1:
+		if err := executeMigrate(ctx, db); err != nil {
+			return fmt.Errorf("migration failed: %w", err)
+		}
+		return nil
+	default:
+		return fmt.Errorf(
+			"database version mismatch: expected %d or %d, but got %d",
+			version.Version-1,
+			version.Version,
+			v)
+	}
+}
+
+func executeSchema(ctx context.Context, db *sql.DB) error {
 	var buf bytes.Buffer
 	t := template.Must(template.New("schema").Parse(schemaTmpl))
 	if err := t.Execute(&buf, version); err != nil {
 		return fmt.Errorf("failed to render schema template: %w", err)
 	}
-	if _, err := s.db.Exec(buf.String()); err != nil {
+	if _, err := db.ExecContext(ctx, buf.String()); err != nil {
 		return fmt.Errorf("schema creation failed: %w", err)
 	}
-
 	return nil
 }
 
-func (s *SQLiteStorage) migrate() error {
+func executeMigrate(ctx context.Context, db *sql.DB) error {
 	var buf bytes.Buffer
 	t := template.Must(template.New("migrate").Parse(migrateTmpl))
 	if err := t.Execute(&buf, version); err != nil {
 		return fmt.Errorf("migration template render failed: %w", err)
 	}
-	if _, err := s.db.Exec(buf.String()); err != nil {
+	if _, err := db.ExecContext(ctx, buf.String()); err != nil {
 		return fmt.Errorf("schema migration failed: %w", err)
 	}
-
 	return nil
+}
+
+func (s *SQLiteStorage) initSchema() error {
+	return executeSchema(context.Background(), s.db)
+}
+
+func (s *SQLiteStorage) migrate() error {
+	return executeMigrate(context.Background(), s.db)
 }
 
 func (s *SQLiteStorage) getSchemaVersion() (int, error) {
