@@ -54,27 +54,27 @@
 ---
 
 ## Phase 3: Core FSM Engine, State Dispatcher & Simple Tool Loop FSM
-- [ ] Task: Implement core state dispatcher and delayed transition poller
-    - [ ] Create `internal/fsm/engine.go` managing workflow run lifecycle
-    - [ ] Implement in-memory timer channel + background SQLite ticker (2-second interval) to resume runs where `status = 'WAITING' AND resume_at <= now()`
-    - [ ] Implement crash recovery: on engine startup, query `ListActiveRuns` and resume interrupted executions from their last committed state
-- [ ] Task: Implement Simple Tool Loop FSM
-    - [ ] Create `internal/fsm/tool_loop.go` with state handlers:
+- [x] Task: Implement core state dispatcher and delayed transition poller
+    - [x] Create `internal/fsm/engine.go` managing workflow run lifecycle
+    - [x] Implement in-memory timer channel + background SQLite ticker (2-second interval) to resume runs where `status = 'WAITING' AND resume_at <= now()`
+    - [x] Implement crash recovery: on engine startup, query `ListActiveRuns` and resume interrupted executions from their last committed state
+- [x] Task: Implement Simple Tool Loop FSM
+    - [x] Create `internal/fsm/tool_loop.go` with state handlers:
       - `INIT` -> `LLM_REQUEST`
       - `LLM_REQUEST` -> `COMPLETED` (text response) | `PREPARE_STEPS` (tool calls) | `SYNTHESIS` (iteration cap reached)
       - `PREPARE_STEPS` -> `EXECUTE_STEPS`
       - `EXECUTE_STEPS` -> `WAITING` (delayed retry) | `LLM_REQUEST` (results appended)
       - `SYNTHESIS` -> `COMPLETED` | `FAILED`
-- [ ] Task: Write unit and integration tests for FSM engine
-    - [ ] Create `internal/fsm/engine_test.go` and `internal/fsm/tool_loop_test.go` testing full tool loop execution, delayed transitions (`resume_at`), crash recovery, and max iteration synthesis
-    - [ ] Run `go test -race ./internal/fsm/...`
-- [ ] Task: Phase 3 Validation & Independent Model Review
-    - [ ] Run `go test -race ./internal/fsm/...`
-    - [ ] Run independent model verification:
+- [x] Task: Write unit and integration tests for FSM engine
+    - [x] Create `internal/fsm/engine_test.go` and `internal/fsm/tool_loop_test.go` testing full tool loop execution, delayed transitions (`resume_at`), crash recovery, and max iteration synthesis
+    - [x] Run `go test -race ./internal/fsm/...`
+- [x] Task: Phase 3 Validation & Independent Model Review
+    - [x] Run `go test -race ./internal/fsm/...`
+    - [x] Run independent model verification:
       ```bash
       opencode run --auto -m opencode/muse-spark-1.3-contributor-free "Review the unstaged changes (Phase 3: Core FSM engine, delayed transitions, crash recovery, and simple tool loop state machine). Just say LGTM if the changes address the issue and do not introduce new serious one. Don't nitpick"
       ```
-    - [ ] Address any valid concerns reported by the verifier and re-verify before proceeding
+    - [x] Address any valid concerns reported by the verifier and re-verify before proceeding
 
 ---
 

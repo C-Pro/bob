@@ -156,6 +156,11 @@ func (s *Store) UpdateRunState(ctx context.Context, run *FSMRun) error {
 	return nil
 }
 
+// UpdateRun is an alias for UpdateRunState.
+func (s *Store) UpdateRun(ctx context.Context, run *FSMRun) error {
+	return s.UpdateRunState(ctx, run)
+}
+
 // ListActiveRuns returns all runs currently in PENDING, RUNNING, or WAITING status.
 func (s *Store) ListActiveRuns(ctx context.Context) ([]FSMRun, error) {
 	query := `
@@ -396,6 +401,11 @@ func (s *Store) GetStepsForIteration(ctx context.Context, runID string, iteratio
 	`
 
 	return s.querySteps(ctx, query, runID, iteration)
+}
+
+// ListStepsByIteration is an alias for GetStepsForIteration.
+func (s *Store) ListStepsByIteration(ctx context.Context, runID string, iteration int) ([]FSMStep, error) {
+	return s.GetStepsForIteration(ctx, runID, iteration)
 }
 
 // GetPendingSteps returns all pending steps for a run and iteration, ordered by step_index ASC.
