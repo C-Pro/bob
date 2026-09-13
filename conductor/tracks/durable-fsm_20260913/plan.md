@@ -79,31 +79,31 @@
 ---
 
 ## Phase 4: Gateway Integration & Channel Iteration Budgets
-- [ ] Task: Wire FSM engine into Gateway and lifecycle
-    - [ ] Initialize `fsm.Engine` in `cmd/agent/main.go` and pass to `internal/gateway`
-    - [ ] Update `internal/gateway/gateway.go` to route tool requests through `fsm.Engine` instead of volatile loop
-    - [ ] Enforce channel iteration caps: 10 iterations in Townhall, 20 iterations in DMs
-    - [ ] Connect ephemeral progress reporting (`ProgressReporter`) to emit notifications during FSM transitions
-    - [ ] Connect periodic retention pruning and incremental vacuum to gateway maintenance ticker
-- [ ] Task: Write integration tests for Gateway FSM routing
-    - [ ] Add gateway integration tests in `internal/gateway/gateway_test.go` verifying Townhall iteration limits (10), DM limits (20), and tool execution via FSM
-    - [ ] Run `go test -race ./internal/gateway/...`
-- [ ] Task: Phase 4 Validation & Independent Model Review
-    - [ ] Run `go test -race ./internal/gateway/... ./cmd/agent/...`
-    - [ ] Run independent model verification:
+- [x] Task: Wire FSM engine into Gateway and lifecycle
+    - [x] Initialize `fsm.Engine` in `cmd/agent/main.go` and pass to `internal/gateway`
+    - [x] Update `internal/gateway/gateway.go` to route tool requests through `fsm.Engine` instead of volatile loop
+    - [x] Enforce channel iteration caps: 10 iterations in Townhall, 20 iterations in DMs
+    - [x] Connect ephemeral progress reporting (`ProgressReporter`) to emit notifications during FSM transitions
+    - [x] Connect periodic retention pruning and incremental vacuum to gateway maintenance ticker
+- [x] Task: Write integration tests for Gateway FSM routing
+    - [x] Add gateway integration tests in `internal/gateway/gateway_test.go` verifying Townhall iteration limits (10), DM limits (20), and tool execution via FSM
+    - [x] Run `go test -race ./internal/gateway/...`
+- [x] Task: Phase 4 Validation & Independent Model Review
+    - [x] Run `go test -race ./internal/gateway/... ./cmd/agent/...`
+    - [x] Run independent model verification:
       ```bash
       opencode run --auto -m opencode/muse-spark-1.3-contributor-free "Review the unstaged changes (Phase 4: Gateway integration with FSM engine, channel iteration limits of 10 for Townhall and 20 for DM, and ephemeral progress reporting). Just say LGTM if the changes address the issue and do not introduce new serious one. Don't nitpick"
       ```
-    - [ ] Address any valid concerns reported by the verifier and re-verify before proceeding
+    - [x] Address any valid concerns reported by the verifier and re-verify before proceeding
 
 ---
 
 ## Phase 5: Verification & Quality Enforcement
-- [ ] Task: Run full test suite and quality enforcement
-    - [ ] Run `go test -race ./...` across all packages
-    - [ ] Run `make check` (`golangci-lint`, `go test -race`, `semgrep`, `osv-scanner`) ensuring 0 errors
-    - [ ] Run independent model verification on the complete branch diff:
+- [x] Task: Run full test suite and quality enforcement
+    - [x] Run `go test -race ./...` across all packages
+    - [x] Run `make check` (`golangci-lint`, `go test -race`, `semgrep`, `osv-scanner`) ensuring 0 errors
+    - [x] Run independent model verification on the complete branch diff:
       ```bash
       opencode run --auto -m opencode/muse-spark-1.3-contributor-free "Review the unstaged changes (Phase 5: Full durable FSM implementation, tests, and documentation). Just say LGTM if the changes address the issue and do not introduce new serious one. Don't nitpick"
       ```
-    - [ ] Update documentation (`conductor/index.md`, `README.md`, `GEMINI.md`)
+    - [x] Update documentation (`conductor/index.md`, `README.md`, `GEMINI.md`)

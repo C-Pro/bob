@@ -40,6 +40,6 @@
 
 ---
 
-- [ ] **Track: Durable FSM for Simple Tool Loops & Agentic Workflows**
+- [x] **Track: Durable FSM for Simple Tool Loops & Agentic Workflows**
 *Link: [./tracks/durable-fsm_20260913/](./tracks/durable-fsm_20260913/)*
 

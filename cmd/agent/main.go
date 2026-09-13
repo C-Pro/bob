@@ -13,6 +13,7 @@ import (
 
 	"bob/internal/backup"
 	"bob/internal/config"
+	"bob/internal/fsm"
 	"bob/internal/gateway"
 	"bob/internal/geoip"
 	"bob/internal/llm"
@@ -189,6 +190,16 @@ func main() {
 	if loc != nil {
 		gw.SetLocation(loc)
 	}
+
+	// Initialize durable FSM engine and attach to Gateway
+	storeProv := gateway.NewMemoryStoreProvider(gw.MemoryManager(), cfg.DataDir)
+	fsmEngine := fsm.NewEngine(
+		storeProv,
+		llmClient,
+		gw.ToolsRegistry(),
+		fsm.WithDefaultModel(cfg.OpenAIModel),
+	)
+	gw.SetFSMEngine(fsmEngine)
 
 	// Start periodic backup scheduler if S3 is enabled
 	var scheduler *backup.Scheduler

@@ -1,0 +1,353 @@
+package fsm
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+
+	openai "github.com/sashabaranov/go-openai"
+)
+
+// SynthesisPrompt is appended when the maximum tool execution iterations are exhausted.
+const SynthesisPrompt = "You have reached the tool execution limit. Please synthesize and provide the best possible response based on all information gathered so far, including original markdown links to sources found in the search results, without calling any more tools. If any requested actions, scripts, or files could not be completed or executed due to the tool limit, state clearly what was accomplished and what remains to be run; do not claim files were created if they were not."
+
+// ToolLoopRunner executes the simple tool loop finite state machine.
+type ToolLoopRunner struct {
+	llmClient    LLMClient
+	stepExecutor *StepExecutor
+	defaultModel string
+}
+
+// NewToolLoopRunner creates a new ToolLoopRunner.
+func NewToolLoopRunner(llmClient LLMClient, stepExecutor *StepExecutor, defaultModel string) *ToolLoopRunner {
+	if defaultModel == "" {
+		defaultModel = "gemini-3.7-flash"
+	}
+	return &ToolLoopRunner{
+		llmClient:    llmClient,
+		stepExecutor: stepExecutor,
+		defaultModel: defaultModel,
+	}
+}
+
+// Execute drives the state machine for the given FSMRun until it reaches a terminal or suspended state.
+func (r *ToolLoopRunner) Execute(ctx context.Context, run *FSMRun, store *Store, tools []openai.Tool, model string) error {
+	if run == nil {
+		return errors.New("run cannot be nil")
+	}
+	if store == nil {
+		return errors.New("store cannot be nil")
+	}
+	if model == "" {
+		model = r.defaultModel
+	}
+	defer func() {
+		if cb := GetTransitionCallback(ctx); cb != nil {
+			cb(run.CurrentState, run)
+		}
+	}()
+
+	for !run.Status.IsTerminal() {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		if cb := GetTransitionCallback(ctx); cb != nil {
+			cb(run.CurrentState, run)
+		}
+
+		switch run.CurrentState {
+		case StateInit:
+			if err := r.handleInit(ctx, run, store); err != nil {
+				return err
+			}
+
+		case StateLLMRequest:
+			if err := r.handleLLMRequest(ctx, run, store, tools, model); err != nil {
+				return err
+			}
+
+		case StatePrepareSteps:
+			if err := r.handlePrepareSteps(ctx, run, store); err != nil {
+				return err
+			}
+
+		case StateExecuteSteps:
+			waiting, err := r.handleExecuteSteps(ctx, run, store)
+			if err != nil {
+				return err
+			}
+			if waiting {
+				return nil
+			}
+
+		case StateWaiting:
+			now := time.Now().Unix()
+			if run.ResumeAt != nil && *run.ResumeAt > now {
+				return nil
+			}
+			run.Status = RunStatusRunning
+			run.ResumeAt = nil
+			run.CurrentState = StateExecuteSteps
+			if err := store.UpdateRun(ctx, run); err != nil {
+				return err
+			}
+
+		case StateSynthesis:
+			if err := r.handleSynthesis(ctx, run, store, model); err != nil {
+				return err
+			}
+
+		case StateCompleted, StateFailed, StateTerminated:
+			return nil
+
+		default:
+			run.Status = RunStatusFailed
+			run.ErrorText = fmt.Sprintf("unknown state: %s", run.CurrentState)
+			if err := store.UpdateRun(ctx, run); err != nil {
+				return errors.Join(fmt.Errorf("unknown fsm state: %s", run.CurrentState), err)
+			}
+			return fmt.Errorf("unknown fsm state: %s", run.CurrentState)
+		}
+	}
+
+	return nil
+}
+
+func (r *ToolLoopRunner) handleInit(ctx context.Context, run *FSMRun, store *Store) error {
+	if run.MaxIterations <= 0 {
+		run.MaxIterations = 10
+	}
+	run.Status = RunStatusRunning
+	run.CurrentState = StateLLMRequest
+	return store.UpdateRun(ctx, run)
+}
+
+func (r *ToolLoopRunner) handleLLMRequest(ctx context.Context, run *FSMRun, store *Store, tools []openai.Tool, model string) error {
+	messages, err := DecodeMessages(run.ContextJSON)
+	if err != nil {
+		run.Status = RunStatusFailed
+		run.ErrorText = fmt.Sprintf("failed to decode messages: %v", err)
+		_ = store.UpdateRun(ctx, run)
+		return err
+	}
+
+	req := openai.ChatCompletionRequest{
+		Model:    model,
+		Messages: messages,
+		Tools:    tools,
+	}
+
+	resp, err := r.llmClient.CreateChatCompletion(ctx, req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		run.Status = RunStatusFailed
+		run.ErrorText = fmt.Sprintf("llm request failed: %v", err)
+		if updateErr := store.UpdateRun(ctx, run); updateErr != nil {
+			return errors.Join(err, updateErr)
+		}
+		return err
+	}
+
+	if len(resp.Choices) == 0 {
+		run.Status = RunStatusFailed
+		run.ErrorText = "llm returned empty choices"
+		if updateErr := store.UpdateRun(ctx, run); updateErr != nil {
+			return updateErr
+		}
+		return errors.New("llm returned empty choices")
+	}
+
+	assistantMsg := resp.Choices[0].Message
+
+	// If no tool calls were requested, return the assistant text directly
+	if len(assistantMsg.ToolCalls) == 0 {
+		messages = append(messages, assistantMsg)
+		encoded, err := EncodeMessages(messages)
+		if err != nil {
+			return err
+		}
+		run.ContextJSON = encoded
+		run.ResultJSON = assistantMsg.Content
+		run.Status = RunStatusCompleted
+		run.CurrentState = StateCompleted
+		return store.UpdateRun(ctx, run)
+	}
+
+	// Tool calls requested: evaluate iteration limit
+	if run.Iteration >= run.MaxIterations {
+		run.CurrentState = StateSynthesis
+		return store.UpdateRun(ctx, run)
+	}
+
+	run.Iteration++
+	messages = append(messages, assistantMsg)
+	encoded, err := EncodeMessages(messages)
+	if err != nil {
+		return err
+	}
+	run.ContextJSON = encoded
+	run.CurrentState = StatePrepareSteps
+	return store.UpdateRun(ctx, run)
+}
+
+func (r *ToolLoopRunner) handlePrepareSteps(ctx context.Context, run *FSMRun, store *Store) error {
+	messages, err := DecodeMessages(run.ContextJSON)
+	if err != nil {
+		return err
+	}
+	if len(messages) == 0 {
+		return errors.New("cannot prepare steps: no messages in context")
+	}
+
+	lastMsg := messages[len(messages)-1]
+	if len(lastMsg.ToolCalls) == 0 {
+		run.CurrentState = StateLLMRequest
+		return store.UpdateRun(ctx, run)
+	}
+
+	mode := ClassifyExecutionMode(lastMsg.ToolCalls)
+	steps := make([]FSMStep, len(lastMsg.ToolCalls))
+	for i, tc := range lastMsg.ToolCalls {
+		steps[i] = NewStepFromToolCall(run.ID, run.Iteration, i, tc, mode)
+	}
+
+	if err := store.CreateSteps(ctx, steps); err != nil {
+		return fmt.Errorf("failed to create fsm steps: %w", err)
+	}
+
+	run.CurrentState = StateExecuteSteps
+	return store.UpdateRun(ctx, run)
+}
+
+func (r *ToolLoopRunner) handleExecuteSteps(ctx context.Context, run *FSMRun, store *Store) (bool, error) {
+	steps, err := store.ListStepsByIteration(ctx, run.ID, run.Iteration)
+	if err != nil {
+		return false, err
+	}
+
+	if len(steps) == 0 {
+		run.CurrentState = StateLLMRequest
+		return false, store.UpdateRun(ctx, run)
+	}
+
+	stepPtrs := make([]*FSMStep, len(steps))
+	for i := range steps {
+		stepPtrs[i] = &steps[i]
+	}
+
+	// Create executor bound to the current store
+	executor := r.stepExecutor
+	if executor == nil || executor.store != store {
+		invoker := r.stepExecutor.invoker
+		executor = NewStepExecutor(invoker, store, WithRetryConfig(r.stepExecutor.retryConfig), WithMaxWorkers(r.stepExecutor.maxWorkers))
+	}
+
+	execErr := executor.Execute(ctx, stepPtrs)
+	if execErr != nil && ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+
+	// Check if any step requires waiting
+	for _, s := range stepPtrs {
+		if s.Status == StepStatusPending {
+			run.Status = RunStatusWaiting
+			run.CurrentState = StateWaiting
+			now := time.Now().Unix()
+			resumeAt := now + 1
+			run.ResumeAt = &resumeAt
+			return true, store.UpdateRun(ctx, run)
+		}
+	}
+
+	// Collect tool results and append them as tool messages
+	messages, err := DecodeMessages(run.ContextJSON)
+	if err != nil {
+		return false, err
+	}
+
+	for _, s := range stepPtrs {
+		slog.Info("fsm step finished", "tool", s.ToolName, "status", s.Status, "run_id", run.ID)
+		content := s.ResultJSON
+		if content == "" && s.ErrorText != "" {
+			content = fmt.Sprintf(`{"error": %q}`, s.ErrorText)
+		}
+		messages = append(messages, openai.ChatCompletionMessage{
+			Role:       openai.ChatMessageRoleTool,
+			Content:    content,
+			ToolCallID: s.ToolCallID,
+		})
+	}
+
+	encoded, err := EncodeMessages(messages)
+	if err != nil {
+		return false, err
+	}
+
+	run.ContextJSON = encoded
+	if run.Iteration >= run.MaxIterations {
+		run.CurrentState = StateSynthesis
+	} else {
+		run.CurrentState = StateLLMRequest
+	}
+	return false, store.UpdateRun(ctx, run)
+}
+
+func (r *ToolLoopRunner) handleSynthesis(ctx context.Context, run *FSMRun, store *Store, model string) error {
+	messages, err := DecodeMessages(run.ContextJSON)
+	if err != nil {
+		return err
+	}
+
+	messages = append(messages, openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleUser,
+		Content: SynthesisPrompt,
+	})
+
+	req := openai.ChatCompletionRequest{
+		Model:    model,
+		Messages: messages,
+		Tools:    nil,
+	}
+
+	resp, err := r.llmClient.CreateChatCompletion(ctx, req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		run.Status = RunStatusFailed
+		run.CurrentState = StateFailed
+		run.ErrorText = fmt.Sprintf("failed to generate final synthesis response: %v", err)
+		if updateErr := store.UpdateRun(ctx, run); updateErr != nil {
+			return errors.Join(err, updateErr)
+		}
+		return fmt.Errorf("failed to generate final synthesis response: %w", err)
+	}
+
+	if len(resp.Choices) == 0 {
+		run.Status = RunStatusFailed
+		run.CurrentState = StateFailed
+		run.ErrorText = "llm returned empty choices during synthesis"
+		if updateErr := store.UpdateRun(ctx, run); updateErr != nil {
+			return updateErr
+		}
+		return errors.New("llm returned empty choices during synthesis")
+	}
+
+	finalMsg := resp.Choices[0].Message
+	messages = append(messages, finalMsg)
+	encoded, err := EncodeMessages(messages)
+	if err != nil {
+		return err
+	}
+
+	run.ContextJSON = encoded
+	run.ResultJSON = finalMsg.Content
+	run.Status = RunStatusCompleted
+	run.CurrentState = StateCompleted
+	return store.UpdateRun(ctx, run)
+}
