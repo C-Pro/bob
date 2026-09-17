@@ -1031,15 +1031,16 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 	var err error
 	if toolsRegistry != nil && len(toolDefs) > 0 {
 		toolCtx := tools.WithChatSession(ctx, sessionCtx)
+		maxIterations := g.cfg.TownhallToolMaxIterations
+		if isDM {
+			maxIterations = g.cfg.DMToolMaxIterations
+		}
+
 		g.mu.Lock()
 		fsmEng := g.fsmEngine
 		g.mu.Unlock()
 
 		if fsmEng != nil {
-			maxIterations := g.cfg.TownhallToolMaxIterations
-			if isDM {
-				maxIterations = g.cfg.DMToolMaxIterations
-			}
 			fsmReq := fsm.ToolLoopRequest{
 				ChatID:        msg.ChatID,
 				UserID:        msg.UserID,
@@ -1063,7 +1064,20 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 			}
 			var res *fsm.ToolLoopResult
 			res, err = fsmEng.RunToolLoop(toolCtx, fsmReq)
-			if err == nil && res != nil {
+			if err != nil {
+				if toolCtx.Err() != nil {
+					// Context was cancelled or timed out; do not fall back
+				} else {
+					slog.Error("fsm tool loop failed, falling back to volatile loop", "chat_id", msg.ChatID, "error", err)
+					reply, err = g.llmClient.GenerateChatResponseWithToolLoop(
+						toolCtx,
+						llmMsgs,
+						toolDefs,
+						toolsRegistry,
+						maxIterations,
+					)
+				}
+			} else if res != nil {
 				reply = res.Content
 			}
 		} else {
@@ -1072,7 +1086,7 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 				llmMsgs,
 				toolDefs,
 				toolsRegistry,
-				20,
+				maxIterations,
 			)
 		}
 	} else {

@@ -445,3 +445,142 @@ func TestGateway_RunMaintenance(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotNil(t, gotWaiting)
 }
+
+type failingStoreProvider struct{}
+
+func (f *failingStoreProvider) GetStore(ctx context.Context, chatID string, isDM bool) (*fsm.Store, error) {
+	return nil, fmt.Errorf("simulated sqlite database failure")
+}
+
+func (f *failingStoreProvider) ActiveStores(ctx context.Context) ([]*fsm.Store, error) {
+	return nil, nil
+}
+
+func TestGateway_FSMToolLoop_FallbackToVolatileOnFSMFailure(t *testing.T) {
+	tempDir := t.TempDir()
+	var llmCallCount int32
+
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := atomic.AddInt32(&llmCallCount, 1)
+
+		var req openai.ChatCompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		if count == 1 {
+			// First call from volatile loop: request a tool call
+			resp := openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role: openai.ChatMessageRoleAssistant,
+							ToolCalls: []openai.ToolCall{
+								{
+									ID:   "call_fallback",
+									Type: openai.ToolTypeFunction,
+									Function: openai.FunctionCall{
+										Name:      "web_search",
+										Arguments: `{"query":"test"}`,
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		// Second call from volatile loop: return final answer
+		resp := openai.ChatCompletionResponse{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Message: openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "Volatile fallback successful reply.",
+					},
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer llmServer.Close()
+
+	sentMsgs := make(chan models.ClientMessage, 10)
+	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/me":
+			_ = json.NewEncoder(w).Encode(models.User{ID: "bot_1", DisplayName: "Bob", UserName: "bot"})
+		case "/api/users":
+			_ = json.NewEncoder(w).Encode([]models.User{{ID: "u1", DisplayName: "Alice"}})
+		case "/api/chats":
+			_ = json.NewEncoder(w).Encode([]models.Chat{{ID: "townhall"}})
+		case "/api/chat":
+			upgrader := websocket.Upgrader{}
+			c, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer func() { _ = c.Close() }()
+			for {
+				var cm models.ClientMessage
+				if err := c.ReadJSON(&cm); err != nil {
+					return
+				}
+				sentMsgs <- cm
+			}
+		}
+	}))
+	defer besedkaServer.Close()
+
+	cfg := &config.Config{
+		BesedkaURL:                besedkaServer.URL,
+		BesedkaAPIKey:             "test-key",
+		OpenAIAPIKey:              "test-key",
+		OpenAIBaseURL:             llmServer.URL,
+		OpenAIModel:               "test-model",
+		BotHandle:                 "@bot",
+		DataDir:                   tempDir,
+		TownhallToolMaxIterations: 10,
+		DMToolMaxIterations:       20,
+		TownhallMaxParagraphs:     5,
+		DMMaxParagraphs:           10,
+		MsgRingBufferSize:         10,
+	}
+
+	llmClient := llm.NewClient(cfg, llmServer.Client())
+	gw := NewGateway(cfg, llmClient)
+	defer gw.Stop()
+	gw.httpClient = besedkaServer.Client()
+
+	// Inject FSM Engine with failing store provider to trigger infrastructure error
+	gw.mu.Lock()
+	gw.fsmEngine = fsm.NewEngine(&failingStoreProvider{}, llmClient, gw.toolsRegistry)
+	gw.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	require.NoError(t, gw.DialWebSocket(ctx))
+	_, err := gw.FetchBotUser(ctx)
+	require.NoError(t, err)
+
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "townhall",
+		UserID:    "u1",
+		Content:   "@bot search test",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+
+	select {
+	case reply := <-sentMsgs:
+		assert.Contains(t, reply.Content, "Volatile fallback successful reply.")
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for fallback bot response")
+	}
+}
+
