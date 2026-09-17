@@ -134,6 +134,15 @@ func WithRecoveryStalenessCutoff(d time.Duration) EngineOption {
 	}
 }
 
+// WithMaxRecoveryConcurrency sets the maximum concurrency for crash recovery executions.
+func WithMaxRecoveryConcurrency(n int) EngineOption {
+	return func(e *Engine) {
+		if n > 0 {
+			e.maxRecoveryConcurrency = n
+		}
+	}
+}
+
 // Engine coordinates durable FSM workflow executions, state dispatching, delayed transitions, and crash recovery.
 type Engine struct {
 	storeProvider           StoreProvider
@@ -145,6 +154,7 @@ type Engine struct {
 	pollInterval            time.Duration
 	defaultModel            string
 	recoveryStalenessCutoff time.Duration
+	maxRecoveryConcurrency  int
 
 	runnersMu sync.RWMutex
 	runners   map[FSMType]Runner
@@ -168,6 +178,7 @@ func NewEngine(storeProvider StoreProvider, llmClient LLMClient, invoker ToolInv
 		pollInterval:            500 * time.Millisecond,
 		defaultModel:            "gemini-3.7-flash",
 		recoveryStalenessCutoff: 15 * time.Minute,
+		maxRecoveryConcurrency:  4,
 		runners:                 make(map[FSMType]Runner),
 		running:                 make(map[string]context.CancelFunc),
 		wakeCh:                  make(chan struct{}, 16),
@@ -335,8 +346,15 @@ func (e *Engine) Recover(ctx context.Context) error {
 		return fmt.Errorf("failed to list active stores for recovery: %w", err)
 	}
 
+	maxConc := e.maxRecoveryConcurrency
+	if maxConc <= 0 {
+		maxConc = 4
+	}
+	sem := make(chan struct{}, maxConc)
+
 	now := time.Now().Unix()
 	var allErrs error
+	dispatchedCount := 0
 
 	for _, store := range stores {
 		runs, err := store.ListActiveRuns(ctx)
@@ -360,6 +378,18 @@ func (e *Engine) Recover(ctx context.Context) error {
 				continue
 			}
 
+			if dispatchedCount > 0 {
+				var b [1]byte
+				_, _ = rand.Read(b[:])
+				jitter := time.Duration(10+int(b[0]%25)) * time.Millisecond
+				select {
+				case <-ctx.Done():
+					return errors.Join(allErrs, ctx.Err())
+				case <-time.After(jitter):
+				}
+			}
+			dispatchedCount++
+
 			// Interrupted in RUNNING, PENDING, or due WAITING: resume execution
 			runID := run.ID
 			s := store
@@ -371,6 +401,14 @@ func (e *Engine) Recover(ctx context.Context) error {
 					return
 				}
 				defer e.releaseRun(runID)
+
+				// Acquire recovery concurrency semaphore before executing recovery
+				select {
+				case sem <- struct{}{}:
+					defer func() { <-sem }()
+				case <-runCtx.Done():
+					return
+				}
 
 				fresh, err := s.GetRun(runCtx, runID)
 				if err != nil {

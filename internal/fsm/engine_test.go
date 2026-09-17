@@ -3,6 +3,7 @@ package fsm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -515,11 +516,14 @@ func TestEngine_RecoverySkipsTerminalFreshRun(t *testing.T) {
 	var execCount atomic.Int32
 	runner := &mockRunner{
 		execFunc: func(ctx context.Context, run *FSMRun, s *Store, toolsList []openai.Tool, model string) error {
-			execCount.Add(1)
 			run.Status = RunStatusCompleted
 			run.CurrentState = StateCompleted
 			run.ResultJSON = "completed"
-			return s.UpdateRun(ctx, run)
+			err := s.UpdateRun(ctx, run)
+			if err == nil {
+				execCount.Add(1)
+			}
+			return err
 		},
 	}
 
@@ -549,6 +553,11 @@ func TestEngine_RecoverySkipsTerminalFreshRun(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+
+	require.Eventually(t, func() bool {
+		return execCount.Load() == 1
+	}, 3*time.Second, 10*time.Millisecond)
+
 	engine.Stop()
 
 	// Exactly 1 execution should have occurred despite multiple concurrent passes
@@ -568,11 +577,14 @@ func TestEngine_PollDueWaitingRuns_SkipsTerminalFreshRun(t *testing.T) {
 	var execCount atomic.Int32
 	runner := &mockRunner{
 		execFunc: func(ctx context.Context, run *FSMRun, s *Store, toolsList []openai.Tool, model string) error {
-			execCount.Add(1)
 			run.Status = RunStatusCompleted
 			run.CurrentState = StateCompleted
 			run.ResultJSON = "completed from poll"
-			return s.UpdateRun(ctx, run)
+			err := s.UpdateRun(ctx, run)
+			if err == nil {
+				execCount.Add(1)
+			}
+			return err
 		},
 	}
 
@@ -604,6 +616,11 @@ func TestEngine_PollDueWaitingRuns_SkipsTerminalFreshRun(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+
+	require.Eventually(t, func() bool {
+		return execCount.Load() == 1
+	}, 3*time.Second, 10*time.Millisecond)
+
 	engine.Stop()
 
 	assert.Equal(t, int32(1), execCount.Load(), "exactly one poll pass should execute the run")
@@ -741,6 +758,72 @@ func TestEngine_Recover_StaleRun_MarksTerminated(t *testing.T) {
 	assert.Equal(t, StateTerminated, persisted.CurrentState)
 	assert.Contains(t, persisted.ErrorText, "stale run expired before recovery")
 }
+
+func TestEngine_Recover_BoundedConcurrency(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	storeProvider := NewStaticStoreProvider(store)
+	ctx := context.Background()
+
+	var currentConcurrent atomic.Int32
+	var maxObserved atomic.Int32
+	var completedCount atomic.Int32
+
+	runner := &mockRunner{
+		execFunc: func(execCtx context.Context, run *FSMRun, s *Store, toolsList []openai.Tool, model string) error {
+			cur := currentConcurrent.Add(1)
+			for {
+				oldMax := maxObserved.Load()
+				if cur <= oldMax || maxObserved.CompareAndSwap(oldMax, cur) {
+					break
+				}
+			}
+
+			time.Sleep(25 * time.Millisecond)
+			currentConcurrent.Add(-1)
+
+			run.Status = RunStatusCompleted
+			run.CurrentState = StateCompleted
+			err := s.UpdateRun(execCtx, run)
+			if err == nil {
+				completedCount.Add(1)
+			}
+			return err
+		},
+	}
+
+	const maxRecoveryConc = 2
+	engine := NewEngine(storeProvider, nil, nil, WithMaxRecoveryConcurrency(maxRecoveryConc))
+	engine.RegisterRunner(FSMTypeToolLoop, runner)
+
+	const totalRuns = 6
+	for i := 0; i < totalRuns; i++ {
+		run := &FSMRun{
+			ID:            fmt.Sprintf("run_bounded_%d", i),
+			ChatID:        fmt.Sprintf("chat_%d", i),
+			FSMType:       FSMTypeToolLoop,
+			Status:        RunStatusRunning,
+			CurrentState:  StateExecuteSteps,
+			Iteration:     1,
+			MaxIterations: 5,
+			ContextJSON:   "[]",
+		}
+		require.NoError(t, store.CreateRun(ctx, run))
+	}
+
+	err := engine.Recover(ctx)
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		return completedCount.Load() == int32(totalRuns)
+	}, 3*time.Second, 10*time.Millisecond)
+
+	engine.Stop()
+
+	assert.Equal(t, int32(totalRuns), completedCount.Load(), "all runs must complete")
+	assert.LessOrEqual(t, maxObserved.Load(), int32(maxRecoveryConc), "concurrency must not exceed maxRecoveryConcurrency")
+}
+
 
 
 

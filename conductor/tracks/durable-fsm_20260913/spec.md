@@ -84,6 +84,7 @@ ON fsm_steps(run_id, iteration, step_index);
 - State transitions can set a future `resume_at` timestamp and enter `WAITING` status.
 - The engine uses an in-memory timer channel for immediate wakeups alongside a background SQLite poller (every 2 seconds) to find runs where `status = 'WAITING' AND resume_at <= now()`.
 - On service restart, interrupted runs in `RUNNING` or `WAITING` are recovered and resumed from their last committed state.
+- **Bounded Recovery Concurrency:** Recovery fan-out is bounded by a semaphore (`maxRecoveryConcurrency = 4`, default 2-4) and staggered with jitter across dispatches to prevent startup thundering herds against LLM and tool backends.
 
 ## 4. Retention & SQLite Page Management
 
