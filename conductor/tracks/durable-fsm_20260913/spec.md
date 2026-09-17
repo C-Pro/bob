@@ -95,8 +95,8 @@ ON fsm_steps(run_id, iteration, step_index);
 - Cascading deletes (`ON DELETE CASCADE`) atomically remove child `fsm_steps`.
 
 ### 4.2 Incremental Vacuuming
-- Chat databases set `PRAGMA auto_vacuum = INCREMENTAL;` at creation.
-- Periodic maintenance executes `PRAGMA incremental_vacuum(500);` to release freed pages back to the OS without exclusive long-running table locks.
+- Chat databases set `PRAGMA auto_vacuum = INCREMENTAL;` at creation (prior to table creation on fresh databases).
+- Periodic maintenance executes `PRAGMA incremental_vacuum(500);` to release freed pages back to the OS without exclusive long-running table locks. If `auto_vacuum` is disabled (`0`), incremental vacuum logs a warning and is safely skipped.
 
 ## 5. Channel Iteration Budgets
 - **Townhall Chat:** Maximum 10 tool iterations per request.

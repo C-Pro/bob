@@ -2,6 +2,8 @@ package fsm
 
 import (
 	"context"
+	"database/sql"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -127,9 +129,14 @@ func TestRetentionManager_PruneTerminalRunsAndActiveImmunity(t *testing.T) {
 }
 
 func TestRetentionManager_IncrementalVacuum(t *testing.T) {
+	// Database initialized via EnsureDBSchema has auto_vacuum = INCREMENTAL (2)
 	db := setupTestDB(t)
 	retention := NewRetentionManager(db, 7)
 	ctx := context.Background()
+
+	var autoVac int
+	require.NoError(t, db.QueryRowContext(ctx, "PRAGMA auto_vacuum;").Scan(&autoVac))
+	assert.Equal(t, 2, autoVac)
 
 	err := retention.IncrementalVacuum(ctx, 100)
 	require.NoError(t, err)
@@ -137,4 +144,28 @@ func TestRetentionManager_IncrementalVacuum(t *testing.T) {
 	// Default pages
 	err = retention.IncrementalVacuum(ctx, 0)
 	require.NoError(t, err)
+
+	// Database with auto_vacuum = NONE (0) should log a warning and safely skip without error
+	dbPathNoAV := filepath.Join(t.TempDir(), "no_av.db")
+	rawDB, err := setupRawDBWithAutoVacuum0(t, dbPathNoAV)
+	require.NoError(t, err)
+	defer func() { _ = rawDB.Close() }()
+
+	retentionNoAV := NewRetentionManager(rawDB, 7)
+	err = retentionNoAV.IncrementalVacuum(ctx, 500)
+	require.NoError(t, err)
+}
+
+func setupRawDBWithAutoVacuum0(t *testing.T, path string) (*sql.DB, error) {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		return nil, err
+	}
+	// Creating table first forces auto_vacuum to remain 0 (NONE)
+	if _, err := db.Exec("CREATE TABLE t(a INT);"); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"time"
 )
 
@@ -53,10 +54,21 @@ func (r *RetentionManager) PruneTerminalRuns(ctx context.Context, cutoffTime tim
 
 // IncrementalVacuum releases freed database pages back to the operating system.
 // If pages <= 0, a default of 500 pages (approx 2MB) is requested.
+// If PRAGMA auto_vacuum is 0 (disabled), a warning is logged and vacuuming is skipped.
 func (r *RetentionManager) IncrementalVacuum(ctx context.Context, pages int) error {
 	if r.db == nil {
 		return fmt.Errorf("db cannot be nil")
 	}
+
+	var autoVacuum int
+	if err := r.db.QueryRowContext(ctx, "PRAGMA auto_vacuum;").Scan(&autoVacuum); err != nil {
+		return fmt.Errorf("failed to check auto_vacuum status: %w", err)
+	}
+	if autoVacuum == 0 {
+		slog.Warn("incremental vacuum skipped because database auto_vacuum is disabled (0)")
+		return nil
+	}
+
 	if pages <= 0 {
 		pages = 500
 	}

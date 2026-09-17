@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"text/template" // nosemgrep: go.lang.security.audit.xss.import-text-template.import-text-template
 
 	_ "embed"
@@ -34,17 +35,23 @@ type SQLiteStorage struct {
 // When init is false, the database is opened in read-write mode (mode=rw) and
 // auto-migrated if its current version is version.Version - 1.
 func NewSQLiteStore(fname string, init bool) (*SQLiteStorage, error) {
-	dsn := fname
+	var dsn string
+	cleanPath := strings.TrimPrefix(fname, "file:")
+	if idx := strings.Index(cleanPath, "?"); idx != -1 {
+		cleanPath = cleanPath[:idx]
+	}
+
 	if init {
-		dir := filepath.Dir(fname)
+		dir := filepath.Dir(cleanPath)
 		if dir != "" && dir != "." {
 			if err := os.MkdirAll(dir, 0o755); err != nil {
 				return nil, fmt.Errorf("failed to create database directory %q: %w", dir, err)
 			}
 		}
+		dsn = fmt.Sprintf("file:%s?_auto_vacuum=INCREMENTAL&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)", cleanPath)
 	} else {
 		// mode=rw will fail if fname does not exist as opposed to default mode=rwc
-		dsn = fmt.Sprintf("file:%s?mode=rw", fname)
+		dsn = fmt.Sprintf("file:%s?mode=rw&_auto_vacuum=INCREMENTAL&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)", cleanPath)
 	}
 
 	db, err := sql.Open("sqlite", dsn)
@@ -58,17 +65,16 @@ func NewSQLiteStore(fname string, init bool) (*SQLiteStorage, error) {
 		return nil, fmt.Errorf("failed to Ping the database %q: %w", fname, err)
 	}
 
-	// Configure SQLite pragmas for concurrency, durability, and incremental space reclamation
-	if _, err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA auto_vacuum = INCREMENTAL;"); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("failed to configure sqlite pragmas: %w", err)
-	}
-
 	s := &SQLiteStorage{
 		db: db,
 	}
 
 	if init {
+		// auto_vacuum only takes effect on empty databases before any tables exist
+		var tableCount int
+		if err := db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table'").Scan(&tableCount); err == nil && tableCount == 0 {
+			_, _ = db.Exec("PRAGMA auto_vacuum = INCREMENTAL;")
+		}
 		if err := s.initSchema(); err != nil {
 			_ = db.Close()
 			return nil, err
@@ -140,14 +146,21 @@ func (s *SQLiteStorage) GetSchemaVersion(ctx context.Context) (int, error) {
 	return v, nil
 }
 
-// EnsureDBSchema ensures SQLite pragmas are set and either initializes the schema or migrates it to the current version.
+// EnsureDBSchema ensures SQLite schema is initialized or migrated to the current version.
 func EnsureDBSchema(ctx context.Context, db *sql.DB) error {
 	if db == nil {
 		return fmt.Errorf("database connection is nil")
 	}
 
-	if _, err := db.ExecContext(ctx, "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA auto_vacuum = INCREMENTAL;"); err != nil {
+	// Apply core runtime pragmas for connections opened without DSN pragmas
+	if _, err := db.ExecContext(ctx, "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;"); err != nil {
 		return fmt.Errorf("failed to configure sqlite pragmas: %w", err)
+	}
+
+	// auto_vacuum only takes effect on empty databases before any tables exist
+	var allTables int
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_master WHERE type='table'").Scan(&allTables); err == nil && allTables == 0 {
+		_, _ = db.ExecContext(ctx, "PRAGMA auto_vacuum = INCREMENTAL;")
 	}
 
 	var tableCount int

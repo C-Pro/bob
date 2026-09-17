@@ -19,7 +19,7 @@ func setupTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)", dbPath)
+	dsn := fmt.Sprintf("file:%s?_auto_vacuum=INCREMENTAL&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)", dbPath)
 
 	db, err := sql.Open("sqlite", dsn)
 	require.NoError(t, err)
@@ -256,12 +256,14 @@ func TestStore_CascadeDeleteStepsOnRunDeletion(t *testing.T) {
 func TestStore_ChatIsolation(t *testing.T) {
 	dir := t.TempDir()
 
-	db1, err := sql.Open("sqlite", filepath.Join(dir, "townhall.db"))
+	dsn1 := fmt.Sprintf("file:%s?_auto_vacuum=INCREMENTAL&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)", filepath.Join(dir, "townhall.db"))
+	db1, err := sql.Open("sqlite", dsn1)
 	require.NoError(t, err)
 	defer func() { _ = db1.Close() }()
 	require.NoError(t, store.EnsureDBSchema(context.Background(), db1))
 
-	db2, err := sql.Open("sqlite", filepath.Join(dir, "dm_user1.db"))
+	dsn2 := fmt.Sprintf("file:%s?_auto_vacuum=INCREMENTAL&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)", filepath.Join(dir, "dm_user1.db"))
+	db2, err := sql.Open("sqlite", dsn2)
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 	require.NoError(t, store.EnsureDBSchema(context.Background(), db2))

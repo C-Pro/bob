@@ -32,6 +32,11 @@ func TestCreateSchema(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, version.Version, v)
 	assert.NotNil(t, s.DB())
+
+	var autoVac int
+	err = s.DB().QueryRow("PRAGMA auto_vacuum;").Scan(&autoVac)
+	require.NoError(t, err)
+	assert.Equal(t, 2, autoVac)
 }
 
 func TestOpenOrCreate(t *testing.T) {
