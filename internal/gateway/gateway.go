@@ -166,11 +166,55 @@ func (g *Gateway) FSMEngine() *fsm.Engine {
 	return g.fsmEngine
 }
 
-// SetFSMEngine sets the durable FSM Engine for the gateway.
+// SetFSMEngine sets the durable FSM Engine for the gateway and configures it with the gateway ResultSink.
 func (g *Gateway) SetFSMEngine(e *fsm.Engine) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.fsmEngine = e
+	if e != nil {
+		e.SetResultSink(g)
+	}
+}
+
+// Deliver implements fsm.ResultSink to deliver completed or failed workflow results out-of-band.
+func (g *Gateway) Deliver(ctx context.Context, run *fsm.FSMRun) error {
+	if run == nil || run.ChatID == "" {
+		return nil
+	}
+	var reply string
+	switch run.Status {
+	case fsm.RunStatusCompleted:
+		reply = run.ResultJSON
+	case fsm.RunStatusFailed, fsm.RunStatusTerminated:
+		reply = "Sorry, I encountered an issue processing your request. Please try again later."
+	default:
+		return nil
+	}
+
+	if reply == "" {
+		return nil
+	}
+
+	formattedReply := FormatResponse(reply, run.IsDM, g.cfg.TownhallMaxParagraphs, g.cfg.DMMaxParagraphs)
+	if err := g.SendMessage(run.ChatID, formattedReply); err != nil {
+		return fmt.Errorf("failed to deliver recovered reply to chat %s: %w", run.ChatID, err)
+	}
+
+	botID := g.botUserID
+	botName := g.botUser.GetDisplayName()
+	if botName == "" {
+		botName = "Bob"
+	}
+
+	g.contextManager.Push(run.ChatID, chatcontext.Entry{
+		Role:       "assistant",
+		SenderID:   botID,
+		SenderName: botName,
+		Content:    formattedReply,
+		Timestamp:  time.Now().Unix(),
+	})
+
+	return nil
 }
 
 // SandboxManager returns the Gateway's sandbox Manager.

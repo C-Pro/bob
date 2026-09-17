@@ -2,6 +2,7 @@ package fsm
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -350,3 +351,64 @@ func (m *mockRunner) Execute(ctx context.Context, run *FSMRun, store *Store, too
 	}
 	return nil
 }
+
+type mockResultSink struct {
+	delivered []*FSMRun
+	mu        sync.Mutex
+}
+
+func (s *mockResultSink) Deliver(ctx context.Context, run *FSMRun) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.delivered = append(s.delivered, run)
+	return nil
+}
+
+func TestEngine_RecoveryResultSinkDelivery(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	storeProvider := NewStaticStoreProvider(store)
+	ctx := context.Background()
+
+	sink := &mockResultSink{}
+	runner := &mockRunner{
+		execFunc: func(ctx context.Context, run *FSMRun, s *Store, toolsList []openai.Tool, model string) error {
+			run.Status = RunStatusCompleted
+			run.ResultJSON = "Here is your recovered answer."
+			return s.UpdateRun(ctx, run)
+		},
+	}
+
+	engine := NewEngine(storeProvider, nil, nil, WithResultSink(sink))
+	engine.RegisterRunner(FSMTypeToolLoop, runner)
+
+	run := &FSMRun{
+		ID:            "run_deliver_test",
+		ChatID:        "chat_dm_deliver",
+		UserID:        "user_bob",
+		IsDM:          true,
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusRunning,
+		CurrentState:  StateExecuteSteps,
+		Iteration:     1,
+		MaxIterations: 20,
+		ContextJSON:   "[]",
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	require.NoError(t, engine.Recover(ctx))
+
+	require.Eventually(t, func() bool {
+		sink.mu.Lock()
+		defer sink.mu.Unlock()
+		return len(sink.delivered) > 0
+	}, 2*time.Second, 50*time.Millisecond)
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	require.Len(t, sink.delivered, 1)
+	assert.Equal(t, "run_deliver_test", sink.delivered[0].ID)
+	assert.Equal(t, "chat_dm_deliver", sink.delivered[0].ChatID)
+	assert.Equal(t, "Here is your recovered answer.", sink.delivered[0].ResultJSON)
+}
+

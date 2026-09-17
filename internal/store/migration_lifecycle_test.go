@@ -88,6 +88,58 @@ insert into schema_version(version, description, is_current) values(%d, 'ancient
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "database version mismatch")
 	})
+
+	t.Run("DB at current version with older fsm_runs schema auto-adds is_dm", func(t *testing.T) {
+		dbPath := filepath.Join(t.TempDir(), "v2_no_isdm.db")
+		db, err := sql.Open("sqlite", dbPath)
+		require.NoError(t, err)
+		setup := fmt.Sprintf(`
+create table schema_version(
+  version integer primary key,
+  description text not null,
+  is_current boolean default 0 check (is_current in (0, 1))
+);
+create unique index schema_version_uk on schema_version(is_current) where is_current = 1;
+insert into schema_version(version, description, is_current) values(%d, 'v2 without is_dm', 1);
+create table fsm_runs (
+  id text primary key,
+  chat_id text not null,
+  user_id text not null,
+  fsm_type text not null,
+  status text not null,
+  current_state text not null,
+  iteration integer not null default 0,
+  max_iterations integer not null default 20,
+  context_json text not null,
+  result_json text,
+  error_text text,
+  resume_at integer,
+  created_at integer not null,
+  updated_at integer not null
+);`, version.Version)
+		_, err = db.Exec(setup)
+		require.NoError(t, err)
+		require.NoError(t, db.Close())
+
+		s, err := NewSQLiteStore(dbPath, false)
+		require.NoError(t, err)
+		defer func() { _ = s.Close() }()
+
+		var hasCol bool
+		rows, err := s.DB().Query("PRAGMA table_info(fsm_runs)")
+		require.NoError(t, err)
+		defer rows.Close()
+		for rows.Next() {
+			var cid, notnull, pk int
+			var name, colType string
+			var dflt sql.NullString
+			require.NoError(t, rows.Scan(&cid, &name, &colType, &notnull, &dflt, &pk))
+			if name == "is_dm" {
+				hasCol = true
+			}
+		}
+		assert.True(t, hasCol, "expected is_dm column to be added automatically")
+	})
 }
 
 func TestEnsureDBSchema(t *testing.T) {

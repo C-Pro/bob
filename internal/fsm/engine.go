@@ -113,6 +113,18 @@ func WithToolDefinitionProvider(p ToolDefinitionProvider) EngineOption {
 	}
 }
 
+// ResultSink defines the interface for delivering completed or failed workflow results out-of-band.
+type ResultSink interface {
+	Deliver(ctx context.Context, run *FSMRun) error
+}
+
+// WithResultSink configures a ResultSink for delivering async/recovered run results.
+func WithResultSink(sink ResultSink) EngineOption {
+	return func(e *Engine) {
+		e.resultSink = sink
+	}
+}
+
 // Engine coordinates durable FSM workflow executions, state dispatching, delayed transitions, and crash recovery.
 type Engine struct {
 	storeProvider   StoreProvider
@@ -120,6 +132,7 @@ type Engine struct {
 	invoker         ToolInvoker
 	stepExecutor    *StepExecutor
 	toolDefProvider ToolDefinitionProvider
+	resultSink      ResultSink
 	pollInterval    time.Duration
 	defaultModel    string
 
@@ -169,6 +182,11 @@ func (e *Engine) RegisterRunner(fsmType FSMType, runner Runner) {
 	e.runnersMu.Lock()
 	defer e.runnersMu.Unlock()
 	e.runners[fsmType] = runner
+}
+
+// SetResultSink configures or updates the result delivery sink for the engine.
+func (e *Engine) SetResultSink(sink ResultSink) {
+	e.resultSink = sink
 }
 
 func (e *Engine) getRunner(fsmType FSMType) (Runner, error) {
@@ -339,6 +357,11 @@ func (e *Engine) Recover(ctx context.Context) error {
 				if err := runner.Execute(runCtx, &runToRecover, s, tools, e.defaultModel); err != nil {
 					slog.Error("error executing recovered run", "run_id", runToRecover.ID, "error", err)
 				}
+				if e.resultSink != nil && (runToRecover.Status == RunStatusCompleted || runToRecover.Status == RunStatusFailed) {
+					if err := e.resultSink.Deliver(runCtx, &runToRecover); err != nil {
+						slog.Error("failed to deliver recovered run result", "run_id", runToRecover.ID, "error", err)
+					}
+				}
 			}(run, store)
 		}
 	}
@@ -414,6 +437,11 @@ func (e *Engine) PollDueWaitingRuns(ctx context.Context) error {
 
 				if err := runner.Execute(runCtx, &runToResume, s, tools, e.defaultModel); err != nil {
 					slog.Error("error executing resumed run", "run_id", runToResume.ID, "error", err)
+				}
+				if e.resultSink != nil && (runToResume.Status == RunStatusCompleted || runToResume.Status == RunStatusFailed) {
+					if err := e.resultSink.Deliver(runCtx, &runToResume); err != nil {
+						slog.Error("failed to deliver resumed run result", "run_id", runToResume.ID, "error", err)
+					}
 				}
 			}(run, store)
 		}

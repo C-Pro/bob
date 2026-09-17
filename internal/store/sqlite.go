@@ -82,12 +82,19 @@ func NewSQLiteStore(fname string, init bool) (*SQLiteStorage, error) {
 
 		switch v {
 		case version.Version:
-			// nothing to do
+			if err := ensureFSMColumns(context.Background(), s.db); err != nil {
+				_ = db.Close()
+				return nil, err
+			}
 		case version.Version - 1:
 			// run migration
 			if err := s.migrate(); err != nil {
 				_ = db.Close()
 				return nil, fmt.Errorf("migration failed: %w", err)
+			}
+			if err := ensureFSMColumns(context.Background(), s.db); err != nil {
+				_ = db.Close()
+				return nil, err
 			}
 		default:
 			_ = db.Close()
@@ -160,12 +167,12 @@ func EnsureDBSchema(ctx context.Context, db *sql.DB) error {
 
 	switch v {
 	case version.Version:
-		return nil
+		return ensureFSMColumns(ctx, db)
 	case version.Version - 1:
 		if err := executeMigrate(ctx, db); err != nil {
 			return fmt.Errorf("migration failed: %w", err)
 		}
-		return nil
+		return ensureFSMColumns(ctx, db)
 	default:
 		return fmt.Errorf(
 			"database version mismatch: expected %d or %d, but got %d",
@@ -173,6 +180,40 @@ func EnsureDBSchema(ctx context.Context, db *sql.DB) error {
 			version.Version,
 			v)
 	}
+}
+
+func ensureFSMColumns(ctx context.Context, db *sql.DB) error {
+	var fsmRunsCount int
+	err := db.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='fsm_runs'").Scan(&fsmRunsCount)
+	if err != nil || fsmRunsCount == 0 {
+		return nil
+	}
+
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info(fsm_runs)")
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = rows.Close() }()
+
+	hasIsDM := false
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notnull, pk int
+		var dfltValue sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notnull, &dfltValue, &pk); err == nil {
+			if name == "is_dm" {
+				hasIsDM = true
+				break
+			}
+		}
+	}
+	if !hasIsDM {
+		if _, err := db.ExecContext(ctx, "ALTER TABLE fsm_runs ADD COLUMN is_dm INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return fmt.Errorf("failed to add is_dm column to fsm_runs: %w", err)
+		}
+	}
+	return nil
 }
 
 func executeSchema(ctx context.Context, db *sql.DB) error {

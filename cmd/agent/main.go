@@ -198,6 +198,7 @@ func main() {
 		llmClient,
 		gw.ToolsRegistry(),
 		fsm.WithDefaultModel(cfg.OpenAIModel),
+		fsm.WithResultSink(gw),
 	)
 	gw.SetFSMEngine(fsmEngine)
 
