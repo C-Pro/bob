@@ -125,16 +125,26 @@ func WithResultSink(sink ResultSink) EngineOption {
 	}
 }
 
+// WithRecoveryStalenessCutoff sets the maximum staleness duration for interrupted runs on recovery.
+func WithRecoveryStalenessCutoff(d time.Duration) EngineOption {
+	return func(e *Engine) {
+		if d > 0 {
+			e.recoveryStalenessCutoff = d
+		}
+	}
+}
+
 // Engine coordinates durable FSM workflow executions, state dispatching, delayed transitions, and crash recovery.
 type Engine struct {
-	storeProvider   StoreProvider
-	llmClient       LLMClient
-	invoker         ToolInvoker
-	stepExecutor    *StepExecutor
-	toolDefProvider ToolDefinitionProvider
-	resultSink      ResultSink
-	pollInterval    time.Duration
-	defaultModel    string
+	storeProvider           StoreProvider
+	llmClient               LLMClient
+	invoker                 ToolInvoker
+	stepExecutor            *StepExecutor
+	toolDefProvider         ToolDefinitionProvider
+	resultSink              ResultSink
+	pollInterval            time.Duration
+	defaultModel            string
+	recoveryStalenessCutoff time.Duration
 
 	runnersMu sync.RWMutex
 	runners   map[FSMType]Runner
@@ -152,15 +162,16 @@ type Engine struct {
 // NewEngine creates and initializes a new FSM Engine.
 func NewEngine(storeProvider StoreProvider, llmClient LLMClient, invoker ToolInvoker, opts ...EngineOption) *Engine {
 	e := &Engine{
-		storeProvider: storeProvider,
-		llmClient:     llmClient,
-		invoker:       invoker,
-		pollInterval:  500 * time.Millisecond,
-		defaultModel:  "gemini-3.7-flash",
-		runners:       make(map[FSMType]Runner),
-		running:       make(map[string]context.CancelFunc),
-		wakeCh:        make(chan struct{}, 16),
-		stopCh:        make(chan struct{}),
+		storeProvider:           storeProvider,
+		llmClient:               llmClient,
+		invoker:                 invoker,
+		pollInterval:            500 * time.Millisecond,
+		defaultModel:            "gemini-3.7-flash",
+		recoveryStalenessCutoff: 15 * time.Minute,
+		runners:                 make(map[FSMType]Runner),
+		running:                 make(map[string]context.CancelFunc),
+		wakeCh:                  make(chan struct{}, 16),
+		stopCh:                  make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -369,6 +380,19 @@ func (e *Engine) Recover(ctx context.Context) error {
 				if fresh.Status.IsTerminal() {
 					return
 				}
+
+				if e.recoveryStalenessCutoff > 0 && fresh.UpdatedAt > 0 {
+					staleness := time.Duration(time.Now().Unix()-fresh.UpdatedAt) * time.Second
+					if staleness > e.recoveryStalenessCutoff {
+						fresh.Status = RunStatusTerminated
+						fresh.CurrentState = StateTerminated
+						fresh.ErrorText = fmt.Sprintf("stale run expired before recovery (last updated %s ago, threshold %s)", staleness.Round(time.Second), e.recoveryStalenessCutoff)
+						if updateErr := s.UpdateRun(runCtx, fresh); updateErr != nil {
+							slog.Error("failed to mark stale run as terminated", "run_id", runID, "error", updateErr)
+						}
+						return
+					}
+				}
 				if fresh.Status == RunStatusWaiting && fresh.ResumeAt != nil && *fresh.ResumeAt > time.Now().Unix() {
 					delay := time.Until(time.Unix(*fresh.ResumeAt, 0))
 					time.AfterFunc(delay, func() {
@@ -483,6 +507,20 @@ func (e *Engine) PollDueWaitingRuns(ctx context.Context) error {
 				if fresh.ResumeAt != nil && *fresh.ResumeAt > time.Now().Unix() {
 					return
 				}
+
+				if e.recoveryStalenessCutoff > 0 && fresh.UpdatedAt > 0 {
+					staleness := time.Duration(time.Now().Unix()-fresh.UpdatedAt) * time.Second
+					if staleness > e.recoveryStalenessCutoff {
+						fresh.Status = RunStatusTerminated
+						fresh.CurrentState = StateTerminated
+						fresh.ErrorText = fmt.Sprintf("stale waiting run expired before resume (last updated %s ago, threshold %s)", staleness.Round(time.Second), e.recoveryStalenessCutoff)
+						if updateErr := s.UpdateRun(runCtx, fresh); updateErr != nil {
+							slog.Error("failed to mark stale run as terminated", "run_id", runID, "error", updateErr)
+						}
+						return
+					}
+				}
+
 				runToResume := *fresh
 
 				if runToResume.ChatID == "" {
@@ -618,6 +656,17 @@ func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (*ToolLoo
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	defer func() {
+		if runCtx.Err() != nil && !run.Status.IsTerminal() {
+			bg, c := context.WithTimeout(context.Background(), 5*time.Second)
+			defer c()
+			run.Status = RunStatusTerminated
+			run.CurrentState = StateTerminated
+			run.ErrorText = "request context cancelled"
+			_ = store.UpdateRun(bg, run)
+		}
+	}()
 
 	sess, ok := tools.ChatSessionFromContext(ctx)
 	if !ok {

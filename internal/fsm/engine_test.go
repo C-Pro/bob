@@ -2,6 +2,7 @@ package fsm
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -650,6 +651,97 @@ func TestEngine_Stop_ConcurrentWithSpawn(t *testing.T) {
 	// After Stop, further spawn calls must return false
 	assert.False(t, engine.spawn(func() {}), "spawn must return false after engine is stopped")
 }
+
+func TestEngine_RunToolLoop_CancelledContext_MarksTerminated(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	storeProvider := NewStaticStoreProvider(store)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	runner := &mockRunner{
+		execFunc: func(execCtx context.Context, run *FSMRun, s *Store, toolsList []openai.Tool, model string) error {
+			cancel() // cancel parent context during execution
+			<-execCtx.Done()
+			return execCtx.Err()
+		},
+	}
+
+	engine := NewEngine(storeProvider, nil, nil)
+	engine.RegisterRunner(FSMTypeToolLoop, runner)
+
+	req := ToolLoopRequest{
+		RunID:  "run_cancelled_test",
+		ChatID: "chat_cancel",
+		UserID: "user_cancel",
+		Messages: []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleUser, Content: "hi"},
+		},
+	}
+
+	res, err := engine.RunToolLoop(ctx, req)
+	require.Error(t, err)
+	assert.Nil(t, res)
+	assert.True(t, errors.Is(err, context.Canceled))
+
+	persisted, err := store.GetRun(context.Background(), "run_cancelled_test")
+	require.NoError(t, err)
+	assert.Equal(t, RunStatusTerminated, persisted.Status)
+	assert.Equal(t, StateTerminated, persisted.CurrentState)
+	assert.Equal(t, "request context cancelled", persisted.ErrorText)
+}
+
+func TestEngine_Recover_StaleRun_MarksTerminated(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	storeProvider := NewStaticStoreProvider(store)
+	ctx := context.Background()
+
+	execCount := 0
+	runner := &mockRunner{
+		execFunc: func(execCtx context.Context, run *FSMRun, s *Store, toolsList []openai.Tool, model string) error {
+			execCount++
+			return nil
+		},
+	}
+
+	// Set 5 minute staleness cutoff
+	engine := NewEngine(storeProvider, nil, nil, WithRecoveryStalenessCutoff(5*time.Minute))
+	engine.RegisterRunner(FSMTypeToolLoop, runner)
+
+	// Create an interrupted run whose UpdatedAt is 1 hour in the past
+	pastTime := time.Now().Unix() - 3600
+	run := &FSMRun{
+		ID:            "run_stale_test",
+		ChatID:        "chat_stale",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusRunning,
+		CurrentState:  StateExecuteSteps,
+		Iteration:     1,
+		MaxIterations: 5,
+		ContextJSON:   "[]",
+		UpdatedAt:     pastTime,
+		CreatedAt:     pastTime,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	// Manually ensure updated_at is in the past (since CreateRun sets it to now if 0)
+	_, err := db.ExecContext(ctx, "UPDATE fsm_runs SET updated_at = ? WHERE id = ?", pastTime, run.ID)
+	require.NoError(t, err)
+
+	err = engine.Recover(ctx)
+	require.NoError(t, err)
+
+	engine.Stop()
+
+	assert.Equal(t, 0, execCount, "stale run should not be executed")
+	persisted, err := store.GetRun(ctx, "run_stale_test")
+	require.NoError(t, err)
+	assert.Equal(t, RunStatusTerminated, persisted.Status)
+	assert.Equal(t, StateTerminated, persisted.CurrentState)
+	assert.Contains(t, persisted.ErrorText, "stale run expired before recovery")
+}
+
 
 
 
