@@ -72,10 +72,13 @@ ON fsm_steps(run_id, iteration, step_index);
 - **Parallel Mode:** Applied when all tool calls in an iteration batch are read-only (`web_search`, `web_fetch`, `recall_memory`). Dispatches steps concurrently using a worker pool bounded by `maxParallelWorkers = 4` and synchronizes with `sync.WaitGroup`.
 - **Sequential Mode:** Applied when the batch contains mutating tools (`sandbox_exec`, file writes, sandbox lifecycle) or dependent steps. Steps execute in strict sequential order by `step_index`.
 
-### 3.2 Tool Call Resilience
+### 3.2 Tool Call Resilience & Recovery Semantics
 - **Granular Timeouts:** Enforce explicit per-tool deadlines using Go `context.WithTimeout(ctx, step.Timeout)`.
 - **Transient Retries:** Retry transient failures (network timeouts, HTTP 429 rate limits, 503 errors) with exponential backoff and jitter up to `max_attempts`.
 - **Deterministic Errors:** Deterministic errors (e.g. invalid JSON args, missing files) fail immediately without wasteful retries.
+- **Idempotency & Delivery Guarantees on Recovery:**
+  - Read-only tools (`web_search`, `web_fetch`, `recall_memory`) provide **at-least-once** execution; an interrupted step left `RUNNING` on crash is safely re-executed.
+  - Mutating tools (e.g. `sandbox_exec`, file writes) provide **at-most-once / fail-closed** execution; an interrupted mutating step left `RUNNING` fails immediately with an error message (`"interrupted mid-execution; not retried (non-idempotent tool)"`) and is not retried automatically. The failure is surfaced to the LLM in the next iteration so the model can inspect state and decide whether to retry.
 
 ### 3.3 Delayed Transitions & Scheduler Integration
 - State transitions can set a future `resume_at` timestamp and enter `WAITING` status.

@@ -326,8 +326,16 @@ func (e *StepExecutor) skipRemainingSteps(ctx context.Context, steps []*FSMStep,
 }
 
 func (e *StepExecutor) executeSingleStep(ctx context.Context, step *FSMStep) error {
-	if step.Status == StepStatusCompleted || step.Status == StepStatusSkipped {
+	if step.Status.IsTerminal() {
 		return nil
+	}
+
+	if step.Status == StepStatusRunning && !IsReadOnlyTool(step.ToolName) {
+		step.Status = StepStatusFailed
+		step.ErrorText = "interrupted mid-execution; not retried (non-idempotent tool)"
+		now := time.Now().Unix()
+		step.CompletedAt = &now
+		return e.updateStep(ctx, step)
 	}
 
 	timeoutSec := step.TimeoutSeconds

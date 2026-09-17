@@ -475,3 +475,51 @@ func TestStepExecutor_SequentialStepFailureSkipsRemaining(t *testing.T) {
 	assert.Contains(t, s2.ErrorText, "skipped due to failure in step s1")
 }
 
+func TestStepExecutor_RecoveryInterruptedMutatingStepFailsClosed(t *testing.T) {
+	invokerCalls := 0
+	invoker := ToolInvokerFunc(func(ctx context.Context, name string, argsJSON string) (string, error) {
+		invokerCalls++
+		return `{"result":"done"}`, nil
+	})
+	executor := NewStepExecutor(invoker, nil)
+
+	step := &FSMStep{
+		ID:            "step_mutating_running",
+		ToolName:      "sandbox_exec",
+		Status:        StepStatusRunning,
+		ExecutionMode: ExecutionModeSequential,
+	}
+
+	err := executor.Execute(context.Background(), []*FSMStep{step})
+	require.NoError(t, err)
+	assert.Equal(t, 0, invokerCalls, "mutating tool left running must not be re-invoked")
+	assert.Equal(t, StepStatusFailed, step.Status)
+	assert.Contains(t, step.ErrorText, "interrupted mid-execution; not retried (non-idempotent tool)")
+	assert.NotNil(t, step.CompletedAt)
+}
+
+func TestStepExecutor_RecoveryInterruptedReadOnlyStepReexecutes(t *testing.T) {
+	invokerCalls := 0
+	invoker := ToolInvokerFunc(func(ctx context.Context, name string, argsJSON string) (string, error) {
+		invokerCalls++
+		return `{"result":"found"}`, nil
+	})
+	executor := NewStepExecutor(invoker, nil)
+
+	step := &FSMStep{
+		ID:            "step_readonly_running",
+		ToolName:      "web_search",
+		Status:        StepStatusRunning,
+		ExecutionMode: ExecutionModeSequential,
+	}
+
+	err := executor.Execute(context.Background(), []*FSMStep{step})
+	require.NoError(t, err)
+	assert.Equal(t, 1, invokerCalls, "read-only tool left running must be re-executed")
+	assert.Equal(t, StepStatusCompleted, step.Status)
+	assert.Equal(t, `{"result":"found"}`, step.ResultJSON)
+	assert.Empty(t, step.ErrorText)
+	assert.NotNil(t, step.CompletedAt)
+}
+
+
