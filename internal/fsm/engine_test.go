@@ -505,4 +505,112 @@ func TestEngine_RunToolLoop_MaxWaitCyclesExceeded(t *testing.T) {
 	assert.Contains(t, persisted.ErrorText, "exceeded maximum wait cycles")
 }
 
+func TestEngine_RecoverySkipsTerminalFreshRun(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	storeProvider := NewStaticStoreProvider(store)
+	ctx := context.Background()
+
+	var execCount atomic.Int32
+	runner := &mockRunner{
+		execFunc: func(ctx context.Context, run *FSMRun, s *Store, toolsList []openai.Tool, model string) error {
+			execCount.Add(1)
+			run.Status = RunStatusCompleted
+			run.CurrentState = StateCompleted
+			run.ResultJSON = "completed"
+			return s.UpdateRun(ctx, run)
+		},
+	}
+
+	engine := NewEngine(storeProvider, nil, nil)
+	engine.RegisterRunner(FSMTypeToolLoop, runner)
+
+	run := &FSMRun{
+		ID:            "run_fresh_check",
+		ChatID:        "chat_test",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusRunning,
+		CurrentState:  StateExecuteSteps,
+		Iteration:     1,
+		MaxIterations: 5,
+		ContextJSON:   "[]",
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	// Launch multiple concurrent Recover passes
+	const passes = 10
+	var wg sync.WaitGroup
+	for i := 0; i < passes; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = engine.Recover(ctx)
+		}()
+	}
+	wg.Wait()
+	engine.Stop()
+
+	// Exactly 1 execution should have occurred despite multiple concurrent passes
+	assert.Equal(t, int32(1), execCount.Load(), "exactly one recovery pass should execute the run")
+	persisted, err := store.GetRun(ctx, "run_fresh_check")
+	require.NoError(t, err)
+	assert.Equal(t, RunStatusCompleted, persisted.Status)
+	assert.Equal(t, "completed", persisted.ResultJSON)
+}
+
+func TestEngine_PollDueWaitingRuns_SkipsTerminalFreshRun(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	storeProvider := NewStaticStoreProvider(store)
+	ctx := context.Background()
+
+	var execCount atomic.Int32
+	runner := &mockRunner{
+		execFunc: func(ctx context.Context, run *FSMRun, s *Store, toolsList []openai.Tool, model string) error {
+			execCount.Add(1)
+			run.Status = RunStatusCompleted
+			run.CurrentState = StateCompleted
+			run.ResultJSON = "completed from poll"
+			return s.UpdateRun(ctx, run)
+		},
+	}
+
+	engine := NewEngine(storeProvider, nil, nil)
+	engine.RegisterRunner(FSMTypeToolLoop, runner)
+
+	past := time.Now().Unix() - 10
+	run := &FSMRun{
+		ID:            "run_poll_race_check",
+		ChatID:        "chat_test",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusWaiting,
+		CurrentState:  StateWaiting,
+		ResumeAt:      &past,
+		Iteration:     1,
+		MaxIterations: 5,
+		ContextJSON:   "[]",
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	// Launch multiple concurrent PollDueWaitingRuns passes
+	const passes = 10
+	var wg sync.WaitGroup
+	for i := 0; i < passes; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = engine.PollDueWaitingRuns(ctx)
+		}()
+	}
+	wg.Wait()
+	engine.Stop()
+
+	assert.Equal(t, int32(1), execCount.Load(), "exactly one poll pass should execute the run")
+	persisted, err := store.GetRun(ctx, "run_poll_race_check")
+	require.NoError(t, err)
+	assert.Equal(t, RunStatusCompleted, persisted.Status)
+	assert.Equal(t, "completed from poll", persisted.ResultJSON)
+}
+
+
 

@@ -335,10 +335,32 @@ func (e *Engine) Recover(ctx context.Context) error {
 
 			// Interrupted in RUNNING, PENDING, or due WAITING: resume execution
 			e.wg.Add(1)
-			go func(runToRecover FSMRun, s *Store) {
+			go func(runID string, s *Store) {
 				defer e.wg.Done()
 				runCtx, cancel := context.WithCancel(ctx)
 				defer cancel()
+
+				if !e.acquireRun(runID, cancel) {
+					return
+				}
+				defer e.releaseRun(runID)
+
+				fresh, err := s.GetRun(runCtx, runID)
+				if err != nil {
+					slog.Error("failed to get fresh run on recovery", "run_id", runID, "error", err)
+					return
+				}
+				if fresh.Status.IsTerminal() {
+					return
+				}
+				if fresh.Status == RunStatusWaiting && fresh.ResumeAt != nil && *fresh.ResumeAt > time.Now().Unix() {
+					delay := time.Until(time.Unix(*fresh.ResumeAt, 0))
+					time.AfterFunc(delay, func() {
+						e.signalWake()
+					})
+					return
+				}
+				runToRecover := *fresh
 
 				if runToRecover.ChatID == "" {
 					slog.Error("refusing to recover run with empty chat_id", "run_id", runToRecover.ID)
@@ -350,11 +372,6 @@ func (e *Engine) Recover(ctx context.Context) error {
 					UserID: runToRecover.UserID,
 					IsDM:   runToRecover.IsDM,
 				})
-
-				if !e.acquireRun(runToRecover.ID, cancel) {
-					return
-				}
-				defer e.releaseRun(runToRecover.ID)
 
 				runToRecover.Status = RunStatusRunning
 				runToRecover.ResumeAt = nil
@@ -395,7 +412,7 @@ func (e *Engine) Recover(ctx context.Context) error {
 						slog.Error("failed to deliver recovered run result", "run_id", runToRecover.ID, "error", err)
 					}
 				}
-			}(run, store)
+			}(run.ID, store)
 		}
 	}
 
@@ -426,10 +443,31 @@ func (e *Engine) PollDueWaitingRuns(ctx context.Context) error {
 			}
 
 			e.wg.Add(1)
-			go func(runToResume FSMRun, s *Store) {
+			go func(runID string, s *Store) {
 				defer e.wg.Done()
 				runCtx, cancel := context.WithCancel(ctx)
 				defer cancel()
+
+				if !e.acquireRun(runID, cancel) {
+					return
+				}
+				defer e.releaseRun(runID)
+
+				fresh, err := s.GetRun(runCtx, runID)
+				if err != nil {
+					slog.Error("failed to get fresh run on resume", "run_id", runID, "error", err)
+					return
+				}
+				if fresh.Status.IsTerminal() {
+					return
+				}
+				if fresh.Status != RunStatusWaiting {
+					return
+				}
+				if fresh.ResumeAt != nil && *fresh.ResumeAt > time.Now().Unix() {
+					return
+				}
+				runToResume := *fresh
 
 				if runToResume.ChatID == "" {
 					slog.Error("refusing to resume run with empty chat_id", "run_id", runToResume.ID)
@@ -441,11 +479,6 @@ func (e *Engine) PollDueWaitingRuns(ctx context.Context) error {
 					UserID: runToResume.UserID,
 					IsDM:   runToResume.IsDM,
 				})
-
-				if !e.acquireRun(runToResume.ID, cancel) {
-					return
-				}
-				defer e.releaseRun(runToResume.ID)
 
 				runToResume.Status = RunStatusRunning
 				runToResume.ResumeAt = nil
@@ -486,7 +519,7 @@ func (e *Engine) PollDueWaitingRuns(ctx context.Context) error {
 						slog.Error("failed to deliver resumed run result", "run_id", runToResume.ID, "error", err)
 					}
 				}
-			}(run, store)
+			}(run.ID, store)
 		}
 	}
 

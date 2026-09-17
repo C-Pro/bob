@@ -1137,9 +1137,6 @@ func (g *Gateway) Start(ctx context.Context) error {
 		if err := fsmEng.Start(ctx); err != nil {
 			slog.Error("failed to start fsm engine", "error", err)
 		}
-		if err := fsmEng.Recover(ctx); err != nil {
-			slog.Error("failed to recover fsm runs on startup", "error", err)
-		}
 	}
 
 	// Start periodic maintenance ticker (FSM retention pruning and vacuum)
