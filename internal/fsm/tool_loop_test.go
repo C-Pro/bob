@@ -512,3 +512,170 @@ func TestEngine_RunToolLoop_WithTransitionCallback(t *testing.T) {
 	assert.Contains(t, observedStates, StateLLMRequest)
 	assert.Contains(t, observedStates, StateCompleted)
 }
+
+func TestToolLoop_SequentialFailureDoesNotCauseWaitingLoop(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	llm := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			if len(req.Messages) == 1 {
+				return &openai.ChatCompletionResponse{
+					Choices: []openai.ChatCompletionChoice{
+						{
+							Message: openai.ChatCompletionMessage{
+								Role: openai.ChatMessageRoleAssistant,
+								ToolCalls: []openai.ToolCall{
+									{
+										ID:   "call_seq_1",
+										Type: openai.ToolTypeFunction,
+										Function: openai.FunctionCall{
+											Name:      "sandbox_exec",
+											Arguments: `{"cmd":"exit 1"}`,
+										},
+									},
+									{
+										ID:   "call_seq_2",
+										Type: openai.ToolTypeFunction,
+										Function: openai.FunctionCall{
+											Name:      "sandbox_exec",
+											Arguments: `{"cmd":"echo hi"}`,
+										},
+									},
+								},
+							},
+						},
+					},
+				}, nil
+			}
+
+			// Turn 2: verify both tool calls got responses (1 failed, 2 skipped)
+			require.True(t, len(req.Messages) >= 3)
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    openai.ChatMessageRoleAssistant,
+							Content: "Command failed, handled gracefully.",
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	invoker := ToolInvokerFunc(func(ctx context.Context, name, argsJSON string) (string, error) {
+		return "", errors.New("command execution failed")
+	})
+
+	executor := NewStepExecutor(invoker, store)
+	runner := NewToolLoopRunner(llm, executor, "test-model")
+
+	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "Run commands"},
+	})
+	require.NoError(t, err)
+
+	run := &FSMRun{
+		ID:            "run_seq_fail",
+		ChatID:        "chat_1",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusRunning,
+		CurrentState:  StateInit,
+		Iteration:     0,
+		MaxIterations: 5,
+		ContextJSON:   contextJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	err = runner.Execute(ctx, run, store, nil, "test-model")
+	require.NoError(t, err)
+
+	assert.Equal(t, RunStatusCompleted, run.Status)
+	assert.Equal(t, "Command failed, handled gracefully.", run.ResultJSON)
+
+	// Verify steps in store
+	steps, err := store.ListStepsByIteration(ctx, run.ID, 1)
+	require.NoError(t, err)
+	require.Len(t, steps, 2)
+	assert.Equal(t, StepStatusFailed, steps[0].Status)
+	assert.Equal(t, StepStatusSkipped, steps[1].Status)
+	assert.Contains(t, steps[1].ErrorText, "skipped due to failure in step")
+}
+
+func TestToolLoop_PersistenceErrorDuringStepExecution_FailsRun(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	llm := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role: openai.ChatMessageRoleAssistant,
+							ToolCalls: []openai.ToolCall{
+								{
+									ID:   "call_persist_fail",
+									Type: openai.ToolTypeFunction,
+									Function: openai.FunctionCall{
+										Name:      "web_search",
+										Arguments: `{"query":"test"}`,
+									},
+								},
+							},
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	invoker := ToolInvokerFunc(func(ctx context.Context, name, argsJSON string) (string, error) {
+		return `{"result":"ok"}`, nil
+	})
+
+	executor := NewStepExecutor(invoker, store)
+	runner := NewToolLoopRunner(llm, executor, "test-model")
+
+	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "Hello"},
+	})
+	require.NoError(t, err)
+
+	run := &FSMRun{
+		ID:            "run_persist_fail",
+		ChatID:        "chat_1",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusRunning,
+		CurrentState:  StateInit,
+		Iteration:     0,
+		MaxIterations: 5,
+		ContextJSON:   contextJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	// Install a trigger that simulates disk I/O error specifically when updating steps
+	_, err = db.Exec(`CREATE TRIGGER fail_step_update BEFORE UPDATE ON fsm_steps
+	BEGIN
+		SELECT RAISE(FAIL, 'disk I/O error');
+	END;`)
+	require.NoError(t, err)
+
+	err = runner.Execute(ctx, run, store, nil, "test-model")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "step persistence failed")
+
+	assert.Equal(t, RunStatusFailed, run.Status)
+	assert.Equal(t, StateFailed, run.CurrentState)
+	assert.Contains(t, run.ErrorText, "persistence failure during step execution")
+
+	persisted, err := store.GetRun(ctx, run.ID)
+	require.NoError(t, err)
+	assert.Equal(t, RunStatusFailed, persisted.Status)
+	assert.Equal(t, StateFailed, persisted.CurrentState)
+	assert.Contains(t, persisted.ErrorText, "persistence failure during step execution")
+}
+

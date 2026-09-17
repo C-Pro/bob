@@ -73,6 +73,15 @@ func TestRunStatus_IsTerminal(t *testing.T) {
 	assert.True(t, RunStatusTerminated.IsTerminal())
 }
 
+func TestStepStatus_IsTerminal(t *testing.T) {
+	assert.False(t, StepStatusPending.IsTerminal())
+	assert.False(t, StepStatusRunning.IsTerminal())
+	assert.True(t, StepStatusCompleted.IsTerminal())
+	assert.True(t, StepStatusFailed.IsTerminal())
+	assert.True(t, StepStatusTimedOut.IsTerminal())
+	assert.True(t, StepStatusSkipped.IsTerminal())
+}
+
 func TestNewStepFromToolCall(t *testing.T) {
 	tc := openai.ToolCall{
 		ID:   "call_abc",

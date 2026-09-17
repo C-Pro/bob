@@ -359,6 +359,16 @@ func (e *Engine) Recover(ctx context.Context) error {
 				runToRecover.Status = RunStatusRunning
 				runToRecover.ResumeAt = nil
 				if runToRecover.CurrentState == StateWaiting {
+					runToRecover.WaitCycles++
+					if runToRecover.WaitCycles >= 10 {
+						runToRecover.Status = RunStatusFailed
+						runToRecover.CurrentState = StateFailed
+						runToRecover.ErrorText = fmt.Sprintf("recovered run %s exceeded maximum wait cycles (10)", runToRecover.ID)
+						if updateErr := s.UpdateRun(runCtx, &runToRecover); updateErr != nil {
+							slog.Error("failed to persist wait cycles failure for recovered run", "run_id", runToRecover.ID, "error", updateErr)
+						}
+						return
+					}
 					runToRecover.CurrentState = StateExecuteSteps
 				}
 				if err := s.UpdateRun(runCtx, &runToRecover); err != nil {
@@ -440,6 +450,16 @@ func (e *Engine) PollDueWaitingRuns(ctx context.Context) error {
 				runToResume.Status = RunStatusRunning
 				runToResume.ResumeAt = nil
 				if runToResume.CurrentState == StateWaiting {
+					runToResume.WaitCycles++
+					if runToResume.WaitCycles >= 10 {
+						runToResume.Status = RunStatusFailed
+						runToResume.CurrentState = StateFailed
+						runToResume.ErrorText = fmt.Sprintf("waiting run %s exceeded maximum wait cycles (10)", runToResume.ID)
+						if updateErr := s.UpdateRun(runCtx, &runToResume); updateErr != nil {
+							slog.Error("failed to persist wait cycles failure for waiting run", "run_id", runToResume.ID, "error", updateErr)
+						}
+						return
+					}
 					runToResume.CurrentState = StateExecuteSteps
 				}
 				if err := s.UpdateRun(runCtx, &runToResume); err != nil {
@@ -588,7 +608,24 @@ func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (*ToolLoo
 	}
 
 	// Handle WAITING state: wait for resume_at or timer wakeup
+	const maxWaitCycles = 10
+	localWaitCycles := 0
 	for run.Status == RunStatusWaiting {
+		localWaitCycles++
+		run.WaitCycles++
+		if run.WaitCycles >= maxWaitCycles || localWaitCycles >= maxWaitCycles {
+			run.Status = RunStatusFailed
+			run.CurrentState = StateFailed
+			run.ErrorText = fmt.Sprintf("run exceeded maximum wait cycles (%d)", maxWaitCycles)
+			if updateErr := store.UpdateRun(runCtx, run); updateErr != nil {
+				return nil, errors.Join(fmt.Errorf("run %s exceeded maximum wait cycles (%d)", run.ID, maxWaitCycles), updateErr)
+			}
+			return nil, fmt.Errorf("run %s exceeded maximum wait cycles (%d)", run.ID, maxWaitCycles)
+		}
+		if updateErr := store.UpdateRun(runCtx, run); updateErr != nil {
+			return nil, updateErr
+		}
+
 		if runCtx.Err() != nil {
 			return nil, runCtx.Err()
 		}
@@ -613,6 +650,9 @@ func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (*ToolLoo
 		if getErr != nil {
 			return nil, getErr
 		}
+		if updatedRun.WaitCycles < run.WaitCycles {
+			updatedRun.WaitCycles = run.WaitCycles
+		}
 		run = updatedRun
 		if run.Status == RunStatusWaiting {
 			now := time.Now().Unix()
@@ -629,6 +669,10 @@ func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (*ToolLoo
 				}
 			}
 		}
+	}
+
+	if run.Status == RunStatusFailed {
+		return nil, fmt.Errorf("run %s failed: %s", run.ID, run.ErrorText)
 	}
 
 	return &ToolLoopResult{

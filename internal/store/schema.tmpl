@@ -18,6 +18,7 @@ create table fsm_runs (
   current_state text not null,
   iteration integer not null default 0,
   max_iterations integer not null default 20,
+  wait_cycles integer not null default 0,
   context_json text not null,
   result_json text,
   error_text text,

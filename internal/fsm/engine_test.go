@@ -464,3 +464,45 @@ func TestEngine_RecoveryResultSinkDelivery(t *testing.T) {
 	assert.Equal(t, "Here is your recovered answer.", sink.delivered[0].ResultJSON)
 }
 
+func TestEngine_RunToolLoop_MaxWaitCyclesExceeded(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	storeProvider := NewStaticStoreProvider(store)
+	ctx := context.Background()
+
+	runner := &mockRunner{
+		execFunc: func(ctx context.Context, run *FSMRun, s *Store, toolsList []openai.Tool, model string) error {
+			now := time.Now().Unix() - 10
+			run.Status = RunStatusWaiting
+			run.ResumeAt = &now
+			return s.UpdateRun(ctx, run)
+		},
+	}
+
+	engine := NewEngine(storeProvider, nil, nil)
+	engine.RegisterRunner(FSMTypeToolLoop, runner)
+
+	req := ToolLoopRequest{
+		RunID:  "run_wait_loop",
+		ChatID: "chat_wait",
+		UserID: "user_wait",
+		IsDM:   true,
+		Messages: []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleUser, Content: "Hello"},
+		},
+	}
+
+	res, err := engine.RunToolLoop(ctx, req)
+	require.Error(t, err)
+	assert.Nil(t, res)
+	assert.Contains(t, err.Error(), "exceeded maximum wait cycles")
+
+	persisted, err := store.GetRun(ctx, "run_wait_loop")
+	require.NoError(t, err)
+	assert.Equal(t, RunStatusFailed, persisted.Status)
+	assert.Equal(t, StateFailed, persisted.CurrentState)
+	assert.Equal(t, 10, persisted.WaitCycles)
+	assert.Contains(t, persisted.ErrorText, "exceeded maximum wait cycles")
+}
+
+

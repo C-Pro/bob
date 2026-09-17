@@ -162,13 +162,27 @@ func NewStepExecutor(invoker ToolInvoker, store StepStore, opts ...StepExecutorO
 	return e
 }
 
+// StoreError indicates a failure when persisting step state to the SQLite store.
+type StoreError struct {
+	StepID string
+	Err    error
+}
+
+func (e *StoreError) Error() string {
+	return fmt.Sprintf("fsm store update step %s: %v", e.StepID, e.Err)
+}
+
+func (e *StoreError) Unwrap() error {
+	return e.Err
+}
+
 // updateStep persists the given step to the store if configured, returning any storage error.
 func (e *StepExecutor) updateStep(ctx context.Context, step *FSMStep) error {
 	if e.store == nil {
 		return nil
 	}
 	if err := e.store.UpdateStep(ctx, step); err != nil {
-		return fmt.Errorf("fsm store update step %s: %w", step.ID, err)
+		return &StoreError{StepID: step.ID, Err: err}
 	}
 	return nil
 }

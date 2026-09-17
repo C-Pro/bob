@@ -51,6 +51,11 @@ const (
 	StepStatusSkipped   StepStatus = "SKIPPED"
 )
 
+// IsTerminal reports whether the step status represents a finished end state.
+func (s StepStatus) IsTerminal() bool {
+	return s == StepStatusCompleted || s == StepStatusFailed || s == StepStatusTimedOut || s == StepStatusSkipped
+}
+
 // ExecutionMode defines whether steps are executed sequentially or concurrently.
 type ExecutionMode string
 
@@ -78,6 +83,7 @@ type FSMRun struct {
 	CurrentState  RunState  `json:"current_state"`
 	Iteration     int       `json:"iteration"`
 	MaxIterations int       `json:"max_iterations"`
+	WaitCycles    int       `json:"wait_cycles"`
 	ContextJSON   string    `json:"context_json"`
 	ResultJSON    string    `json:"result_json"`
 	ErrorText     string    `json:"error_text"`

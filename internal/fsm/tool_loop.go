@@ -88,6 +88,16 @@ func (r *ToolLoopRunner) Execute(ctx context.Context, run *FSMRun, store *Store,
 			if run.ResumeAt != nil && *run.ResumeAt > now {
 				return nil
 			}
+			run.WaitCycles++
+			if run.WaitCycles >= 10 {
+				run.Status = RunStatusFailed
+				run.CurrentState = StateFailed
+				run.ErrorText = "run exceeded maximum wait cycles (10)"
+				if err := store.UpdateRun(ctx, run); err != nil {
+					return errors.Join(fmt.Errorf("run %s exceeded maximum wait cycles (10)", run.ID), err)
+				}
+				return fmt.Errorf("run %s exceeded maximum wait cycles (10)", run.ID)
+			}
 			run.Status = RunStatusRunning
 			run.ResumeAt = nil
 			run.CurrentState = StateExecuteSteps
@@ -248,20 +258,48 @@ func (r *ToolLoopRunner) handleExecuteSteps(ctx context.Context, run *FSMRun, st
 	}
 
 	execErr := executor.Execute(ctx, stepPtrs)
-	if execErr != nil && ctx.Err() != nil {
+	if ctx.Err() != nil {
 		return false, ctx.Err()
 	}
 
-	// Check if any step requires waiting
-	for _, s := range stepPtrs {
-		if s.Status == StepStatusPending {
-			run.Status = RunStatusWaiting
-			run.CurrentState = StateWaiting
-			now := time.Now().Unix()
-			resumeAt := now + 1
-			run.ResumeAt = &resumeAt
-			return true, store.UpdateRun(ctx, run)
+	// If a persistence error occurred during step execution, fail the run immediately.
+	var storeErr *StoreError
+	if errors.As(execErr, &storeErr) {
+		run.Status = RunStatusFailed
+		run.CurrentState = StateFailed
+		run.ErrorText = fmt.Sprintf("persistence failure during step execution: %v", storeErr)
+		if updateErr := store.UpdateRun(ctx, run); updateErr != nil {
+			return false, errors.Join(storeErr, updateErr)
 		}
+		return false, fmt.Errorf("step persistence failed: %w", storeErr)
+	}
+
+	// Any step left in a non-terminal status (such as PENDING or RUNNING) after executor.Execute
+	// is an invariant violation. We must fail the run rather than reinterpreting it as WAITING.
+	for _, s := range stepPtrs {
+		if !s.Status.IsTerminal() {
+			run.Status = RunStatusFailed
+			run.CurrentState = StateFailed
+			if execErr != nil {
+				run.ErrorText = fmt.Sprintf("step %s unexpectedly left in %s status: %v", s.ID, s.Status, execErr)
+			} else {
+				run.ErrorText = fmt.Sprintf("step %s unexpectedly left in %s status", s.ID, s.Status)
+			}
+			if updateErr := store.UpdateRun(ctx, run); updateErr != nil {
+				if execErr != nil {
+					return false, errors.Join(fmt.Errorf("step %s unexpectedly left in %s: %w", s.ID, s.Status, execErr), updateErr)
+				}
+				return false, errors.Join(fmt.Errorf("step %s unexpectedly left in %s", s.ID, s.Status), updateErr)
+			}
+			if execErr != nil {
+				return false, fmt.Errorf("step execution failed: %w", execErr)
+			}
+			return false, fmt.Errorf("step %s unexpectedly left in %s status", s.ID, s.Status)
+		}
+	}
+
+	if execErr != nil {
+		slog.Warn("fsm step execution completed with step failures", "run_id", run.ID, "error", execErr)
 	}
 
 	// Collect tool results and append them as tool messages

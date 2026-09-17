@@ -125,7 +125,7 @@ create table fsm_runs (
 		require.NoError(t, err)
 		defer func() { _ = s.Close() }()
 
-		var hasCol bool
+		var hasIsDM, hasWaitCycles bool
 		rows, err := s.DB().Query("PRAGMA table_info(fsm_runs)")
 		require.NoError(t, err)
 		defer rows.Close()
@@ -135,10 +135,14 @@ create table fsm_runs (
 			var dflt sql.NullString
 			require.NoError(t, rows.Scan(&cid, &name, &colType, &notnull, &dflt, &pk))
 			if name == "is_dm" {
-				hasCol = true
+				hasIsDM = true
+			}
+			if name == "wait_cycles" {
+				hasWaitCycles = true
 			}
 		}
-		assert.True(t, hasCol, "expected is_dm column to be added automatically")
+		assert.True(t, hasIsDM, "expected is_dm column to be added automatically")
+		assert.True(t, hasWaitCycles, "expected wait_cycles column to be added automatically")
 	})
 }
 

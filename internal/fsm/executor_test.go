@@ -457,3 +457,21 @@ func TestStepExecutor_ParallelExecutionErrorPropagation(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "search execution failed")
 }
+
+func TestStepExecutor_SequentialStepFailureSkipsRemaining(t *testing.T) {
+	invoker := ToolInvokerFunc(func(ctx context.Context, name string, argsJSON string) (string, error) {
+		if name == "fail_tool" {
+			return "", errors.New("tool execution exploded")
+		}
+		return `{"ok":true}`, nil
+	})
+	executor := NewStepExecutor(invoker, nil)
+	s1 := &FSMStep{ID: "s1", ToolName: "fail_tool", ExecutionMode: ExecutionModeSequential}
+	s2 := &FSMStep{ID: "s2", ToolName: "subsequent_tool", ExecutionMode: ExecutionModeSequential}
+	err := executor.Execute(context.Background(), []*FSMStep{s1, s2})
+	require.Error(t, err)
+	assert.Equal(t, StepStatusFailed, s1.Status)
+	assert.Equal(t, StepStatusSkipped, s2.Status)
+	assert.Contains(t, s2.ErrorText, "skipped due to failure in step s1")
+}
+
