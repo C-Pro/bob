@@ -281,3 +281,45 @@ func TestStore_ChatIsolation(t *testing.T) {
 	_, err = store2.GetRun(ctx, "run_townhall")
 	assert.ErrorIs(t, err, ErrRunNotFound)
 }
+
+func TestStore_CreateSteps_Idempotent(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	run := &FSMRun{
+		ID:           "run_idempotent_steps",
+		ChatID:       "chat_1",
+		UserID:       "user_1",
+		FSMType:      FSMTypeToolLoop,
+		Status:       RunStatusRunning,
+		CurrentState: StatePrepareSteps,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	steps := []FSMStep{
+		{
+			ID:            "step_idem_1",
+			RunID:         run.ID,
+			Iteration:     1,
+			StepIndex:     0,
+			ToolName:      "web_search",
+			ToolCallID:    "call_1",
+			ArgsJSON:      `{"q":"test"}`,
+			ExecutionMode: ExecutionModeParallel,
+			Status:        StepStatusPending,
+		},
+	}
+
+	// First insert
+	require.NoError(t, store.CreateSteps(ctx, steps))
+
+	// Second insert with same ID should not error (ON CONFLICT DO NOTHING)
+	require.NoError(t, store.CreateSteps(ctx, steps))
+
+	gotSteps, err := store.ListStepsByIteration(ctx, run.ID, 1)
+	require.NoError(t, err)
+	require.Len(t, gotSteps, 1)
+	assert.Equal(t, "step_idem_1", gotSteps[0].ID)
+}
+

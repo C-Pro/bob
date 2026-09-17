@@ -220,6 +220,17 @@ func (r *ToolLoopRunner) handlePrepareSteps(ctx context.Context, run *FSMRun, st
 		return store.UpdateRun(ctx, run)
 	}
 
+	// If steps for this (run.ID, run.Iteration) already exist (e.g. recovered after CreateSteps crashed before UpdateRun),
+	// skip re-creating and advance directly to StateExecuteSteps.
+	existingSteps, err := store.ListStepsByIteration(ctx, run.ID, run.Iteration)
+	if err != nil {
+		return fmt.Errorf("failed to check existing fsm steps: %w", err)
+	}
+	if len(existingSteps) > 0 {
+		run.CurrentState = StateExecuteSteps
+		return store.UpdateRun(ctx, run)
+	}
+
 	mode := ClassifyExecutionMode(lastMsg.ToolCalls)
 	steps := make([]FSMStep, len(lastMsg.ToolCalls))
 	for i, tc := range lastMsg.ToolCalls {

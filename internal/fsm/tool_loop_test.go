@@ -679,3 +679,75 @@ func TestToolLoop_PersistenceErrorDuringStepExecution_FailsRun(t *testing.T) {
 	assert.Contains(t, persisted.ErrorText, "persistence failure during step execution")
 }
 
+func TestToolLoop_PrepareSteps_CrashRecoveryIdempotent(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	llm := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    openai.ChatMessageRoleAssistant,
+							Content: "Finished recovering!",
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	invoker := ToolInvokerFunc(func(ctx context.Context, name, argsJSON string) (string, error) {
+		return `{"result":"found"}`, nil
+	})
+
+	executor := NewStepExecutor(invoker, store)
+	runner := NewToolLoopRunner(llm, executor, "test-model")
+
+	// Create run that crashed while in StatePrepareSteps after steps were already created
+	messages := []openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "Search"},
+		{
+			Role: openai.ChatMessageRoleAssistant,
+			ToolCalls: []openai.ToolCall{
+				{
+					ID:   "call_rec",
+					Type: openai.ToolTypeFunction,
+					Function: openai.FunctionCall{
+						Name:      "web_search",
+						Arguments: `{"query":"golang"}`,
+					},
+				},
+			},
+		},
+	}
+	contextJSON, err := EncodeMessages(messages)
+	require.NoError(t, err)
+
+	run := &FSMRun{
+		ID:            "run_crash_prep",
+		ChatID:        "chat_1",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusRunning,
+		CurrentState:  StatePrepareSteps,
+		Iteration:     1,
+		MaxIterations: 5,
+		ContextJSON:   contextJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	// Pre-insert the step as if CreateSteps completed before crash
+	existingStep := NewStepFromToolCall(run.ID, run.Iteration, 0, messages[1].ToolCalls[0], ExecutionModeParallel)
+	require.NoError(t, store.CreateSteps(ctx, []FSMStep{existingStep}))
+
+	// Execute should cleanly resume from StatePrepareSteps without UNIQUE constraint violation
+	err = runner.Execute(ctx, run, store, nil, "test-model")
+	require.NoError(t, err)
+
+	assert.Equal(t, RunStatusCompleted, run.Status)
+	assert.Equal(t, "Finished recovering!", run.ResultJSON)
+}
+
+

@@ -307,6 +307,7 @@ func (s *Store) CreateSteps(ctx context.Context, steps []FSMStep) error {
 			args_json, result_json, execution_mode, status, attempt,
 			max_attempts, timeout_seconds, started_at, completed_at, error_text
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO NOTHING
 	`
 
 	stmt, err := tx.PrepareContext(ctx, query)
