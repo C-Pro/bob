@@ -99,3 +99,36 @@ func TestFetchError(t *testing.T) {
 	assert.Equal(t, underlying, errWrap.Unwrap())
 	assert.Equal(t, "fetch error: underlying network failure", errWrap.Error())
 }
+
+func TestFetchHTTPStatusErrors(t *testing.T) {
+	tests := []struct {
+		name        string
+		statusCode  int
+		isRetryable bool
+	}{
+		{name: "TooManyRequests 429", statusCode: http.StatusTooManyRequests, isRetryable: true},
+		{name: "ServiceUnavailable 503", statusCode: http.StatusServiceUnavailable, isRetryable: true},
+		{name: "InternalServerError 500", statusCode: http.StatusInternalServerError, isRetryable: true},
+		{name: "NotFound 404", statusCode: http.StatusNotFound, isRetryable: false},
+		{name: "Forbidden 403", statusCode: http.StatusForbidden, isRetryable: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, "server message", tc.statusCode)
+			}))
+			defer ts.Close()
+
+			res, err := Fetch(context.Background(), ts.URL, ts.Client())
+			assert.Nil(t, res)
+			require.Error(t, err)
+
+			var fetchErr *FetchError
+			require.True(t, errors.As(err, &fetchErr))
+			assert.Equal(t, tc.statusCode, fetchErr.StatusCode)
+			assert.Equal(t, tc.isRetryable, fetchErr.IsRetryable())
+		})
+	}
+}
+

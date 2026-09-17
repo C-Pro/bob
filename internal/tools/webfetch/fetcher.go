@@ -90,6 +90,13 @@ func Fetch(ctx context.Context, targetURL string, client *http.Client) (*FetchRe
 		_ = resp.Body.Close()
 	}()
 
+	if resp.StatusCode >= 400 {
+		return nil, &FetchError{
+			StatusCode: resp.StatusCode,
+			Err:        fmt.Errorf("upstream returned %s", resp.Status),
+		}
+	}
+
 	contentType := resp.Header.Get("Content-Type")
 	mediaType, _, err := mime.ParseMediaType(contentType)
 	if err != nil || mediaType == "" {
