@@ -157,6 +157,9 @@ func (g *Gateway) SetToolsRegistry(r *tools.Registry) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.toolsRegistry = r
+	if g.fsmEngine != nil {
+		g.fsmEngine.SetToolDefinitionProvider(g)
+	}
 }
 
 // FSMEngine returns the Gateway's durable FSM Engine.
@@ -166,14 +169,29 @@ func (g *Gateway) FSMEngine() *fsm.Engine {
 	return g.fsmEngine
 }
 
-// SetFSMEngine sets the durable FSM Engine for the gateway and configures it with the gateway ResultSink.
+// SetFSMEngine sets the durable FSM Engine for the gateway and configures it with the gateway ResultSink and ToolDefinitionProvider.
 func (g *Gateway) SetFSMEngine(e *fsm.Engine) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.fsmEngine = e
 	if e != nil {
 		e.SetResultSink(g)
+		e.SetToolDefinitionProvider(g)
 	}
+}
+
+// ToolDefinitions implements fsm.ToolDefinitionProvider to supply tool definitions for a chat.
+func (g *Gateway) ToolDefinitions(ctx context.Context, chatID string, isDM bool) []openai.Tool {
+	g.mu.Lock()
+	r := g.toolsRegistry
+	g.mu.Unlock()
+	if r == nil {
+		return nil
+	}
+	return r.ToolDefinitionsForSession(tools.ChatSessionContext{
+		ChatID: chatID,
+		IsDM:   isDM,
+	})
 }
 
 // Deliver implements fsm.ResultSink to deliver completed or failed workflow results out-of-band.

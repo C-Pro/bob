@@ -294,6 +294,14 @@ func (r *Registry) ToolDefinitionsForSession(session ChatSessionContext) []opena
 	return r.toolDefinitions
 }
 
+// ToolDefinitionsForChat returns tool definitions for a given chat session context.
+func (r *Registry) ToolDefinitionsForChat(ctx context.Context, chatID string, isDM bool) []openai.Tool {
+	return r.ToolDefinitionsForSession(ChatSessionContext{
+		ChatID: chatID,
+		IsDM:   isDM,
+	})
+}
+
 // WebSearchArgs defines arguments for the web_search tool.
 type WebSearchArgs struct {
 	Query       string `json:"query"`

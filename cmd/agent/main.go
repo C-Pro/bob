@@ -199,6 +199,7 @@ func main() {
 		gw.ToolsRegistry(),
 		fsm.WithDefaultModel(cfg.OpenAIModel),
 		fsm.WithResultSink(gw),
+		fsm.WithToolDefinitionProvider(gw),
 	)
 	gw.SetFSMEngine(fsmEngine)
 

@@ -299,6 +299,58 @@ func TestEngine_RecoverySessionContext(t *testing.T) {
 	assert.True(t, capturedSession.IsDM)
 }
 
+func TestEngine_RecoveryToolDefinitionProvider(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	storeProvider := NewStaticStoreProvider(store)
+	ctx := context.Background()
+
+	var capturedTools []openai.Tool
+	runner := &mockRunner{
+		execFunc: func(ctx context.Context, run *FSMRun, s *Store, toolsList []openai.Tool, model string) error {
+			capturedTools = toolsList
+			run.Status = RunStatusCompleted
+			return s.UpdateRun(ctx, run)
+		},
+	}
+
+	expectedTools := []openai.Tool{
+		{Type: openai.ToolTypeFunction, Function: &openai.FunctionDefinition{Name: "custom_tool"}},
+	}
+	provider := ToolDefinitionProviderFunc(func(ctx context.Context, chatID string, isDM bool) []openai.Tool {
+		if isDM {
+			return expectedTools
+		}
+		return nil
+	})
+
+	engine := NewEngine(storeProvider, nil, nil, WithToolDefinitionProvider(provider))
+	engine.RegisterRunner(FSMTypeToolLoop, runner)
+
+	run := &FSMRun{
+		ID:            "run_tool_recovery",
+		ChatID:        "dm_chat_456",
+		UserID:        "user_bob",
+		IsDM:          true,
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusRunning,
+		CurrentState:  StateExecuteSteps,
+		Iteration:     1,
+		MaxIterations: 20,
+		ContextJSON:   "[]",
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	require.NoError(t, engine.Recover(ctx))
+
+	require.Eventually(t, func() bool {
+		r, err := store.GetRun(ctx, "run_tool_recovery")
+		return err == nil && r.Status == RunStatusCompleted
+	}, 2*time.Second, 50*time.Millisecond)
+
+	require.Len(t, capturedTools, 1)
+	assert.Equal(t, "custom_tool", capturedTools[0].Function.Name)
+}
 
 func TestEngine_ConcurrencyDeduplication(t *testing.T) {
 	db := setupTestDB(t)

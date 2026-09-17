@@ -171,6 +171,16 @@ func NewEngine(storeProvider StoreProvider, llmClient LLMClient, invoker ToolInv
 		e.stepExecutor = NewStepExecutor(invoker, nil)
 	}
 
+	if e.toolDefProvider == nil && invoker != nil {
+		if p, ok := invoker.(ToolDefinitionProvider); ok {
+			e.toolDefProvider = p
+		} else if inv, ok := invoker.(interface {
+			ToolDefinitionsForChat(ctx context.Context, chatID string, isDM bool) []openai.Tool
+		}); ok {
+			e.toolDefProvider = ToolDefinitionProviderFunc(inv.ToolDefinitionsForChat)
+		}
+	}
+
 	// Register default ToolLoopRunner
 	e.RegisterRunner(FSMTypeToolLoop, NewToolLoopRunner(llmClient, e.stepExecutor, e.defaultModel))
 
@@ -182,6 +192,19 @@ func (e *Engine) RegisterRunner(fsmType FSMType, runner Runner) {
 	e.runnersMu.Lock()
 	defer e.runnersMu.Unlock()
 	e.runners[fsmType] = runner
+}
+
+// SetToolDefinitionProvider configures or updates the tool definition provider for the engine.
+func (e *Engine) SetToolDefinitionProvider(p ToolDefinitionProvider) {
+	e.toolDefProvider = p
+}
+
+// ToolDefinitionProviderFunc adapts a function to ToolDefinitionProvider.
+type ToolDefinitionProviderFunc func(ctx context.Context, chatID string, isDM bool) []openai.Tool
+
+// ToolDefinitions calls the underlying function to return tool definitions.
+func (f ToolDefinitionProviderFunc) ToolDefinitions(ctx context.Context, chatID string, isDM bool) []openai.Tool {
+	return f(ctx, chatID, isDM)
 }
 
 // SetResultSink configures or updates the result delivery sink for the engine.
