@@ -328,3 +328,57 @@ func TestStore_CreateSteps_Idempotent(t *testing.T) {
 	assert.Equal(t, "step_idem_1", gotSteps[0].ID)
 }
 
+func TestStore_OptimisticConcurrencyConflict(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	run := &FSMRun{
+		ID:           "run_occ_test",
+		ChatID:       "chat_1",
+		UserID:       "user_1",
+		FSMType:      FSMTypeToolLoop,
+		Status:       RunStatusRunning,
+		CurrentState: StateExecuteSteps,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	// Fetch two independent copies of the run
+	copy1, err := store.GetRun(ctx, run.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 0, copy1.Version)
+
+	copy2, err := store.GetRun(ctx, run.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 0, copy2.Version)
+
+	// Update first copy - should succeed and increment version to 1
+	copy1.Status = RunStatusWaiting
+	require.NoError(t, store.UpdateRunState(ctx, copy1))
+	assert.Equal(t, 1, copy1.Version)
+
+	// Update second copy - should fail with ErrConcurrentUpdate because version 0 is stale
+	copy2.Status = RunStatusCompleted
+	err = store.UpdateRunState(ctx, copy2)
+	require.ErrorIs(t, err, ErrConcurrentUpdate)
+
+	// Updating a non-existent run should still return ErrRunNotFound
+	err = store.UpdateRunState(ctx, &FSMRun{ID: "does_not_exist", Version: 0})
+	require.ErrorIs(t, err, ErrRunNotFound)
+
+	// Re-reading copy2 and then updating should succeed
+	refreshed, err := store.GetRun(ctx, run.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, refreshed.Version)
+	assert.Equal(t, RunStatusWaiting, refreshed.Status)
+
+	refreshed.Status = RunStatusCompleted
+	require.NoError(t, store.UpdateRunState(ctx, refreshed))
+	assert.Equal(t, 2, refreshed.Version)
+
+	finalRun, err := store.GetRun(ctx, run.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 2, finalRun.Version)
+	assert.Equal(t, RunStatusCompleted, finalRun.Status)
+}
+

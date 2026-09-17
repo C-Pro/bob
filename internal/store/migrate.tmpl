@@ -16,6 +16,7 @@ create table fsm_runs (
   result_json text,
   error_text text,
   resume_at integer,
+  version integer not null default 0,
   created_at integer not null,
   updated_at integer not null
 );

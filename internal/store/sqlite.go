@@ -210,6 +210,7 @@ func ensureFSMColumns(ctx context.Context, db *sql.DB) error {
 
 	hasIsDM := false
 	hasWaitCycles := false
+	hasVersion := false
 	for rows.Next() {
 		var cid int
 		var name, colType string
@@ -222,6 +223,9 @@ func ensureFSMColumns(ctx context.Context, db *sql.DB) error {
 			if name == "wait_cycles" {
 				hasWaitCycles = true
 			}
+			if name == "version" {
+				hasVersion = true
+			}
 		}
 	}
 	if !hasIsDM {
@@ -232,6 +236,11 @@ func ensureFSMColumns(ctx context.Context, db *sql.DB) error {
 	if !hasWaitCycles {
 		if _, err := db.ExecContext(ctx, "ALTER TABLE fsm_runs ADD COLUMN wait_cycles INTEGER NOT NULL DEFAULT 0"); err != nil {
 			return fmt.Errorf("failed to add wait_cycles column to fsm_runs: %w", err)
+		}
+	}
+	if !hasVersion {
+		if _, err := db.ExecContext(ctx, "ALTER TABLE fsm_runs ADD COLUMN version INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return fmt.Errorf("failed to add version column to fsm_runs: %w", err)
 		}
 	}
 	return nil

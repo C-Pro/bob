@@ -13,6 +13,8 @@ var (
 	ErrRunNotFound = errors.New("fsm run not found")
 	// ErrStepNotFound indicates that an FSM step with the given ID does not exist.
 	ErrStepNotFound = errors.New("fsm step not found")
+	// ErrConcurrentUpdate indicates that an optimistic concurrency conflict occurred while updating an FSM run.
+	ErrConcurrentUpdate = errors.New("concurrent fsm run update conflict")
 )
 
 // Store provides persistence methods for FSM runs and steps on a specific SQLite database.
@@ -58,8 +60,8 @@ func (s *Store) CreateRun(ctx context.Context, run *FSMRun) error {
 		INSERT INTO fsm_runs (
 			id, chat_id, user_id, is_dm, fsm_type, status, current_state,
 			iteration, max_iterations, wait_cycles, context_json, result_json,
-			error_text, resume_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			error_text, resume_at, version, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	var resumeAt sql.NullInt64
@@ -70,7 +72,7 @@ func (s *Store) CreateRun(ctx context.Context, run *FSMRun) error {
 	_, err := s.db.ExecContext(ctx, query,
 		run.ID, run.ChatID, run.UserID, isDMInt, string(run.FSMType), string(run.Status), string(run.CurrentState),
 		run.Iteration, run.MaxIterations, run.WaitCycles, run.ContextJSON, run.ResultJSON,
-		run.ErrorText, resumeAt, run.CreatedAt, run.UpdatedAt,
+		run.ErrorText, resumeAt, run.Version, run.CreatedAt, run.UpdatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to insert fsm_run %s: %w", run.ID, err)
@@ -84,7 +86,7 @@ func (s *Store) GetRun(ctx context.Context, id string) (*FSMRun, error) {
 	query := `
 		SELECT id, chat_id, user_id, is_dm, fsm_type, status, current_state,
 		       iteration, max_iterations, wait_cycles, context_json, result_json,
-		       error_text, resume_at, created_at, updated_at
+		       error_text, resume_at, version, created_at, updated_at
 		FROM fsm_runs
 		WHERE id = ?
 	`
@@ -98,7 +100,7 @@ func (s *Store) GetRun(ctx context.Context, id string) (*FSMRun, error) {
 	err := s.db.QueryRowContext(ctx, query, id).Scan(
 		&run.ID, &run.ChatID, &run.UserID, &isDMInt, &fsmType, &status, &currentState,
 		&run.Iteration, &run.MaxIterations, &run.WaitCycles, &run.ContextJSON, &resultJSON,
-		&errorText, &resumeAt, &run.CreatedAt, &run.UpdatedAt,
+		&errorText, &resumeAt, &run.Version, &run.CreatedAt, &run.UpdatedAt,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -125,12 +127,14 @@ func (s *Store) GetRun(ctx context.Context, id string) (*FSMRun, error) {
 	return &run, nil
 }
 
-// UpdateRunState updates the dynamic execution state, status, context, and timestamps of a run.
+// UpdateRunState updates the dynamic execution state, status, context, and timestamps of a run using optimistic concurrency control.
 func (s *Store) UpdateRunState(ctx context.Context, run *FSMRun) error {
 	if run == nil {
 		return fmt.Errorf("run cannot be nil")
 	}
-	run.UpdatedAt = time.Now().Unix()
+	oldVersion := run.Version
+	newVersion := oldVersion + 1
+	now := time.Now().Unix()
 
 	isDMInt := 0
 	if run.IsDM {
@@ -140,8 +144,8 @@ func (s *Store) UpdateRunState(ctx context.Context, run *FSMRun) error {
 	query := `
 		UPDATE fsm_runs
 		SET status = ?, current_state = ?, iteration = ?, wait_cycles = ?, context_json = ?,
-		    result_json = ?, error_text = ?, resume_at = ?, is_dm = ?, updated_at = ?
-		WHERE id = ?
+		    result_json = ?, error_text = ?, resume_at = ?, is_dm = ?, version = ?, updated_at = ?
+		WHERE id = ? AND version = ?
 	`
 
 	var resumeAt sql.NullInt64
@@ -151,7 +155,7 @@ func (s *Store) UpdateRunState(ctx context.Context, run *FSMRun) error {
 
 	res, err := s.db.ExecContext(ctx, query,
 		string(run.Status), string(run.CurrentState), run.Iteration, run.WaitCycles, run.ContextJSON,
-		run.ResultJSON, run.ErrorText, resumeAt, isDMInt, run.UpdatedAt, run.ID,
+		run.ResultJSON, run.ErrorText, resumeAt, isDMInt, newVersion, now, run.ID, oldVersion,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to update fsm_run %s: %w", run.ID, err)
@@ -162,9 +166,15 @@ func (s *Store) UpdateRunState(ctx context.Context, run *FSMRun) error {
 		return fmt.Errorf("failed to check affected rows for fsm_run %s: %w", run.ID, err)
 	}
 	if affected == 0 {
+		var exists int
+		if checkErr := s.db.QueryRowContext(ctx, "SELECT count(*) FROM fsm_runs WHERE id = ?", run.ID).Scan(&exists); checkErr == nil && exists > 0 {
+			return ErrConcurrentUpdate
+		}
 		return ErrRunNotFound
 	}
 
+	run.Version = newVersion
+	run.UpdatedAt = now
 	return nil
 }
 
@@ -178,7 +188,7 @@ func (s *Store) ListActiveRuns(ctx context.Context) ([]FSMRun, error) {
 	query := `
 		SELECT id, chat_id, user_id, is_dm, fsm_type, status, current_state,
 		       iteration, max_iterations, wait_cycles, context_json, result_json,
-		       error_text, resume_at, created_at, updated_at
+		       error_text, resume_at, version, created_at, updated_at
 		FROM fsm_runs
 		WHERE status IN ('PENDING', 'RUNNING', 'WAITING')
 		ORDER BY created_at ASC
@@ -201,7 +211,7 @@ func (s *Store) ListActiveRuns(ctx context.Context) ([]FSMRun, error) {
 		if err := rows.Scan(
 			&run.ID, &run.ChatID, &run.UserID, &isDMInt, &fsmType, &status, &currentState,
 			&run.Iteration, &run.MaxIterations, &run.WaitCycles, &run.ContextJSON, &resultJSON,
-			&errorText, &resumeAt, &run.CreatedAt, &run.UpdatedAt,
+			&errorText, &resumeAt, &run.Version, &run.CreatedAt, &run.UpdatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan active fsm_run: %w", err)
 		}
@@ -236,7 +246,7 @@ func (s *Store) ListDueWaitingRuns(ctx context.Context, nowUnix int64) ([]FSMRun
 	query := `
 		SELECT id, chat_id, user_id, is_dm, fsm_type, status, current_state,
 		       iteration, max_iterations, wait_cycles, context_json, result_json,
-		       error_text, resume_at, created_at, updated_at
+		       error_text, resume_at, version, created_at, updated_at
 		FROM fsm_runs
 		WHERE status = 'WAITING' AND resume_at IS NOT NULL AND resume_at <= ?
 		ORDER BY resume_at ASC
@@ -259,7 +269,7 @@ func (s *Store) ListDueWaitingRuns(ctx context.Context, nowUnix int64) ([]FSMRun
 		if err := rows.Scan(
 			&run.ID, &run.ChatID, &run.UserID, &isDMInt, &fsmType, &status, &currentState,
 			&run.Iteration, &run.MaxIterations, &run.WaitCycles, &run.ContextJSON, &resultJSON,
-			&errorText, &resumeAt, &run.CreatedAt, &run.UpdatedAt,
+			&errorText, &resumeAt, &run.Version, &run.CreatedAt, &run.UpdatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan due waiting fsm_run: %w", err)
 		}

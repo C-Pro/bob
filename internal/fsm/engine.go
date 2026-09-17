@@ -426,6 +426,10 @@ func (e *Engine) Recover(ctx context.Context) error {
 						fresh.CurrentState = StateTerminated
 						fresh.ErrorText = fmt.Sprintf("stale run expired before recovery (last updated %s ago, threshold %s)", staleness.Round(time.Second), e.recoveryStalenessCutoff)
 						if updateErr := s.UpdateRun(runCtx, fresh); updateErr != nil {
+							if errors.Is(updateErr, ErrConcurrentUpdate) {
+								slog.Warn("skipping stale run termination due to concurrent update", "run_id", runID)
+								return
+							}
 							slog.Error("failed to mark stale run as terminated", "run_id", runID, "error", updateErr)
 						}
 						return
@@ -460,6 +464,10 @@ func (e *Engine) Recover(ctx context.Context) error {
 						runToRecover.CurrentState = StateFailed
 						runToRecover.ErrorText = fmt.Sprintf("recovered run %s exceeded maximum wait cycles (10)", runToRecover.ID)
 						if updateErr := s.UpdateRun(runCtx, &runToRecover); updateErr != nil {
+							if errors.Is(updateErr, ErrConcurrentUpdate) {
+								slog.Warn("skipping recovered run wait cycles failure due to concurrent update", "run_id", runToRecover.ID)
+								return
+							}
 							slog.Error("failed to persist wait cycles failure for recovered run", "run_id", runToRecover.ID, "error", updateErr)
 						}
 						return
@@ -467,6 +475,10 @@ func (e *Engine) Recover(ctx context.Context) error {
 					runToRecover.CurrentState = StateExecuteSteps
 				}
 				if err := s.UpdateRun(runCtx, &runToRecover); err != nil {
+					if errors.Is(err, ErrConcurrentUpdate) {
+						slog.Warn("skipping recovered run due to concurrent update", "run_id", runToRecover.ID)
+						return
+					}
 					slog.Error("failed to update recovered run", "run_id", runToRecover.ID, "error", err)
 					return
 				}
@@ -553,6 +565,10 @@ func (e *Engine) PollDueWaitingRuns(ctx context.Context) error {
 						fresh.CurrentState = StateTerminated
 						fresh.ErrorText = fmt.Sprintf("stale waiting run expired before resume (last updated %s ago, threshold %s)", staleness.Round(time.Second), e.recoveryStalenessCutoff)
 						if updateErr := s.UpdateRun(runCtx, fresh); updateErr != nil {
+							if errors.Is(updateErr, ErrConcurrentUpdate) {
+								slog.Warn("skipping stale run termination due to concurrent update", "run_id", runID)
+								return
+							}
 							slog.Error("failed to mark stale run as terminated", "run_id", runID, "error", updateErr)
 						}
 						return
@@ -581,6 +597,10 @@ func (e *Engine) PollDueWaitingRuns(ctx context.Context) error {
 						runToResume.CurrentState = StateFailed
 						runToResume.ErrorText = fmt.Sprintf("waiting run %s exceeded maximum wait cycles (10)", runToResume.ID)
 						if updateErr := s.UpdateRun(runCtx, &runToResume); updateErr != nil {
+							if errors.Is(updateErr, ErrConcurrentUpdate) {
+								slog.Warn("skipping resumed run wait cycles failure due to concurrent update", "run_id", runToResume.ID)
+								return
+							}
 							slog.Error("failed to persist wait cycles failure for waiting run", "run_id", runToResume.ID, "error", updateErr)
 						}
 						return
@@ -588,6 +608,10 @@ func (e *Engine) PollDueWaitingRuns(ctx context.Context) error {
 					runToResume.CurrentState = StateExecuteSteps
 				}
 				if err := s.UpdateRun(runCtx, &runToResume); err != nil {
+					if errors.Is(err, ErrConcurrentUpdate) {
+						slog.Warn("skipping resumed run due to concurrent update", "run_id", runToResume.ID)
+						return
+					}
 					slog.Error("failed to update waiting run to running", "run_id", runToResume.ID, "error", err)
 					return
 				}

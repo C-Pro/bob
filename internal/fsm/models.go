@@ -88,6 +88,7 @@ type FSMRun struct {
 	ResultJSON    string    `json:"result_json"`
 	ErrorText     string    `json:"error_text"`
 	ResumeAt      *int64    `json:"resume_at"` // Unix timestamp in seconds; nil if not waiting
+	Version       int       `json:"version"`
 	CreatedAt     int64     `json:"created_at"`
 	UpdatedAt     int64     `json:"updated_at"`
 }
