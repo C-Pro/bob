@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 
 	"bob/internal/fsm"
 	"bob/internal/memory"
@@ -14,8 +15,11 @@ import (
 
 // MemoryStoreProvider implements fsm.StoreProvider backed by memory.Manager and per-chat SQLite databases.
 type MemoryStoreProvider struct {
-	memMgr  *memory.Manager
-	dataDir string
+	memMgr   *memory.Manager
+	dataDir  string
+	mu       sync.RWMutex
+	stores   map[string]*fsm.Store
+	initOnce sync.Once
 }
 
 // NewMemoryStoreProvider creates a new MemoryStoreProvider.
@@ -23,13 +27,37 @@ func NewMemoryStoreProvider(memMgr *memory.Manager, dataDir string) *MemoryStore
 	return &MemoryStoreProvider{
 		memMgr:  memMgr,
 		dataDir: dataDir,
+		stores:  make(map[string]*fsm.Store),
 	}
+}
+
+func (p *MemoryStoreProvider) storeKey(chatID string, isDM bool) string {
+	if !isDM || chatID == "townhall" {
+		return "townhall"
+	}
+	return "dm_" + memory.SanitizeChatID(chatID)
 }
 
 // GetStore retrieves or initializes the durable FSM store for the given chat context.
 func (p *MemoryStoreProvider) GetStore(ctx context.Context, chatID string, isDM bool) (*fsm.Store, error) {
 	if p.memMgr == nil {
 		return nil, fmt.Errorf("memory manager is nil")
+	}
+
+	key := p.storeKey(chatID, isDM)
+
+	p.mu.RLock()
+	st, ok := p.stores[key]
+	p.mu.RUnlock()
+	if ok {
+		return st, nil
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if st, ok = p.stores[key]; ok {
+		return st, nil
 	}
 
 	cortexDB, err := p.memMgr.GetDB(ctx, chatID, isDM)
@@ -42,7 +70,40 @@ func (p *MemoryStoreProvider) GetStore(ctx context.Context, chatID string, isDM 
 		return nil, fmt.Errorf("failed to ensure fsm schema for chat %s: %w", chatID, err)
 	}
 
-	return fsm.NewStore(rawDB), nil
+	st = fsm.NewStore(rawDB)
+	p.stores[key] = st
+	return st, nil
+}
+
+func (p *MemoryStoreProvider) discoverStores(ctx context.Context) {
+	if p.dataDir == "" {
+		return
+	}
+
+	entries, err := os.ReadDir(p.dataDir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn("failed to read data directory during initial active store discovery", "dataDir", p.dataDir, "error", err)
+		}
+		return
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if name == "townhall.db" {
+			if _, err := p.GetStore(ctx, "townhall", false); err != nil {
+				slog.Warn("failed to open townhall.db during initial active store discovery", "error", err)
+			}
+		} else if strings.HasPrefix(name, "dm_") && strings.HasSuffix(name, ".db") {
+			chatID := strings.TrimSuffix(strings.TrimPrefix(name, "dm_"), ".db")
+			if _, err := p.GetStore(ctx, chatID, true); err != nil {
+				slog.Warn("failed to open dm db during initial active store discovery", "chatID", chatID, "error", err)
+			}
+		}
+	}
 }
 
 // ActiveStores discovers and returns durable FSM stores for all existing or active chat databases.
@@ -51,38 +112,16 @@ func (p *MemoryStoreProvider) ActiveStores(ctx context.Context) ([]*fsm.Store, e
 		return nil, nil
 	}
 
-	// Discover on-disk chat databases in dataDir to ensure they are loaded in memoryManager
-	if p.dataDir != "" {
-		entries, err := os.ReadDir(p.dataDir)
-		if err != nil && !os.IsNotExist(err) {
-			slog.Warn("failed to read data directory during active store discovery", "dataDir", p.dataDir, "error", err)
-		} else if err == nil {
-			for _, entry := range entries {
-				if entry.IsDir() {
-					continue
-				}
-				name := entry.Name()
-				if name == "townhall.db" {
-					if _, err := p.memMgr.GetDB(ctx, "townhall", false); err != nil {
-						slog.Warn("failed to open townhall.db during active store discovery", "error", err)
-					}
-				} else if strings.HasPrefix(name, "dm_") && strings.HasSuffix(name, ".db") {
-					chatID := strings.TrimSuffix(strings.TrimPrefix(name, "dm_"), ".db")
-					if _, err := p.memMgr.GetDB(ctx, chatID, true); err != nil {
-						slog.Warn("failed to open dm db during active store discovery", "chatID", chatID, "error", err)
-					}
-				}
-			}
-		}
-	}
+	p.initOnce.Do(func() {
+		p.discoverStores(ctx)
+	})
 
-	activeDBs := p.memMgr.ActiveDBs()
-	stores := make([]*fsm.Store, 0, len(activeDBs))
-	for _, rawDB := range activeDBs {
-		if err := store.EnsureDBSchema(ctx, rawDB); err != nil {
-			return nil, fmt.Errorf("failed to ensure fsm schema for active database: %w", err)
-		}
-		stores = append(stores, fsm.NewStore(rawDB))
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	stores := make([]*fsm.Store, 0, len(p.stores))
+	for _, st := range p.stores {
+		stores = append(stores, st)
 	}
 
 	return stores, nil

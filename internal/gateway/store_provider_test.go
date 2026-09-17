@@ -35,10 +35,20 @@ func TestMemoryStoreProvider_GetStore(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, activeRuns)
 
+	// Repeated call returns cached store instance
+	thStoreCached, err := provider.GetStore(ctx, "townhall", false)
+	require.NoError(t, err)
+	assert.Same(t, thStore, thStoreCached)
+
 	// DM store
 	dmStore, err := provider.GetStore(ctx, "user_123", true)
 	require.NoError(t, err)
 	require.NotNil(t, dmStore)
+
+	// Repeated call returns cached DM store instance
+	dmStoreCached, err := provider.GetStore(ctx, "user_123", true)
+	require.NoError(t, err)
+	assert.Same(t, dmStore, dmStoreCached)
 
 	activeRuns, err = dmStore.ListActiveRuns(ctx)
 	require.NoError(t, err)

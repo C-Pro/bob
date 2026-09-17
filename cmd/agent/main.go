@@ -200,6 +200,7 @@ func main() {
 		fsm.WithDefaultModel(cfg.OpenAIModel),
 		fsm.WithResultSink(gw),
 		fsm.WithToolDefinitionProvider(gw),
+		fsm.WithPollInterval(2*time.Second),
 	)
 	gw.SetFSMEngine(fsmEngine)
 

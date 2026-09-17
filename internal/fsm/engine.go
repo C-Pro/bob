@@ -175,7 +175,7 @@ func NewEngine(storeProvider StoreProvider, llmClient LLMClient, invoker ToolInv
 		storeProvider:           storeProvider,
 		llmClient:               llmClient,
 		invoker:                 invoker,
-		pollInterval:            500 * time.Millisecond,
+		pollInterval:            2 * time.Second,
 		defaultModel:            "gemini-3.7-flash",
 		recoveryStalenessCutoff: 15 * time.Minute,
 		maxRecoveryConcurrency:  4,

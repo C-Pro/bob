@@ -125,6 +125,7 @@ func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 			llmClient,
 			toolsRegistry,
 			fsm.WithDefaultModel(cfg.OpenAIModel),
+			fsm.WithPollInterval(2*time.Second),
 		)
 	}
 
