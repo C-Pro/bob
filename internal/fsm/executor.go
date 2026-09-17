@@ -378,26 +378,27 @@ func (e *StepExecutor) executeSingleStep(ctx context.Context, step *FSMStep) err
 			return nil
 		}
 
-		// Step timed out
-		if errors.Is(stepCtx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
-			step.Status = StepStatusTimedOut
-			step.ErrorText = fmt.Sprintf("tool execution timed out after %ds", step.TimeoutSeconds)
-			step.CompletedAt = &completedTime
-			updateErr := e.updateStep(ctx, step)
-			return errors.Join(err, updateErr)
-		}
-
-		// Parent context canceled
+		// Parent context canceled or timed out - must remain terminal immediately
 		if ctx.Err() != nil {
-			step.Status = StepStatusFailed
-			step.ErrorText = ctx.Err().Error()
+			status := StepStatusFailed
+			errText := ctx.Err().Error()
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				status = StepStatusTimedOut
+				errText = fmt.Sprintf("tool execution timed out after %ds", step.TimeoutSeconds)
+			}
+			step.Status = status
+			step.ErrorText = errText
 			step.CompletedAt = &completedTime
 			updateErr := e.updateStep(ctx, step)
 			return errors.Join(ctx.Err(), updateErr)
 		}
 
-		// Transient error and retries remain
-		if IsTransientError(err) && step.Attempt < maxAttempts {
+		// Check if step timed out or encountered a transient error
+		isTimeout := errors.Is(stepCtx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded)
+		isRetryable := isTimeout || IsTransientError(err)
+
+		if isRetryable && step.Attempt < maxAttempts {
+			step.Status = StepStatusRunning
 			backoff := CalculateBackoff(step.Attempt, e.retryConfig)
 			slog.Warn("retrying transient tool execution failure",
 				"tool", step.ToolName,
@@ -405,8 +406,12 @@ func (e *StepExecutor) executeSingleStep(ctx context.Context, step *FSMStep) err
 				"attempt", step.Attempt,
 				"max_attempts", maxAttempts,
 				"backoff", backoff,
+				"timeout", isTimeout,
 				"error", err,
 			)
+			if updateErr := e.updateStep(ctx, step); updateErr != nil {
+				return updateErr
+			}
 			select {
 			case <-ctx.Done():
 				step.Status = StepStatusFailed
@@ -417,6 +422,15 @@ func (e *StepExecutor) executeSingleStep(ctx context.Context, step *FSMStep) err
 			case <-time.After(backoff):
 				continue
 			}
+		}
+
+		// Step timed out and attempts exhausted
+		if isTimeout {
+			step.Status = StepStatusTimedOut
+			step.ErrorText = fmt.Sprintf("tool execution timed out after %ds", step.TimeoutSeconds)
+			step.CompletedAt = &completedTime
+			updateErr := e.updateStep(ctx, step)
+			return errors.Join(err, updateErr)
 		}
 
 		// Non-transient error or attempts exhausted

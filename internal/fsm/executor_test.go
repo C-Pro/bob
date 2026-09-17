@@ -317,6 +317,59 @@ func TestStepExecutor_TransientErrorExhaustion(t *testing.T) {
 	assert.Contains(t, step.ErrorText, "503 Service Unavailable")
 }
 
+func TestStepExecutor_StepTimeoutRetries(t *testing.T) {
+	var attempts int32
+
+	invoker := ToolInvokerFunc(func(ctx context.Context, name string, argsJSON string) (string, error) {
+		n := atomic.AddInt32(&attempts, 1)
+		if n < 3 {
+			return "", context.DeadlineExceeded
+		}
+		return `{"recovered": true}`, nil
+	})
+
+	fastRetry := RetryConfig{InitialBackoff: 2 * time.Millisecond, MaxBackoff: 10 * time.Millisecond, Multiplier: 2.0}
+	executor := NewStepExecutor(invoker, nil, WithRetryConfig(fastRetry))
+
+	step := &FSMStep{
+		ID:             "step_timeout_retry",
+		ToolName:       "web_search",
+		TimeoutSeconds: 1,
+		MaxAttempts:    3,
+	}
+
+	err := executor.Execute(context.Background(), []*FSMStep{step})
+	require.NoError(t, err)
+	assert.Equal(t, StepStatusCompleted, step.Status)
+	assert.Equal(t, 3, step.Attempt)
+	assert.Equal(t, `{"recovered": true}`, step.ResultJSON)
+}
+
+func TestStepExecutor_StepTimeoutExhaustion(t *testing.T) {
+	var attempts int32
+
+	invoker := ToolInvokerFunc(func(ctx context.Context, name string, argsJSON string) (string, error) {
+		atomic.AddInt32(&attempts, 1)
+		return "", context.DeadlineExceeded
+	})
+
+	fastRetry := RetryConfig{InitialBackoff: 2 * time.Millisecond, MaxBackoff: 10 * time.Millisecond, Multiplier: 2.0}
+	executor := NewStepExecutor(invoker, nil, WithRetryConfig(fastRetry))
+
+	step := &FSMStep{
+		ID:             "step_timeout_exhaust",
+		ToolName:       "web_search",
+		TimeoutSeconds: 1,
+		MaxAttempts:    3,
+	}
+
+	err := executor.Execute(context.Background(), []*FSMStep{step})
+	require.Error(t, err)
+	assert.Equal(t, StepStatusTimedOut, step.Status)
+	assert.Equal(t, 3, step.Attempt)
+	assert.Contains(t, step.ErrorText, "timed out after 1s")
+}
+
 func TestStepExecutor_NonTransientErrorNoRetry(t *testing.T) {
 	var attempts int32
 
