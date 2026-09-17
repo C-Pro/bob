@@ -12,6 +12,7 @@ create table fsm_runs (
   id text primary key,
   chat_id text not null,
   user_id text not null,
+  is_dm integer not null default 0,
   fsm_type text not null,
   status text not null,
   current_state text not null,

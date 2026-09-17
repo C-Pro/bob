@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"bob/internal/tools"
+
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -297,6 +299,17 @@ func (e *Engine) Recover(ctx context.Context) error {
 				runCtx, cancel := context.WithCancel(ctx)
 				defer cancel()
 
+				if runToRecover.ChatID == "" {
+					slog.Error("refusing to recover run with empty chat_id", "run_id", runToRecover.ID)
+					return
+				}
+
+				runCtx = tools.WithChatSession(runCtx, tools.ChatSessionContext{
+					ChatID: runToRecover.ChatID,
+					UserID: runToRecover.UserID,
+					IsDM:   runToRecover.IsDM,
+				})
+
 				if !e.acquireRun(runToRecover.ID, cancel) {
 					return
 				}
@@ -320,7 +333,7 @@ func (e *Engine) Recover(ctx context.Context) error {
 
 				var tools []openai.Tool
 				if e.toolDefProvider != nil {
-					tools = e.toolDefProvider.ToolDefinitions(runCtx, runToRecover.ChatID, runToRecover.ChatID != "townhall")
+					tools = e.toolDefProvider.ToolDefinitions(runCtx, runToRecover.ChatID, runToRecover.IsDM)
 				}
 
 				if err := runner.Execute(runCtx, &runToRecover, s, tools, e.defaultModel); err != nil {
@@ -362,6 +375,17 @@ func (e *Engine) PollDueWaitingRuns(ctx context.Context) error {
 				runCtx, cancel := context.WithCancel(ctx)
 				defer cancel()
 
+				if runToResume.ChatID == "" {
+					slog.Error("refusing to resume run with empty chat_id", "run_id", runToResume.ID)
+					return
+				}
+
+				runCtx = tools.WithChatSession(runCtx, tools.ChatSessionContext{
+					ChatID: runToResume.ChatID,
+					UserID: runToResume.UserID,
+					IsDM:   runToResume.IsDM,
+				})
+
 				if !e.acquireRun(runToResume.ID, cancel) {
 					return
 				}
@@ -385,7 +409,7 @@ func (e *Engine) PollDueWaitingRuns(ctx context.Context) error {
 
 				var tools []openai.Tool
 				if e.toolDefProvider != nil {
-					tools = e.toolDefProvider.ToolDefinitions(runCtx, runToResume.ChatID, runToResume.ChatID != "townhall")
+					tools = e.toolDefProvider.ToolDefinitions(runCtx, runToResume.ChatID, runToResume.IsDM)
 				}
 
 				if err := runner.Execute(runCtx, &runToResume, s, tools, e.defaultModel); err != nil {
@@ -459,6 +483,7 @@ func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (*ToolLoo
 		ID:            req.RunID,
 		ChatID:        req.ChatID,
 		UserID:        req.UserID,
+		IsDM:          req.IsDM,
 		FSMType:       FSMTypeToolLoop,
 		Status:        RunStatusRunning,
 		CurrentState:  StateInit,
@@ -473,6 +498,15 @@ func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (*ToolLoo
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	sess, ok := tools.ChatSessionFromContext(ctx)
+	if !ok {
+		sess = tools.ChatSessionContext{}
+	}
+	sess.ChatID = req.ChatID
+	sess.UserID = req.UserID
+	sess.IsDM = req.IsDM
+	runCtx = tools.WithChatSession(runCtx, sess)
 
 	if !e.acquireRun(run.ID, cancel) {
 		return nil, fmt.Errorf("run %s is already executing", run.ID)

@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"bob/internal/tools"
+
 	openai "github.com/sashabaranov/go-openai"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -248,6 +250,54 @@ func TestEngine_CrashRecoveryInterruptedRuns(t *testing.T) {
 	assert.Equal(t, RunStatusCompleted, recovered.Status)
 	assert.Equal(t, "Recovered and completed.", recovered.ResultJSON)
 }
+
+func TestEngine_RecoverySessionContext(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	storeProvider := NewStaticStoreProvider(store)
+	ctx := context.Background()
+
+	var capturedSession tools.ChatSessionContext
+	runner := &mockRunner{
+		execFunc: func(ctx context.Context, run *FSMRun, s *Store, toolsList []openai.Tool, model string) error {
+			if sess, ok := tools.ChatSessionFromContext(ctx); ok {
+				capturedSession = sess
+			}
+			run.Status = RunStatusCompleted
+			return s.UpdateRun(ctx, run)
+		},
+	}
+
+	engine := NewEngine(storeProvider, nil, nil)
+	engine.RegisterRunner(FSMTypeToolLoop, runner)
+
+	run := &FSMRun{
+		ID:            "run_dm_recovery",
+		ChatID:        "dm_chat_123",
+		UserID:        "user_alice",
+		IsDM:          true,
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusRunning,
+		CurrentState:  StateExecuteSteps,
+		Iteration:     1,
+		MaxIterations: 20,
+		ContextJSON:   "[]",
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	err := engine.Recover(ctx)
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		r, err := store.GetRun(ctx, "run_dm_recovery")
+		return err == nil && r.Status == RunStatusCompleted
+	}, 2*time.Second, 50*time.Millisecond)
+
+	assert.Equal(t, "dm_chat_123", capturedSession.ChatID)
+	assert.Equal(t, "user_alice", capturedSession.UserID)
+	assert.True(t, capturedSession.IsDM)
+}
+
 
 func TestEngine_ConcurrencyDeduplication(t *testing.T) {
 	db := setupTestDB(t)

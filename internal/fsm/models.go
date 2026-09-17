@@ -72,6 +72,7 @@ type FSMRun struct {
 	ID            string    `json:"id"`
 	ChatID        string    `json:"chat_id"`
 	UserID        string    `json:"user_id"`
+	IsDM          bool      `json:"is_dm"`
 	FSMType       FSMType   `json:"fsm_type"`
 	Status        RunStatus `json:"status"`
 	CurrentState  RunState  `json:"current_state"`

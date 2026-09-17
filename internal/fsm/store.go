@@ -49,12 +49,17 @@ func (s *Store) CreateRun(ctx context.Context, run *FSMRun) error {
 		run.CurrentState = StateInit
 	}
 
+	isDMInt := 0
+	if run.IsDM {
+		isDMInt = 1
+	}
+
 	query := `
 		INSERT INTO fsm_runs (
-			id, chat_id, user_id, fsm_type, status, current_state,
+			id, chat_id, user_id, is_dm, fsm_type, status, current_state,
 			iteration, max_iterations, context_json, result_json,
 			error_text, resume_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	var resumeAt sql.NullInt64
@@ -63,7 +68,7 @@ func (s *Store) CreateRun(ctx context.Context, run *FSMRun) error {
 	}
 
 	_, err := s.db.ExecContext(ctx, query,
-		run.ID, run.ChatID, run.UserID, string(run.FSMType), string(run.Status), string(run.CurrentState),
+		run.ID, run.ChatID, run.UserID, isDMInt, string(run.FSMType), string(run.Status), string(run.CurrentState),
 		run.Iteration, run.MaxIterations, run.ContextJSON, run.ResultJSON,
 		run.ErrorText, resumeAt, run.CreatedAt, run.UpdatedAt,
 	)
@@ -77,7 +82,7 @@ func (s *Store) CreateRun(ctx context.Context, run *FSMRun) error {
 // GetRun retrieves an FSM run by its unique ID.
 func (s *Store) GetRun(ctx context.Context, id string) (*FSMRun, error) {
 	query := `
-		SELECT id, chat_id, user_id, fsm_type, status, current_state,
+		SELECT id, chat_id, user_id, is_dm, fsm_type, status, current_state,
 		       iteration, max_iterations, context_json, result_json,
 		       error_text, resume_at, created_at, updated_at
 		FROM fsm_runs
@@ -85,12 +90,13 @@ func (s *Store) GetRun(ctx context.Context, id string) (*FSMRun, error) {
 	`
 
 	var run FSMRun
+	var isDMInt int
 	var fsmType, status, currentState string
 	var resumeAt sql.NullInt64
 	var resultJSON, errorText sql.NullString
 
 	err := s.db.QueryRowContext(ctx, query, id).Scan(
-		&run.ID, &run.ChatID, &run.UserID, &fsmType, &status, &currentState,
+		&run.ID, &run.ChatID, &run.UserID, &isDMInt, &fsmType, &status, &currentState,
 		&run.Iteration, &run.MaxIterations, &run.ContextJSON, &resultJSON,
 		&errorText, &resumeAt, &run.CreatedAt, &run.UpdatedAt,
 	)
@@ -101,6 +107,7 @@ func (s *Store) GetRun(ctx context.Context, id string) (*FSMRun, error) {
 		return nil, fmt.Errorf("failed to query fsm_run %s: %w", id, err)
 	}
 
+	run.IsDM = isDMInt == 1
 	run.FSMType = FSMType(fsmType)
 	run.Status = RunStatus(status)
 	run.CurrentState = RunState(currentState)
@@ -125,10 +132,15 @@ func (s *Store) UpdateRunState(ctx context.Context, run *FSMRun) error {
 	}
 	run.UpdatedAt = time.Now().Unix()
 
+	isDMInt := 0
+	if run.IsDM {
+		isDMInt = 1
+	}
+
 	query := `
 		UPDATE fsm_runs
 		SET status = ?, current_state = ?, iteration = ?, context_json = ?,
-		    result_json = ?, error_text = ?, resume_at = ?, updated_at = ?
+		    result_json = ?, error_text = ?, resume_at = ?, is_dm = ?, updated_at = ?
 		WHERE id = ?
 	`
 
@@ -139,7 +151,7 @@ func (s *Store) UpdateRunState(ctx context.Context, run *FSMRun) error {
 
 	res, err := s.db.ExecContext(ctx, query,
 		string(run.Status), string(run.CurrentState), run.Iteration, run.ContextJSON,
-		run.ResultJSON, run.ErrorText, resumeAt, run.UpdatedAt, run.ID,
+		run.ResultJSON, run.ErrorText, resumeAt, isDMInt, run.UpdatedAt, run.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to update fsm_run %s: %w", run.ID, err)
@@ -164,7 +176,7 @@ func (s *Store) UpdateRun(ctx context.Context, run *FSMRun) error {
 // ListActiveRuns returns all runs currently in PENDING, RUNNING, or WAITING status.
 func (s *Store) ListActiveRuns(ctx context.Context) ([]FSMRun, error) {
 	query := `
-		SELECT id, chat_id, user_id, fsm_type, status, current_state,
+		SELECT id, chat_id, user_id, is_dm, fsm_type, status, current_state,
 		       iteration, max_iterations, context_json, result_json,
 		       error_text, resume_at, created_at, updated_at
 		FROM fsm_runs
@@ -181,18 +193,20 @@ func (s *Store) ListActiveRuns(ctx context.Context) ([]FSMRun, error) {
 	var runs []FSMRun
 	for rows.Next() {
 		var run FSMRun
+		var isDMInt int
 		var fsmType, status, currentState string
 		var resumeAt sql.NullInt64
 		var resultJSON, errorText sql.NullString
 
 		if err := rows.Scan(
-			&run.ID, &run.ChatID, &run.UserID, &fsmType, &status, &currentState,
+			&run.ID, &run.ChatID, &run.UserID, &isDMInt, &fsmType, &status, &currentState,
 			&run.Iteration, &run.MaxIterations, &run.ContextJSON, &resultJSON,
 			&errorText, &resumeAt, &run.CreatedAt, &run.UpdatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan active fsm_run: %w", err)
 		}
 
+		run.IsDM = isDMInt == 1
 		run.FSMType = FSMType(fsmType)
 		run.Status = RunStatus(status)
 		run.CurrentState = RunState(currentState)
@@ -220,7 +234,7 @@ func (s *Store) ListActiveRuns(ctx context.Context) ([]FSMRun, error) {
 // ListDueWaitingRuns returns runs in WAITING status whose resume_at deadline has arrived.
 func (s *Store) ListDueWaitingRuns(ctx context.Context, nowUnix int64) ([]FSMRun, error) {
 	query := `
-		SELECT id, chat_id, user_id, fsm_type, status, current_state,
+		SELECT id, chat_id, user_id, is_dm, fsm_type, status, current_state,
 		       iteration, max_iterations, context_json, result_json,
 		       error_text, resume_at, created_at, updated_at
 		FROM fsm_runs
@@ -237,18 +251,20 @@ func (s *Store) ListDueWaitingRuns(ctx context.Context, nowUnix int64) ([]FSMRun
 	var runs []FSMRun
 	for rows.Next() {
 		var run FSMRun
+		var isDMInt int
 		var fsmType, status, currentState string
 		var resumeAt sql.NullInt64
 		var resultJSON, errorText sql.NullString
 
 		if err := rows.Scan(
-			&run.ID, &run.ChatID, &run.UserID, &fsmType, &status, &currentState,
+			&run.ID, &run.ChatID, &run.UserID, &isDMInt, &fsmType, &status, &currentState,
 			&run.Iteration, &run.MaxIterations, &run.ContextJSON, &resultJSON,
 			&errorText, &resumeAt, &run.CreatedAt, &run.UpdatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan due waiting fsm_run: %w", err)
 		}
 
+		run.IsDM = isDMInt == 1
 		run.FSMType = FSMType(fsmType)
 		run.Status = RunStatus(status)
 		run.CurrentState = RunState(currentState)
