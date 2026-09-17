@@ -32,6 +32,9 @@ func NewToolLoopRunner(llmClient LLMClient, stepExecutor *StepExecutor, defaultM
 	if defaultModel == "" {
 		defaultModel = "gemini-3.7-flash"
 	}
+	if stepExecutor == nil {
+		stepExecutor = NewStepExecutor(nil, nil)
+	}
 	return &ToolLoopRunner{
 		llmClient:    llmClient,
 		stepExecutor: stepExecutor,
@@ -46,6 +49,9 @@ func (r *ToolLoopRunner) Execute(ctx context.Context, run *FSMRun, store *Store,
 	}
 	if store == nil {
 		return errors.New("store cannot be nil")
+	}
+	if r.stepExecutor == nil {
+		r.stepExecutor = NewStepExecutor(nil, nil)
 	}
 	if model == "" {
 		model = r.defaultModel
@@ -277,8 +283,15 @@ func (r *ToolLoopRunner) handleExecuteSteps(ctx context.Context, run *FSMRun, st
 	// Create executor bound to the current store
 	executor := r.stepExecutor
 	if executor == nil || executor.store != store {
-		invoker := r.stepExecutor.invoker
-		executor = NewStepExecutor(invoker, store, WithRetryConfig(r.stepExecutor.retryConfig), WithMaxWorkers(r.stepExecutor.maxWorkers))
+		var invoker ToolInvoker
+		var retryConfig RetryConfig = DefaultRetryConfig
+		var maxWorkers int = 4
+		if r.stepExecutor != nil {
+			invoker = r.stepExecutor.invoker
+			retryConfig = r.stepExecutor.retryConfig
+			maxWorkers = r.stepExecutor.maxWorkers
+		}
+		executor = NewStepExecutor(invoker, store, WithRetryConfig(retryConfig), WithMaxWorkers(maxWorkers))
 	}
 
 	execErr := executor.Execute(ctx, stepPtrs)

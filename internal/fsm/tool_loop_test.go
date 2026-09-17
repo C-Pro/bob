@@ -916,6 +916,114 @@ func TestToolLoop_ContextCeiling_PersistsFailedState(t *testing.T) {
 	assert.Equal(t, RunStatusFailed, persisted.Status)
 }
 
+func TestToolLoop_NilStepExecutor_NoPanic(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	llm := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    openai.ChatMessageRoleAssistant,
+							Content: "No step executor needed",
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	// Constructing with nil stepExecutor should not leave it nil
+	runner := NewToolLoopRunner(llm, nil, "test-model")
+	require.NotNil(t, runner.stepExecutor)
+
+	// Even if manually nulled, Execute must not panic
+	runner.stepExecutor = nil
+
+	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "Hello"},
+	})
+	require.NoError(t, err)
+
+	run := &FSMRun{
+		ID:           "run_nil_executor",
+		ChatID:       "chat_1",
+		FSMType:      FSMTypeToolLoop,
+		Status:       RunStatusRunning,
+		CurrentState: StateInit,
+		ContextJSON:  contextJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	err = runner.Execute(ctx, run, store, nil, "test-model")
+	require.NoError(t, err)
+	assert.Equal(t, RunStatusCompleted, run.Status)
+	assert.Equal(t, "No step executor needed", run.ResultJSON)
+}
+
+func TestToolLoop_NilStepExecutor_WithToolCall_NoPanic(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	llm := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role: openai.ChatMessageRoleAssistant,
+							ToolCalls: []openai.ToolCall{
+								{
+									ID:   "call_nil_exec_1",
+									Type: openai.ToolTypeFunction,
+									Function: openai.FunctionCall{
+										Name:      "web_search",
+										Arguments: `{"q":"test"}`,
+									},
+								},
+							},
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	// Construct runner with nil stepExecutor directly to exercise handleExecuteSteps
+	runner := &ToolLoopRunner{
+		llmClient:    llm,
+		stepExecutor: nil,
+		defaultModel: "test-model",
+	}
+
+	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "Search something"},
+	})
+	require.NoError(t, err)
+
+	run := &FSMRun{
+		ID:           "run_nil_exec_toolcall",
+		ChatID:       "chat_1",
+		FSMType:      FSMTypeToolLoop,
+		Status:       RunStatusRunning,
+		CurrentState: StateInit,
+		ContextJSON:  contextJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	// Execute should not panic; it should fail gracefully because invoker is not configured
+	err = runner.Execute(ctx, run, store, nil, "test-model")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "step")
+	assert.Equal(t, RunStatusFailed, run.Status)
+}
+
+
+
 
 
 
