@@ -612,5 +612,45 @@ func TestEngine_PollDueWaitingRuns_SkipsTerminalFreshRun(t *testing.T) {
 	assert.Equal(t, "completed from poll", persisted.ResultJSON)
 }
 
+func TestEngine_Stop_ConcurrentWithSpawn(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	storeProvider := NewStaticStoreProvider(store)
+	engine := NewEngine(storeProvider, nil, nil)
+
+	var wg sync.WaitGroup
+	stopSignal := make(chan struct{})
+
+	// Spin up workers that repeatedly attempt to spawn tasks on engine
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stopSignal:
+					return
+				default:
+					engine.spawn(func() {
+						time.Sleep(time.Microsecond)
+					})
+				}
+			}
+		}()
+	}
+
+	// Let workers run for a short duration
+	time.Sleep(10 * time.Millisecond)
+
+	// Stop the engine concurrently with active spawners
+	engine.Stop()
+	close(stopSignal)
+	wg.Wait()
+
+	// After Stop, further spawn calls must return false
+	assert.False(t, engine.spawn(func() {}), "spawn must return false after engine is stopped")
+}
+
+
 
 

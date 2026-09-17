@@ -252,15 +252,27 @@ func (e *Engine) signalWake() {
 	}
 }
 
+func (e *Engine) spawn(fn func()) bool {
+	e.runningMu.Lock()
+	defer e.runningMu.Unlock()
+	if e.closed.Load() {
+		return false
+	}
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		fn()
+	}()
+	return true
+}
+
 // Start initiates background delayed-transition polling and crash recovery.
 func (e *Engine) Start(ctx context.Context) error {
 	if err := e.Recover(ctx); err != nil {
 		slog.Error("fsm engine crash recovery encountered errors", "error", err)
 	}
 
-	e.wg.Add(1)
-	go func() {
-		defer e.wg.Done()
+	started := e.spawn(func() {
 		ticker := time.NewTicker(e.pollInterval)
 		defer ticker.Stop()
 
@@ -280,19 +292,23 @@ func (e *Engine) Start(ctx context.Context) error {
 				}
 			}
 		}
-	}()
+	})
+	if !started {
+		return errors.New("cannot start closed fsm engine")
+	}
 
 	return nil
 }
 
 // Stop terminates the engine's background poller and cancels any active running runs.
 func (e *Engine) Stop() {
+	e.runningMu.Lock()
 	if e.closed.Swap(true) {
+		e.runningMu.Unlock()
 		return
 	}
 	close(e.stopCh)
 
-	e.runningMu.Lock()
 	for _, cancel := range e.running {
 		cancel()
 	}
@@ -334,9 +350,9 @@ func (e *Engine) Recover(ctx context.Context) error {
 			}
 
 			// Interrupted in RUNNING, PENDING, or due WAITING: resume execution
-			e.wg.Add(1)
-			go func(runID string, s *Store) {
-				defer e.wg.Done()
+			runID := run.ID
+			s := store
+			e.spawn(func() {
 				runCtx, cancel := context.WithCancel(ctx)
 				defer cancel()
 
@@ -412,7 +428,7 @@ func (e *Engine) Recover(ctx context.Context) error {
 						slog.Error("failed to deliver recovered run result", "run_id", runToRecover.ID, "error", err)
 					}
 				}
-			}(run.ID, store)
+			})
 		}
 	}
 
@@ -442,9 +458,9 @@ func (e *Engine) PollDueWaitingRuns(ctx context.Context) error {
 				continue
 			}
 
-			e.wg.Add(1)
-			go func(runID string, s *Store) {
-				defer e.wg.Done()
+			runID := run.ID
+			s := store
+			e.spawn(func() {
 				runCtx, cancel := context.WithCancel(ctx)
 				defer cancel()
 
@@ -519,7 +535,7 @@ func (e *Engine) PollDueWaitingRuns(ctx context.Context) error {
 						slog.Error("failed to deliver resumed run result", "run_id", runToResume.ID, "error", err)
 					}
 				}
-			}(run.ID, store)
+			})
 		}
 	}
 
