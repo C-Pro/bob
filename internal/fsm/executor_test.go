@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -594,5 +595,31 @@ func TestStepExecutor_RecoveryInterruptedReadOnlyStepReexecutes(t *testing.T) {
 	assert.Empty(t, step.ErrorText)
 	assert.NotNil(t, step.CompletedAt)
 }
+
+func TestStepExecutor_StepResultTruncation(t *testing.T) {
+	oversized := make([]byte, 300*1024)
+	for i := range oversized {
+		oversized[i] = 'z'
+	}
+
+	invoker := ToolInvokerFunc(func(ctx context.Context, name string, argsJSON string) (string, error) {
+		return string(oversized), nil
+	})
+	executor := NewStepExecutor(invoker, nil)
+
+	step := &FSMStep{
+		ID:            "step_large_result",
+		ToolName:      "web_search",
+		Status:        StepStatusPending,
+		ExecutionMode: ExecutionModeSequential,
+	}
+
+	err := executor.Execute(context.Background(), []*FSMStep{step})
+	require.NoError(t, err)
+	assert.Equal(t, StepStatusCompleted, step.Status)
+	assert.True(t, len(step.ResultJSON) <= MaxStepResultBytes+len(StepTruncationNotice))
+	assert.True(t, strings.HasSuffix(step.ResultJSON, StepTruncationNotice))
+}
+
 
 

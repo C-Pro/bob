@@ -750,4 +750,172 @@ func TestToolLoop_PrepareSteps_CrashRecoveryIdempotent(t *testing.T) {
 	assert.Equal(t, "Finished recovering!", run.ResultJSON)
 }
 
+func TestToolLoop_ToolResultTruncationAndContextCeiling(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	// 25KB large tool output
+	largeOutput := make([]byte, 25*1024)
+	for i := range largeOutput {
+		largeOutput[i] = 'a'
+	}
+	largeStr := string(largeOutput)
+
+	var lastReqMessages []openai.ChatCompletionMessage
+	callCount := 0
+
+	llm := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			callCount++
+			if callCount == 1 {
+				return &openai.ChatCompletionResponse{
+					Choices: []openai.ChatCompletionChoice{
+						{
+							Message: openai.ChatCompletionMessage{
+								Role: openai.ChatMessageRoleAssistant,
+								ToolCalls: []openai.ToolCall{
+									{
+										ID:   "call_trunc_1",
+										Type: openai.ToolTypeFunction,
+										Function: openai.FunctionCall{
+											Name:      "web_fetch",
+											Arguments: `{"url":"https://example.com"}`,
+										},
+									},
+								},
+							},
+						},
+					},
+				}, nil
+			}
+			lastReqMessages = req.Messages
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    openai.ChatMessageRoleAssistant,
+							Content: "Done reading large content",
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	invoker := ToolInvokerFunc(func(ctx context.Context, name, argsJSON string) (string, error) {
+		return largeStr, nil
+	})
+
+	executor := NewStepExecutor(invoker, store)
+	runner := NewToolLoopRunner(llm, executor, "test-model")
+
+	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "Fetch large webpage"},
+	})
+	require.NoError(t, err)
+
+	run := &FSMRun{
+		ID:            "run_trunc_test",
+		ChatID:        "chat_1",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusRunning,
+		CurrentState:  StateInit,
+		Iteration:     0,
+		MaxIterations: 5,
+		ContextJSON:   contextJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	err = runner.Execute(ctx, run, store, nil, "test-model")
+	require.NoError(t, err)
+	assert.Equal(t, RunStatusCompleted, run.Status)
+
+	// Step in database must preserve full output (25KB)
+	steps, err := store.ListStepsByIteration(ctx, run.ID, 1)
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	assert.Equal(t, len(largeStr), len(steps[0].ResultJSON))
+
+	// Tool message in context passed to LLM must be truncated to MaxToolResultSizeInContext
+	require.Len(t, lastReqMessages, 3) // user, assistant with tool_call, tool result
+	toolMsg := lastReqMessages[2]
+	assert.Equal(t, openai.ChatMessageRoleTool, toolMsg.Role)
+	assert.Contains(t, toolMsg.Content, "[tool output truncated in context]")
+	assert.True(t, len(toolMsg.Content) <= MaxToolResultSizeInContext+len("\n[tool output truncated in context]"))
+}
+
+func TestToolLoop_ContextCeiling_PersistsFailedState(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	// 1.1MB large message from assistant
+	hugeText := make([]byte, 1100*1024)
+	for i := range hugeText {
+		hugeText[i] = 'h'
+	}
+
+	llm := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    openai.ChatMessageRoleAssistant,
+							Content: string(hugeText),
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	invoker := ToolInvokerFunc(func(ctx context.Context, name, argsJSON string) (string, error) {
+		return "", errors.New("unused")
+	})
+
+	executor := NewStepExecutor(invoker, store)
+	runner := NewToolLoopRunner(llm, executor, "test-model")
+
+	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "Hello"},
+	})
+	require.NoError(t, err)
+
+	run := &FSMRun{
+		ID:            "run_ceiling_test",
+		ChatID:        "chat_1",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusRunning,
+		CurrentState:  StateInit,
+		Iteration:     0,
+		MaxIterations: 5,
+		ContextJSON:   contextJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	err = runner.Execute(ctx, run, store, nil, "test-model")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceeds maximum allowable limit")
+
+	// Run must be in terminal FAILED status in memory
+	assert.Equal(t, RunStatusFailed, run.Status)
+	assert.Equal(t, StateFailed, run.CurrentState)
+
+	// Run must be persisted as FAILED in database
+	persisted, err := store.GetRun(ctx, run.ID)
+	require.NoError(t, err)
+	assert.Equal(t, RunStatusFailed, persisted.Status)
+	assert.Equal(t, StateFailed, persisted.CurrentState)
+	assert.Contains(t, persisted.ErrorText, "exceeds maximum allowable limit")
+
+	// Re-executing runner must immediately terminate without looping
+	err = runner.Execute(ctx, persisted, store, nil, "test-model")
+	require.NoError(t, err)
+	assert.Equal(t, RunStatusFailed, persisted.Status)
+}
+
+
+
 

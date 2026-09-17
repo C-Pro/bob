@@ -20,6 +20,14 @@ type ToolInvoker interface {
 	Execute(ctx context.Context, name string, argsJSON string) (string, error)
 }
 
+const (
+	// MaxStepResultBytes is the maximum bytes stored in fsm_steps.result_json (256KB)
+	// to prevent unbounded growth of SQLite storage and backup archives.
+	MaxStepResultBytes = 256 * 1024
+	// StepTruncationNotice is appended to result_json when step output exceeds MaxStepResultBytes.
+	StepTruncationNotice = "\n[step output truncated: exceeded maximum step result size]"
+)
+
 // ToolInvokerFunc is an adapter to allow the use of ordinary functions as ToolInvoker.
 type ToolInvokerFunc func(ctx context.Context, name string, argsJSON string) (string, error)
 
@@ -391,6 +399,9 @@ func (e *StepExecutor) executeSingleStep(ctx context.Context, step *FSMStep) err
 		completedTime := time.Now().Unix()
 		if err == nil {
 			step.Status = StepStatusCompleted
+			if len(res) > MaxStepResultBytes {
+				res = res[:MaxStepResultBytes] + StepTruncationNotice
+			}
 			step.ResultJSON = res
 			step.ErrorText = ""
 			step.CompletedAt = &completedTime

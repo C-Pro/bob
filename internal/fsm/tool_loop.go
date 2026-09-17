@@ -13,6 +13,13 @@ import (
 // SynthesisPrompt is appended when the maximum tool execution iterations are exhausted.
 const SynthesisPrompt = "You have reached the tool execution limit. Please synthesize and provide the best possible response based on all information gathered so far, including original markdown links to sources found in the search results, without calling any more tools. If any requested actions, scripts, or files could not be completed or executed due to the tool limit, state clearly what was accomplished and what remains to be run; do not claim files were created if they were not."
 
+const (
+	// MaxToolResultSizeInContext is the maximum bytes of tool output stored directly inside conversation context.
+	MaxToolResultSizeInContext = 16 * 1024
+	// MaxContextJSONBytes is the maximum total size in bytes for context_json in a single run.
+	MaxContextJSONBytes = 1024 * 1024
+)
+
 // ToolLoopRunner executes the simple tool loop finite state machine.
 type ToolLoopRunner struct {
 	llmClient    LLMClient
@@ -181,6 +188,9 @@ func (r *ToolLoopRunner) handleLLMRequest(ctx context.Context, run *FSMRun, stor
 		if err != nil {
 			return err
 		}
+		if len(encoded) > MaxContextJSONBytes {
+			return r.failRunWithContextLimit(ctx, run, store, len(encoded))
+		}
 		run.ContextJSON = encoded
 		run.ResultJSON = assistantMsg.Content
 		run.Status = RunStatusCompleted
@@ -199,6 +209,9 @@ func (r *ToolLoopRunner) handleLLMRequest(ctx context.Context, run *FSMRun, stor
 	encoded, err := EncodeMessages(messages)
 	if err != nil {
 		return err
+	}
+	if len(encoded) > MaxContextJSONBytes {
+		return r.failRunWithContextLimit(ctx, run, store, len(encoded))
 	}
 	run.ContextJSON = encoded
 	run.CurrentState = StatePrepareSteps
@@ -325,6 +338,9 @@ func (r *ToolLoopRunner) handleExecuteSteps(ctx context.Context, run *FSMRun, st
 		if content == "" && s.ErrorText != "" {
 			content = fmt.Sprintf(`{"error": %q}`, s.ErrorText)
 		}
+		if len(content) > MaxToolResultSizeInContext {
+			content = content[:MaxToolResultSizeInContext] + "\n[tool output truncated in context]"
+		}
 		messages = append(messages, openai.ChatCompletionMessage{
 			Role:       openai.ChatMessageRoleTool,
 			Content:    content,
@@ -335,6 +351,9 @@ func (r *ToolLoopRunner) handleExecuteSteps(ctx context.Context, run *FSMRun, st
 	encoded, err := EncodeMessages(messages)
 	if err != nil {
 		return false, err
+	}
+	if len(encoded) > MaxContextJSONBytes {
+		return false, r.failRunWithContextLimit(ctx, run, store, len(encoded))
 	}
 
 	run.ContextJSON = encoded
@@ -393,10 +412,23 @@ func (r *ToolLoopRunner) handleSynthesis(ctx context.Context, run *FSMRun, store
 	if err != nil {
 		return err
 	}
+	if len(encoded) > MaxContextJSONBytes {
+		return r.failRunWithContextLimit(ctx, run, store, len(encoded))
+	}
 
 	run.ContextJSON = encoded
 	run.ResultJSON = finalMsg.Content
 	run.Status = RunStatusCompleted
 	run.CurrentState = StateCompleted
 	return store.UpdateRun(ctx, run)
+}
+
+func (r *ToolLoopRunner) failRunWithContextLimit(ctx context.Context, run *FSMRun, store *Store, size int) error {
+	run.Status = RunStatusFailed
+	run.CurrentState = StateFailed
+	run.ErrorText = fmt.Sprintf("context size (%d bytes) exceeds maximum allowable limit (%d bytes)", size, MaxContextJSONBytes)
+	if updateErr := store.UpdateRun(ctx, run); updateErr != nil {
+		return fmt.Errorf("context size (%d bytes) exceeds maximum allowable limit (%d bytes); failed to persist failure state: %w", size, MaxContextJSONBytes, updateErr)
+	}
+	return fmt.Errorf("context size (%d bytes) exceeds maximum allowable limit (%d bytes)", size, MaxContextJSONBytes)
 }

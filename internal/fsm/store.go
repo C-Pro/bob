@@ -78,6 +78,7 @@ func (s *Store) CreateRun(ctx context.Context, run *FSMRun) error {
 		return fmt.Errorf("failed to insert fsm_run %s: %w", run.ID, err)
 	}
 
+	run.MarkContextSynced()
 	return nil
 }
 
@@ -123,11 +124,13 @@ func (s *Store) GetRun(ctx context.Context, id string) (*FSMRun, error) {
 		val := resumeAt.Int64
 		run.ResumeAt = &val
 	}
+	run.MarkContextSynced()
 
 	return &run, nil
 }
 
 // UpdateRunState updates the dynamic execution state, status, context, and timestamps of a run using optimistic concurrency control.
+// If ContextJSON has not changed since last persistent sync, context_json is omitted from the SQL UPDATE to avoid write amplification.
 func (s *Store) UpdateRunState(ctx context.Context, run *FSMRun) error {
 	if run == nil {
 		return fmt.Errorf("run cannot be nil")
@@ -141,22 +144,38 @@ func (s *Store) UpdateRunState(ctx context.Context, run *FSMRun) error {
 		isDMInt = 1
 	}
 
-	query := `
-		UPDATE fsm_runs
-		SET status = ?, current_state = ?, iteration = ?, wait_cycles = ?, context_json = ?,
-		    result_json = ?, error_text = ?, resume_at = ?, is_dm = ?, version = ?, updated_at = ?
-		WHERE id = ? AND version = ?
-	`
-
 	var resumeAt sql.NullInt64
 	if run.ResumeAt != nil {
 		resumeAt = sql.NullInt64{Int64: *run.ResumeAt, Valid: true}
 	}
 
-	res, err := s.db.ExecContext(ctx, query,
-		string(run.Status), string(run.CurrentState), run.Iteration, run.WaitCycles, run.ContextJSON,
-		run.ResultJSON, run.ErrorText, resumeAt, isDMInt, newVersion, now, run.ID, oldVersion,
-	)
+	isDirty := run.IsContextDirty()
+	var res sql.Result
+	var err error
+
+	if isDirty {
+		query := `
+			UPDATE fsm_runs
+			SET status = ?, current_state = ?, iteration = ?, wait_cycles = ?, context_json = ?,
+			    result_json = ?, error_text = ?, resume_at = ?, is_dm = ?, version = ?, updated_at = ?
+			WHERE id = ? AND version = ?
+		`
+		res, err = s.db.ExecContext(ctx, query,
+			string(run.Status), string(run.CurrentState), run.Iteration, run.WaitCycles, run.ContextJSON,
+			run.ResultJSON, run.ErrorText, resumeAt, isDMInt, newVersion, now, run.ID, oldVersion,
+		)
+	} else {
+		query := `
+			UPDATE fsm_runs
+			SET status = ?, current_state = ?, iteration = ?, wait_cycles = ?,
+			    result_json = ?, error_text = ?, resume_at = ?, is_dm = ?, version = ?, updated_at = ?
+			WHERE id = ? AND version = ?
+		`
+		res, err = s.db.ExecContext(ctx, query,
+			string(run.Status), string(run.CurrentState), run.Iteration, run.WaitCycles,
+			run.ResultJSON, run.ErrorText, resumeAt, isDMInt, newVersion, now, run.ID, oldVersion,
+		)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to update fsm_run %s: %w", run.ID, err)
 	}
@@ -175,6 +194,7 @@ func (s *Store) UpdateRunState(ctx context.Context, run *FSMRun) error {
 
 	run.Version = newVersion
 	run.UpdatedAt = now
+	run.MarkContextSynced()
 	return nil
 }
 
@@ -230,6 +250,7 @@ func (s *Store) ListActiveRuns(ctx context.Context) ([]FSMRun, error) {
 			val := resumeAt.Int64
 			run.ResumeAt = &val
 		}
+		run.MarkContextSynced()
 
 		runs = append(runs, run)
 	}
@@ -288,6 +309,7 @@ func (s *Store) ListDueWaitingRuns(ctx context.Context, nowUnix int64) ([]FSMRun
 			val := resumeAt.Int64
 			run.ResumeAt = &val
 		}
+		run.MarkContextSynced()
 
 		runs = append(runs, run)
 	}

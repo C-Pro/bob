@@ -698,6 +698,9 @@ func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (*ToolLoo
 	if err != nil {
 		return nil, fmt.Errorf("failed to encode messages: %w", err)
 	}
+	if len(contextJSON) > MaxContextJSONBytes {
+		return nil, fmt.Errorf("initial context size (%d bytes) exceeds maximum allowable limit (%d bytes)", len(contextJSON), MaxContextJSONBytes)
+	}
 
 	run := &FSMRun{
 		ID:            req.RunID,

@@ -66,6 +66,13 @@ CREATE INDEX IF NOT EXISTS idx_fsm_steps_run_iter
 ON fsm_steps(run_id, iteration, step_index);
 ```
 
+#### Storage Profile & Serialization Bounds
+- **Selective Persistence:** `context_json` is only written to SQLite when conversation messages are actually added or modified (e.g. following LLM response or step output collation). State-only transitions (e.g. `INIT -> LLM_REQUEST`, step preparation, wait suspension, crash recovery) omit `context_json` from the SQL update to avoid $O(n^2)$ write amplification.
+- **Per-Tool Result Truncation:** Tool results embedded in the context are capped at 16KB (`MaxToolResultSizeInContext`) to prevent runaway growth from verbose outputs while preserving full step output in `fsm_steps.result_json`.
+- **Per-Step Storage Bound:** Step results stored in `fsm_steps.result_json` are bounded at 256KB (`MaxStepResultBytes`) with truncation notice, preventing single tool executions from causing unbounded SQLite page or backup growth.
+- **Context Size Ceiling & Terminal Failure:** Total `context_json` size is bounded by `MaxContextJSONBytes` (1MB). If a run exceeds this threshold, it is immediately transitioned to `FAILED` with persisted `ErrorText`, preventing unpersisted wedging or poison-pill recovery loops.
+
+
 ## 3. Execution Engine & Tool Classification
 
 ### 3.1 Execution Modes

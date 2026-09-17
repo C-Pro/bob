@@ -91,6 +91,21 @@ type FSMRun struct {
 	Version       int       `json:"version"`
 	CreatedAt     int64     `json:"created_at"`
 	UpdatedAt     int64     `json:"updated_at"`
+
+	// Unexported fields tracking database synchronization to avoid unnecessary rewrites of context_json.
+	lastSavedContextJSON string
+	contextSynced        bool
+}
+
+// MarkContextSynced marks the current ContextJSON as synchronized with persistent storage.
+func (r *FSMRun) MarkContextSynced() {
+	r.lastSavedContextJSON = r.ContextJSON
+	r.contextSynced = true
+}
+
+// IsContextDirty reports whether ContextJSON has changed since the last database sync.
+func (r *FSMRun) IsContextDirty() bool {
+	return !r.contextSynced || r.ContextJSON != r.lastSavedContextJSON
 }
 
 // FSMStep represents an atomic step or tool invocation within a workflow run.

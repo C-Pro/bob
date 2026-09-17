@@ -382,3 +382,42 @@ func TestStore_OptimisticConcurrencyConflict(t *testing.T) {
 	assert.Equal(t, RunStatusCompleted, finalRun.Status)
 }
 
+func TestStore_ContextSelectivePersistence(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	initialContext := `[{"role":"user","content":"hello"}]`
+	run := &FSMRun{
+		ID:           "run_ctx_sync_test",
+		ChatID:       "chat_1",
+		UserID:       "user_1",
+		FSMType:      FSMTypeToolLoop,
+		Status:       RunStatusRunning,
+		CurrentState: StateInit,
+		ContextJSON:  initialContext,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+	assert.False(t, run.IsContextDirty())
+
+	// Updating state without mutating ContextJSON should leave it clean
+	run.CurrentState = StateLLMRequest
+	assert.False(t, run.IsContextDirty())
+	require.NoError(t, store.UpdateRunState(ctx, run))
+	assert.False(t, run.IsContextDirty())
+
+	// Mutating ContextJSON marks it dirty
+	updatedContext := `[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}]`
+	run.ContextJSON = updatedContext
+	assert.True(t, run.IsContextDirty())
+
+	require.NoError(t, store.UpdateRunState(ctx, run))
+	assert.False(t, run.IsContextDirty())
+
+	fetched, err := store.GetRun(ctx, run.ID)
+	require.NoError(t, err)
+	assert.Equal(t, updatedContext, fetched.ContextJSON)
+	assert.False(t, fetched.IsContextDirty())
+}
+
+
