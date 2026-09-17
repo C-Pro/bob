@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"math/rand/v2"
 	"net"
 	"strings"
 	"sync"
@@ -94,24 +95,45 @@ type RetryConfig struct {
 	InitialBackoff time.Duration
 	MaxBackoff     time.Duration
 	Multiplier     float64
+	Jitter         float64 // Jitter factor (0.0 for deterministic, 1.0 for equal jitter)
 }
 
-// DefaultRetryConfig provides standard retry backoff parameters.
+// DefaultRetryConfig provides standard retry backoff parameters with equal jitter.
 var DefaultRetryConfig = RetryConfig{
 	InitialBackoff: 100 * time.Millisecond,
 	MaxBackoff:     2 * time.Second,
 	Multiplier:     2.0,
+	Jitter:         1.0,
 }
 
 // CalculateBackoff computes the exponential backoff duration for a given attempt number.
 func CalculateBackoff(attempt int, cfg RetryConfig) time.Duration {
-	if attempt <= 1 {
-		return cfg.InitialBackoff
+	if cfg.InitialBackoff <= 0 {
+		return 0
 	}
-	multiplier := math.Pow(cfg.Multiplier, float64(attempt-1))
-	delay := time.Duration(float64(cfg.InitialBackoff) * multiplier)
+	delay := cfg.InitialBackoff
+	if attempt > 1 {
+		mult := cfg.Multiplier
+		if mult <= 0 {
+			mult = 2.0
+		}
+		multiplier := math.Pow(mult, float64(attempt-1))
+		delay = time.Duration(float64(cfg.InitialBackoff) * multiplier)
+	}
 	if cfg.MaxBackoff > 0 && delay > cfg.MaxBackoff {
-		return cfg.MaxBackoff
+		delay = cfg.MaxBackoff
+	}
+	if cfg.Jitter > 0 {
+		jitterFraction := cfg.Jitter
+		if jitterFraction > 1.0 {
+			jitterFraction = 1.0
+		}
+		// Equal jitter: half fixed, half random
+		randomPart := time.Duration(float64(delay) * jitterFraction / 2)
+		fixedPart := delay - randomPart
+		if randomPart > 0 {
+			delay = fixedPart + time.Duration(rand.Int64N(int64(randomPart)+1))
+		}
 	}
 	return delay
 }

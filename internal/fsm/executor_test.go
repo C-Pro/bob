@@ -111,6 +111,26 @@ func TestCalculateBackoff(t *testing.T) {
 	assert.Equal(t, 300*time.Millisecond, CalculateBackoff(4, cfg)) // capped at MaxBackoff
 }
 
+func TestCalculateBackoff_Jitter(t *testing.T) {
+	cfg := RetryConfig{
+		InitialBackoff: 100 * time.Millisecond,
+		MaxBackoff:     1 * time.Second,
+		Multiplier:     2.0,
+		Jitter:         1.0,
+	}
+
+	seen := make(map[time.Duration]bool)
+	for i := 0; i < 50; i++ {
+		b := CalculateBackoff(2, cfg)
+		// With delay=200ms and equal jitter, backoff must be in [100ms, 200ms]
+		assert.GreaterOrEqual(t, b, 100*time.Millisecond)
+		assert.LessOrEqual(t, b, 200*time.Millisecond)
+		seen[b] = true
+	}
+	// Assert randomness: across 50 calls we should see more than 1 distinct value
+	assert.Greater(t, len(seen), 1)
+}
+
 func TestStepExecutor_ParallelExecutionAndConcurrencyLimit(t *testing.T) {
 	var currentActive int32
 	var maxObserved int32
