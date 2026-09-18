@@ -149,7 +149,7 @@ func (r *ToolLoopRunner) handleInit(ctx context.Context, run *FSMRun, store *Sto
 }
 
 func (r *ToolLoopRunner) handleLLMRequest(ctx context.Context, run *FSMRun, store *Store, tools []openai.Tool, model string) error {
-	messages, err := DecodeMessages(run.ContextJSON)
+	messages, err := r.buildChatMessages(ctx, run, store)
 	if err != nil {
 		run.Status = RunStatusFailed
 		run.ErrorText = fmt.Sprintf("failed to decode messages: %v", err)
@@ -187,17 +187,25 @@ func (r *ToolLoopRunner) handleLLMRequest(ctx context.Context, run *FSMRun, stor
 
 	assistantMsg := resp.Choices[0].Message
 
+	baseMessages, err := DecodeMessages(run.ContextJSON)
+	if err != nil {
+		run.Status = RunStatusFailed
+		run.ErrorText = fmt.Sprintf("failed to decode context messages: %v", err)
+		_ = store.UpdateRun(ctx, run)
+		return err
+	}
+	baseMessages = append(baseMessages, assistantMsg)
+	encoded, err := EncodeMessages(baseMessages)
+	if err != nil {
+		return err
+	}
+	if len(encoded) > MaxContextJSONBytes {
+		return r.failRunWithContextLimit(ctx, run, store, len(encoded))
+	}
+	run.ContextJSON = encoded
+
 	// If no tool calls were requested, return the assistant text directly
 	if len(assistantMsg.ToolCalls) == 0 {
-		messages = append(messages, assistantMsg)
-		encoded, err := EncodeMessages(messages)
-		if err != nil {
-			return err
-		}
-		if len(encoded) > MaxContextJSONBytes {
-			return r.failRunWithContextLimit(ctx, run, store, len(encoded))
-		}
-		run.ContextJSON = encoded
 		run.ResultJSON = assistantMsg.Content
 		run.Status = RunStatusCompleted
 		run.CurrentState = StateCompleted
@@ -211,15 +219,6 @@ func (r *ToolLoopRunner) handleLLMRequest(ctx context.Context, run *FSMRun, stor
 	}
 
 	run.Iteration++
-	messages = append(messages, assistantMsg)
-	encoded, err := EncodeMessages(messages)
-	if err != nil {
-		return err
-	}
-	if len(encoded) > MaxContextJSONBytes {
-		return r.failRunWithContextLimit(ctx, run, store, len(encoded))
-	}
-	run.ContextJSON = encoded
 	run.CurrentState = StatePrepareSteps
 	return store.UpdateRun(ctx, run)
 }
@@ -331,42 +330,10 @@ func (r *ToolLoopRunner) handleExecuteSteps(ctx context.Context, run *FSMRun, st
 		slog.Warn("fsm step execution completed with step failures", "run_id", run.ID, "error", execErr)
 	}
 
-	// Collect tool results and append them as tool messages
-	messages, err := DecodeMessages(run.ContextJSON)
-	if err != nil {
-		return false, err
-	}
-
 	for _, s := range stepPtrs {
 		slog.Info("fsm step finished", "tool", s.ToolName, "status", s.Status, "run_id", run.ID)
-		content := s.ResultJSON
-		switch {
-		case content != "":
-			// use as-is
-		case s.ErrorText != "":
-			content = fmt.Sprintf(`{"error": %q}`, s.ErrorText)
-		default:
-			content = fmt.Sprintf(`{"status": %q, "result": ""}`, s.Status)
-		}
-		if len(content) > MaxToolResultSizeInContext {
-			content = content[:MaxToolResultSizeInContext] + "\n[tool output truncated in context]"
-		}
-		messages = append(messages, openai.ChatCompletionMessage{
-			Role:       openai.ChatMessageRoleTool,
-			Content:    content,
-			ToolCallID: s.ToolCallID,
-		})
 	}
 
-	encoded, err := EncodeMessages(messages)
-	if err != nil {
-		return false, err
-	}
-	if len(encoded) > MaxContextJSONBytes {
-		return false, r.failRunWithContextLimit(ctx, run, store, len(encoded))
-	}
-
-	run.ContextJSON = encoded
 	if run.Iteration >= run.MaxIterations {
 		run.CurrentState = StateSynthesis
 	} else {
@@ -376,7 +343,7 @@ func (r *ToolLoopRunner) handleExecuteSteps(ctx context.Context, run *FSMRun, st
 }
 
 func (r *ToolLoopRunner) handleSynthesis(ctx context.Context, run *FSMRun, store *Store, model string) error {
-	messages, err := DecodeMessages(run.ContextJSON)
+	messages, err := r.buildChatMessages(ctx, run, store)
 	if err != nil {
 		return err
 	}
@@ -417,8 +384,17 @@ func (r *ToolLoopRunner) handleSynthesis(ctx context.Context, run *FSMRun, store
 	}
 
 	finalMsg := resp.Choices[0].Message
-	messages = append(messages, finalMsg)
-	encoded, err := EncodeMessages(messages)
+
+	baseMessages, err := DecodeMessages(run.ContextJSON)
+	if err != nil {
+		return err
+	}
+	baseMessages = append(baseMessages, openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleUser,
+		Content: SynthesisPrompt,
+	}, finalMsg)
+
+	encoded, err := EncodeMessages(baseMessages)
 	if err != nil {
 		return err
 	}
@@ -431,6 +407,75 @@ func (r *ToolLoopRunner) handleSynthesis(ctx context.Context, run *FSMRun, store
 	run.Status = RunStatusCompleted
 	run.CurrentState = StateCompleted
 	return store.UpdateRun(ctx, run)
+}
+
+func formatToolStepResult(s FSMStep) string {
+	content := s.ResultJSON
+	switch {
+	case content != "":
+		// use as-is
+	case s.ErrorText != "":
+		content = fmt.Sprintf(`{"error": %q}`, s.ErrorText)
+	default:
+		content = fmt.Sprintf(`{"status": %q, "result": ""}`, s.Status)
+	}
+	if len(content) > MaxToolResultSizeInContext {
+		content = content[:MaxToolResultSizeInContext] + "\n[tool output truncated in context]"
+	}
+	return content
+}
+
+func (r *ToolLoopRunner) buildChatMessages(ctx context.Context, run *FSMRun, store *Store) ([]openai.ChatCompletionMessage, error) {
+	messages, err := DecodeMessages(run.ContextJSON)
+	if err != nil {
+		return nil, err
+	}
+	if store == nil {
+		return messages, nil
+	}
+
+	steps, err := store.ListStepsByRun(ctx, run.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list steps for run %s: %w", run.ID, err)
+	}
+	if len(steps) == 0 {
+		return messages, nil
+	}
+
+	stepsByCallID := make(map[string]FSMStep, len(steps))
+	for _, s := range steps {
+		if s.ToolCallID != "" {
+			stepsByCallID[s.ToolCallID] = s
+		}
+	}
+
+	existingToolIDs := make(map[string]bool)
+	for _, m := range messages {
+		if m.Role == openai.ChatMessageRoleTool && m.ToolCallID != "" {
+			existingToolIDs[m.ToolCallID] = true
+		}
+	}
+
+	reconstructed := make([]openai.ChatCompletionMessage, 0, len(messages)+len(steps))
+	for _, m := range messages {
+		reconstructed = append(reconstructed, m)
+		if m.Role == openai.ChatMessageRoleAssistant && len(m.ToolCalls) > 0 {
+			for _, tc := range m.ToolCalls {
+				if existingToolIDs[tc.ID] {
+					continue
+				}
+				if s, ok := stepsByCallID[tc.ID]; ok {
+					reconstructed = append(reconstructed, openai.ChatCompletionMessage{
+						Role:       openai.ChatMessageRoleTool,
+						Content:    formatToolStepResult(s),
+						ToolCallID: tc.ID,
+					})
+				}
+			}
+		}
+	}
+
+	return reconstructed, nil
 }
 
 func (r *ToolLoopRunner) failRunWithContextLimit(ctx context.Context, run *FSMRun, store *Store, size int) error {

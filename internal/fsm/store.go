@@ -457,6 +457,20 @@ func (s *Store) ListStepsByIteration(ctx context.Context, runID string, iteratio
 	return s.GetStepsForIteration(ctx, runID, iteration)
 }
 
+// ListStepsByRun returns all steps associated with a run, ordered by iteration ASC, step_index ASC.
+func (s *Store) ListStepsByRun(ctx context.Context, runID string) ([]FSMStep, error) {
+	query := `
+		SELECT id, run_id, iteration, step_index, tool_name, tool_call_id,
+		       args_json, result_json, execution_mode, status, attempt,
+		       max_attempts, timeout_seconds, started_at, completed_at, error_text
+		FROM fsm_steps
+		WHERE run_id = ?
+		ORDER BY iteration ASC, step_index ASC
+	`
+
+	return s.querySteps(ctx, query, runID)
+}
+
 // GetPendingSteps returns all pending steps for a run and iteration, ordered by step_index ASC.
 func (s *Store) GetPendingSteps(ctx context.Context, runID string, iteration int) ([]FSMStep, error) {
 	query := `

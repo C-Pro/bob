@@ -1121,6 +1121,101 @@ func TestToolLoop_Execute_RequiresModel(t *testing.T) {
 	assert.Contains(t, err.Error(), "model cannot be empty")
 }
 
+func TestToolLoop_ToolOutputNotDuplicatedInContext(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	const secretOutput = "secret_unique_tool_output_98765"
+	var turn int
+	var turn2Messages []openai.ChatCompletionMessage
+
+	llm := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			turn++
+			if turn == 1 {
+				return &openai.ChatCompletionResponse{
+					Choices: []openai.ChatCompletionChoice{
+						{
+							Message: openai.ChatCompletionMessage{
+								Role: openai.ChatMessageRoleAssistant,
+								ToolCalls: []openai.ToolCall{
+									{
+										ID:   "call_secret_1",
+										Type: openai.ToolTypeFunction,
+										Function: openai.FunctionCall{
+											Name:      "web_fetch",
+											Arguments: `{"url":"https://secret.local"}`,
+										},
+									},
+								},
+							},
+						},
+					},
+				}, nil
+			}
+
+			turn2Messages = req.Messages
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    openai.ChatMessageRoleAssistant,
+							Content: "Received secret data.",
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	invoker := ToolInvokerFunc(func(ctx context.Context, name, argsJSON string) (string, error) {
+		return secretOutput, nil
+	})
+
+	executor := NewStepExecutor(invoker)
+	runner := NewToolLoopRunner(llm, executor, "test-model")
+
+	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "Fetch secret"},
+	})
+	require.NoError(t, err)
+
+	run := &FSMRun{
+		ID:            "run_dedup_test",
+		ChatID:        "chat_1",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusRunning,
+		CurrentState:  StateInit,
+		Iteration:     0,
+		MaxIterations: 5,
+		ContextJSON:   contextJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	err = runner.Execute(ctx, run, store, nil, "test-model")
+	require.NoError(t, err)
+	assert.Equal(t, RunStatusCompleted, run.Status)
+
+	// 1. Tool result must be saved in fsm_steps in SQLite
+	steps, err := store.ListStepsByRun(ctx, run.ID)
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	assert.Equal(t, secretOutput, steps[0].ResultJSON)
+
+	// 2. run.ContextJSON must NOT contain secretOutput (no duplication)
+	persistedRun, err := store.GetRun(ctx, run.ID)
+	require.NoError(t, err)
+	assert.NotContains(t, persistedRun.ContextJSON, secretOutput, "tool output must not be duplicated into ContextJSON")
+
+	// 3. The request messages passed to LLM on turn 2 DID contain secretOutput (reconstructed from fsm_steps)
+	require.GreaterOrEqual(t, len(turn2Messages), 3)
+	toolMsg := turn2Messages[len(turn2Messages)-1]
+	assert.Equal(t, openai.ChatMessageRoleTool, toolMsg.Role)
+	assert.Equal(t, "call_secret_1", toolMsg.ToolCallID)
+	assert.Equal(t, secretOutput, toolMsg.Content)
+}
+
 
 
 

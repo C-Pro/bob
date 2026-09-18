@@ -185,6 +185,14 @@ func TestStore_StepCRUDAndIterationQueries(t *testing.T) {
 	require.Len(t, pending, 1)
 	assert.Equal(t, "step_2", pending[0].ID)
 
+	// ListStepsByRun returns all 3 steps ordered by iteration ASC, step_index ASC
+	allSteps, err := store.ListStepsByRun(ctx, run.ID)
+	require.NoError(t, err)
+	require.Len(t, allSteps, 3)
+	assert.Equal(t, "step_1", allSteps[0].ID)
+	assert.Equal(t, "step_2", allSteps[1].ID)
+	assert.Equal(t, "step_3", allSteps[2].ID)
+
 	// Not found
 	_, err = store.GetStep(ctx, "unknown_step")
 	assert.ErrorIs(t, err, ErrStepNotFound)

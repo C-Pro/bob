@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"bob/internal/config"
+	"bob/internal/fsm"
 	"bob/internal/memory"
 
 	"github.com/stretchr/testify/assert"
@@ -72,14 +73,29 @@ func TestMemoryStoreProvider_ActiveStores(t *testing.T) {
 	// Open two stores
 	_, err := provider.GetStore(ctx, "townhall", false)
 	require.NoError(t, err)
-	_, err = provider.GetStore(ctx, "user_alice", true)
+	aliceStore, err := provider.GetStore(ctx, "user_alice", true)
 	require.NoError(t, err)
 
 	activeStores, err := provider.ActiveStores(ctx)
 	require.NoError(t, err)
 	assert.Len(t, activeStores, 2)
 
-	// Create a new provider pointing to the same dataDir without prior GetStore calls
+	// Create an active run in user_alice so it requires recovery/polling at startup.
+	// townhall remains idle without active runs.
+	err = aliceStore.CreateRun(ctx, &fsm.FSMRun{
+		ID:           "run_alice_active",
+		ChatID:       "user_alice",
+		UserID:       "alice",
+		IsDM:         true,
+		FSMType:      fsm.FSMTypeToolLoop,
+		CurrentState: fsm.StateLLMRequest,
+		Status:       fsm.RunStatusRunning,
+		ContextJSON:  "[]",
+	})
+	require.NoError(t, err)
+
+	// Create a new provider pointing to the same dataDir without prior GetStore calls.
+	// Only user_alice should be discovered because townhall has no active runs.
 	memMgr2 := memory.NewManager(cfg, nil)
 	defer func() {
 		_ = memMgr2.Close()
@@ -88,7 +104,7 @@ func TestMemoryStoreProvider_ActiveStores(t *testing.T) {
 	provider2 := NewMemoryStoreProvider(memMgr2, tempDir)
 	discoveredStores, err := provider2.ActiveStores(ctx)
 	require.NoError(t, err)
-	assert.Len(t, discoveredStores, 2)
+	assert.Len(t, discoveredStores, 1)
 }
 
 func TestMemoryStoreProvider_NilManager(t *testing.T) {

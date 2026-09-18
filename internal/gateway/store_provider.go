@@ -2,9 +2,12 @@ package gateway
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -74,6 +77,45 @@ func (p *MemoryStoreProvider) GetStore(ctx context.Context, chatID string, isDM 
 	return st, nil
 }
 
+func hasActiveRuns(dbPath string) (bool, error) {
+	fi, err := os.Stat(dbPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if fi.Size() == 0 {
+		return false, nil
+	}
+
+	dsn := fmt.Sprintf("file:%s?mode=ro", dbPath)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = db.Close() }()
+
+	var tableExists int
+	err = db.QueryRow("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fsm_runs'").Scan(&tableExists)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	var hasActive int
+	err = db.QueryRow("SELECT 1 FROM fsm_runs WHERE status IN ('RUNNING', 'WAITING', 'PENDING') LIMIT 1").Scan(&hasActive)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 func (p *MemoryStoreProvider) discoverStores(ctx context.Context) {
 	if p.dataDir == "" {
 		return
@@ -92,14 +134,30 @@ func (p *MemoryStoreProvider) discoverStores(ctx context.Context) {
 			continue
 		}
 		name := entry.Name()
+		filePath := filepath.Join(p.dataDir, name)
+
 		if name == "townhall.db" {
-			if _, err := p.GetStore(ctx, "townhall", false); err != nil {
-				slog.Warn("failed to open townhall.db during initial active store discovery", "error", err)
+			active, err := hasActiveRuns(filePath)
+			if err != nil {
+				slog.Warn("failed to inspect townhall.db for active runs; opening for safety", "error", err)
+				active = true
+			}
+			if active {
+				if _, err := p.GetStore(ctx, "townhall", false); err != nil {
+					slog.Warn("failed to open townhall.db during initial active store discovery", "error", err)
+				}
 			}
 		} else if strings.HasPrefix(name, "dm_") && strings.HasSuffix(name, ".db") {
-			chatID := strings.TrimSuffix(strings.TrimPrefix(name, "dm_"), ".db")
-			if _, err := p.GetStore(ctx, chatID, true); err != nil {
-				slog.Warn("failed to open dm db during initial active store discovery", "chatID", chatID, "error", err)
+			active, err := hasActiveRuns(filePath)
+			if err != nil {
+				slog.Warn("failed to inspect dm db for active runs; opening for safety", "name", name, "error", err)
+				active = true
+			}
+			if active {
+				chatID := strings.TrimSuffix(strings.TrimPrefix(name, "dm_"), ".db")
+				if _, err := p.GetStore(ctx, chatID, true); err != nil {
+					slog.Warn("failed to open dm db during initial active store discovery", "chatID", chatID, "error", err)
+				}
 			}
 		}
 	}

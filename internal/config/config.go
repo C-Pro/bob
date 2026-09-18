@@ -84,7 +84,7 @@ func LoadFromEnv() (*Config, error) {
 	}
 
 	apiKey := getEnvOrDefault("OPENAI_API_KEY", os.Getenv("GEMINI_API_KEY"))
-	model := getEnvOrDefault("OPENAI_MODEL", os.Getenv("GEMINI_MODEL"))
+	model := getEnvOrDefault("OPENAI_MODEL", getEnvOrDefault("GEMINI_MODEL", "gemini-3.8-flash"))
 	baseURL := getEnvOrDefault("OPENAI_BASE_URL", getEnvOrDefault("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"))
 	tavilyBaseURL := strings.TrimSuffix(getEnvOrDefault("TAVILY_BASE_URL", "https://api.tavily.com"), "/")
 	backupIntervalStr := getEnvOrDefault("S3_BACKUP_INTERVAL", "1h")
