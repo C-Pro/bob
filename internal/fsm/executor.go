@@ -2,11 +2,12 @@ package fsm
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math"
-	"math/rand/v2"
+	"math/big"
 	"net"
 	"strings"
 	"sync"
@@ -140,7 +141,9 @@ func CalculateBackoff(attempt int, cfg RetryConfig) time.Duration {
 		randomPart := time.Duration(float64(delay) * jitterFraction / 2)
 		fixedPart := delay - randomPart
 		if randomPart > 0 {
-			delay = fixedPart + time.Duration(rand.Int64N(int64(randomPart)+1))
+			if n, err := rand.Int(rand.Reader, big.NewInt(int64(randomPart)+1)); err == nil {
+				delay = fixedPart + time.Duration(n.Int64())
+			}
 		}
 	}
 	return delay
