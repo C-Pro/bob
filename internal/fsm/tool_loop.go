@@ -33,7 +33,7 @@ func NewToolLoopRunner(llmClient LLMClient, stepExecutor *StepExecutor, defaultM
 		defaultModel = "gemini-3.7-flash"
 	}
 	if stepExecutor == nil {
-		stepExecutor = NewStepExecutor(nil, nil)
+		stepExecutor = NewStepExecutor(nil)
 	}
 	return &ToolLoopRunner{
 		llmClient:    llmClient,
@@ -51,7 +51,7 @@ func (r *ToolLoopRunner) Execute(ctx context.Context, run *FSMRun, store *Store,
 		return errors.New("store cannot be nil")
 	}
 	if r.stepExecutor == nil {
-		r.stepExecutor = NewStepExecutor(nil, nil)
+		r.stepExecutor = NewStepExecutor(nil)
 	}
 	if model == "" {
 		model = r.defaultModel
@@ -280,21 +280,13 @@ func (r *ToolLoopRunner) handleExecuteSteps(ctx context.Context, run *FSMRun, st
 		stepPtrs[i] = &steps[i]
 	}
 
-	// Create executor bound to the current store
+	// Use shared executor directly, passing per-chat store to Execute
 	executor := r.stepExecutor
-	if executor == nil || executor.store != store {
-		var invoker ToolInvoker
-		var retryConfig RetryConfig = DefaultRetryConfig
-		var maxWorkers int = 4
-		if r.stepExecutor != nil {
-			invoker = r.stepExecutor.invoker
-			retryConfig = r.stepExecutor.retryConfig
-			maxWorkers = r.stepExecutor.maxWorkers
-		}
-		executor = NewStepExecutor(invoker, store, WithRetryConfig(retryConfig), WithMaxWorkers(maxWorkers))
+	if executor == nil {
+		executor = NewStepExecutor(nil)
 	}
 
-	execErr := executor.Execute(ctx, stepPtrs)
+	execErr := executor.Execute(ctx, store, stepPtrs)
 	if ctx.Err() != nil {
 		return false, ctx.Err()
 	}

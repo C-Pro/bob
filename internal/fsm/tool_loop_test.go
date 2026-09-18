@@ -50,7 +50,7 @@ func TestToolLoop_TextOnlyResponse(t *testing.T) {
 		return "", errors.New("should not be called")
 	})
 
-	executor := NewStepExecutor(invoker, store)
+	executor := NewStepExecutor(invoker)
 	runner := NewToolLoopRunner(llm, executor, "test-model")
 
 	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
@@ -145,7 +145,7 @@ func TestToolLoop_SingleToolCallExecution(t *testing.T) {
 		return `{"result": "Go 1.26 released"}`, nil
 	})
 
-	executor := NewStepExecutor(invoker, store)
+	executor := NewStepExecutor(invoker)
 	runner := NewToolLoopRunner(llm, executor, "test-model")
 
 	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
@@ -255,7 +255,7 @@ func TestToolLoop_ParallelToolCallsExecution(t *testing.T) {
 		return fmt.Sprintf(`{"tool": %q}`, name), nil
 	})
 
-	executor := NewStepExecutor(invoker, store)
+	executor := NewStepExecutor(invoker)
 	runner := NewToolLoopRunner(llm, executor, "test-model")
 
 	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
@@ -346,7 +346,7 @@ func TestToolLoop_MaxIterationsSynthesis(t *testing.T) {
 		return `{"ok":true}`, nil
 	})
 
-	executor := NewStepExecutor(invoker, store)
+	executor := NewStepExecutor(invoker)
 	runner := NewToolLoopRunner(llm, executor, "test-model")
 
 	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
@@ -431,7 +431,7 @@ func TestToolLoop_ToolExecutionFailureRecordedAndFedBack(t *testing.T) {
 		return "", errors.New("invalid tool argument")
 	})
 
-	executor := NewStepExecutor(invoker, store)
+	executor := NewStepExecutor(invoker)
 	runner := NewToolLoopRunner(llm, executor, "test-model")
 
 	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
@@ -569,7 +569,7 @@ func TestToolLoop_SequentialFailureDoesNotCauseWaitingLoop(t *testing.T) {
 		return "", errors.New("command execution failed")
 	})
 
-	executor := NewStepExecutor(invoker, store)
+	executor := NewStepExecutor(invoker)
 	runner := NewToolLoopRunner(llm, executor, "test-model")
 
 	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
@@ -637,7 +637,7 @@ func TestToolLoop_PersistenceErrorDuringStepExecution_FailsRun(t *testing.T) {
 		return `{"result":"ok"}`, nil
 	})
 
-	executor := NewStepExecutor(invoker, store)
+	executor := NewStepExecutor(invoker)
 	runner := NewToolLoopRunner(llm, executor, "test-model")
 
 	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
@@ -703,7 +703,7 @@ func TestToolLoop_PrepareSteps_CrashRecoveryIdempotent(t *testing.T) {
 		return `{"result":"found"}`, nil
 	})
 
-	executor := NewStepExecutor(invoker, store)
+	executor := NewStepExecutor(invoker)
 	runner := NewToolLoopRunner(llm, executor, "test-model")
 
 	// Create run that crashed while in StatePrepareSteps after steps were already created
@@ -807,7 +807,7 @@ func TestToolLoop_ToolResultTruncationAndContextCeiling(t *testing.T) {
 		return largeStr, nil
 	})
 
-	executor := NewStepExecutor(invoker, store)
+	executor := NewStepExecutor(invoker)
 	runner := NewToolLoopRunner(llm, executor, "test-model")
 
 	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
@@ -875,7 +875,7 @@ func TestToolLoop_ContextCeiling_PersistsFailedState(t *testing.T) {
 		return "", errors.New("unused")
 	})
 
-	executor := NewStepExecutor(invoker, store)
+	executor := NewStepExecutor(invoker)
 	runner := NewToolLoopRunner(llm, executor, "test-model")
 
 	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{

@@ -190,7 +190,7 @@ func NewEngine(storeProvider StoreProvider, llmClient LLMClient, invoker ToolInv
 	}
 
 	if e.stepExecutor == nil {
-		e.stepExecutor = NewStepExecutor(invoker, nil)
+		e.stepExecutor = NewStepExecutor(invoker)
 	}
 
 	if e.toolDefProvider == nil && invoker != nil {

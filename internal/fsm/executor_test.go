@@ -150,7 +150,7 @@ func TestStepExecutor_ParallelExecutionAndConcurrencyLimit(t *testing.T) {
 	})
 
 	fastRetry := RetryConfig{InitialBackoff: 5 * time.Millisecond, MaxBackoff: 20 * time.Millisecond, Multiplier: 2.0}
-	executor := NewStepExecutor(invoker, nil, WithMaxWorkers(2), WithRetryConfig(fastRetry))
+	executor := NewStepExecutor(invoker, WithMaxWorkers(2), WithRetryConfig(fastRetry))
 
 	steps := []*FSMStep{
 		{ID: "s1", ToolName: "web_search", TimeoutSeconds: 5},
@@ -160,7 +160,7 @@ func TestStepExecutor_ParallelExecutionAndConcurrencyLimit(t *testing.T) {
 	}
 
 	start := time.Now()
-	err := executor.Execute(context.Background(), steps)
+	err := executor.Execute(context.Background(), nil, steps)
 	elapsed := time.Since(start)
 
 	require.NoError(t, err)
@@ -197,7 +197,7 @@ func TestStepExecutor_SequentialExecutionOrderAndSkipOnFailure(t *testing.T) {
 		return `{"status":"ok"}`, nil
 	})
 
-	executor := NewStepExecutor(invoker, nil)
+	executor := NewStepExecutor(invoker)
 
 	steps := []*FSMStep{
 		{ID: "step_0", ToolName: "step_first", TimeoutSeconds: 5},
@@ -205,7 +205,7 @@ func TestStepExecutor_SequentialExecutionOrderAndSkipOnFailure(t *testing.T) {
 		{ID: "step_2", ToolName: "step_subsequent", TimeoutSeconds: 5},
 	}
 
-	err := executor.Execute(context.Background(), steps)
+	err := executor.Execute(context.Background(), nil, steps)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "command failed")
 	assert.True(t, HasFailedStep(steps))
@@ -238,7 +238,7 @@ func TestStepExecutor_PerStepTimeout(t *testing.T) {
 		}
 	})
 
-	executor := NewStepExecutor(invoker, nil)
+	executor := NewStepExecutor(invoker)
 
 	// Step timeout of 30ms simulated via parent deadline or step timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
@@ -250,7 +250,7 @@ func TestStepExecutor_PerStepTimeout(t *testing.T) {
 		TimeoutSeconds: 1,
 	}
 
-	err := executor.Execute(ctx, []*FSMStep{step})
+	err := executor.Execute(ctx, nil, []*FSMStep{step})
 	require.Error(t, err)
 	assert.Equal(t, StepStatusTimedOut, step.Status)
 	assert.Contains(t, step.ErrorText, "timed out")
@@ -266,7 +266,7 @@ func TestStepExecutor_ParentContextCanceled(t *testing.T) {
 		}
 	})
 
-	executor := NewStepExecutor(invoker, nil)
+	executor := NewStepExecutor(invoker)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	// Cancel parent context before or immediately during execution
@@ -281,7 +281,7 @@ func TestStepExecutor_ParentContextCanceled(t *testing.T) {
 		TimeoutSeconds: 10,
 	}
 
-	err := executor.Execute(ctx, []*FSMStep{step})
+	err := executor.Execute(ctx, nil, []*FSMStep{step})
 	require.Error(t, err)
 	assert.Equal(t, StepStatusFailed, step.Status)
 	assert.Contains(t, step.ErrorText, "context canceled")
@@ -299,7 +299,7 @@ func TestStepExecutor_TransientErrorRetries(t *testing.T) {
 	})
 
 	fastRetry := RetryConfig{InitialBackoff: 2 * time.Millisecond, MaxBackoff: 10 * time.Millisecond, Multiplier: 2.0}
-	executor := NewStepExecutor(invoker, nil, WithRetryConfig(fastRetry))
+	executor := NewStepExecutor(invoker, WithRetryConfig(fastRetry))
 
 	step := &FSMStep{
 		ID:          "step_retry",
@@ -307,7 +307,7 @@ func TestStepExecutor_TransientErrorRetries(t *testing.T) {
 		MaxAttempts: 3,
 	}
 
-	err := executor.Execute(context.Background(), []*FSMStep{step})
+	err := executor.Execute(context.Background(), nil, []*FSMStep{step})
 	require.NoError(t, err)
 	assert.Equal(t, StepStatusCompleted, step.Status)
 	assert.Equal(t, 3, step.Attempt)
@@ -323,7 +323,7 @@ func TestStepExecutor_TransientErrorExhaustion(t *testing.T) {
 	})
 
 	fastRetry := RetryConfig{InitialBackoff: 2 * time.Millisecond, MaxBackoff: 5 * time.Millisecond, Multiplier: 2.0}
-	executor := NewStepExecutor(invoker, nil, WithRetryConfig(fastRetry))
+	executor := NewStepExecutor(invoker, WithRetryConfig(fastRetry))
 
 	step := &FSMStep{
 		ID:          "step_exhaust",
@@ -331,7 +331,7 @@ func TestStepExecutor_TransientErrorExhaustion(t *testing.T) {
 		MaxAttempts: 3,
 	}
 
-	err := executor.Execute(context.Background(), []*FSMStep{step})
+	err := executor.Execute(context.Background(), nil, []*FSMStep{step})
 	require.Error(t, err)
 	assert.Equal(t, StepStatusFailed, step.Status)
 	assert.Equal(t, 3, step.Attempt)
@@ -350,7 +350,7 @@ func TestStepExecutor_StepTimeoutRetries(t *testing.T) {
 	})
 
 	fastRetry := RetryConfig{InitialBackoff: 2 * time.Millisecond, MaxBackoff: 10 * time.Millisecond, Multiplier: 2.0}
-	executor := NewStepExecutor(invoker, nil, WithRetryConfig(fastRetry))
+	executor := NewStepExecutor(invoker, WithRetryConfig(fastRetry))
 
 	step := &FSMStep{
 		ID:             "step_timeout_retry",
@@ -359,7 +359,7 @@ func TestStepExecutor_StepTimeoutRetries(t *testing.T) {
 		MaxAttempts:    3,
 	}
 
-	err := executor.Execute(context.Background(), []*FSMStep{step})
+	err := executor.Execute(context.Background(), nil, []*FSMStep{step})
 	require.NoError(t, err)
 	assert.Equal(t, StepStatusCompleted, step.Status)
 	assert.Equal(t, 3, step.Attempt)
@@ -375,7 +375,7 @@ func TestStepExecutor_StepTimeoutExhaustion(t *testing.T) {
 	})
 
 	fastRetry := RetryConfig{InitialBackoff: 2 * time.Millisecond, MaxBackoff: 10 * time.Millisecond, Multiplier: 2.0}
-	executor := NewStepExecutor(invoker, nil, WithRetryConfig(fastRetry))
+	executor := NewStepExecutor(invoker, WithRetryConfig(fastRetry))
 
 	step := &FSMStep{
 		ID:             "step_timeout_exhaust",
@@ -384,7 +384,7 @@ func TestStepExecutor_StepTimeoutExhaustion(t *testing.T) {
 		MaxAttempts:    3,
 	}
 
-	err := executor.Execute(context.Background(), []*FSMStep{step})
+	err := executor.Execute(context.Background(), nil, []*FSMStep{step})
 	require.Error(t, err)
 	assert.Equal(t, StepStatusTimedOut, step.Status)
 	assert.Equal(t, 3, step.Attempt)
@@ -399,7 +399,7 @@ func TestStepExecutor_NonTransientErrorNoRetry(t *testing.T) {
 		return "", errors.New("invalid JSON arguments syntax")
 	})
 
-	executor := NewStepExecutor(invoker, nil)
+	executor := NewStepExecutor(invoker)
 
 	step := &FSMStep{
 		ID:          "step_nontransient",
@@ -407,7 +407,7 @@ func TestStepExecutor_NonTransientErrorNoRetry(t *testing.T) {
 		MaxAttempts: 3,
 	}
 
-	err := executor.Execute(context.Background(), []*FSMStep{step})
+	err := executor.Execute(context.Background(), nil, []*FSMStep{step})
 	require.Error(t, err)
 	assert.Equal(t, StepStatusFailed, step.Status)
 	assert.Equal(t, 1, step.Attempt) // Only 1 attempt, no useless retries
@@ -419,14 +419,14 @@ func TestStepExecutor_ExecuteBatchWrapper(t *testing.T) {
 		return fmt.Sprintf("result for %s", name), nil
 	})
 
-	executor := NewStepExecutor(invoker, nil)
+	executor := NewStepExecutor(invoker)
 
 	steps := []FSMStep{
 		{ID: "b1", ToolName: "web_search"},
 		{ID: "b2", ToolName: "web_fetch"},
 	}
 
-	results, err := executor.ExecuteBatch(context.Background(), steps)
+	results, err := executor.ExecuteBatch(context.Background(), nil, steps)
 	require.NoError(t, err)
 	require.Len(t, results, 2)
 	assert.Equal(t, StepStatusCompleted, results[0].Status)
@@ -475,10 +475,10 @@ func TestStepExecutor_WithStorePersistence(t *testing.T) {
 		return fmt.Sprintf("ok-%s", name), nil
 	})
 
-	executor := NewStepExecutor(invoker, store)
+	executor := NewStepExecutor(invoker)
 
 	stepPtrs := []*FSMStep{&steps[0], &steps[1]}
-	err := executor.Execute(ctx, stepPtrs)
+	err := executor.Execute(ctx, store, stepPtrs)
 	require.NoError(t, err)
 
 	// Fetch directly from SQLite database and verify state was persisted
@@ -505,12 +505,12 @@ func TestStepExecutor_StoreUpdateFailurePropagated(t *testing.T) {
 	invoker := ToolInvokerFunc(func(ctx context.Context, name string, argsJSON string) (string, error) {
 		return `{"ok":true}`, nil
 	})
-	executor := NewStepExecutor(invoker, &mockFailingStore{})
+	executor := NewStepExecutor(invoker)
 	step := &FSMStep{
 		ID:       "step_fail_store",
 		ToolName: "web_search",
 	}
-	err := executor.Execute(context.Background(), []*FSMStep{step})
+	err := executor.Execute(context.Background(), &mockFailingStore{}, []*FSMStep{step})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "sqlite disk I/O error")
 }
@@ -522,12 +522,12 @@ func TestStepExecutor_ParallelExecutionErrorPropagation(t *testing.T) {
 		}
 		return `{"ok":true}`, nil
 	})
-	executor := NewStepExecutor(invoker, nil)
+	executor := NewStepExecutor(invoker)
 	steps := []*FSMStep{
 		{ID: "s1", ToolName: "web_search"},
 		{ID: "s2", ToolName: "web_fetch"},
 	}
-	err := executor.Execute(context.Background(), steps)
+	err := executor.Execute(context.Background(), nil, steps)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "search execution failed")
 }
@@ -539,10 +539,10 @@ func TestStepExecutor_SequentialStepFailureSkipsRemaining(t *testing.T) {
 		}
 		return `{"ok":true}`, nil
 	})
-	executor := NewStepExecutor(invoker, nil)
+	executor := NewStepExecutor(invoker)
 	s1 := &FSMStep{ID: "s1", ToolName: "fail_tool", ExecutionMode: ExecutionModeSequential}
 	s2 := &FSMStep{ID: "s2", ToolName: "subsequent_tool", ExecutionMode: ExecutionModeSequential}
-	err := executor.Execute(context.Background(), []*FSMStep{s1, s2})
+	err := executor.Execute(context.Background(), nil, []*FSMStep{s1, s2})
 	require.Error(t, err)
 	assert.Equal(t, StepStatusFailed, s1.Status)
 	assert.Equal(t, StepStatusSkipped, s2.Status)
@@ -555,7 +555,7 @@ func TestStepExecutor_RecoveryInterruptedMutatingStepFailsClosed(t *testing.T) {
 		invokerCalls++
 		return `{"result":"done"}`, nil
 	})
-	executor := NewStepExecutor(invoker, nil)
+	executor := NewStepExecutor(invoker)
 
 	step := &FSMStep{
 		ID:            "step_mutating_running",
@@ -564,7 +564,7 @@ func TestStepExecutor_RecoveryInterruptedMutatingStepFailsClosed(t *testing.T) {
 		ExecutionMode: ExecutionModeSequential,
 	}
 
-	err := executor.Execute(context.Background(), []*FSMStep{step})
+	err := executor.Execute(context.Background(), nil, []*FSMStep{step})
 	require.NoError(t, err)
 	assert.Equal(t, 0, invokerCalls, "mutating tool left running must not be re-invoked")
 	assert.Equal(t, StepStatusFailed, step.Status)
@@ -578,7 +578,7 @@ func TestStepExecutor_RecoveryInterruptedReadOnlyStepReexecutes(t *testing.T) {
 		invokerCalls++
 		return `{"result":"found"}`, nil
 	})
-	executor := NewStepExecutor(invoker, nil)
+	executor := NewStepExecutor(invoker)
 
 	step := &FSMStep{
 		ID:            "step_readonly_running",
@@ -587,7 +587,7 @@ func TestStepExecutor_RecoveryInterruptedReadOnlyStepReexecutes(t *testing.T) {
 		ExecutionMode: ExecutionModeSequential,
 	}
 
-	err := executor.Execute(context.Background(), []*FSMStep{step})
+	err := executor.Execute(context.Background(), nil, []*FSMStep{step})
 	require.NoError(t, err)
 	assert.Equal(t, 1, invokerCalls, "read-only tool left running must be re-executed")
 	assert.Equal(t, StepStatusCompleted, step.Status)
@@ -605,7 +605,7 @@ func TestStepExecutor_StepResultTruncation(t *testing.T) {
 	invoker := ToolInvokerFunc(func(ctx context.Context, name string, argsJSON string) (string, error) {
 		return string(oversized), nil
 	})
-	executor := NewStepExecutor(invoker, nil)
+	executor := NewStepExecutor(invoker)
 
 	step := &FSMStep{
 		ID:            "step_large_result",
@@ -614,7 +614,7 @@ func TestStepExecutor_StepResultTruncation(t *testing.T) {
 		ExecutionMode: ExecutionModeSequential,
 	}
 
-	err := executor.Execute(context.Background(), []*FSMStep{step})
+	err := executor.Execute(context.Background(), nil, []*FSMStep{step})
 	require.NoError(t, err)
 	assert.Equal(t, StepStatusCompleted, step.Status)
 	assert.True(t, len(step.ResultJSON) <= MaxStepResultBytes+len(StepTruncationNotice))
