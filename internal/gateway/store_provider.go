@@ -10,7 +10,6 @@ import (
 
 	"bob/internal/fsm"
 	"bob/internal/memory"
-	"bob/internal/store"
 )
 
 // MemoryStoreProvider implements fsm.StoreProvider backed by memory.Manager and per-chat SQLite databases.
@@ -66,7 +65,7 @@ func (p *MemoryStoreProvider) GetStore(ctx context.Context, chatID string, isDM 
 	}
 
 	rawDB := cortexDB.SQL()
-	if err := store.EnsureDBSchema(ctx, rawDB); err != nil {
+	if err := fsm.EnsureDBSchema(ctx, rawDB); err != nil {
 		return nil, fmt.Errorf("failed to ensure fsm schema for chat %s: %w", chatID, err)
 	}
 

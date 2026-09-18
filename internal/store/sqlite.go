@@ -88,19 +88,12 @@ func NewSQLiteStore(fname string, init bool) (*SQLiteStorage, error) {
 
 		switch v {
 		case version.Version:
-			if err := ensureFSMColumns(context.Background(), s.db); err != nil {
-				_ = db.Close()
-				return nil, err
-			}
+			// nothing to do
 		case version.Version - 1:
 			// run migration
 			if err := s.migrate(); err != nil {
 				_ = db.Close()
 				return nil, fmt.Errorf("migration failed: %w", err)
-			}
-			if err := ensureFSMColumns(context.Background(), s.db); err != nil {
-				_ = db.Close()
-				return nil, err
 			}
 		default:
 			_ = db.Close()
@@ -146,136 +139,30 @@ func (s *SQLiteStorage) GetSchemaVersion(ctx context.Context) (int, error) {
 	return v, nil
 }
 
-// EnsureDBSchema ensures SQLite schema is initialized or migrated to the current version.
-func EnsureDBSchema(ctx context.Context, db *sql.DB) error {
-	if db == nil {
-		return fmt.Errorf("database connection is nil")
-	}
-
-	// Apply core runtime pragmas for connections opened without DSN pragmas
-	if _, err := db.ExecContext(ctx, "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;"); err != nil {
-		return fmt.Errorf("failed to configure sqlite pragmas: %w", err)
-	}
-
-	// auto_vacuum only takes effect on empty databases before any tables exist
-	var allTables int
-	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_master WHERE type='table'").Scan(&allTables); err == nil && allTables == 0 {
-		_, _ = db.ExecContext(ctx, "PRAGMA auto_vacuum = INCREMENTAL;")
-	}
-
-	var tableCount int
-	err := db.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='schema_version'").Scan(&tableCount)
-	if err != nil {
-		return fmt.Errorf("failed to check schema_version table: %w", err)
-	}
-
-	if tableCount == 0 {
-		return executeSchema(ctx, db)
-	}
-
-	var v int
-	if err := db.QueryRowContext(ctx, "SELECT version FROM schema_version WHERE is_current=1").Scan(&v); err != nil {
-		return fmt.Errorf("failed to get schema version: %w", err)
-	}
-
-	switch v {
-	case version.Version:
-		return ensureFSMColumns(ctx, db)
-	case version.Version - 1:
-		if err := executeMigrate(ctx, db); err != nil {
-			return fmt.Errorf("migration failed: %w", err)
-		}
-		return ensureFSMColumns(ctx, db)
-	default:
-		return fmt.Errorf(
-			"database version mismatch: expected %d or %d, but got %d",
-			version.Version-1,
-			version.Version,
-			v)
-	}
-}
-
-func ensureFSMColumns(ctx context.Context, db *sql.DB) error {
-	var fsmRunsCount int
-	err := db.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='fsm_runs'").Scan(&fsmRunsCount)
-	if err != nil || fsmRunsCount == 0 {
-		return nil
-	}
-
-	rows, err := db.QueryContext(ctx, "PRAGMA table_info(fsm_runs)")
-	if err != nil {
-		return nil
-	}
-	defer func() { _ = rows.Close() }()
-
-	hasIsDM := false
-	hasWaitCycles := false
-	hasVersion := false
-	for rows.Next() {
-		var cid int
-		var name, colType string
-		var notnull, pk int
-		var dfltValue sql.NullString
-		if err := rows.Scan(&cid, &name, &colType, &notnull, &dfltValue, &pk); err == nil {
-			if name == "is_dm" {
-				hasIsDM = true
-			}
-			if name == "wait_cycles" {
-				hasWaitCycles = true
-			}
-			if name == "version" {
-				hasVersion = true
-			}
-		}
-	}
-	if !hasIsDM {
-		if _, err := db.ExecContext(ctx, "ALTER TABLE fsm_runs ADD COLUMN is_dm INTEGER NOT NULL DEFAULT 0"); err != nil {
-			return fmt.Errorf("failed to add is_dm column to fsm_runs: %w", err)
-		}
-	}
-	if !hasWaitCycles {
-		if _, err := db.ExecContext(ctx, "ALTER TABLE fsm_runs ADD COLUMN wait_cycles INTEGER NOT NULL DEFAULT 0"); err != nil {
-			return fmt.Errorf("failed to add wait_cycles column to fsm_runs: %w", err)
-		}
-	}
-	if !hasVersion {
-		if _, err := db.ExecContext(ctx, "ALTER TABLE fsm_runs ADD COLUMN version INTEGER NOT NULL DEFAULT 0"); err != nil {
-			return fmt.Errorf("failed to add version column to fsm_runs: %w", err)
-		}
-	}
-	return nil
-}
-
-func executeSchema(ctx context.Context, db *sql.DB) error {
+func (s *SQLiteStorage) initSchema() error {
 	var buf bytes.Buffer
 	t := template.Must(template.New("schema").Parse(schemaTmpl))
 	if err := t.Execute(&buf, version); err != nil {
 		return fmt.Errorf("failed to render schema template: %w", err)
 	}
-	if _, err := db.ExecContext(ctx, buf.String()); err != nil {
+	if _, err := s.db.Exec(buf.String()); err != nil {
 		return fmt.Errorf("schema creation failed: %w", err)
 	}
+
 	return nil
 }
 
-func executeMigrate(ctx context.Context, db *sql.DB) error {
+func (s *SQLiteStorage) migrate() error {
 	var buf bytes.Buffer
 	t := template.Must(template.New("migrate").Parse(migrateTmpl))
 	if err := t.Execute(&buf, version); err != nil {
 		return fmt.Errorf("migration template render failed: %w", err)
 	}
-	if _, err := db.ExecContext(ctx, buf.String()); err != nil {
+	if _, err := s.db.Exec(buf.String()); err != nil {
 		return fmt.Errorf("schema migration failed: %w", err)
 	}
+
 	return nil
-}
-
-func (s *SQLiteStorage) initSchema() error {
-	return executeSchema(context.Background(), s.db)
-}
-
-func (s *SQLiteStorage) migrate() error {
-	return executeMigrate(context.Background(), s.db)
 }
 
 func (s *SQLiteStorage) getSchemaVersion() (int, error) {

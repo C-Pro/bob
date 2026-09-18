@@ -8,8 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"bob/internal/store"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	_ "modernc.org/sqlite"
@@ -27,7 +25,7 @@ func setupTestDB(t *testing.T) *sql.DB {
 	t.Cleanup(func() { _ = db.Close() })
 
 	ctx := context.Background()
-	err = store.EnsureDBSchema(ctx, db)
+	err = EnsureDBSchema(ctx, db)
 	require.NoError(t, err)
 
 	return db
@@ -260,13 +258,13 @@ func TestStore_ChatIsolation(t *testing.T) {
 	db1, err := sql.Open("sqlite", dsn1)
 	require.NoError(t, err)
 	defer func() { _ = db1.Close() }()
-	require.NoError(t, store.EnsureDBSchema(context.Background(), db1))
+	require.NoError(t, EnsureDBSchema(context.Background(), db1))
 
 	dsn2 := fmt.Sprintf("file:%s?_auto_vacuum=INCREMENTAL&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)", filepath.Join(dir, "dm_user1.db"))
 	db2, err := sql.Open("sqlite", dsn2)
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
-	require.NoError(t, store.EnsureDBSchema(context.Background(), db2))
+	require.NoError(t, EnsureDBSchema(context.Background(), db2))
 
 	store1 := NewStore(db1)
 	store2 := NewStore(db2)

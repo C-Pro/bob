@@ -66,6 +66,10 @@ CREATE INDEX IF NOT EXISTS idx_fsm_steps_run_iter
 ON fsm_steps(run_id, iteration, step_index);
 ```
 
+#### Schema Management & Namespaced Versioning
+- **Namespaced Version Tracking (`fsm_schema_version`):** FSM tables (`fsm_runs`, `fsm_steps`) and migrations are managed directly by `internal/fsm` via `fsm.EnsureDBSchema` and tracked through a dedicated `fsm_schema_version` table (`version INTEGER PRIMARY KEY, description TEXT NOT NULL, applied_at INTEGER NOT NULL`).
+- **Decoupled Lineages:** FSM schema evolution is completely isolated from both the standalone `internal/store` package (which uses `schema_version` for `bob.db`) and `cortexdb` tables, eliminating schema coupling, cross-database migration cascades, and table name collision risks.
+
 #### Storage Profile & Serialization Bounds
 - **Selective Persistence:** `context_json` is only written to SQLite when conversation messages are actually added or modified (e.g. following LLM response or step output collation). State-only transitions (e.g. `INIT -> LLM_REQUEST`, step preparation, wait suspension, crash recovery) omit `context_json` from the SQL update to avoid $O(n^2)$ write amplification.
 - **Per-Tool Result Truncation:** Tool results embedded in the context are capped at 16KB (`MaxToolResultSizeInContext`) to prevent runaway growth from verbose outputs while preserving full step output in `fsm_steps.result_json`.
