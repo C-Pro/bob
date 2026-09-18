@@ -340,8 +340,13 @@ func (r *ToolLoopRunner) handleExecuteSteps(ctx context.Context, run *FSMRun, st
 	for _, s := range stepPtrs {
 		slog.Info("fsm step finished", "tool", s.ToolName, "status", s.Status, "run_id", run.ID)
 		content := s.ResultJSON
-		if content == "" && s.ErrorText != "" {
+		switch {
+		case content != "":
+			// use as-is
+		case s.ErrorText != "":
 			content = fmt.Sprintf(`{"error": %q}`, s.ErrorText)
+		default:
+			content = fmt.Sprintf(`{"status": %q, "result": ""}`, s.Status)
 		}
 		if len(content) > MaxToolResultSizeInContext {
 			content = content[:MaxToolResultSizeInContext] + "\n[tool output truncated in context]"

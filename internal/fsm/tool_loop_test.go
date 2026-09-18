@@ -1022,6 +1022,87 @@ func TestToolLoop_NilStepExecutor_WithToolCall_NoPanic(t *testing.T) {
 	assert.Equal(t, RunStatusFailed, run.Status)
 }
 
+func TestToolLoop_EmptyToolResultFormatted(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	var lastReqMessages []openai.ChatCompletionMessage
+	callCount := 0
+
+	llm := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			callCount++
+			lastReqMessages = req.Messages
+			if callCount == 1 {
+				return &openai.ChatCompletionResponse{
+					Choices: []openai.ChatCompletionChoice{
+						{
+							Message: openai.ChatCompletionMessage{
+								Role: openai.ChatMessageRoleAssistant,
+								ToolCalls: []openai.ToolCall{
+									{
+										ID:   "call_empty_1",
+										Type: openai.ToolTypeFunction,
+										Function: openai.FunctionCall{
+											Name:      "recall_memory",
+											Arguments: `{"query": "something"}`,
+										},
+									},
+								},
+							},
+						},
+					},
+				}, nil
+			}
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    openai.ChatMessageRoleAssistant,
+							Content: "Found nothing.",
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	// Invoker returns empty string with no error
+	invoker := ToolInvokerFunc(func(ctx context.Context, name, argsJSON string) (string, error) {
+		return "", nil
+	})
+
+	executor := NewStepExecutor(invoker)
+	runner := NewToolLoopRunner(llm, executor, "test-model")
+
+	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "Recall something"},
+	})
+	require.NoError(t, err)
+
+	run := &FSMRun{
+		ID:            "run_empty_result",
+		ChatID:        "chat_1",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusRunning,
+		CurrentState:  StateInit,
+		Iteration:     0,
+		MaxIterations: 5,
+		ContextJSON:   contextJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	err = runner.Execute(ctx, run, store, nil, "test-model")
+	require.NoError(t, err)
+	assert.Equal(t, RunStatusCompleted, run.Status)
+
+	require.Len(t, lastReqMessages, 3)
+	toolMsg := lastReqMessages[2]
+	assert.Equal(t, openai.ChatMessageRoleTool, toolMsg.Role)
+	assert.Equal(t, `{"status": "COMPLETED", "result": ""}`, toolMsg.Content)
+}
+
 
 
 
