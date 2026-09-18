@@ -91,9 +91,7 @@ func WithPollInterval(d time.Duration) EngineOption {
 // WithDefaultModel sets the default LLM model identifier.
 func WithDefaultModel(m string) EngineOption {
 	return func(e *Engine) {
-		if m != "" {
-			e.defaultModel = m
-		}
+		e.defaultModel = m
 	}
 }
 
@@ -176,7 +174,6 @@ func NewEngine(storeProvider StoreProvider, llmClient LLMClient, invoker ToolInv
 		llmClient:               llmClient,
 		invoker:                 invoker,
 		pollInterval:            2 * time.Second,
-		defaultModel:            "gemini-3.7-flash",
 		recoveryStalenessCutoff: 15 * time.Minute,
 		maxRecoveryConcurrency:  4,
 		runners:                 make(map[FSMType]Runner),
@@ -290,6 +287,10 @@ func (e *Engine) spawn(fn func()) bool {
 
 // Start initiates background delayed-transition polling and crash recovery.
 func (e *Engine) Start(ctx context.Context) error {
+	if e.defaultModel == "" {
+		return errors.New("fsm engine requires a default model")
+	}
+
 	if err := e.Recover(ctx); err != nil {
 		slog.Error("fsm engine crash recovery encountered errors", "error", err)
 	}
@@ -678,6 +679,13 @@ func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (*ToolLoo
 	if len(req.Messages) == 0 {
 		return nil, errors.New("messages cannot be empty")
 	}
+	model := req.Model
+	if model == "" {
+		model = e.defaultModel
+	}
+	if model == "" {
+		return nil, errors.New("model cannot be empty")
+	}
 	if req.RunID == "" {
 		req.RunID = generateRunID()
 	}
@@ -750,11 +758,6 @@ func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (*ToolLoo
 	tools := req.Tools
 	if len(tools) == 0 && e.toolDefProvider != nil {
 		tools = e.toolDefProvider.ToolDefinitions(ctx, req.ChatID, req.IsDM)
-	}
-
-	model := req.Model
-	if model == "" {
-		model = e.defaultModel
 	}
 
 	runner, err := e.getRunner(FSMTypeToolLoop)

@@ -39,7 +39,7 @@ Bob is an autonomous AI agent service designed for the [Besedka](https://github.
    - `BESEDKA_URL`: `http://127.0.0.1:8080`
    - `BESEDKA_API_KEY`: API key or bot session token
    - `OPENAI_API_KEY` (or `GEMINI_API_KEY`): LLM provider API key
-   - `OPENAI_MODEL` / `GEMINI_MODEL`: Model identifier (default: `gemini-3.7-flash`)
+   - `OPENAI_MODEL` / `GEMINI_MODEL`: Model identifier
    - `BOT_HANDLE`: Bot username mention handle (default: `@bot`)
 3. Run the service:
    ```bash

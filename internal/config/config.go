@@ -84,7 +84,7 @@ func LoadFromEnv() (*Config, error) {
 	}
 
 	apiKey := getEnvOrDefault("OPENAI_API_KEY", os.Getenv("GEMINI_API_KEY"))
-	model := getEnvOrDefault("OPENAI_MODEL", getEnvOrDefault("GEMINI_MODEL", "gemini-3.7-flash"))
+	model := getEnvOrDefault("OPENAI_MODEL", os.Getenv("GEMINI_MODEL"))
 	baseURL := getEnvOrDefault("OPENAI_BASE_URL", getEnvOrDefault("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"))
 	tavilyBaseURL := strings.TrimSuffix(getEnvOrDefault("TAVILY_BASE_URL", "https://api.tavily.com"), "/")
 	backupIntervalStr := getEnvOrDefault("S3_BACKUP_INTERVAL", "1h")
@@ -214,8 +214,13 @@ func (c *Config) SandboxConfig() sandbox.Config {
 
 // Validate checks required fields for runtime readiness.
 func (c *Config) Validate(requireAPIKey bool) error {
-	if requireAPIKey && strings.TrimSpace(c.OpenAIAPIKey) == "" && strings.TrimSpace(c.GeminiAPIKey) == "" {
-		return errors.New("OPENAI_API_KEY (or GEMINI_API_KEY) is required")
+	if requireAPIKey {
+		if strings.TrimSpace(c.OpenAIAPIKey) == "" && strings.TrimSpace(c.GeminiAPIKey) == "" {
+			return errors.New("OPENAI_API_KEY (or GEMINI_API_KEY) is required")
+		}
+		if strings.TrimSpace(c.OpenAIModel) == "" && strings.TrimSpace(c.GeminiModel) == "" {
+			return errors.New("OPENAI_MODEL (or GEMINI_MODEL) cannot be empty")
+		}
 	}
 	if strings.TrimSpace(c.BesedkaURL) == "" {
 		return errors.New("BESEDKA_URL cannot be empty")

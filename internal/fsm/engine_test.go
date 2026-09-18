@@ -103,7 +103,7 @@ func TestEngine_DefaultIterationLimits(t *testing.T) {
 		},
 	}
 
-	engine := NewEngine(storeProvider, llm, nil)
+	engine := NewEngine(storeProvider, llm, nil, WithDefaultModel("test-model"))
 
 	// Townhall request: max_iterations defaults to 10
 	resTH, err := engine.RunToolLoop(context.Background(), ToolLoopRequest{
@@ -157,7 +157,7 @@ func TestEngine_DelayedTransitionPoller(t *testing.T) {
 	}
 
 	fastPoll := 50 * time.Millisecond
-	engine := NewEngine(storeProvider, nil, nil, WithPollInterval(fastPoll))
+	engine := NewEngine(storeProvider, nil, nil, WithPollInterval(fastPoll), WithDefaultModel("test-model"))
 	engine.RegisterRunner(FSMTypeToolLoop, runner)
 
 	// Create waiting run in SQLite
@@ -215,7 +215,7 @@ func TestEngine_CrashRecoveryInterruptedRuns(t *testing.T) {
 		},
 	}
 
-	engine := NewEngine(storeProvider, llm, nil)
+	engine := NewEngine(storeProvider, llm, nil, WithDefaultModel("test-model"))
 
 	// Simulate runs that were mid-flight when process crashed
 	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
@@ -384,7 +384,7 @@ func TestEngine_LifecycleStartStop(t *testing.T) {
 	store := NewStore(db)
 	storeProvider := NewStaticStoreProvider(store)
 
-	engine := NewEngine(storeProvider, nil, nil, WithPollInterval(10*time.Millisecond))
+	engine := NewEngine(storeProvider, nil, nil, WithPollInterval(10*time.Millisecond), WithDefaultModel("test-model"))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -489,6 +489,7 @@ func TestEngine_RunToolLoop_MaxWaitCyclesExceeded(t *testing.T) {
 		ChatID: "chat_wait",
 		UserID: "user_wait",
 		IsDM:   true,
+		Model:  "test-model",
 		Messages: []openai.ChatCompletionMessage{
 			{Role: openai.ChatMessageRoleUser, Content: "Hello"},
 		},
@@ -691,6 +692,7 @@ func TestEngine_RunToolLoop_CancelledContext_MarksTerminated(t *testing.T) {
 		RunID:  "run_cancelled_test",
 		ChatID: "chat_cancel",
 		UserID: "user_cancel",
+		Model:  "test-model",
 		Messages: []openai.ChatCompletionMessage{
 			{Role: openai.ChatMessageRoleUser, Content: "hi"},
 		},
@@ -822,6 +824,40 @@ func TestEngine_Recover_BoundedConcurrency(t *testing.T) {
 
 	assert.Equal(t, int32(totalRuns), completedCount.Load(), "all runs must complete")
 	assert.LessOrEqual(t, maxObserved.Load(), int32(maxRecoveryConc), "concurrency must not exceed maxRecoveryConcurrency")
+}
+
+func TestEngine_Start_RequiresDefaultModel(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	storeProvider := NewStaticStoreProvider(store)
+
+	engine := NewEngine(storeProvider, nil, nil)
+	err := engine.Start(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "fsm engine requires a default model")
+}
+
+func TestEngine_RunToolLoop_RequiresModel(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	storeProvider := NewStaticStoreProvider(store)
+
+	engine := NewEngine(storeProvider, nil, nil)
+	req := ToolLoopRequest{
+		ChatID: "chat_1",
+		Messages: []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleUser, Content: "hello"},
+		},
+	}
+	res, err := engine.RunToolLoop(context.Background(), req)
+	require.Error(t, err)
+	assert.Nil(t, res)
+	assert.Contains(t, err.Error(), "model cannot be empty")
+
+	var runCount int
+	err = db.QueryRow("SELECT COUNT(*) FROM fsm_runs").Scan(&runCount)
+	require.NoError(t, err)
+	assert.Equal(t, 0, runCount, "no run should be persisted when model validation fails")
 }
 
 

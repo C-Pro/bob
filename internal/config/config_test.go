@@ -61,7 +61,7 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	assert.Equal(t, "http://127.0.0.1:8080", cfg.BesedkaURL)
 	assert.Equal(t, "", cfg.BesedkaAPIKey)
 	assert.Equal(t, "", cfg.OpenAIAPIKey)
-	assert.Equal(t, "gemini-3.7-flash", cfg.OpenAIModel)
+	assert.Equal(t, "", cfg.OpenAIModel)
 	assert.Equal(t, "https://generativelanguage.googleapis.com/v1beta/openai/", cfg.OpenAIBaseURL)
 	assert.Equal(t, "", cfg.TavilyAPIKey)
 	assert.Equal(t, "https://api.tavily.com", cfg.TavilyBaseURL)
@@ -191,6 +191,10 @@ func TestConfigValidation(t *testing.T) {
 
 	cfg.OpenAIAPIKey = "valid-key"
 	err = cfg.Validate(true)
+	assert.ErrorContains(t, err, "OPENAI_MODEL (or GEMINI_MODEL) cannot be empty")
+
+	cfg.OpenAIModel = "test-model"
+	err = cfg.Validate(true)
 	assert.NoError(t, err)
 
 	cfg.BesedkaURL = ""
@@ -268,6 +272,7 @@ export PRE_EXISTING=new_val
 func TestSandboxConfigValidation(t *testing.T) {
 	cfg := &Config{
 		OpenAIAPIKey:               "test-key",
+		OpenAIModel:                "test-model",
 		BesedkaURL:                 "http://127.0.0.1:8080",
 		TownhallMaxParagraphs:      2,
 		DMMaxParagraphs:            10,
@@ -398,6 +403,7 @@ func TestLoadFromEnv_SandboxHostDataDir(t *testing.T) {
 func TestConfig_Validate_SandboxHostDataDir(t *testing.T) {
 	baseCfg := Config{
 		OpenAIAPIKey:               "test-key",
+		OpenAIModel:                "test-model",
 		BesedkaURL:                 "http://127.0.0.1:8080",
 		TownhallMaxParagraphs:      2,
 		DMMaxParagraphs:            10,
@@ -445,6 +451,7 @@ func TestLoadFromEnv_FSMConfig(t *testing.T) {
 func TestConfig_Validate_FSMConfig(t *testing.T) {
 	baseCfg := Config{
 		OpenAIAPIKey:          "test-key",
+		OpenAIModel:           "test-model",
 		BesedkaURL:            "http://127.0.0.1:8080",
 		TownhallMaxParagraphs: 2,
 		DMMaxParagraphs:       10,
@@ -459,6 +466,7 @@ func TestConfig_Validate_FSMConfig(t *testing.T) {
 	// Explicit values are preserved
 	customCfg := Config{
 		OpenAIAPIKey:              "test-key",
+		OpenAIModel:               "test-model",
 		BesedkaURL:                "http://127.0.0.1:8080",
 		TownhallMaxParagraphs:     2,
 		DMMaxParagraphs:           10,

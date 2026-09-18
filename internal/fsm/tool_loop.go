@@ -29,9 +29,6 @@ type ToolLoopRunner struct {
 
 // NewToolLoopRunner creates a new ToolLoopRunner.
 func NewToolLoopRunner(llmClient LLMClient, stepExecutor *StepExecutor, defaultModel string) *ToolLoopRunner {
-	if defaultModel == "" {
-		defaultModel = "gemini-3.7-flash"
-	}
 	if stepExecutor == nil {
 		stepExecutor = NewStepExecutor(nil)
 	}
@@ -55,6 +52,9 @@ func (r *ToolLoopRunner) Execute(ctx context.Context, run *FSMRun, store *Store,
 	}
 	if model == "" {
 		model = r.defaultModel
+	}
+	if model == "" {
+		return errors.New("model cannot be empty")
 	}
 	defer func() {
 		if cb := GetTransitionCallback(ctx); cb != nil {

@@ -48,7 +48,7 @@ BOT_HANDLE=@botname
 | `BESEDKA_API_KEY` | *(required)* | Bot account API key or session token |
 | `BOT_HANDLE` | `@bot` | Bot username mention handle |
 | `OPENAI_API_KEY` / `GEMINI_API_KEY` | *(required)* | LLM provider API key |
-| `OPENAI_MODEL` / `GEMINI_MODEL` | `gemini-3.7-flash` | Model identifier |
+| `OPENAI_MODEL` / `GEMINI_MODEL` | *(required)* | Model identifier |
 | `OPENAI_BASE_URL` / `GEMINI_BASE_URL` | Google Gemini OpenAI endpoint | Base URL for OpenAI-compatible API |
 | `MSG_RING_BUFFER_SIZE` | `100` | In-memory message ring buffer capacity per chat |
 | `TOWNHALL_MAX_PARAGRAPHS` | `2` | Maximum paragraph length for Townhall responses |

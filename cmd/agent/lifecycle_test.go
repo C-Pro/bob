@@ -51,6 +51,7 @@ func TestServiceDatabaseLifecycle(t *testing.T) {
 			"DATA_DIR="+dataDir,
 			"BESEDKA_URL=http://127.0.0.1:59999", // Unused port, won't connect
 			"OPENAI_API_KEY=test-key",
+			"OPENAI_MODEL=test-model",
 			"EMBEDDING_MODEL=test-model",
 		)
 		out, _ := cmd.CombinedOutput()
@@ -99,6 +100,7 @@ insert into schema_version(version, description, is_current) values(-1, 'ancient
 			"DATA_DIR="+dataDir,
 			"BESEDKA_URL=http://127.0.0.1:59999",
 			"OPENAI_API_KEY=test-key",
+			"OPENAI_MODEL=test-model",
 			"EMBEDDING_MODEL=test-model",
 		)
 		out, err := cmd.CombinedOutput()
@@ -158,6 +160,7 @@ insert into schema_version(version, description, is_current) values(-1, 'ancient
 		cmd.Env = append(os.Environ(),
 			"BESEDKA_URL=http://127.0.0.1:59999",
 			"OPENAI_API_KEY=test-key",
+			"OPENAI_MODEL=test-model",
 			"EMBEDDING_MODEL=",
 		)
 		out, err := cmd.CombinedOutput()
@@ -330,6 +333,7 @@ insert into schema_version(version, description, is_current) values(-1, 'ancient
 			"BESEDKA_URL=http://127.0.0.1:59999",
 			"SECRET="+secret,
 			"OPENAI_API_KEY=test-key",
+			"OPENAI_MODEL=test-model",
 			"EMBEDDING_MODEL=test-model",
 			"S3_ENDPOINT="+srv.URL,
 			"S3_BUCKET=testbucket",
@@ -368,6 +372,7 @@ insert into schema_version(version, description, is_current) values(-1, 'ancient
 			"BESEDKA_URL=http://127.0.0.1:59999",
 			"SECRET=secret",
 			"OPENAI_API_KEY=test-key",
+			"OPENAI_MODEL=test-model",
 			"EMBEDDING_MODEL=test-model",
 			"S3_ENDPOINT=http://127.0.0.1:59998",
 			"S3_BUCKET=testbucket",

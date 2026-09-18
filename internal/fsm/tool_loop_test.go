@@ -485,7 +485,7 @@ func TestEngine_RunToolLoop_WithTransitionCallback(t *testing.T) {
 		},
 	}
 
-	engine := NewEngine(storeProv, llmClient, nil)
+	engine := NewEngine(storeProv, llmClient, nil, WithDefaultModel("test-model"))
 
 	var observedStates []RunState
 	var mu sync.Mutex
@@ -1101,6 +1101,24 @@ func TestToolLoop_EmptyToolResultFormatted(t *testing.T) {
 	toolMsg := lastReqMessages[2]
 	assert.Equal(t, openai.ChatMessageRoleTool, toolMsg.Role)
 	assert.Equal(t, `{"status": "COMPLETED", "result": ""}`, toolMsg.Content)
+}
+
+func TestToolLoop_Execute_RequiresModel(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	runner := NewToolLoopRunner(nil, nil, "")
+	run := &FSMRun{
+		ID:           "run_no_model",
+		ChatID:       "chat_1",
+		Status:       RunStatusRunning,
+		CurrentState: StateInit,
+		ContextJSON:  "[]",
+	}
+	err := runner.Execute(ctx, run, store, nil, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "model cannot be empty")
 }
 
 
