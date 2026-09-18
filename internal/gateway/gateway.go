@@ -118,17 +118,6 @@ func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 		gw.handleEvictedBatch(chatID, evicted)
 	})
 
-	if memoryManager != nil && llmClient != nil && toolsRegistry != nil && cfg != nil && cfg.DataDir != "" {
-		storeProv := NewMemoryStoreProvider(memoryManager, cfg.DataDir)
-		gw.fsmEngine = fsm.NewEngine(
-			storeProv,
-			llmClient,
-			toolsRegistry,
-			fsm.WithDefaultModel(cfg.OpenAIModel),
-			fsm.WithPollInterval(2*time.Second),
-		)
-	}
-
 	return gw
 }
 

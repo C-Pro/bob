@@ -126,6 +126,10 @@ func TestGateway_FSMToolLoop_TownhallIterationCap(t *testing.T) {
 	defer gw.Stop()
 	gw.httpClient = besedkaServer.Client()
 
+	storeProv := NewMemoryStoreProvider(gw.MemoryManager(), cfg.DataDir)
+	fsmEngine := fsm.NewEngine(storeProv, llmClient, gw.ToolsRegistry(), fsm.WithDefaultModel(cfg.OpenAIModel))
+	gw.SetFSMEngine(fsmEngine)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -266,6 +270,10 @@ func TestGateway_FSMToolLoop_DMIterationCap(t *testing.T) {
 	gw := NewGateway(cfg, llmClient)
 	defer gw.Stop()
 	gw.httpClient = besedkaServer.Client()
+
+	storeProv := NewMemoryStoreProvider(gw.MemoryManager(), cfg.DataDir)
+	fsmEngine := fsm.NewEngine(storeProv, llmClient, gw.ToolsRegistry(), fsm.WithDefaultModel(cfg.OpenAIModel))
+	gw.SetFSMEngine(fsmEngine)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -557,9 +565,7 @@ func TestGateway_FSMToolLoop_FallbackToVolatileOnFSMFailure(t *testing.T) {
 	gw.httpClient = besedkaServer.Client()
 
 	// Inject FSM Engine with failing store provider to trigger infrastructure error
-	gw.mu.Lock()
-	gw.fsmEngine = fsm.NewEngine(&failingStoreProvider{}, llmClient, gw.toolsRegistry)
-	gw.mu.Unlock()
+	gw.SetFSMEngine(fsm.NewEngine(&failingStoreProvider{}, llmClient, gw.toolsRegistry, fsm.WithDefaultModel(cfg.OpenAIModel)))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
