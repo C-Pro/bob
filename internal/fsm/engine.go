@@ -160,6 +160,9 @@ type Engine struct {
 	runningMu sync.Mutex
 	running   map[string]context.CancelFunc
 
+	timersMu sync.Mutex
+	timers   map[string]*time.Timer
+
 	wakeCh chan struct{}
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -178,6 +181,7 @@ func NewEngine(storeProvider StoreProvider, llmClient LLMClient, invoker ToolInv
 		maxRecoveryConcurrency:  4,
 		runners:                 make(map[FSMType]Runner),
 		running:                 make(map[string]context.CancelFunc),
+		timers:                  make(map[string]*time.Timer),
 		wakeCh:                  make(chan struct{}, 16),
 		stopCh:                  make(chan struct{}),
 	}
@@ -248,7 +252,50 @@ func (e *Engine) acquireRun(runID string, cancel context.CancelFunc) bool {
 		return false
 	}
 	e.running[runID] = cancel
+	e.cancelWakeTimer(runID)
 	return true
+}
+
+func (e *Engine) scheduleWakeTimer(runID string, delay time.Duration) {
+	if delay <= 0 {
+		e.signalWake()
+		return
+	}
+
+	e.timersMu.Lock()
+	defer e.timersMu.Unlock()
+
+	if e.closed.Load() {
+		return
+	}
+
+	if t, ok := e.timers[runID]; ok {
+		t.Stop()
+	}
+
+	e.timers[runID] = time.AfterFunc(delay, func() {
+		e.timersMu.Lock()
+		delete(e.timers, runID)
+		e.timersMu.Unlock()
+
+		e.signalWake()
+	})
+}
+
+func (e *Engine) cancelWakeTimer(runID string) {
+	e.timersMu.Lock()
+	defer e.timersMu.Unlock()
+	if t, ok := e.timers[runID]; ok {
+		t.Stop()
+		delete(e.timers, runID)
+	}
+}
+
+// ActiveTimersCount returns the number of active wake timers pending.
+func (e *Engine) ActiveTimersCount() int {
+	e.timersMu.Lock()
+	defer e.timersMu.Unlock()
+	return len(e.timers)
 }
 
 func (e *Engine) releaseRun(runID string) {
@@ -337,6 +384,13 @@ func (e *Engine) Stop() {
 	}
 	e.runningMu.Unlock()
 
+	e.timersMu.Lock()
+	for id, t := range e.timers {
+		t.Stop()
+		delete(e.timers, id)
+	}
+	e.timersMu.Unlock()
+
 	e.wg.Wait()
 }
 
@@ -373,9 +427,7 @@ func (e *Engine) Recover(ctx context.Context) error {
 			// If it's WAITING and not yet due, schedule an in-memory timer
 			if run.Status == RunStatusWaiting && run.ResumeAt != nil && *run.ResumeAt > now {
 				delay := time.Until(time.Unix(*run.ResumeAt, 0))
-				time.AfterFunc(delay, func() {
-					e.signalWake()
-				})
+				e.scheduleWakeTimer(run.ID, delay)
 				continue
 			}
 
@@ -438,9 +490,7 @@ func (e *Engine) Recover(ctx context.Context) error {
 				}
 				if fresh.Status == RunStatusWaiting && fresh.ResumeAt != nil && *fresh.ResumeAt > time.Now().Unix() {
 					delay := time.Until(time.Unix(*fresh.ResumeAt, 0))
-					time.AfterFunc(delay, func() {
-						e.signalWake()
-					})
+					e.scheduleWakeTimer(fresh.ID, delay)
 					return
 				}
 				runToRecover := *fresh

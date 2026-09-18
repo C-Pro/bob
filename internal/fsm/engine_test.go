@@ -860,6 +860,73 @@ func TestEngine_RunToolLoop_RequiresModel(t *testing.T) {
 	assert.Equal(t, 0, runCount, "no run should be persisted when model validation fails")
 }
 
+func TestEngine_DelayedTransitionTimers_CancelledOnStop(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	storeProvider := NewStaticStoreProvider(store)
+
+	ctx := context.Background()
+	futureTime := time.Now().Add(1 * time.Hour).Unix()
+	waitingRun := &FSMRun{
+		ID:            "run_waiting_future",
+		ChatID:        "chat_future",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusWaiting,
+		CurrentState:  StateWaiting,
+		Iteration:     1,
+		MaxIterations: 5,
+		ResumeAt:      &futureTime,
+		ContextJSON:   "[]",
+	}
+	require.NoError(t, store.CreateRun(ctx, waitingRun))
+
+	engine := NewEngine(storeProvider, nil, nil, WithDefaultModel("test-model"))
+
+	// Recover should find waiting run and schedule an in-memory timer
+	require.NoError(t, engine.Recover(ctx))
+	assert.Equal(t, 1, engine.ActiveTimersCount(), "one active timer should be scheduled")
+
+	// Calling Recover again should not accumulate timers for the same run
+	require.NoError(t, engine.Recover(ctx))
+	assert.Equal(t, 1, engine.ActiveTimersCount(), "timer count must remain 1 after repeated recovery")
+
+	// Stopping engine must cancel all active timers
+	engine.Stop()
+	assert.Equal(t, 0, engine.ActiveTimersCount(), "active timers must be drained on Stop")
+}
+
+func TestEngine_DelayedTransitionTimers_CancelledOnAcquire(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	storeProvider := NewStaticStoreProvider(store)
+
+	ctx := context.Background()
+	futureTime := time.Now().Add(1 * time.Hour).Unix()
+	waitingRun := &FSMRun{
+		ID:            "run_waiting_acquire",
+		ChatID:        "chat_acquire",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusWaiting,
+		CurrentState:  StateWaiting,
+		Iteration:     1,
+		MaxIterations: 5,
+		ResumeAt:      &futureTime,
+		ContextJSON:   "[]",
+	}
+	require.NoError(t, store.CreateRun(ctx, waitingRun))
+
+	engine := NewEngine(storeProvider, nil, nil, WithDefaultModel("test-model"))
+	require.NoError(t, engine.Recover(ctx))
+	assert.Equal(t, 1, engine.ActiveTimersCount())
+
+	// Acquire run (e.g. if it starts executing)
+	cancelCalled := false
+	acquired := engine.acquireRun("run_waiting_acquire", func() { cancelCalled = true })
+	assert.True(t, acquired)
+	assert.Equal(t, 0, engine.ActiveTimersCount(), "timer should be cancelled when run is acquired")
+	_ = cancelCalled
+}
+
 
 
 
