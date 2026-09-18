@@ -1,0 +1,1223 @@
+package fsm
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"testing"
+
+	openai "github.com/sashabaranov/go-openai"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+type mockLLMClient struct {
+	handler func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error)
+	calls   int32
+}
+
+func (m *mockLLMClient) CreateChatCompletion(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+	atomic.AddInt32(&m.calls, 1)
+	if m.handler != nil {
+		return m.handler(ctx, req)
+	}
+	return nil, errors.New("no mock handler configured")
+}
+
+func TestToolLoop_TextOnlyResponse(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	llm := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    openai.ChatMessageRoleAssistant,
+							Content: "Hello, I am Bob!",
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	invoker := ToolInvokerFunc(func(ctx context.Context, name, argsJSON string) (string, error) {
+		return "", errors.New("should not be called")
+	})
+
+	executor := NewStepExecutor(invoker)
+	runner := NewToolLoopRunner(llm, executor, "test-model")
+
+	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "Hello!"},
+	})
+	require.NoError(t, err)
+
+	run := &FSMRun{
+		ID:            "run_text_only",
+		ChatID:        "chat_1",
+		UserID:        "user_1",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusPending,
+		CurrentState:  StateInit,
+		Iteration:     0,
+		MaxIterations: 10,
+		ContextJSON:   contextJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	err = runner.Execute(ctx, run, store, nil, "test-model")
+	require.NoError(t, err)
+
+	assert.Equal(t, RunStatusCompleted, run.Status)
+	assert.Equal(t, StateCompleted, run.CurrentState)
+	assert.Equal(t, "Hello, I am Bob!", run.ResultJSON)
+	assert.Equal(t, 0, run.Iteration)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&llm.calls))
+
+	// Verify persistence in SQLite
+	persisted, err := store.GetRun(ctx, run.ID)
+	require.NoError(t, err)
+	assert.Equal(t, RunStatusCompleted, persisted.Status)
+	assert.Equal(t, "Hello, I am Bob!", persisted.ResultJSON)
+}
+
+func TestToolLoop_SingleToolCallExecution(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	var toolCallsMade int32
+
+	llm := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			// Turn 1: request tool call
+			if len(req.Messages) == 1 {
+				return &openai.ChatCompletionResponse{
+					Choices: []openai.ChatCompletionChoice{
+						{
+							Message: openai.ChatCompletionMessage{
+								Role: openai.ChatMessageRoleAssistant,
+								ToolCalls: []openai.ToolCall{
+									{
+										ID:   "call_search_1",
+										Type: openai.ToolTypeFunction,
+										Function: openai.FunctionCall{
+											Name:      "web_search",
+											Arguments: `{"query": "golang 1.26"}`,
+										},
+									},
+								},
+							},
+						},
+					},
+				}, nil
+			}
+
+			// Turn 2: verify tool result was appended
+			require.GreaterOrEqual(t, len(req.Messages), 3)
+			lastMsg := req.Messages[len(req.Messages)-1]
+			assert.Equal(t, openai.ChatMessageRoleTool, lastMsg.Role)
+			assert.Equal(t, "call_search_1", lastMsg.ToolCallID)
+			assert.Contains(t, lastMsg.Content, "Go 1.26 released")
+
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    openai.ChatMessageRoleAssistant,
+							Content: "Go 1.26 has been released with major updates.",
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	invoker := ToolInvokerFunc(func(ctx context.Context, name, argsJSON string) (string, error) {
+		atomic.AddInt32(&toolCallsMade, 1)
+		assert.Equal(t, "web_search", name)
+		return `{"result": "Go 1.26 released"}`, nil
+	})
+
+	executor := NewStepExecutor(invoker)
+	runner := NewToolLoopRunner(llm, executor, "test-model")
+
+	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "What is new in Go?"},
+	})
+	require.NoError(t, err)
+
+	run := &FSMRun{
+		ID:            "run_single_tool",
+		ChatID:        "chat_1",
+		UserID:        "user_1",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusRunning,
+		CurrentState:  StateInit,
+		Iteration:     0,
+		MaxIterations: 5,
+		ContextJSON:   contextJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	tools := []openai.Tool{
+		{
+			Type: openai.ToolTypeFunction,
+			Function: &openai.FunctionDefinition{
+				Name: "web_search",
+			},
+		},
+	}
+
+	err = runner.Execute(ctx, run, store, tools, "test-model")
+	require.NoError(t, err)
+
+	assert.Equal(t, RunStatusCompleted, run.Status)
+	assert.Equal(t, StateCompleted, run.CurrentState)
+	assert.Equal(t, "Go 1.26 has been released with major updates.", run.ResultJSON)
+	assert.Equal(t, 1, run.Iteration)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&toolCallsMade))
+
+	// Verify steps persisted in SQLite
+	steps, err := store.ListStepsByIteration(ctx, run.ID, 1)
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	assert.Equal(t, StepStatusCompleted, steps[0].Status)
+	assert.Equal(t, "web_search", steps[0].ToolName)
+	assert.Equal(t, `{"result": "Go 1.26 released"}`, steps[0].ResultJSON)
+}
+
+func TestToolLoop_ParallelToolCallsExecution(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	var executedTools []string
+	var execMu sync.Mutex
+
+	llm := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			if len(req.Messages) == 1 {
+				// Return two read-only tool calls in parallel
+				return &openai.ChatCompletionResponse{
+					Choices: []openai.ChatCompletionChoice{
+						{
+							Message: openai.ChatCompletionMessage{
+								Role: openai.ChatMessageRoleAssistant,
+								ToolCalls: []openai.ToolCall{
+									{
+										ID:   "call_s1",
+										Type: openai.ToolTypeFunction,
+										Function: openai.FunctionCall{
+											Name:      "web_search",
+											Arguments: `{"q":"a"}`,
+										},
+									},
+									{
+										ID:   "call_s2",
+										Type: openai.ToolTypeFunction,
+										Function: openai.FunctionCall{
+											Name:      "web_fetch",
+											Arguments: `{"url":"b"}`,
+										},
+									},
+								},
+							},
+						},
+					},
+				}, nil
+			}
+
+			// Final completion
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    openai.ChatMessageRoleAssistant,
+							Content: "Parallel tools finished.",
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	invoker := ToolInvokerFunc(func(ctx context.Context, name, argsJSON string) (string, error) {
+		execMu.Lock()
+		executedTools = append(executedTools, name)
+		execMu.Unlock()
+		return fmt.Sprintf(`{"tool": %q}`, name), nil
+	})
+
+	executor := NewStepExecutor(invoker)
+	runner := NewToolLoopRunner(llm, executor, "test-model")
+
+	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "Look up two things"},
+	})
+	require.NoError(t, err)
+
+	run := &FSMRun{
+		ID:            "run_parallel_tools",
+		ChatID:        "chat_1",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusRunning,
+		CurrentState:  StateInit,
+		Iteration:     0,
+		MaxIterations: 5,
+		ContextJSON:   contextJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	err = runner.Execute(ctx, run, store, nil, "test-model")
+	require.NoError(t, err)
+
+	assert.Equal(t, RunStatusCompleted, run.Status)
+	assert.Equal(t, "Parallel tools finished.", run.ResultJSON)
+
+	// Verify both were executed and classified as parallel
+	execMu.Lock()
+	assert.Len(t, executedTools, 2)
+	execMu.Unlock()
+
+	steps, err := store.ListStepsByIteration(ctx, run.ID, 1)
+	require.NoError(t, err)
+	require.Len(t, steps, 2)
+	for _, s := range steps {
+		assert.Equal(t, ExecutionModeParallel, s.ExecutionMode)
+		assert.Equal(t, StepStatusCompleted, s.Status)
+	}
+}
+
+func TestToolLoop_MaxIterationsSynthesis(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	llm := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			// If tools are nil, it's the synthesis prompt!
+			if req.Tools == nil {
+				lastMsg := req.Messages[len(req.Messages)-1]
+				assert.Equal(t, openai.ChatMessageRoleUser, lastMsg.Role)
+				assert.Equal(t, SynthesisPrompt, lastMsg.Content)
+				return &openai.ChatCompletionResponse{
+					Choices: []openai.ChatCompletionChoice{
+						{
+							Message: openai.ChatCompletionMessage{
+								Role:    openai.ChatMessageRoleAssistant,
+								Content: "Synthesized summary after max iterations reached.",
+							},
+						},
+					},
+				}, nil
+			}
+
+			// Keep requesting tool calls
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role: openai.ChatMessageRoleAssistant,
+							ToolCalls: []openai.ToolCall{
+								{
+									ID:   fmt.Sprintf("call_%d", len(req.Messages)),
+									Type: openai.ToolTypeFunction,
+									Function: openai.FunctionCall{
+										Name:      "web_search",
+										Arguments: `{"q":"loop"}`,
+									},
+								},
+							},
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	invoker := ToolInvokerFunc(func(ctx context.Context, name, argsJSON string) (string, error) {
+		return `{"ok":true}`, nil
+	})
+
+	executor := NewStepExecutor(invoker)
+	runner := NewToolLoopRunner(llm, executor, "test-model")
+
+	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "Keep searching"},
+	})
+	require.NoError(t, err)
+
+	// Max iterations set to 2
+	run := &FSMRun{
+		ID:            "run_max_iter",
+		ChatID:        "chat_1",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusRunning,
+		CurrentState:  StateInit,
+		Iteration:     0,
+		MaxIterations: 2,
+		ContextJSON:   contextJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	tools := []openai.Tool{
+		{Type: openai.ToolTypeFunction, Function: &openai.FunctionDefinition{Name: "web_search"}},
+	}
+
+	err = runner.Execute(ctx, run, store, tools, "test-model")
+	require.NoError(t, err)
+
+	assert.Equal(t, RunStatusCompleted, run.Status)
+	assert.Equal(t, StateCompleted, run.CurrentState)
+	// Exactly 2 tool iterations were executed before synthesis
+	assert.Equal(t, 2, run.Iteration)
+}
+
+func TestToolLoop_ToolExecutionFailureRecordedAndFedBack(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	llm := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			if len(req.Messages) == 1 {
+				return &openai.ChatCompletionResponse{
+					Choices: []openai.ChatCompletionChoice{
+						{
+							Message: openai.ChatCompletionMessage{
+								Role: openai.ChatMessageRoleAssistant,
+								ToolCalls: []openai.ToolCall{
+									{
+										ID:   "call_fail",
+										Type: openai.ToolTypeFunction,
+										Function: openai.FunctionCall{
+											Name:      "web_search",
+											Arguments: `{"bad":"args"}`,
+										},
+									},
+								},
+							},
+						},
+					},
+				}, nil
+			}
+
+			// Verify error was fed back as tool output
+			lastMsg := req.Messages[len(req.Messages)-1]
+			assert.Equal(t, openai.ChatMessageRoleTool, lastMsg.Role)
+			assert.Contains(t, lastMsg.Content, "invalid tool argument")
+
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    openai.ChatMessageRoleAssistant,
+							Content: "Search failed, acknowledging error.",
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	invoker := ToolInvokerFunc(func(ctx context.Context, name, argsJSON string) (string, error) {
+		return "", errors.New("invalid tool argument")
+	})
+
+	executor := NewStepExecutor(invoker)
+	runner := NewToolLoopRunner(llm, executor, "test-model")
+
+	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "Fail tool"},
+	})
+	require.NoError(t, err)
+
+	run := &FSMRun{
+		ID:            "run_tool_fail",
+		ChatID:        "chat_1",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusRunning,
+		CurrentState:  StateInit,
+		Iteration:     0,
+		MaxIterations: 5,
+		ContextJSON:   contextJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	err = runner.Execute(ctx, run, store, nil, "test-model")
+	require.NoError(t, err)
+
+	assert.Equal(t, RunStatusCompleted, run.Status)
+	assert.Equal(t, "Search failed, acknowledging error.", run.ResultJSON)
+
+	// Step in SQLite has failed status and error text
+	steps, err := store.ListStepsByIteration(ctx, run.ID, 1)
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	assert.Equal(t, StepStatusFailed, steps[0].Status)
+	assert.Contains(t, steps[0].ErrorText, "invalid tool argument")
+}
+
+func TestEngine_RunToolLoop_WithTransitionCallback(t *testing.T) {
+	db := setupTestDB(t)
+	s := NewStore(db)
+	storeProv := NewStaticStoreProvider(s)
+
+	llmClient := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    openai.ChatMessageRoleAssistant,
+							Content: "Hello world!",
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	engine := NewEngine(storeProv, llmClient, nil, WithDefaultModel("test-model"))
+
+	var observedStates []RunState
+	var mu sync.Mutex
+
+	res, err := engine.RunToolLoop(context.Background(), ToolLoopRequest{
+		ChatID: "townhall",
+		UserID: "user1",
+		IsDM:   false,
+		Messages: []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleUser, Content: "Hello"},
+		},
+		OnTransition: func(state RunState, run *FSMRun) {
+			mu.Lock()
+			defer mu.Unlock()
+			observedStates = append(observedStates, state)
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "Hello world!", res.Content)
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Contains(t, observedStates, StateInit)
+	assert.Contains(t, observedStates, StateLLMRequest)
+	assert.Contains(t, observedStates, StateCompleted)
+}
+
+func TestToolLoop_SequentialFailureDoesNotCauseWaitingLoop(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	llm := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			if len(req.Messages) == 1 {
+				return &openai.ChatCompletionResponse{
+					Choices: []openai.ChatCompletionChoice{
+						{
+							Message: openai.ChatCompletionMessage{
+								Role: openai.ChatMessageRoleAssistant,
+								ToolCalls: []openai.ToolCall{
+									{
+										ID:   "call_seq_1",
+										Type: openai.ToolTypeFunction,
+										Function: openai.FunctionCall{
+											Name:      "sandbox_exec",
+											Arguments: `{"cmd":"exit 1"}`,
+										},
+									},
+									{
+										ID:   "call_seq_2",
+										Type: openai.ToolTypeFunction,
+										Function: openai.FunctionCall{
+											Name:      "sandbox_exec",
+											Arguments: `{"cmd":"echo hi"}`,
+										},
+									},
+								},
+							},
+						},
+					},
+				}, nil
+			}
+
+			// Turn 2: verify both tool calls got responses (1 failed, 2 skipped)
+			require.True(t, len(req.Messages) >= 3)
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    openai.ChatMessageRoleAssistant,
+							Content: "Command failed, handled gracefully.",
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	invoker := ToolInvokerFunc(func(ctx context.Context, name, argsJSON string) (string, error) {
+		return "", errors.New("command execution failed")
+	})
+
+	executor := NewStepExecutor(invoker)
+	runner := NewToolLoopRunner(llm, executor, "test-model")
+
+	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "Run commands"},
+	})
+	require.NoError(t, err)
+
+	run := &FSMRun{
+		ID:            "run_seq_fail",
+		ChatID:        "chat_1",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusRunning,
+		CurrentState:  StateInit,
+		Iteration:     0,
+		MaxIterations: 5,
+		ContextJSON:   contextJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	err = runner.Execute(ctx, run, store, nil, "test-model")
+	require.NoError(t, err)
+
+	assert.Equal(t, RunStatusCompleted, run.Status)
+	assert.Equal(t, "Command failed, handled gracefully.", run.ResultJSON)
+
+	// Verify steps in store
+	steps, err := store.ListStepsByIteration(ctx, run.ID, 1)
+	require.NoError(t, err)
+	require.Len(t, steps, 2)
+	assert.Equal(t, StepStatusFailed, steps[0].Status)
+	assert.Equal(t, StepStatusSkipped, steps[1].Status)
+	assert.Contains(t, steps[1].ErrorText, "skipped due to failure in step")
+}
+
+func TestToolLoop_PersistenceErrorDuringStepExecution_FailsRun(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	llm := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role: openai.ChatMessageRoleAssistant,
+							ToolCalls: []openai.ToolCall{
+								{
+									ID:   "call_persist_fail",
+									Type: openai.ToolTypeFunction,
+									Function: openai.FunctionCall{
+										Name:      "web_search",
+										Arguments: `{"query":"test"}`,
+									},
+								},
+							},
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	invoker := ToolInvokerFunc(func(ctx context.Context, name, argsJSON string) (string, error) {
+		return `{"result":"ok"}`, nil
+	})
+
+	executor := NewStepExecutor(invoker)
+	runner := NewToolLoopRunner(llm, executor, "test-model")
+
+	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "Hello"},
+	})
+	require.NoError(t, err)
+
+	run := &FSMRun{
+		ID:            "run_persist_fail",
+		ChatID:        "chat_1",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusRunning,
+		CurrentState:  StateInit,
+		Iteration:     0,
+		MaxIterations: 5,
+		ContextJSON:   contextJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	// Install a trigger that simulates disk I/O error specifically when updating steps
+	_, err = db.Exec(`CREATE TRIGGER fail_step_update BEFORE UPDATE ON fsm_steps
+	BEGIN
+		SELECT RAISE(FAIL, 'disk I/O error');
+	END;`)
+	require.NoError(t, err)
+
+	err = runner.Execute(ctx, run, store, nil, "test-model")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "step persistence failed")
+
+	assert.Equal(t, RunStatusFailed, run.Status)
+	assert.Equal(t, StateFailed, run.CurrentState)
+	assert.Contains(t, run.ErrorText, "persistence failure during step execution")
+
+	persisted, err := store.GetRun(ctx, run.ID)
+	require.NoError(t, err)
+	assert.Equal(t, RunStatusFailed, persisted.Status)
+	assert.Equal(t, StateFailed, persisted.CurrentState)
+	assert.Contains(t, persisted.ErrorText, "persistence failure during step execution")
+}
+
+func TestToolLoop_PrepareSteps_CrashRecoveryIdempotent(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	llm := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    openai.ChatMessageRoleAssistant,
+							Content: "Finished recovering!",
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	invoker := ToolInvokerFunc(func(ctx context.Context, name, argsJSON string) (string, error) {
+		return `{"result":"found"}`, nil
+	})
+
+	executor := NewStepExecutor(invoker)
+	runner := NewToolLoopRunner(llm, executor, "test-model")
+
+	// Create run that crashed while in StatePrepareSteps after steps were already created
+	messages := []openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "Search"},
+		{
+			Role: openai.ChatMessageRoleAssistant,
+			ToolCalls: []openai.ToolCall{
+				{
+					ID:   "call_rec",
+					Type: openai.ToolTypeFunction,
+					Function: openai.FunctionCall{
+						Name:      "web_search",
+						Arguments: `{"query":"golang"}`,
+					},
+				},
+			},
+		},
+	}
+	contextJSON, err := EncodeMessages(messages)
+	require.NoError(t, err)
+
+	run := &FSMRun{
+		ID:            "run_crash_prep",
+		ChatID:        "chat_1",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusRunning,
+		CurrentState:  StatePrepareSteps,
+		Iteration:     1,
+		MaxIterations: 5,
+		ContextJSON:   contextJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	// Pre-insert the step as if CreateSteps completed before crash
+	existingStep := NewStepFromToolCall(run.ID, run.Iteration, 0, messages[1].ToolCalls[0], ExecutionModeParallel)
+	require.NoError(t, store.CreateSteps(ctx, []FSMStep{existingStep}))
+
+	// Execute should cleanly resume from StatePrepareSteps without UNIQUE constraint violation
+	err = runner.Execute(ctx, run, store, nil, "test-model")
+	require.NoError(t, err)
+
+	assert.Equal(t, RunStatusCompleted, run.Status)
+	assert.Equal(t, "Finished recovering!", run.ResultJSON)
+}
+
+func TestToolLoop_ToolResultTruncationAndContextCeiling(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	// 25KB large tool output
+	largeOutput := make([]byte, 25*1024)
+	for i := range largeOutput {
+		largeOutput[i] = 'a'
+	}
+	largeStr := string(largeOutput)
+
+	var lastReqMessages []openai.ChatCompletionMessage
+	callCount := 0
+
+	llm := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			callCount++
+			if callCount == 1 {
+				return &openai.ChatCompletionResponse{
+					Choices: []openai.ChatCompletionChoice{
+						{
+							Message: openai.ChatCompletionMessage{
+								Role: openai.ChatMessageRoleAssistant,
+								ToolCalls: []openai.ToolCall{
+									{
+										ID:   "call_trunc_1",
+										Type: openai.ToolTypeFunction,
+										Function: openai.FunctionCall{
+											Name:      "web_fetch",
+											Arguments: `{"url":"https://example.com"}`,
+										},
+									},
+								},
+							},
+						},
+					},
+				}, nil
+			}
+			lastReqMessages = req.Messages
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    openai.ChatMessageRoleAssistant,
+							Content: "Done reading large content",
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	invoker := ToolInvokerFunc(func(ctx context.Context, name, argsJSON string) (string, error) {
+		return largeStr, nil
+	})
+
+	executor := NewStepExecutor(invoker)
+	runner := NewToolLoopRunner(llm, executor, "test-model")
+
+	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "Fetch large webpage"},
+	})
+	require.NoError(t, err)
+
+	run := &FSMRun{
+		ID:            "run_trunc_test",
+		ChatID:        "chat_1",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusRunning,
+		CurrentState:  StateInit,
+		Iteration:     0,
+		MaxIterations: 5,
+		ContextJSON:   contextJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	err = runner.Execute(ctx, run, store, nil, "test-model")
+	require.NoError(t, err)
+	assert.Equal(t, RunStatusCompleted, run.Status)
+
+	// Step in database must preserve full output (25KB)
+	steps, err := store.ListStepsByIteration(ctx, run.ID, 1)
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	assert.Equal(t, len(largeStr), len(steps[0].ResultJSON))
+
+	// Tool message in context passed to LLM must be truncated to MaxToolResultSizeInContext
+	require.Len(t, lastReqMessages, 3) // user, assistant with tool_call, tool result
+	toolMsg := lastReqMessages[2]
+	assert.Equal(t, openai.ChatMessageRoleTool, toolMsg.Role)
+	assert.Contains(t, toolMsg.Content, "[tool output truncated in context]")
+	assert.True(t, len(toolMsg.Content) <= MaxToolResultSizeInContext+len("\n[tool output truncated in context]"))
+}
+
+func TestToolLoop_ContextCeiling_PersistsFailedState(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	// 1.1MB large message from assistant
+	hugeText := make([]byte, 1100*1024)
+	for i := range hugeText {
+		hugeText[i] = 'h'
+	}
+
+	llm := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    openai.ChatMessageRoleAssistant,
+							Content: string(hugeText),
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	invoker := ToolInvokerFunc(func(ctx context.Context, name, argsJSON string) (string, error) {
+		return "", errors.New("unused")
+	})
+
+	executor := NewStepExecutor(invoker)
+	runner := NewToolLoopRunner(llm, executor, "test-model")
+
+	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "Hello"},
+	})
+	require.NoError(t, err)
+
+	run := &FSMRun{
+		ID:            "run_ceiling_test",
+		ChatID:        "chat_1",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusRunning,
+		CurrentState:  StateInit,
+		Iteration:     0,
+		MaxIterations: 5,
+		ContextJSON:   contextJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	err = runner.Execute(ctx, run, store, nil, "test-model")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceeds maximum allowable limit")
+
+	// Run must be in terminal FAILED status in memory
+	assert.Equal(t, RunStatusFailed, run.Status)
+	assert.Equal(t, StateFailed, run.CurrentState)
+
+	// Run must be persisted as FAILED in database
+	persisted, err := store.GetRun(ctx, run.ID)
+	require.NoError(t, err)
+	assert.Equal(t, RunStatusFailed, persisted.Status)
+	assert.Equal(t, StateFailed, persisted.CurrentState)
+	assert.Contains(t, persisted.ErrorText, "exceeds maximum allowable limit")
+
+	// Re-executing runner must immediately terminate without looping
+	err = runner.Execute(ctx, persisted, store, nil, "test-model")
+	require.NoError(t, err)
+	assert.Equal(t, RunStatusFailed, persisted.Status)
+}
+
+func TestToolLoop_NilStepExecutor_NoPanic(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	llm := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    openai.ChatMessageRoleAssistant,
+							Content: "No step executor needed",
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	// Constructing with nil stepExecutor should not leave it nil
+	runner := NewToolLoopRunner(llm, nil, "test-model")
+	require.NotNil(t, runner.stepExecutor)
+
+	// Even if manually nulled, Execute must not panic
+	runner.stepExecutor = nil
+
+	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "Hello"},
+	})
+	require.NoError(t, err)
+
+	run := &FSMRun{
+		ID:           "run_nil_executor",
+		ChatID:       "chat_1",
+		FSMType:      FSMTypeToolLoop,
+		Status:       RunStatusRunning,
+		CurrentState: StateInit,
+		ContextJSON:  contextJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	err = runner.Execute(ctx, run, store, nil, "test-model")
+	require.NoError(t, err)
+	assert.Equal(t, RunStatusCompleted, run.Status)
+	assert.Equal(t, "No step executor needed", run.ResultJSON)
+}
+
+func TestToolLoop_NilStepExecutor_WithToolCall_NoPanic(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	llm := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role: openai.ChatMessageRoleAssistant,
+							ToolCalls: []openai.ToolCall{
+								{
+									ID:   "call_nil_exec_1",
+									Type: openai.ToolTypeFunction,
+									Function: openai.FunctionCall{
+										Name:      "web_search",
+										Arguments: `{"q":"test"}`,
+									},
+								},
+							},
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	// Construct runner with nil stepExecutor directly to exercise handleExecuteSteps
+	runner := &ToolLoopRunner{
+		llmClient:    llm,
+		stepExecutor: nil,
+		defaultModel: "test-model",
+	}
+
+	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "Search something"},
+	})
+	require.NoError(t, err)
+
+	run := &FSMRun{
+		ID:           "run_nil_exec_toolcall",
+		ChatID:       "chat_1",
+		FSMType:      FSMTypeToolLoop,
+		Status:       RunStatusRunning,
+		CurrentState: StateInit,
+		ContextJSON:  contextJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	// Execute should not panic; it should fail gracefully because invoker is not configured
+	err = runner.Execute(ctx, run, store, nil, "test-model")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "step")
+	assert.Equal(t, RunStatusFailed, run.Status)
+}
+
+func TestToolLoop_EmptyToolResultFormatted(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	var lastReqMessages []openai.ChatCompletionMessage
+	callCount := 0
+
+	llm := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			callCount++
+			lastReqMessages = req.Messages
+			if callCount == 1 {
+				return &openai.ChatCompletionResponse{
+					Choices: []openai.ChatCompletionChoice{
+						{
+							Message: openai.ChatCompletionMessage{
+								Role: openai.ChatMessageRoleAssistant,
+								ToolCalls: []openai.ToolCall{
+									{
+										ID:   "call_empty_1",
+										Type: openai.ToolTypeFunction,
+										Function: openai.FunctionCall{
+											Name:      "recall_memory",
+											Arguments: `{"query": "something"}`,
+										},
+									},
+								},
+							},
+						},
+					},
+				}, nil
+			}
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    openai.ChatMessageRoleAssistant,
+							Content: "Found nothing.",
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	// Invoker returns empty string with no error
+	invoker := ToolInvokerFunc(func(ctx context.Context, name, argsJSON string) (string, error) {
+		return "", nil
+	})
+
+	executor := NewStepExecutor(invoker)
+	runner := NewToolLoopRunner(llm, executor, "test-model")
+
+	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "Recall something"},
+	})
+	require.NoError(t, err)
+
+	run := &FSMRun{
+		ID:            "run_empty_result",
+		ChatID:        "chat_1",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusRunning,
+		CurrentState:  StateInit,
+		Iteration:     0,
+		MaxIterations: 5,
+		ContextJSON:   contextJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	err = runner.Execute(ctx, run, store, nil, "test-model")
+	require.NoError(t, err)
+	assert.Equal(t, RunStatusCompleted, run.Status)
+
+	require.Len(t, lastReqMessages, 3)
+	toolMsg := lastReqMessages[2]
+	assert.Equal(t, openai.ChatMessageRoleTool, toolMsg.Role)
+	assert.Equal(t, `{"status": "COMPLETED", "result": ""}`, toolMsg.Content)
+}
+
+func TestToolLoop_Execute_RequiresModel(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	runner := NewToolLoopRunner(nil, nil, "")
+	run := &FSMRun{
+		ID:           "run_no_model",
+		ChatID:       "chat_1",
+		Status:       RunStatusRunning,
+		CurrentState: StateInit,
+		ContextJSON:  "[]",
+	}
+	err := runner.Execute(ctx, run, store, nil, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "model cannot be empty")
+}
+
+func TestToolLoop_ToolOutputNotDuplicatedInContext(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	const secretOutput = "secret_unique_tool_output_98765"
+	var turn int
+	var turn2Messages []openai.ChatCompletionMessage
+
+	llm := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			turn++
+			if turn == 1 {
+				return &openai.ChatCompletionResponse{
+					Choices: []openai.ChatCompletionChoice{
+						{
+							Message: openai.ChatCompletionMessage{
+								Role: openai.ChatMessageRoleAssistant,
+								ToolCalls: []openai.ToolCall{
+									{
+										ID:   "call_secret_1",
+										Type: openai.ToolTypeFunction,
+										Function: openai.FunctionCall{
+											Name:      "web_fetch",
+											Arguments: `{"url":"https://secret.local"}`,
+										},
+									},
+								},
+							},
+						},
+					},
+				}, nil
+			}
+
+			turn2Messages = req.Messages
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    openai.ChatMessageRoleAssistant,
+							Content: "Received secret data.",
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	invoker := ToolInvokerFunc(func(ctx context.Context, name, argsJSON string) (string, error) {
+		return secretOutput, nil
+	})
+
+	executor := NewStepExecutor(invoker)
+	runner := NewToolLoopRunner(llm, executor, "test-model")
+
+	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "Fetch secret"},
+	})
+	require.NoError(t, err)
+
+	run := &FSMRun{
+		ID:            "run_dedup_test",
+		ChatID:        "chat_1",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusRunning,
+		CurrentState:  StateInit,
+		Iteration:     0,
+		MaxIterations: 5,
+		ContextJSON:   contextJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	err = runner.Execute(ctx, run, store, nil, "test-model")
+	require.NoError(t, err)
+	assert.Equal(t, RunStatusCompleted, run.Status)
+
+	// 1. Tool result must be saved in fsm_steps in SQLite
+	steps, err := store.ListStepsByRun(ctx, run.ID)
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	assert.Equal(t, secretOutput, steps[0].ResultJSON)
+
+	// 2. run.ContextJSON must NOT contain secretOutput (no duplication)
+	persistedRun, err := store.GetRun(ctx, run.ID)
+	require.NoError(t, err)
+	assert.NotContains(t, persistedRun.ContextJSON, secretOutput, "tool output must not be duplicated into ContextJSON")
+
+	// 3. The request messages passed to LLM on turn 2 DID contain secretOutput (reconstructed from fsm_steps)
+	require.GreaterOrEqual(t, len(turn2Messages), 3)
+	toolMsg := turn2Messages[len(turn2Messages)-1]
+	assert.Equal(t, openai.ChatMessageRoleTool, toolMsg.Role)
+	assert.Equal(t, "call_secret_1", toolMsg.ToolCallID)
+	assert.Equal(t, secretOutput, toolMsg.Content)
+}
+
+
+
+
+
+

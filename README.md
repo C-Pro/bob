@@ -12,6 +12,7 @@ Bob is an AI agent for the [Besedka](https://github.com/c-pro/besedka) self-host
 - **Automated S3 / object storage backups** — periodic snapshots of SQLite databases uploaded to S3-compatible storage (AWS S3, MinIO, Cloudflare R2, GCS) with retention management and optional database encryption
 - **Live web search** via [Tavily](https://tavily.com/) (when `TAVILY_API_KEY` is set)
 - **Web page fetch & extraction** with readability parsing and dynamic rendering fallback
+- **Durable FSM & resilient tool loop** — SQLite-backed finite state machine executing tool loops with channel iteration caps (10 in Townhall, 20 in DMs), parallel read-only dispatch, ordered sequential mutating dispatch, per-step timeouts, exponential backoff retries for transient errors, delayed transition polling (`resume_at`), startup crash recovery, and automated retention pruning with incremental vacuuming
 - **SQLite storage & schema migrations** — pure Go embedded SQLite database with automatic single-step version migrations
 - **GEOIP location reporting** — round-robin across public providers
 - **OpenAI-compatible LLM client** with exponential retry backoff and tool/function calling
@@ -47,11 +48,14 @@ BOT_HANDLE=@botname
 | `BESEDKA_API_KEY` | *(required)* | Bot account API key or session token |
 | `BOT_HANDLE` | `@bot` | Bot username mention handle |
 | `OPENAI_API_KEY` / `GEMINI_API_KEY` | *(required)* | LLM provider API key |
-| `OPENAI_MODEL` / `GEMINI_MODEL` | `gemini-3.7-flash` | Model identifier |
+| `OPENAI_MODEL` / `GEMINI_MODEL` | *(required)* | Model identifier |
 | `OPENAI_BASE_URL` / `GEMINI_BASE_URL` | Google Gemini OpenAI endpoint | Base URL for OpenAI-compatible API |
 | `MSG_RING_BUFFER_SIZE` | `100` | In-memory message ring buffer capacity per chat |
 | `TOWNHALL_MAX_PARAGRAPHS` | `2` | Maximum paragraph length for Townhall responses |
 | `DM_MAX_PARAGRAPHS` | `10` | Maximum paragraph length for Direct Message responses |
+| `TOWNHALL_TOOL_MAX_ITERATIONS` | `10` | Maximum tool execution loop iterations in Townhall before forced synthesis |
+| `DM_TOOL_MAX_ITERATIONS` | `20` | Maximum tool execution loop iterations in Direct Messages before forced synthesis |
+| `FSM_RETENTION_DAYS` | `7` | Retention period in days for terminal FSM workflow runs |
 
 #### Storage & Long-Term Memory
 

@@ -30,6 +30,9 @@ type Config struct {
 	TownhallMaxParagraphs      int
 	DMMaxParagraphs            int
 	MsgRingBufferSize          int
+	TownhallToolMaxIterations  int
+	DMToolMaxIterations        int
+	FSMRetentionDays           int
 	TavilyAPIKey               string
 	TavilyBaseURL              string
 	DataDir                    string
@@ -81,7 +84,7 @@ func LoadFromEnv() (*Config, error) {
 	}
 
 	apiKey := getEnvOrDefault("OPENAI_API_KEY", os.Getenv("GEMINI_API_KEY"))
-	model := getEnvOrDefault("OPENAI_MODEL", getEnvOrDefault("GEMINI_MODEL", "gemini-3.7-flash"))
+	model := getEnvOrDefault("OPENAI_MODEL", getEnvOrDefault("GEMINI_MODEL", "gemini-3.8-flash"))
 	baseURL := getEnvOrDefault("OPENAI_BASE_URL", getEnvOrDefault("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"))
 	tavilyBaseURL := strings.TrimSuffix(getEnvOrDefault("TAVILY_BASE_URL", "https://api.tavily.com"), "/")
 	backupIntervalStr := getEnvOrDefault("S3_BACKUP_INTERVAL", "1h")
@@ -130,6 +133,9 @@ func LoadFromEnv() (*Config, error) {
 		TownhallMaxParagraphs:      getEnvIntOrDefault("TOWNHALL_MAX_PARAGRAPHS", 2),
 		DMMaxParagraphs:            getEnvIntOrDefault("DM_MAX_PARAGRAPHS", 10),
 		MsgRingBufferSize:          getEnvIntOrDefault("MSG_RING_BUFFER_SIZE", 100),
+		TownhallToolMaxIterations:  getEnvIntOrDefault("TOWNHALL_TOOL_MAX_ITERATIONS", 10),
+		DMToolMaxIterations:        getEnvIntOrDefault("DM_TOOL_MAX_ITERATIONS", 20),
+		FSMRetentionDays:           getEnvIntOrDefault("FSM_RETENTION_DAYS", 7),
 		DataDir:                    getEnvOrDefault("DATA_DIR", "./data"),
 		EmbeddingModel:             getEnvOrDefault("EMBEDDING_MODEL", ""),
 		EmbeddingPrecision:         strings.ToLower(getEnvOrDefault("EMBEDDING_PRECISION", "bf16")),
@@ -208,8 +214,13 @@ func (c *Config) SandboxConfig() sandbox.Config {
 
 // Validate checks required fields for runtime readiness.
 func (c *Config) Validate(requireAPIKey bool) error {
-	if requireAPIKey && strings.TrimSpace(c.OpenAIAPIKey) == "" && strings.TrimSpace(c.GeminiAPIKey) == "" {
-		return errors.New("OPENAI_API_KEY (or GEMINI_API_KEY) is required")
+	if requireAPIKey {
+		if strings.TrimSpace(c.OpenAIAPIKey) == "" && strings.TrimSpace(c.GeminiAPIKey) == "" {
+			return errors.New("OPENAI_API_KEY (or GEMINI_API_KEY) is required")
+		}
+		if strings.TrimSpace(c.OpenAIModel) == "" && strings.TrimSpace(c.GeminiModel) == "" {
+			return errors.New("OPENAI_MODEL (or GEMINI_MODEL) cannot be empty")
+		}
 	}
 	if strings.TrimSpace(c.BesedkaURL) == "" {
 		return errors.New("BESEDKA_URL cannot be empty")
@@ -222,6 +233,15 @@ func (c *Config) Validate(requireAPIKey bool) error {
 	}
 	if c.MsgRingBufferSize <= 0 {
 		return fmt.Errorf("invalid MSG_RING_BUFFER_SIZE: %d", c.MsgRingBufferSize)
+	}
+	if c.TownhallToolMaxIterations <= 0 {
+		c.TownhallToolMaxIterations = 10
+	}
+	if c.DMToolMaxIterations <= 0 {
+		c.DMToolMaxIterations = 20
+	}
+	if c.FSMRetentionDays <= 0 {
+		c.FSMRetentionDays = 7
 	}
 	if (c.S3Bucket == "") != (c.S3Endpoint == "") {
 		return errors.New("S3_BUCKET and S3_ENDPOINT must be set together")

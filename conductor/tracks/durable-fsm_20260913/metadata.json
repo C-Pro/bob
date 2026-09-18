@@ -1,0 +1,8 @@
+{
+  "track_id": "durable-fsm_20260913",
+  "type": "feature",
+  "status": "in_progress",
+  "created_at": "2026-09-13T12:50:00Z",
+  "updated_at": "2026-09-13T12:50:00Z",
+  "description": "Durable SQLite-backed FSM for simple tool loops and Phase 16 agentic workflows with isolated per-chat persistence, sequential/parallel execution modes, delayed transitions, and configurable retention."
+}

@@ -3,6 +3,7 @@ package tavily
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -274,4 +275,24 @@ func TestExtractFailureAfterRetries(t *testing.T) {
 	_, err := client.Extract(context.Background(), "https://example.com")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "tavily API request failed after 2 retries")
+
+	var apiErr *APIError
+	require.True(t, errors.As(err, &apiErr))
+	assert.Equal(t, http.StatusServiceUnavailable, apiErr.StatusCode)
+	assert.True(t, apiErr.IsRetryable())
+}
+
+func TestAPIError(t *testing.T) {
+	err429 := &APIError{StatusCode: 429, Message: "rate limited"}
+	assert.Equal(t, "tavily API returned status 429: rate limited", err429.Error())
+	assert.True(t, err429.IsRetryable())
+
+	err500 := &APIError{StatusCode: 500, Message: "server error"}
+	assert.True(t, err500.IsRetryable())
+
+	err401 := &APIError{StatusCode: 401, Message: "unauthorized"}
+	assert.False(t, err401.IsRetryable())
+
+	err400 := &APIError{StatusCode: 400, Message: "bad request"}
+	assert.False(t, err400.IsRetryable())
 }

@@ -349,3 +349,24 @@ func TestDimensionMismatchGracefulFallback(t *testing.T) {
 	require.NotEmpty(t, hits, "search should return results via graceful fallback")
 	assert.Contains(t, hits[0].Content, "Kubernetes")
 }
+
+func TestManager_GetDB_AutoVacuumIncremental(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &config.Config{
+		DataDir:        tempDir,
+		EmbeddingModel: "none",
+	}
+	manager := NewManager(cfg, nil)
+	defer func() { _ = manager.Close() }()
+
+	ctx := context.Background()
+	cortexDB, err := manager.GetDB(ctx, "townhall", false)
+	require.NoError(t, err)
+	require.NotNil(t, cortexDB)
+
+	var autoVac int
+	err = cortexDB.SQL().QueryRowContext(ctx, "PRAGMA auto_vacuum;").Scan(&autoVac)
+	require.NoError(t, err)
+	assert.Equal(t, 2, autoVac, "new chat database must be created with auto_vacuum = INCREMENTAL (2)")
+}
+

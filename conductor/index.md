@@ -38,3 +38,8 @@
 - [x] **Track: S3 Encrypted Database Backup & Restore**
 *Link: [./tracks/db-backup_20260831/](./tracks/db-backup_20260831/)*
 
+---
+
+- [x] **Track: Durable FSM for Simple Tool Loops & Agentic Workflows**
+*Link: [./tracks/durable-fsm_20260913/](./tracks/durable-fsm_20260913/)*
+

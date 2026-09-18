@@ -10,6 +10,7 @@ Bob is an autonomous AI agent service designed for the [Besedka](https://github.
 - **Prompt Rendering:** Contextual system prompt formatting for Townhall and DM interactions (`internal/prompt`).
 - **GEOIP Location Reporting:** Periodic server location lookup using round-robin querying across public GEOIP providers (`ip-api.com`, `ipapi.co`, `ipinfo.io`) and periodic WebSocket location frame transmission (`internal/geoip`).
 - **LLM Provider:** OpenAI-compatible API client (`internal/llm`) with exponential retry backoff, embedding generation, and tool/function support.
+- **Durable FSM & Resilient Tool Loop:** SQLite-backed finite state machine (`internal/fsm`) for executing tool loops with channel-specific iteration budgets (10 in Townhall, 20 in DMs), parallel read-only dispatch, sequential mutating dispatch, per-step timeouts, exponential backoff retries, delayed transitions (`resume_at`), startup crash recovery, and automated retention pruning with incremental vacuuming.
 
 ## Coding Style
 
@@ -38,7 +39,7 @@ Bob is an autonomous AI agent service designed for the [Besedka](https://github.
    - `BESEDKA_URL`: `http://127.0.0.1:8080`
    - `BESEDKA_API_KEY`: API key or bot session token
    - `OPENAI_API_KEY` (or `GEMINI_API_KEY`): LLM provider API key
-   - `OPENAI_MODEL` / `GEMINI_MODEL`: Model identifier (default: `gemini-3.7-flash`)
+   - `OPENAI_MODEL` / `GEMINI_MODEL`: Model identifier
    - `BOT_HANDLE`: Bot username mention handle (default: `@bot`)
 3. Run the service:
    ```bash

@@ -18,6 +18,7 @@ import (
 
 	"bob/internal/backup"
 	"bob/internal/objectstore"
+	"bob/internal/store"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -37,7 +38,7 @@ func TestServiceDatabaseLifecycle(t *testing.T) {
 	buildOut, err := buildCmd.CombinedOutput()
 	require.NoError(t, err, "failed to build agent binary: %s", string(buildOut))
 
-	t.Run("Fresh start with no db creates db at v1", func(t *testing.T) {
+	t.Run("Fresh start with no db creates db at current version", func(t *testing.T) {
 		dataDir := filepath.Join(t.TempDir(), "data")
 		dbFile := filepath.Join(dataDir, "bob.db")
 		assert.NoFileExists(t, dbFile)
@@ -50,6 +51,7 @@ func TestServiceDatabaseLifecycle(t *testing.T) {
 			"DATA_DIR="+dataDir,
 			"BESEDKA_URL=http://127.0.0.1:59999", // Unused port, won't connect
 			"OPENAI_API_KEY=test-key",
+			"OPENAI_MODEL=test-model",
 			"EMBEDDING_MODEL=test-model",
 		)
 		out, _ := cmd.CombinedOutput()
@@ -67,7 +69,7 @@ func TestServiceDatabaseLifecycle(t *testing.T) {
 		var v int
 		err = db.QueryRow("select version from schema_version where is_current=1").Scan(&v)
 		require.NoError(t, err)
-		assert.Equal(t, 1, v)
+		assert.Equal(t, store.CurrentVersion(), v)
 	})
 
 	t.Run("Start with db at v-2 fails startup with version mismatch", func(t *testing.T) {
@@ -98,6 +100,7 @@ insert into schema_version(version, description, is_current) values(-1, 'ancient
 			"DATA_DIR="+dataDir,
 			"BESEDKA_URL=http://127.0.0.1:59999",
 			"OPENAI_API_KEY=test-key",
+			"OPENAI_MODEL=test-model",
 			"EMBEDDING_MODEL=test-model",
 		)
 		out, err := cmd.CombinedOutput()
@@ -157,6 +160,7 @@ insert into schema_version(version, description, is_current) values(-1, 'ancient
 		cmd.Env = append(os.Environ(),
 			"BESEDKA_URL=http://127.0.0.1:59999",
 			"OPENAI_API_KEY=test-key",
+			"OPENAI_MODEL=test-model",
 			"EMBEDDING_MODEL=",
 		)
 		out, err := cmd.CombinedOutput()
@@ -329,6 +333,7 @@ insert into schema_version(version, description, is_current) values(-1, 'ancient
 			"BESEDKA_URL=http://127.0.0.1:59999",
 			"SECRET="+secret,
 			"OPENAI_API_KEY=test-key",
+			"OPENAI_MODEL=test-model",
 			"EMBEDDING_MODEL=test-model",
 			"S3_ENDPOINT="+srv.URL,
 			"S3_BUCKET=testbucket",
@@ -367,6 +372,7 @@ insert into schema_version(version, description, is_current) values(-1, 'ancient
 			"BESEDKA_URL=http://127.0.0.1:59999",
 			"SECRET=secret",
 			"OPENAI_API_KEY=test-key",
+			"OPENAI_MODEL=test-model",
 			"EMBEDDING_MODEL=test-model",
 			"S3_ENDPOINT=http://127.0.0.1:59998",
 			"S3_BUCKET=testbucket",
