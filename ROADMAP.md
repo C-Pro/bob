@@ -21,12 +21,14 @@ To query long historical conversations without filling up the context window:
 
 \+-----------------------------------------------------------------------------------+  
 |                               PHASED ARCHITECTURE                                 |  
-\+-----------------------------------------------------------------------------------+  
-| \[Phases 1-3\] Core Bot, Besedka API, Task Buffer, Retrieval, Tool Engine          |  
-| \[Phases 4-6\] Docker Sandbox, Trajectory Exporter, Durable FSM Scheduler          |  
-| \[Phases 7-10\] Open-Weights Inference, PESO Python Pipeline, Validation, Reloading  |  
-| \[Phase 11\]  Autonomous "Dreaming", Game Sandboxes, RPE Curiosity Engine       |  
-\+-----------------------------------------------------------------------------------+
++-----------------------------------------------------------------------------------+  
+| [Phases 1-3] Core Bot, Besedka API, Task Buffer, Retrieval, Tool Engine          |  
+| [Phases 4-6] Docker Sandbox, Trajectory Exporter, Durable FSM Scheduler          |  
+| [Phases 7-10] Open-Weights Inference, PESO Python Pipeline, Validation, Reloading  |  
+| [Phase 11]  Autonomous "Dreaming", Game Sandboxes, RPE Curiosity Engine          |  
+| [Phases 12-16] Skills, Knowledge RAG, User Preferences, Ephemeral Progress,      |  
+|                Adaptive Agentic Planning & Supervised Execution Harness          |  
++-----------------------------------------------------------------------------------+
 
 ### **Phase 1: Simple Request/Response Agent & Besedka Gateway**
 
@@ -147,5 +149,37 @@ Support first-class transient / ephemeral notification messages in the chat prot
 * **Storage Exclusion:** Besedka server displays progress and status frames in the active chat UI for real-time human feedback, but excludes them from persistent database storage tables.
 * **Memory Ingress Cleanliness:** Eliminates the need for client-side message prefixes (`⏳ `) and in-memory tracking caches (`recentProgress`) in Bob, ensuring historical backfill, warmup, and sequence catch-up operations never ingest transient progress messages into chat context or long-term CortexDB memory.
 * **Agent Integration:** Update Bob's `ProgressReporter` to transmit native ephemeral frames directly.
+
+### **Phase 16: Adaptive Agentic Planning, Execution & Supervised Reflection Harness**
+
+Empower Bob to evaluate incoming task complexity and dynamically choose between the fast, standard tool loop and an isolated, deep agentic planning, execution, and validation workflow:
+
+* **Dual-Path Execution Architecture (Adaptive Routing):**
+  * **Fast / Direct Path (Standard Tool Loop):** For simple, low-iteration requests that do not require multi-step planning or validation (e.g. direct Q&A, simple information lookup, or straightforward unambiguous instructions completable in $\le 5$ tool steps). The agent proceeds with the standard tool loop bounded by a configurable iteration cap $N_{\text{max}}$ (differentiated by channel context: e.g. lower iteration cap in public Townhall chats to prevent chat spam and context bloat, up to 20 in DMs).
+  * **Deep Agentic Path (DM-Exclusive Tool):** When the agent assesses a request as complex (e.g. multi-step refactoring, multi-file code modifications, research requiring verification, or complex problem-solving), it generates a focused task prompt and invokes a specialized agentic workflow tool (`run_agentic_workflow`). This tool is strictly restricted to 1-on-1 Direct Messages (DMs) and excluded from Townhall to safeguard shared channels.
+
+* **Isolated Read-Only Planning Cycle:**
+  * **Fresh Context Initialization:** The agentic workflow tool spins up a dedicated tool loop cycle in a completely fresh, isolated conversation context, eliminating prompt and context contamination from parent chat history.
+  * **Read-Only Tool Access:** The planning cycle is strictly constrained to non-mutating, read-only tools (e.g. web search, web fetch, reading files/directories, memory recall). Mutating tools (sandbox execution, file writing) are excluded.
+  * **Recursion Guard:** The agentic workflow tool itself is omitted from the planning cycle's tool definitions, completely preventing recursive planning loops.
+  * **Structured Plan Formulation:** Generates an actionable, step-by-step execution roadmap with explicit validation criteria and expected intermediate milestones.
+
+* **Guided Execution, Validation & Reporting:**
+  * **Plan Execution:** Following plan generation, the agentic execution loop follows the planned steps sequentially, utilizing full mutating tool capabilities (e.g. sandbox commands, file writing) authorized for the DM session.
+  * **Plan Validation:** After executing the planned steps, the agent validates the results against the plan's acceptance criteria (e.g. running test suites, verifying file outputs, checking exit statuses).
+  * **Validation Outcomes & Remediation:**
+    * *On Validation Failure:* The agent analyzes the failure, generates structured fix recommendations, and diagnoses the root cause.
+    * *On Validation Success:* The agentic loop generates a comprehensive summary report detailing what was accomplished.
+  * **Return Value:** Returns the final report or remediation recommendations to the parent conversation context.
+
+* **Supervisor Reflection Agents (Anti-Loop Watchdogs):**
+  * **Periodic Progress Auditing:** An independent reflection agent runs periodically out-of-band (triggered by an iteration count threshold, e.g. every $K$ iterations, or a background time ticker) to audit the agentic loop's ongoing trajectory.
+  * **Pathology & Drift Detection:** Evaluates recent actions, tool arguments, and intermediate thought outputs to detect if the main agent has entered a recursive loop, repeated redundant actions, or strayed from the original plan/task.
+  * **Authoritative Termination:** The reflection agent is equipped with a dedicated control tool (`terminate_agentic_workflow`) that aborts runaway execution, marks the agentic workflow as unsuccessful, and logs diagnostic reasons for the termination.
+
+* **Tool Resilience (Timeouts & Retries):**
+  * **Granular Tool Timeouts:** Enforce explicit execution deadlines per tool call and per overall workflow using Go `context.WithTimeout`, ensuring slow, hung, or frozen tool invocations fail fast.
+  * **Automated Transient Retries:** Implement automated retry policies with exponential backoff and jitter for transient errors (e.g. temporary network drops, upstream rate limits / HTTP 429s, 503 service outages), while immediately surfacing non-retryable deterministic errors.
+
 
 

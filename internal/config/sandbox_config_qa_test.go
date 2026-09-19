@@ -14,6 +14,7 @@ func TestSandboxConfig_BoundaryValidation(t *testing.T) {
 	baseCfg := func() *Config {
 		return &Config{
 			OpenAIAPIKey:               "test-key",
+			OpenAIModel:                "test-model",
 			BesedkaURL:                 "http://127.0.0.1:8080",
 			TownhallMaxParagraphs:      2,
 			DMMaxParagraphs:            10,

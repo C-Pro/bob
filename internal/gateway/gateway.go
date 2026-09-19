@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -19,6 +20,7 @@ import (
 
 	"bob/internal/chatcontext"
 	"bob/internal/config"
+	"bob/internal/fsm"
 	"bob/internal/llm"
 	"bob/internal/memory"
 	"bob/internal/models"
@@ -40,6 +42,7 @@ type Gateway struct {
 	llmClient            *llm.Client
 	httpClient           *http.Client
 	toolsRegistry        *tools.Registry
+	fsmEngine            *fsm.Engine
 	memoryManager        *memory.Manager
 	sandboxManager       *sandbox.Manager
 	conn                 *websocket.Conn
@@ -132,11 +135,94 @@ func (g *Gateway) SetMemoryManager(m *memory.Manager) {
 	g.memoryManager = m
 }
 
+// ToolsRegistry returns the Gateway's tools Registry.
+func (g *Gateway) ToolsRegistry() *tools.Registry {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.toolsRegistry
+}
+
 // SetToolsRegistry sets the tool registry for the gateway.
 func (g *Gateway) SetToolsRegistry(r *tools.Registry) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.toolsRegistry = r
+	if g.fsmEngine != nil {
+		g.fsmEngine.SetToolDefinitionProvider(g)
+	}
+}
+
+// FSMEngine returns the Gateway's durable FSM Engine.
+func (g *Gateway) FSMEngine() *fsm.Engine {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.fsmEngine
+}
+
+// SetFSMEngine sets the durable FSM Engine for the gateway and configures it with the gateway ResultSink and ToolDefinitionProvider.
+func (g *Gateway) SetFSMEngine(e *fsm.Engine) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.fsmEngine = e
+	if e != nil {
+		e.SetResultSink(g)
+		e.SetToolDefinitionProvider(g)
+	}
+}
+
+// ToolDefinitions implements fsm.ToolDefinitionProvider to supply tool definitions for a chat.
+func (g *Gateway) ToolDefinitions(ctx context.Context, chatID string, isDM bool) []openai.Tool {
+	g.mu.Lock()
+	r := g.toolsRegistry
+	g.mu.Unlock()
+	if r == nil {
+		return nil
+	}
+	return r.ToolDefinitionsForSession(tools.ChatSessionContext{
+		ChatID: chatID,
+		IsDM:   isDM,
+	})
+}
+
+// Deliver implements fsm.ResultSink to deliver completed or failed workflow results out-of-band.
+func (g *Gateway) Deliver(ctx context.Context, run *fsm.FSMRun) error {
+	if run == nil || run.ChatID == "" {
+		return nil
+	}
+	var reply string
+	switch run.Status {
+	case fsm.RunStatusCompleted:
+		reply = run.ResultJSON
+	case fsm.RunStatusFailed, fsm.RunStatusTerminated:
+		reply = "Sorry, I encountered an issue processing your request. Please try again later."
+	default:
+		return nil
+	}
+
+	if reply == "" {
+		return nil
+	}
+
+	formattedReply := FormatResponse(reply, run.IsDM, g.cfg.TownhallMaxParagraphs, g.cfg.DMMaxParagraphs)
+	if err := g.SendMessage(run.ChatID, formattedReply); err != nil {
+		return fmt.Errorf("failed to deliver recovered reply to chat %s: %w", run.ChatID, err)
+	}
+
+	botID := g.botUserID
+	botName := g.botUser.GetDisplayName()
+	if botName == "" {
+		botName = "Bob"
+	}
+
+	g.contextManager.Push(run.ChatID, chatcontext.Entry{
+		Role:       "assistant",
+		SenderID:   botID,
+		SenderName: botName,
+		Content:    formattedReply,
+		Timestamp:  time.Now().Unix(),
+	})
+
+	return nil
 }
 
 // SandboxManager returns the Gateway's sandbox Manager.
@@ -935,13 +1021,64 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 	var err error
 	if toolsRegistry != nil && len(toolDefs) > 0 {
 		toolCtx := tools.WithChatSession(ctx, sessionCtx)
-		reply, err = g.llmClient.GenerateChatResponseWithToolLoop(
-			toolCtx,
-			llmMsgs,
-			toolDefs,
-			toolsRegistry,
-			20,
-		)
+		maxIterations := g.cfg.TownhallToolMaxIterations
+		if isDM {
+			maxIterations = g.cfg.DMToolMaxIterations
+		}
+
+		g.mu.Lock()
+		fsmEng := g.fsmEngine
+		g.mu.Unlock()
+
+		if fsmEng != nil {
+			fsmReq := fsm.ToolLoopRequest{
+				ChatID:        msg.ChatID,
+				UserID:        msg.UserID,
+				IsDM:          isDM,
+				Model:         g.cfg.OpenAIModel,
+				Messages:      llmMsgs,
+				Tools:         toolDefs,
+				MaxIterations: maxIterations,
+				OnTransition: func(state fsm.RunState, run *fsm.FSMRun) {
+					switch state {
+					case fsm.StateLLMRequest:
+						progress.SetCurrent("Thinking")
+					case fsm.StatePrepareSteps, fsm.StateExecuteSteps:
+						progress.SetCurrent("Executing tools")
+					case fsm.StateWaiting:
+						progress.SetCurrent("Waiting")
+					case fsm.StateSynthesis:
+						progress.SetCurrent("Synthesizing response")
+					}
+				},
+			}
+			var res *fsm.ToolLoopResult
+			res, err = fsmEng.RunToolLoop(toolCtx, fsmReq)
+			if err != nil {
+				if toolCtx.Err() != nil {
+					// Context was cancelled or timed out; do not fall back
+				} else {
+					slog.Error("fsm tool loop failed, falling back to volatile loop", "chat_id", msg.ChatID, "error", err)
+					reply, err = g.llmClient.GenerateChatResponseWithToolLoop(
+						toolCtx,
+						llmMsgs,
+						toolDefs,
+						toolsRegistry,
+						maxIterations,
+					)
+				}
+			} else if res != nil {
+				reply = res.Content
+			}
+		} else {
+			reply, err = g.llmClient.GenerateChatResponseWithToolLoop(
+				toolCtx,
+				llmMsgs,
+				toolDefs,
+				toolsRegistry,
+				maxIterations,
+			)
+		}
 	} else {
 		reply, err = g.llmClient.GenerateChatResponse(ctx, llmMsgs)
 	}
@@ -996,7 +1133,20 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 func (g *Gateway) Start(ctx context.Context) error {
 	g.mu.Lock()
 	g.running = true
+	fsmEng := g.fsmEngine
 	g.mu.Unlock()
+
+	// Start FSM engine background poller and recover interrupted runs
+	if fsmEng != nil {
+		if err := fsmEng.Start(ctx); err != nil {
+			slog.Error("failed to start fsm engine", "error", err)
+		}
+	}
+
+	// Start periodic maintenance ticker (FSM retention pruning and vacuum)
+	maintenanceDone := make(chan struct{})
+	go g.startMaintenanceLoop(ctx, maintenanceDone)
+	defer close(maintenanceDone)
 
 	// Initial context warmup on startup
 	if err := g.WarmupContext(ctx); err != nil {
@@ -1166,7 +1316,12 @@ func (g *Gateway) Stop() {
 		}
 		g.conn = nil
 	}
+	fsmEng := g.fsmEngine
 	g.mu.Unlock()
+
+	if fsmEng != nil {
+		fsmEng.Stop()
+	}
 
 	g.indexingWg.Wait()
 
@@ -1180,6 +1335,86 @@ func (g *Gateway) Stop() {
 	if g.sandboxManager != nil {
 		if err := g.sandboxManager.Close(); err != nil {
 			slog.Warn("error closing sandbox manager on gateway stop", "error", err)
+		}
+	}
+}
+
+func (g *Gateway) startMaintenanceLoop(ctx context.Context, done chan struct{}) {
+	// Run initial maintenance pass after a short startup delay
+	select {
+	case <-ctx.Done():
+		return
+	case <-done:
+		return
+	case <-time.After(30 * time.Second):
+		g.RunMaintenance(ctx)
+	}
+
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+			return
+		case <-ticker.C:
+			g.RunMaintenance(ctx)
+		}
+	}
+}
+
+// RunMaintenance performs periodic maintenance tasks across all active chat databases,
+// including pruning expired terminal FSM runs and reclaiming database pages via incremental vacuum.
+func (g *Gateway) RunMaintenance(ctx context.Context) {
+	g.mu.Lock()
+	memMgr := g.memoryManager
+	cfg := g.cfg
+	g.mu.Unlock()
+
+	if memMgr == nil || cfg == nil {
+		return
+	}
+
+	// Discover on-disk chat databases in dataDir to ensure they are loaded in memoryManager
+	if cfg.DataDir != "" {
+		entries, err := os.ReadDir(cfg.DataDir)
+		if err != nil && !os.IsNotExist(err) {
+			slog.Warn("failed to read data directory during maintenance", "dataDir", cfg.DataDir, "error", err)
+		} else if err == nil {
+			for _, entry := range entries {
+				if entry.IsDir() {
+					continue
+				}
+				name := entry.Name()
+				if name == "townhall.db" {
+					if _, err := memMgr.GetDB(ctx, "townhall", false); err != nil {
+						slog.Warn("failed to open townhall.db for maintenance", "error", err)
+					}
+				} else if strings.HasPrefix(name, "dm_") && strings.HasSuffix(name, ".db") {
+					chatID := strings.TrimSuffix(strings.TrimPrefix(name, "dm_"), ".db")
+					if _, err := memMgr.GetDB(ctx, chatID, true); err != nil {
+						slog.Warn("failed to open dm db for maintenance", "chatID", chatID, "error", err)
+					}
+				}
+			}
+		}
+	}
+
+	activeDBs := memMgr.ActiveDBs()
+	retentionDays := cfg.FSMRetentionDays
+	if retentionDays <= 0 {
+		retentionDays = 7
+	}
+
+	for name, rawDB := range activeDBs {
+		rm := fsm.NewRetentionManager(rawDB, retentionDays)
+		pruned, err := rm.PruneAndCompact(ctx)
+		if err != nil {
+			slog.Warn("fsm retention maintenance failed", "db", name, "error", err)
+		} else if pruned > 0 {
+			slog.Info("fsm retention maintenance completed", "db", name, "pruned", pruned)
 		}
 	}
 }

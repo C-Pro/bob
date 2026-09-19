@@ -43,6 +43,21 @@ func NewClient(apiKey, baseURL string, httpClient *http.Client) *Client {
 	}
 }
 
+// APIError represents an HTTP error response from the Tavily API.
+type APIError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("tavily API returned status %d: %s", e.StatusCode, e.Message)
+}
+
+// IsRetryable reports whether this API status code is temporary and eligible for retry.
+func (e *APIError) IsRetryable() bool {
+	return isRetryableStatus(e.StatusCode)
+}
+
 // isRetryableStatus checks if an HTTP response status code indicates a temporary failure.
 func isRetryableStatus(statusCode int) bool {
 	return statusCode == http.StatusTooManyRequests || statusCode >= 500
@@ -134,7 +149,10 @@ func (c *Client) Search(ctx context.Context, req SearchRequest) (*SearchResponse
 			return &searchResp, nil
 		}
 
-		lastErr = fmt.Errorf("tavily API returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		lastErr = &APIError{
+			StatusCode: resp.StatusCode,
+			Message:    strings.TrimSpace(string(respBody)),
+		}
 		if !isRetryableStatus(resp.StatusCode) {
 			return nil, lastErr
 		}
@@ -216,7 +234,10 @@ func (c *Client) Extract(ctx context.Context, urls ...string) (*ExtractResponse,
 			return &extractResp, nil
 		}
 
-		lastErr = fmt.Errorf("tavily API returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		lastErr = &APIError{
+			StatusCode: resp.StatusCode,
+			Message:    strings.TrimSpace(string(respBody)),
+		}
 		if !isRetryableStatus(resp.StatusCode) {
 			return nil, lastErr
 		}

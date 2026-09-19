@@ -14,7 +14,7 @@
 - **Endpoint Protocol:** OpenAI-compatible REST API (`/v1/chat/completions`) with multimodal image support (`MultiContent` / `ChatMessagePartTypeImageURL`)
 - **Client Library:** `github.com/sashabaranov/go-openai` (built-in support for tool/function definitions)
 - **Primary Provider Target (Phase 1):** Google Gemini OpenAI-compatible REST API (`https://generativelanguage.googleapis.com/v1beta/openai/`)
-- **Default Model:** `gemini-3.7-flash` (configurable via `OPENAI_MODEL` / `GEMINI_MODEL`)
+- **Model:** Configured via `OPENAI_MODEL` / `GEMINI_MODEL`
 - **Configurability:** Standard OpenAI environment variables (`OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_BASE_URL`) with backward-compatible fallback for `GEMINI_*` env vars.
 - **Future Readiness:** Compatible with local open-weights inference servers (vLLM / SGLang) running local models in future phases.
 

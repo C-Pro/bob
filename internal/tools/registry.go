@@ -294,6 +294,14 @@ func (r *Registry) ToolDefinitionsForSession(session ChatSessionContext) []opena
 	return r.toolDefinitions
 }
 
+// ToolDefinitionsForChat returns tool definitions for a given chat session context.
+func (r *Registry) ToolDefinitionsForChat(ctx context.Context, chatID string, isDM bool) []openai.Tool {
+	return r.ToolDefinitionsForSession(ChatSessionContext{
+		ChatID: chatID,
+		IsDM:   isDM,
+	})
+}
+
 // WebSearchArgs defines arguments for the web_search tool.
 type WebSearchArgs struct {
 	Query       string `json:"query"`
@@ -417,17 +425,17 @@ func (r *Registry) executeRecallMemory(ctx context.Context, argsJSON string) (st
 
 func (r *Registry) executeWebSearch(ctx context.Context, argsJSON string) (string, error) {
 	if r.tavilyClient == nil {
-		return "", errors.New("tavily client is not configured")
+		return "", ClassifyWebSearchError(errors.New("tavily client is not configured"))
 	}
 
 	var args WebSearchArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return "", fmt.Errorf("failed to parse arguments: %w", err)
+		return "", ClassifyWebSearchError(fmt.Errorf("failed to parse arguments: %w", err))
 	}
 
 	args.Query = strings.TrimSpace(args.Query)
 	if args.Query == "" {
-		return "", errors.New("query cannot be empty")
+		return "", ClassifyWebSearchError(errors.New("query cannot be empty"))
 	}
 
 	req := tavily.SearchRequest{
@@ -439,7 +447,7 @@ func (r *Registry) executeWebSearch(ctx context.Context, argsJSON string) (strin
 
 	resp, err := r.tavilyClient.Search(ctx, req)
 	if err != nil {
-		return "", fmt.Errorf("search error: %w", err)
+		return "", ClassifyWebSearchError(fmt.Errorf("search error: %w", err))
 	}
 
 	payload := map[string]interface{}{
@@ -451,7 +459,7 @@ func (r *Registry) executeWebSearch(ctx context.Context, argsJSON string) (strin
 
 	respBytes, err := json.Marshal(payload)
 	if err != nil {
-		return "", fmt.Errorf("failed to format search response: %w", err)
+		return "", ClassifyWebSearchError(fmt.Errorf("failed to format search response: %w", err))
 	}
 
 	return string(respBytes), nil
@@ -460,12 +468,12 @@ func (r *Registry) executeWebSearch(ctx context.Context, argsJSON string) (strin
 func (r *Registry) executeWebFetch(ctx context.Context, argsJSON string) (string, error) {
 	var args WebFetchArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return "", fmt.Errorf("failed to parse arguments: %w", err)
+		return "", ClassifyWebFetchError(fmt.Errorf("failed to parse arguments: %w", err))
 	}
 
 	args.URL = strings.TrimSpace(args.URL)
 	if args.URL == "" {
-		return "", errors.New("url cannot be empty")
+		return "", ClassifyWebFetchError(errors.New("url cannot be empty"))
 	}
 
 	mode := strings.ToLower(strings.TrimSpace(args.Mode))
@@ -481,25 +489,25 @@ func (r *Registry) executeWebFetch(ctx context.Context, argsJSON string) (string
 	case "auto":
 		return r.executeFetchAutoMode(ctx, args.URL)
 	default:
-		return "", fmt.Errorf("invalid mode %q: supported modes are 'auto', 'raw', and 'extract'", mode)
+		return "", ClassifyWebFetchError(fmt.Errorf("invalid mode %q: supported modes are 'auto', 'raw', and 'extract'", mode))
 	}
 }
 
 func (r *Registry) executeFetchExtractMode(ctx context.Context, targetURL string) (string, error) {
 	if r.tavilyClient == nil {
-		return "", errors.New("tavily client is not configured for extract mode")
+		return "", ClassifyWebFetchError(errors.New("tavily client is not configured for extract mode"))
 	}
 
 	resp, err := r.tavilyClient.Extract(ctx, targetURL)
 	if err != nil {
-		return "", fmt.Errorf("extract error: %w", err)
+		return "", ClassifyWebFetchError(fmt.Errorf("extract error: %w", err))
 	}
 
 	if len(resp.Results) == 0 {
 		if len(resp.FailedResults) > 0 {
-			return "", fmt.Errorf("extract failed for url %s: %s", resp.FailedResults[0].URL, resp.FailedResults[0].Error)
+			return "", ClassifyWebFetchError(fmt.Errorf("extract failed for url %s: %s", resp.FailedResults[0].URL, resp.FailedResults[0].Error))
 		}
-		return "", fmt.Errorf("no content extracted from %s", targetURL)
+		return "", ClassifyWebFetchError(fmt.Errorf("no content extracted from %s", targetURL))
 	}
 
 	res := resp.Results[0]
@@ -513,7 +521,7 @@ func (r *Registry) executeFetchExtractMode(ctx context.Context, targetURL string
 
 	respBytes, err := json.Marshal(payload)
 	if err != nil {
-		return "", fmt.Errorf("failed to format extract response: %w", err)
+		return "", ClassifyWebFetchError(fmt.Errorf("failed to format extract response: %w", err))
 	}
 	return string(respBytes), nil
 }
@@ -521,7 +529,7 @@ func (r *Registry) executeFetchExtractMode(ctx context.Context, targetURL string
 func (r *Registry) executeFetchRawMode(ctx context.Context, targetURL string) (string, error) {
 	fetchRes, err := webfetch.Fetch(ctx, targetURL, nil)
 	if err != nil {
-		return "", fmt.Errorf("fetch error: %w", err)
+		return "", ClassifyWebFetchError(fmt.Errorf("fetch error: %w", err))
 	}
 
 	truncatedContent := webfetch.TruncateText(string(fetchRes.RawBody), fetchRes.Truncated)
@@ -536,7 +544,7 @@ func (r *Registry) executeFetchRawMode(ctx context.Context, targetURL string) (s
 
 	respBytes, err := json.Marshal(payload)
 	if err != nil {
-		return "", fmt.Errorf("failed to format raw fetch response: %w", err)
+		return "", ClassifyWebFetchError(fmt.Errorf("failed to format raw fetch response: %w", err))
 	}
 	return string(respBytes), nil
 }
@@ -551,7 +559,7 @@ func (r *Registry) executeFetchAutoMode(ctx context.Context, targetURL string) (
 				return extractPayload, nil
 			}
 		}
-		return "", fmt.Errorf("fetch error: %w", fetchErr)
+		return "", ClassifyWebFetchError(fmt.Errorf("fetch error: %w", fetchErr))
 	}
 
 	if webfetch.IsBinary(fetchRes.ContentType) {

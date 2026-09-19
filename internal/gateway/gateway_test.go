@@ -15,6 +15,7 @@ import (
 
 	"bob/internal/chatcontext"
 	"bob/internal/config"
+	"bob/internal/fsm"
 	"bob/internal/llm"
 	"bob/internal/memory"
 	"bob/internal/models"
@@ -2709,3 +2710,80 @@ recvLoop:
 	assert.Contains(t, received[0].Content, "Sandbox Approval Requested")
 	assert.NotContains(t, received[0].Content, "I have created the sandbox request. Please approve")
 }
+
+func TestGateway_DeliverFSMResult(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	receivedMsgs := make(chan models.ClientMessage, 10)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/chat" {
+			upgrader := websocket.Upgrader{}
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer func() { _ = conn.Close() }()
+			for {
+				var msg models.ClientMessage
+				if err := conn.ReadJSON(&msg); err != nil {
+					return
+				}
+				receivedMsgs <- msg
+			}
+		}
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{
+		BesedkaURL: srv.URL,
+	}
+	gw := NewGateway(cfg, nil)
+	defer gw.Stop()
+
+	require.NoError(t, gw.DialWebSocket(ctx))
+
+	run := &fsm.FSMRun{
+		ID:         "run_recovered_123",
+		ChatID:     "townhall",
+		UserID:     "user1",
+		Status:     fsm.RunStatusCompleted,
+		ResultJSON: "Recovered message answer",
+	}
+
+	err := gw.Deliver(ctx, run)
+	require.NoError(t, err)
+
+	select {
+	case msg := <-receivedMsgs:
+		assert.Equal(t, "townhall", msg.ChatID)
+		assert.Equal(t, "Recovered message answer", msg.Content)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for delivered message")
+	}
+
+	entries := gw.contextManager.GetOrCreate("townhall").Entries()
+	require.NotEmpty(t, entries)
+	assert.Equal(t, "Recovered message answer", entries[len(entries)-1].Content)
+
+	// Test delivery of a failed run
+	failedRun := &fsm.FSMRun{
+		ID:        "run_failed_123",
+		ChatID:    "townhall",
+		UserID:    "user1",
+		Status:    fsm.RunStatusFailed,
+		ErrorText: "some LLM failure",
+	}
+	err = gw.Deliver(ctx, failedRun)
+	require.NoError(t, err)
+
+	select {
+	case msg := <-receivedMsgs:
+		assert.Equal(t, "townhall", msg.ChatID)
+		assert.Contains(t, msg.Content, "Sorry, I encountered an issue")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for delivered failed message")
+	}
+}
+
+

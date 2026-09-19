@@ -141,6 +141,16 @@ func (m *Manager) GetDB(ctx context.Context, chatID string, isDM bool) (*cortexd
 		return nil, fmt.Errorf("failed to create data dir: %w", err)
 	}
 
+	// Pre-initialize new chat databases with auto_vacuum=INCREMENTAL and WAL
+	// before cortexdb creates its internal tables, so space reclamation works.
+	if stat, err := os.Stat(path); os.IsNotExist(err) || (err == nil && stat.Size() == 0) {
+		initDSN := fmt.Sprintf("file:%s?_auto_vacuum=INCREMENTAL&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)", path)
+		if preDB, err := sql.Open("sqlite", initDSN); err == nil {
+			_ = preDB.Ping()
+			_ = preDB.Close()
+		}
+	}
+
 	opts := make([]cortexdb.Option, 0, 1)
 	if m.embedder != nil {
 		opts = append(opts, cortexdb.WithEmbedder(m.embedder))
