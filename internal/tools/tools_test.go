@@ -534,6 +534,48 @@ func TestSandboxToolDefinitionsScope(t *testing.T) {
 	assert.Contains(t, names, "sandbox_request")
 	assert.Contains(t, names, "sandbox_exec")
 	assert.Contains(t, names, "sandbox_destroy")
+
+	// When user has an active running sandbox, sandbox_request is filtered out
+	_, err := sandboxMgr.RequestSandbox(context.Background(), "active_user", "chat_dm", sandbox.RequestParams{
+		Driver:      sandbox.DriverBwrap,
+		NetworkMode: sandbox.NetworkNone,
+	})
+	require.NoError(t, err)
+	_, err = sandboxMgr.ApproveSandbox(context.Background(), "active_user")
+	require.NoError(t, err)
+
+	activeDMTools := reg.ToolDefinitionsForSession(ChatSessionContext{IsDM: true, UserID: "active_user"})
+	assert.Equal(t, len(dmTools)-1, len(activeDMTools))
+
+	activeNames := make([]string, len(activeDMTools))
+	for i, tool := range activeDMTools {
+		activeNames[i] = tool.Function.Name
+	}
+	assert.NotContains(t, activeNames, "sandbox_request")
+	assert.Contains(t, activeNames, "sandbox_exec")
+	assert.Contains(t, activeNames, "sandbox_destroy")
+
+	// ToolDefinitionsForChat preserves UserID when passed in context (e.g. from persistent FSM runCtx)
+	runCtx := WithChatSession(context.Background(), ChatSessionContext{
+		ChatID: "chat_dm",
+		UserID: "active_user",
+		IsDM:   true,
+	})
+	fsmTools := reg.ToolDefinitionsForChat(runCtx, "chat_dm", true)
+	fsmNames := make([]string, len(fsmTools))
+	for i, tool := range fsmTools {
+		fsmNames[i] = tool.Function.Name
+	}
+	assert.NotContains(t, fsmNames, "sandbox_request")
+	assert.Contains(t, fsmNames, "sandbox_exec")
+
+	// Another user without active sandbox should still have sandbox_request available
+	otherUserTools := reg.ToolDefinitionsForSession(ChatSessionContext{IsDM: true, UserID: "other_user"})
+	otherNames := make([]string, len(otherUserTools))
+	for i, tool := range otherUserTools {
+		otherNames[i] = tool.Function.Name
+	}
+	assert.Contains(t, otherNames, "sandbox_request")
 }
 
 func TestSandboxToolExecution(t *testing.T) {

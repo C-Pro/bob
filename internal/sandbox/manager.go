@@ -146,7 +146,7 @@ func (m *Manager) RequestSandbox(ctx context.Context, userID, chatID string, par
 		if existing.GetStatus() == StatusRunning {
 			if time.Now().Before(existing.ExpiresAt) {
 				m.mu.Unlock()
-				return nil, errors.New("you already have a running sandbox; destroy it first with /sandbox destroy")
+				return nil, errors.New("user already has an active sandbox; execute commands using sandbox_exec")
 			}
 			toDestroy = existing
 			destroyDriver = m.drivers[existing.Driver]
@@ -374,7 +374,19 @@ func (m *Manager) Exec(ctx context.Context, userID string, cmd []string, request
 		execTimeout = m.cfg.MaxExecTimeout
 	}
 
-	return driver.Exec(ctx, sbx, cmd, execTimeout)
+	res, err := driver.Exec(ctx, sbx, cmd, execTimeout)
+	if err != nil {
+		errStr := err.Error()
+		if errors.Is(err, ErrContainerNotRunning) || strings.Contains(errStr, "is not running") || strings.Contains(errStr, "409") || strings.Contains(errStr, "not running") {
+			m.mu.Lock()
+			sbx.SetStatus(StatusExpired)
+			m.mu.Unlock()
+			_ = driver.Destroy(ctx, sbx)
+			return nil, fmt.Errorf("sandbox container is no longer running: %w", err)
+		}
+		return nil, err
+	}
+	return res, nil
 }
 
 // Destroy terminates and removes the user's active sandbox.

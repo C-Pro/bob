@@ -169,3 +169,19 @@ func setupRawDBWithAutoVacuum0(t *testing.T, path string) (*sql.DB, error) {
 	}
 	return db, nil
 }
+
+func TestRetentionManager_PruneWithoutFSMRunsTable(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "no_fsm_runs.db")
+	db, err := sql.Open("sqlite", "file:"+dbPath)
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	// Database with other tables but no fsm_runs table
+	_, err = db.Exec("CREATE TABLE other_table (id INT);")
+	require.NoError(t, err)
+
+	retention := NewRetentionManager(db, 7)
+	pruned, err := retention.PruneTerminalRuns(context.Background(), time.Now())
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), pruned)
+}

@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ type mockDriver struct {
 	available    bool
 	createdCount int
 	execCount    int
+	execErr      error
 	destroyCount int
 	destroyErr   error
 }
@@ -34,6 +36,9 @@ func (m *mockDriver) Create(ctx context.Context, sbx *UserSandbox, workspace str
 
 func (m *mockDriver) Exec(ctx context.Context, sbx *UserSandbox, cmd []string, timeout time.Duration) (*ExecResult, error) {
 	m.execCount++
+	if m.execErr != nil {
+		return nil, m.execErr
+	}
 	return &ExecResult{
 		ExitCode: 0,
 		Stdout:   "mock stdout",
@@ -104,7 +109,7 @@ func TestManagerLifecycle(t *testing.T) {
 	_, err = mgr.RequestSandbox(ctx, "user1", "chat1", RequestParams{
 		Driver: DriverBwrap,
 	})
-	assert.ErrorContains(t, err, "already have a running sandbox")
+	assert.ErrorContains(t, err, "already has an active sandbox")
 
 	// 7. Exec command
 	res, err := mgr.Exec(ctx, "user1", []string{"echo", "hi"}, 10*time.Second)
@@ -500,4 +505,60 @@ func TestManager_RequestSandbox_InvalidSandboxPath(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cannot be root")
+}
+
+func TestManagerExec_ContainerNotRunning_MarksExpiredAndCleansUp(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := Config{
+		DataDir:            tempDir,
+		Enabled:            true,
+		Drivers:            []string{"docker"},
+		AllowedImages:      []string{"alpine:latest"},
+		MaxLifetime:        30 * time.Minute,
+		DefaultExecTimeout: 1 * time.Minute,
+		MaxExecTimeout:     10 * time.Minute,
+	}
+
+	mockDocker := &mockDriver{
+		driverType: DriverDocker,
+		available:  true,
+	}
+	mgr := NewManager(cfg, []Driver{mockDocker})
+	defer func() { _ = mgr.Close() }()
+
+	ctx := context.Background()
+	_, err := mgr.RequestSandbox(ctx, "user1", "chat1", RequestParams{
+		Driver:      DriverDocker,
+		DockerImage: "alpine:latest",
+		NetworkMode: NetworkNone,
+	})
+	require.NoError(t, err)
+
+	approved, err := mgr.ApproveSandbox(ctx, "user1")
+	require.NoError(t, err)
+	assert.Equal(t, StatusRunning, approved.Status)
+
+	// Simulate container dying behind the scenes: Exec returns 409 conflict
+	mockDocker.execErr = errors.New("exec create returned 409: {\"message\":\"Container mock-c is not running\"}")
+
+	_, err = mgr.Exec(ctx, "user1", []string{"ls"}, 10*time.Second)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "sandbox container is no longer running")
+
+	// Sandbox should be marked expired and driver Destroy called
+	assert.Equal(t, StatusExpired, approved.Status)
+	status, exists := mgr.GetStatus("user1")
+	assert.True(t, exists)
+	assert.Equal(t, StatusExpired, status.Status)
+	assert.Equal(t, 1, mockDocker.destroyCount, "driver Destroy should be called on cleanup")
+
+	// Next RequestSandbox can now succeed because existing sandbox is StatusExpired
+	mockDocker.execErr = nil
+	newSbx, err := mgr.RequestSandbox(ctx, "user1", "chat1", RequestParams{
+		Driver:      DriverDocker,
+		DockerImage: "alpine:latest",
+		NetworkMode: NetworkNone,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, StatusPendingApproval, newSbx.Status)
 }

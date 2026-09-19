@@ -95,10 +95,13 @@ func NewSQLiteStore(fname string, init bool) (*SQLiteStorage, error) {
 				_ = db.Close()
 				return nil, fmt.Errorf("migration failed: %w", err)
 			}
+		case 2:
+			// TODO(migration): Version 2 was an intermediate development schema version for bob.db before
+			// FSM tables were decoupled into per-chat databases. It is fully compatible with version 1.
 		default:
 			_ = db.Close()
 			return nil, fmt.Errorf(
-				"database version mismatch: expected %d or %d, but got %d",
+				"database version mismatch: expected %d or %d (or legacy 2), but got %d",
 				version.Version-1,
 				version.Version,
 				v)

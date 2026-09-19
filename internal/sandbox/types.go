@@ -2,9 +2,13 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 )
+
+// ErrContainerNotRunning indicates the sandbox container is not running (e.g. stopped or exited).
+var ErrContainerNotRunning = errors.New("container is not running")
 
 // DriverType identifies the underlying isolation technology.
 type DriverType string

@@ -58,6 +58,10 @@ func TestDockerDriverWithMockServer(t *testing.T) {
 	mux.HandleFunc("/containers/mock-container-abc/start", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
+	mux.HandleFunc("/containers/mock-container-abc/json", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"State":{"Running":true,"ExitCode":0}}`))
+	})
 
 	mux.HandleFunc("/containers/mock-container-abc/exec", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusCreated)
@@ -231,6 +235,10 @@ func TestDockerDriver_NetworkRestrictedProxyReachability(t *testing.T) {
 
 	mux.HandleFunc("/containers/mock-restr-container/start", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/containers/mock-restr-container/json", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"State":{"Running":true,"ExitCode":0}}`))
 	})
 
 	mux.HandleFunc("/containers/mock-restr-container/exec", func(w http.ResponseWriter, r *http.Request) {
@@ -450,6 +458,10 @@ func TestDockerDriver_AutoPullMissingImage_Success(t *testing.T) {
 
 	mux.HandleFunc("/containers/container-after-pull-123/start", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/containers/container-after-pull-123/json", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"State":{"Running":true,"ExitCode":0}}`))
 	})
 
 	mux.HandleFunc("/containers/container-after-pull-123", func(w http.ResponseWriter, r *http.Request) {
@@ -920,6 +932,10 @@ func TestDockerDriver_HostDataDirBinds(t *testing.T) {
 	mux.HandleFunc("/containers/mock-container-binds/start", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
+	mux.HandleFunc("/containers/mock-container-binds/json", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"State":{"Running":true,"ExitCode":0}}`))
+	})
 	mux.HandleFunc("/containers/mock-container-binds", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete {
 			w.WriteHeader(http.StatusNoContent)
@@ -1374,6 +1390,10 @@ func TestDockerDriver_Destroy_ProxySocketCleanup(t *testing.T) {
 	mux.HandleFunc("/containers/mock-cleanup-container/start", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
+	mux.HandleFunc("/containers/mock-cleanup-container/json", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"State":{"Running":true,"ExitCode":0}}`))
+	})
 	mux.HandleFunc("/containers/mock-cleanup-container", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete {
 			w.WriteHeader(http.StatusNoContent)
@@ -1441,6 +1461,10 @@ func TestDockerDriver_Create_ExistingProxyDirectory(t *testing.T) {
 	})
 	mux.HandleFunc("/containers/mock-exist-container/start", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/containers/mock-exist-container/json", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"State":{"Running":true,"ExitCode":0}}`))
 	})
 	mux.HandleFunc("/containers/mock-exist-container", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete {
@@ -1650,5 +1674,107 @@ func TestDockerDriver_RealDocker_ConcurrentExec_OneTimeoutOneSucceeds(t *testing
 	require.NoError(t, errSuccess)
 	require.NotNil(t, resSuccess)
 	assert.Equal(t, 0, resSuccess.ExitCode, "concurrent exec must succeed and not be killed by timeout of another exec")
+}
+
+func TestDockerDriver_DetectHostDataDir(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "mock_detect.sock")
+	listener, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+	defer func() { _ = listener.Close() }()
+
+	hostname, err := os.Hostname()
+	require.NoError(t, err)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc(fmt.Sprintf("/containers/%s/json", hostname), func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{
+			"Mounts": [
+				{
+					"Type": "bind",
+					"Source": "/host/var/lib/bob/data",
+					"Destination": "/data"
+				}
+			]
+		}`))
+	})
+
+	server := &http.Server{Handler: mux}
+	go func() { _ = server.Serve(listener) }()
+	defer func() { _ = server.Close() }()
+
+	driver := NewDriver(Config{
+		SocketPath: sockPath,
+		DataDir:    "/data",
+	})
+
+	detected := driver.detectHostDataDir(context.Background())
+	assert.Equal(t, "/host/var/lib/bob/data", detected)
+}
+
+func TestDockerDriver_Create_ContainerExitedImmediately(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "mock_crash.sock")
+	listener, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+	defer func() { _ = listener.Close() }()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_ping", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/containers/create", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"Id":"mock-crash-c"}`))
+	})
+	mux.HandleFunc("/containers/mock-crash-c/start", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/containers/mock-crash-c/json", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"State":{"Running":false,"ExitCode":127,"Error":""}}`))
+	})
+	mux.HandleFunc("/containers/mock-crash-c/logs", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		payload := []byte("exec /run/proxy/fwd: no such file or directory\n")
+		header := make([]byte, 8)
+		header[0] = 2 // stderr
+		binary.BigEndian.PutUint32(header[4:8], uint32(len(payload)))
+		_, _ = w.Write(header)
+		_, _ = w.Write(payload)
+	})
+	var deleted bool
+	mux.HandleFunc("/containers/mock-crash-c", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			deleted = true
+			w.WriteHeader(http.StatusNoContent)
+		}
+	})
+
+	server := &http.Server{Handler: mux}
+	go func() { _ = server.Serve(listener) }()
+	defer func() { _ = server.Close() }()
+
+	driver := NewDriver(Config{
+		SocketPath:    sockPath,
+		AllowedImages: []string{"alpine:latest"},
+	})
+
+	userWS := filepath.Join(tempDir, "ws")
+	_ = os.MkdirAll(userWS, 0o755)
+
+	sbx := &sandbox.UserSandbox{
+		UserID:      "testuser",
+		DockerImage: "alpine:latest",
+		Network:     sandbox.NetworkPolicy{Mode: sandbox.NetworkNone},
+		Status:      sandbox.StatusRunning,
+	}
+
+	err = driver.Create(context.Background(), sbx, userWS)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "container exited immediately (exit code 127)")
+	assert.Contains(t, err.Error(), "exec /run/proxy/fwd: no such file or directory")
+	assert.True(t, deleted, "container should be destroyed when it exited immediately")
 }
 

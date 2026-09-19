@@ -37,9 +37,10 @@ type Driver struct {
 	client             *http.Client
 	mu                 sync.Mutex
 	proxies            map[string]*sandbox.FilteringProxy // keyed by userID
-	customBlockedCIDRs []string
-	forwarderPort      int
-	resolver           *net.Resolver
+	customBlockedCIDRs   []string
+	forwarderPort        int
+	resolver             *net.Resolver
+	hostDataDirDetected  bool
 }
 
 // Config provides configuration parameters for the Docker driver.
@@ -155,6 +156,22 @@ func (d *Driver) Available(ctx context.Context) bool {
 
 // Create spawns an idle sandbox container and initializes user mounts.
 func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorkspaceDir string) (err error) {
+	d.mu.Lock()
+	needDetect := !d.hostDataDirDetected && d.hostDataDir == "" && d.dataDir != ""
+	if needDetect {
+		d.hostDataDirDetected = true
+	}
+	d.mu.Unlock()
+	if needDetect {
+		if detected := d.detectHostDataDir(ctx); detected != "" {
+			d.mu.Lock()
+			if d.hostDataDir == "" {
+				d.hostDataDir = detected
+			}
+			d.mu.Unlock()
+		}
+	}
+
 	image := strings.TrimSpace(sbx.DockerImage)
 	if image == "" {
 		if len(d.allowedImages) > 0 {
@@ -429,6 +446,85 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 		return fmt.Errorf("docker container start returned status %d: %s", startResp.StatusCode, string(respBody))
 	}
 
+	// Verify that the container stayed running after start (e.g. entrypoint didn't exit immediately)
+	const maxPollAttempts = 5
+	const pollInterval = 50 * time.Millisecond
+
+	var inspectResult struct {
+		State struct {
+			Status   string `json:"Status"`
+			Running  bool   `json:"Running"`
+			ExitCode int    `json:"ExitCode"`
+			Error    string `json:"Error"`
+		} `json:"State"`
+	}
+
+	for attempt := 0; attempt < maxPollAttempts; attempt++ {
+		time.Sleep(pollInterval)
+
+		inspectCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		inspectURL := fmt.Sprintf("http://localhost/containers/%s/json", sbx.GetInternalID())
+		inspectReq, err := http.NewRequestWithContext(inspectCtx, http.MethodGet, inspectURL, nil)
+		if err != nil {
+			cancel()
+			if dErr := d.Destroy(ctx, sbx); dErr != nil {
+				slog.Warn("failed to cleanup container on inspect request error", "user", sbx.UserID, "error", dErr)
+			}
+			return fmt.Errorf("failed to build container inspect request: %w", err)
+		}
+
+		inspectResp, err := d.client.Do(inspectReq)
+		if err != nil {
+			cancel()
+			if dErr := d.Destroy(ctx, sbx); dErr != nil {
+				slog.Warn("failed to cleanup container on inspect error", "user", sbx.UserID, "error", dErr)
+			}
+			return fmt.Errorf("failed to inspect container after start: %w", err)
+		}
+
+		if inspectResp.StatusCode != http.StatusOK {
+			_ = inspectResp.Body.Close()
+			cancel()
+			if dErr := d.Destroy(ctx, sbx); dErr != nil {
+				slog.Warn("failed to cleanup container on inspect status error", "user", sbx.UserID, "error", dErr)
+			}
+			return fmt.Errorf("docker container inspect returned status %d", inspectResp.StatusCode)
+		}
+
+		decodeErr := json.NewDecoder(inspectResp.Body).Decode(&inspectResult)
+		_ = inspectResp.Body.Close()
+		cancel()
+		if decodeErr != nil {
+			if dErr := d.Destroy(ctx, sbx); dErr != nil {
+				slog.Warn("failed to cleanup container on inspect decode error", "user", sbx.UserID, "error", dErr)
+			}
+			return fmt.Errorf("failed to decode container inspect response: %w", decodeErr)
+		}
+
+		if inspectResult.State.Running {
+			break
+		}
+
+		// If container has definitively crashed/exited with non-zero exit code, stop polling immediately
+		if inspectResult.State.ExitCode != 0 || inspectResult.State.Status == "exited" || inspectResult.State.Status == "dead" {
+			break
+		}
+	}
+
+	if !inspectResult.State.Running {
+		logMsg := d.fetchContainerLogs(ctx, sbx.GetInternalID())
+		if dErr := d.Destroy(ctx, sbx); dErr != nil {
+			slog.Warn("failed to cleanup exited container", "user", sbx.UserID, "error", dErr)
+		}
+		if logMsg != "" {
+			return fmt.Errorf("container exited immediately (exit code %d): %s", inspectResult.State.ExitCode, logMsg)
+		}
+		if inspectResult.State.Error != "" {
+			return fmt.Errorf("container exited immediately (exit code %d): %s", inspectResult.State.ExitCode, inspectResult.State.Error)
+		}
+		return fmt.Errorf("container exited immediately (exit code %d)", inspectResult.State.ExitCode)
+	}
+
 	return nil
 }
 
@@ -495,6 +591,9 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 
 	if resp.StatusCode != http.StatusCreated {
 		b, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode == http.StatusConflict || strings.Contains(string(b), "is not running") {
+			return nil, fmt.Errorf("%w: exec create returned %d: %s", sandbox.ErrContainerNotRunning, resp.StatusCode, string(b))
+		}
 		return nil, fmt.Errorf("exec create returned %d: %s", resp.StatusCode, string(b))
 	}
 
@@ -806,4 +905,112 @@ func (d *Driver) getProxyDir(userID string) string {
 		return filepath.Join(os.TempDir(), "b-p", hashStr)
 	}
 	return shortPath
+}
+
+// detectHostDataDir inspects the container Bob is running in (by hostname) to find
+// the host path mounted to dataDir, if running inside a container.
+func (d *Driver) detectHostDataDir(ctx context.Context) string {
+	if d.dataDir == "" {
+		return ""
+	}
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
+		return ""
+	}
+
+	inspectCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	inspectURL := fmt.Sprintf("http://localhost/containers/%s/json", hostname)
+	req, err := http.NewRequestWithContext(inspectCtx, http.MethodGet, inspectURL, nil)
+	if err != nil {
+		return ""
+	}
+
+	resp, err := d.client.Do(req)
+	if err != nil {
+		slog.Debug("failed to inspect self container for host data dir", "hostname", hostname, "error", err)
+		return ""
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		slog.Debug("self container inspect returned non-200", "hostname", hostname, "status", resp.StatusCode)
+		return ""
+	}
+
+	var inspectResult struct {
+		Mounts []struct {
+			Type        string `json:"Type"`
+			Source      string `json:"Source"`
+			Destination string `json:"Destination"`
+		} `json:"Mounts"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&inspectResult); err != nil {
+		return ""
+	}
+
+	absDataDir, err := filepath.Abs(d.dataDir)
+	if err != nil {
+		absDataDir = filepath.Clean(d.dataDir)
+	}
+
+	var bestHostPath string
+	var bestMatchLen int
+
+	for _, m := range inspectResult.Mounts {
+		cleanDest := filepath.Clean(m.Destination)
+		if cleanDest == absDataDir {
+			bestHostPath = m.Source
+			break
+		}
+		prefix := cleanDest + string(filepath.Separator)
+		if strings.HasPrefix(absDataDir, prefix) {
+			if len(cleanDest) > bestMatchLen {
+				rel, err := filepath.Rel(cleanDest, absDataDir)
+				if err == nil {
+					bestHostPath = filepath.Join(m.Source, rel)
+					bestMatchLen = len(cleanDest)
+				}
+			}
+		}
+	}
+
+	if bestHostPath != "" {
+		slog.Info("auto-detected sandbox host data directory from container inspect",
+			"container", hostname,
+			"dataDir", d.dataDir,
+			"hostDataDir", bestHostPath,
+		)
+	}
+	return bestHostPath
+}
+
+func (d *Driver) fetchContainerLogs(ctx context.Context, internalID string) string {
+	logCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	logsURL := fmt.Sprintf("http://localhost/containers/%s/logs?stdout=true&stderr=true&tail=50", internalID)
+	req, err := http.NewRequestWithContext(logCtx, http.MethodGet, logsURL, nil)
+	if err != nil {
+		return ""
+	}
+
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+
+	var stdout, stderr bytes.Buffer
+	_ = demuxDockerStream(resp.Body, &stdout, &stderr)
+	combined := strings.TrimSpace(stderr.String() + "\n" + stdout.String())
+	if len(combined) > 2048 {
+		combined = combined[:2048] + "\n[truncated]"
+	}
+	return strings.TrimSpace(combined)
 }

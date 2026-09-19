@@ -178,10 +178,19 @@ func (g *Gateway) ToolDefinitions(ctx context.Context, chatID string, isDM bool)
 	if r == nil {
 		return nil
 	}
-	return r.ToolDefinitionsForSession(tools.ChatSessionContext{
-		ChatID: chatID,
-		IsDM:   isDM,
-	})
+	session, ok := tools.ChatSessionFromContext(ctx)
+	if !ok {
+		session = tools.ChatSessionContext{
+			ChatID: chatID,
+			IsDM:   isDM,
+		}
+	} else {
+		if session.ChatID == "" {
+			session.ChatID = chatID
+		}
+		session.IsDM = isDM
+	}
+	return r.ToolDefinitionsForSession(session)
 }
 
 // Deliver implements fsm.ResultSink to deliver completed or failed workflow results out-of-band.
@@ -1409,6 +1418,10 @@ func (g *Gateway) RunMaintenance(ctx context.Context) {
 	}
 
 	for name, rawDB := range activeDBs {
+		if err := fsm.EnsureDBSchema(ctx, rawDB); err != nil {
+			slog.Warn("failed to ensure fsm schema during maintenance", "db", name, "error", err)
+			continue
+		}
 		rm := fsm.NewRetentionManager(rawDB, retentionDays)
 		pruned, err := rm.PruneAndCompact(ctx)
 		if err != nil {

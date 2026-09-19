@@ -33,6 +33,15 @@ func (r *RetentionManager) PruneTerminalRuns(ctx context.Context, cutoffTime tim
 		return 0, fmt.Errorf("db cannot be nil")
 	}
 
+	var tableExists int
+	err := r.db.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='fsm_runs'").Scan(&tableExists)
+	if err != nil {
+		return 0, fmt.Errorf("failed to check fsm_runs table: %w", err)
+	}
+	if tableExists == 0 {
+		return 0, nil
+	}
+
 	query := `
 		DELETE FROM fsm_runs
 		WHERE status IN ('COMPLETED', 'FAILED', 'TERMINATED')

@@ -153,3 +153,38 @@ func dumpSchema(t *testing.T, db *sql.DB) []string {
 	require.NoError(t, rows.Err())
 	return objs
 }
+
+func TestOpenVersion2Compatibility(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "v2.db")
+	db, err := sql.Open("sqlite", dbPath)
+	require.NoError(t, err)
+
+	setup := `
+create table schema_version(
+  version integer primary key,
+  description text not null,
+  is_current boolean default 0 check (is_current in (0, 1))
+);
+create unique index schema_version_uk on schema_version(is_current) where is_current = 1;
+insert into schema_version(version, description, is_current) values(2, 'intermediate fsm schema', 1);`
+	_, err = db.Exec(setup)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	s, err := NewSQLiteStore(dbPath, false)
+	require.NoError(t, err)
+	require.NotNil(t, s)
+	defer func() { _ = s.Close() }()
+
+	v, err := s.GetSchemaVersion(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 2, v)
+
+	// Verify database connection is healthy and functional for read/write
+	_, err = s.DB().ExecContext(context.Background(), "create table test_v2 (id int); insert into test_v2 values (42);")
+	require.NoError(t, err)
+	var val int
+	err = s.DB().QueryRowContext(context.Background(), "select id from test_v2").Scan(&val)
+	require.NoError(t, err)
+	assert.Equal(t, 42, val)
+}

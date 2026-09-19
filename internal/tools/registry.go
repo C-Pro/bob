@@ -287,8 +287,22 @@ func (r *Registry) ToolDefinitions() []openai.Tool {
 
 // ToolDefinitionsForSession returns tool definitions tailored to the session.
 // In DM chats with a configured sandboxManager, sandbox tools are included.
+// When the user already has an active running sandbox, sandbox_request is excluded
+// so the agent interacts with the active sandbox rather than requesting a redundant one.
 func (r *Registry) ToolDefinitionsForSession(session ChatSessionContext) []openai.Tool {
 	if session.IsDM && r.sandboxManager != nil {
+		if session.UserID != "" {
+			if sbx, ok := r.sandboxManager.GetStatus(session.UserID); ok && sbx.Status == sandbox.StatusRunning {
+				tools := make([]openai.Tool, 0, len(r.dmToolDefinitions)-1)
+				for _, t := range r.dmToolDefinitions {
+					if t.Function != nil && t.Function.Name == "sandbox_request" {
+						continue
+					}
+					tools = append(tools, t)
+				}
+				return tools
+			}
+		}
 		return r.dmToolDefinitions
 	}
 	return r.toolDefinitions
@@ -296,10 +310,19 @@ func (r *Registry) ToolDefinitionsForSession(session ChatSessionContext) []opena
 
 // ToolDefinitionsForChat returns tool definitions for a given chat session context.
 func (r *Registry) ToolDefinitionsForChat(ctx context.Context, chatID string, isDM bool) []openai.Tool {
-	return r.ToolDefinitionsForSession(ChatSessionContext{
-		ChatID: chatID,
-		IsDM:   isDM,
-	})
+	session, ok := ChatSessionFromContext(ctx)
+	if !ok {
+		session = ChatSessionContext{
+			ChatID: chatID,
+			IsDM:   isDM,
+		}
+	} else {
+		if session.ChatID == "" {
+			session.ChatID = chatID
+		}
+		session.IsDM = isDM
+	}
+	return r.ToolDefinitionsForSession(session)
 }
 
 // WebSearchArgs defines arguments for the web_search tool.
