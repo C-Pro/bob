@@ -54,6 +54,10 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	_ = os.Unsetenv("SANDBOX_CPU_LIMIT")
 	_ = os.Unsetenv("SANDBOX_MEMORY_LIMIT_MB")
 	_ = os.Unsetenv("SANDBOX_HOST_DATA_DIR")
+	_ = os.Unsetenv("SCHEDULER_MIN_RUN_TIMEOUT")
+	_ = os.Unsetenv("SCHEDULER_MAX_RUN_TIMEOUT")
+	_ = os.Unsetenv("SCHEDULER_MIN_MAX_TURNS")
+	_ = os.Unsetenv("SCHEDULER_MAX_MAX_TURNS")
 
 	cfg, err := LoadFromEnv()
 	require.NoError(t, err)
@@ -92,6 +96,10 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	assert.Equal(t, 1.0, cfg.SandboxCPULimit)
 	assert.Equal(t, 512, cfg.SandboxMemoryLimitMB)
 	assert.Equal(t, "", cfg.SandboxHostDataDir)
+	assert.Equal(t, 1*time.Minute, cfg.SchedulerMinRunTimeout)
+	assert.Equal(t, 1*time.Hour, cfg.SchedulerMaxRunTimeout)
+	assert.Equal(t, 10, cfg.SchedulerMinMaxTurns)
+	assert.Equal(t, 100, cfg.SchedulerMaxMaxTurns)
 }
 
 func TestLoadFromEnvStandardOpenAI(t *testing.T) {
@@ -481,4 +489,55 @@ func TestConfig_Validate_FSMConfig(t *testing.T) {
 	assert.Equal(t, 15, customCfg.TownhallToolMaxIterations)
 	assert.Equal(t, 30, customCfg.DMToolMaxIterations)
 	assert.Equal(t, 14, customCfg.FSMRetentionDays)
+}
+
+func TestConfig_SchedulerConfig(t *testing.T) {
+	t.Run("custom env parsing", func(t *testing.T) {
+		t.Setenv("SCHEDULER_MIN_RUN_TIMEOUT", "2m")
+		t.Setenv("SCHEDULER_MAX_RUN_TIMEOUT", "30m")
+		t.Setenv("SCHEDULER_MIN_MAX_TURNS", "15")
+		t.Setenv("SCHEDULER_MAX_MAX_TURNS", "50")
+
+		cfg, err := LoadFromEnv()
+		require.NoError(t, err)
+		assert.Equal(t, 2*time.Minute, cfg.SchedulerMinRunTimeout)
+		assert.Equal(t, 30*time.Minute, cfg.SchedulerMaxRunTimeout)
+		assert.Equal(t, 15, cfg.SchedulerMinMaxTurns)
+		assert.Equal(t, 50, cfg.SchedulerMaxMaxTurns)
+	})
+
+	t.Run("validation rules", func(t *testing.T) {
+		baseCfg := Config{
+			OpenAIAPIKey:           "test-key",
+			OpenAIModel:            "test-model",
+			BesedkaURL:             "http://127.0.0.1:8080",
+			TownhallMaxParagraphs:  2,
+			DMMaxParagraphs:        10,
+			MsgRingBufferSize:      100,
+			SchedulerMinRunTimeout: 1 * time.Minute,
+			SchedulerMaxRunTimeout: 1 * time.Hour,
+			SchedulerMinMaxTurns:   10,
+			SchedulerMaxMaxTurns:   100,
+		}
+		require.NoError(t, baseCfg.Validate(true))
+
+		invalidMaxTimeout := baseCfg
+		invalidMaxTimeout.SchedulerMaxRunTimeout = 30 * time.Second
+		assert.ErrorContains(t, invalidMaxTimeout.Validate(true), "cannot be less than SCHEDULER_MIN_RUN_TIMEOUT")
+
+		invalidMaxTurns := baseCfg
+		invalidMaxTurns.SchedulerMaxMaxTurns = 5
+		assert.ErrorContains(t, invalidMaxTurns.Validate(true), "cannot be less than SCHEDULER_MIN_MAX_TURNS")
+	})
+
+	t.Run("strict invalid env values fail", func(t *testing.T) {
+		t.Setenv("SCHEDULER_MIN_RUN_TIMEOUT", "invalid-duration")
+		_, err := LoadFromEnv()
+		assert.ErrorContains(t, err, "invalid duration for SCHEDULER_MIN_RUN_TIMEOUT")
+
+		t.Setenv("SCHEDULER_MIN_RUN_TIMEOUT", "1m")
+		t.Setenv("SCHEDULER_MIN_MAX_TURNS", "abc")
+		_, err = LoadFromEnv()
+		assert.ErrorContains(t, err, "invalid integer for SCHEDULER_MIN_MAX_TURNS")
+	})
 }

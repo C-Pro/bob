@@ -212,6 +212,9 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 		if err := os.MkdirAll(proxyDir, 0o755); err != nil {
 			return fmt.Errorf("failed to create proxy directory: %w", err)
 		}
+		if err := checkNoExec(proxyDir); err != nil {
+			return fmt.Errorf("failed to prepare proxy directory: %w", err)
+		}
 		// Hardlink or copy real forwarder binary into proxyDir/fwd so a single bind mount
 		// /run/proxy:ro contains both the forwarder binary and unix domain socket without
 		// fragile overlapping mounts.

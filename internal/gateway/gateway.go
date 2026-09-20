@@ -28,6 +28,7 @@ import (
 	"bob/internal/sandbox"
 	"bob/internal/sandbox/bwrap"
 	"bob/internal/sandbox/docker"
+	"bob/internal/scheduler"
 	"bob/internal/tools"
 	"bob/internal/tools/tavily"
 
@@ -45,6 +46,7 @@ type Gateway struct {
 	fsmEngine            *fsm.Engine
 	memoryManager        *memory.Manager
 	sandboxManager       *sandbox.Manager
+	storeProvider        *MemoryStoreProvider
 	conn                 *websocket.Conn
 	mu                   sync.Mutex
 	running              bool
@@ -58,6 +60,9 @@ type Gateway struct {
 	initialLocationDelay time.Duration
 	indexingWg           sync.WaitGroup
 	recentProgress       sync.Map
+	schedulerEngine      *scheduler.Engine
+	schedulerInvoker     *ScheduleInvoker
+	chatLocker           *ChatLocker
 }
 
 // NewGateway creates a new Besedka Gateway instance.
@@ -98,8 +103,17 @@ func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 		sandboxManager = sandbox.NewManager(sbxCfg, []sandbox.Driver{bwrapDriver, dockerDriver})
 	}
 
+	storeProvider := NewMemoryStoreProvider(memoryManager, cfg.DataDir)
 	toolsRegistry := tools.NewRegistry(tavilyClient, memoryManager, sandboxManager)
+	toolsRegistry.SetSchedulerStoreProvider(storeProvider)
+	toolsRegistry.SetSchedulerLimits(
+		cfg.SchedulerMinRunTimeout,
+		cfg.SchedulerMaxRunTimeout,
+		cfg.SchedulerMinMaxTurns,
+		cfg.SchedulerMaxMaxTurns,
+	)
 
+	chatLocker := NewChatLocker()
 	gw := &Gateway{
 		cfg:                  cfg,
 		llmClient:            llmClient,
@@ -107,12 +121,32 @@ func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 		toolsRegistry:        toolsRegistry,
 		memoryManager:        memoryManager,
 		sandboxManager:       sandboxManager,
+		storeProvider:        storeProvider,
 		userCache:            NewUserCache(),
 		contextManager:       chatcontext.NewManager(cfg.MsgRingBufferSize),
 		startTime:            time.Now(),
 		locationInterval:     9 * time.Minute,
 		initialLocationDelay: 1 * time.Second,
+		chatLocker:           chatLocker,
 	}
+
+	invokerCfg := InvokerConfig{
+		Tools:      toolsRegistry,
+		Sandbox:    sandboxManager,
+		Sender:     gw,
+		ContextMgr: gw.contextManager,
+		Model:      cfg.OpenAIModel,
+		BotID:      "bot",
+		BotName:    "Bob",
+		SchedulerStoreProv: func(ctx context.Context, chatID string, isDM bool) (*scheduler.Store, error) {
+			if gw.storeProvider != nil {
+				return gw.storeProvider.GetSchedulerStore(ctx, chatID, isDM)
+			}
+			return nil, errors.New("store provider not available")
+		},
+	}
+	gw.schedulerInvoker = NewScheduleInvoker(invokerCfg, chatLocker)
+	gw.schedulerEngine = scheduler.NewEngine(storeProvider, gw.schedulerInvoker)
 
 	gw.contextManager.SetOnEvict(func(chatID string, evicted []chatcontext.Entry) {
 		gw.handleEvictedBatch(chatID, evicted)
@@ -133,6 +167,26 @@ func (g *Gateway) SetMemoryManager(m *memory.Manager) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.memoryManager = m
+	if g.cfg != nil {
+		g.storeProvider = NewMemoryStoreProvider(m, g.cfg.DataDir)
+	}
+}
+
+// StoreProvider returns the Gateway's MemoryStoreProvider.
+func (g *Gateway) StoreProvider() *MemoryStoreProvider {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.storeProvider
+}
+
+// SetStoreProvider sets the MemoryStoreProvider for the gateway.
+func (g *Gateway) SetStoreProvider(p *MemoryStoreProvider) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.storeProvider = p
+	if g.schedulerEngine != nil && p != nil {
+		g.schedulerEngine = scheduler.NewEngine(p, g.schedulerInvoker)
+	}
 }
 
 // ToolsRegistry returns the Gateway's tools Registry.
@@ -149,6 +203,9 @@ func (g *Gateway) SetToolsRegistry(r *tools.Registry) {
 	g.toolsRegistry = r
 	if g.fsmEngine != nil {
 		g.fsmEngine.SetToolDefinitionProvider(g)
+	}
+	if g.schedulerInvoker != nil {
+		g.schedulerInvoker.SetTools(r)
 	}
 }
 
@@ -167,6 +224,9 @@ func (g *Gateway) SetFSMEngine(e *fsm.Engine) {
 	if e != nil {
 		e.SetResultSink(g)
 		e.SetToolDefinitionProvider(g)
+	}
+	if g.schedulerInvoker != nil {
+		g.schedulerInvoker.SetFSM(e)
 	}
 }
 
@@ -196,6 +256,11 @@ func (g *Gateway) ToolDefinitions(ctx context.Context, chatID string, isDM bool)
 // Deliver implements fsm.ResultSink to deliver completed or failed workflow results out-of-band.
 func (g *Gateway) Deliver(ctx context.Context, run *fsm.FSMRun) error {
 	if run == nil || run.ChatID == "" {
+		return nil
+	}
+	if strings.HasPrefix(run.ID, "sched_") {
+		// Scheduled task runs handle their own notifications inside schedule_invoker;
+		// suppress generic failure apologies to the chat on crash recovery.
 		return nil
 	}
 	var reply string
@@ -249,6 +314,37 @@ func (g *Gateway) SetSandboxManager(sm *sandbox.Manager) {
 	if g.toolsRegistry != nil {
 		g.toolsRegistry.SetSandboxManager(sm)
 	}
+	if g.schedulerInvoker != nil {
+		g.schedulerInvoker.SetSandbox(sm)
+	}
+}
+
+// SchedulerEngine returns the Gateway's scheduler Engine.
+func (g *Gateway) SchedulerEngine() *scheduler.Engine {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.schedulerEngine
+}
+
+// SetSchedulerEngine sets the scheduler Engine for the gateway.
+func (g *Gateway) SetSchedulerEngine(e *scheduler.Engine) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.schedulerEngine = e
+}
+
+// SchedulerInvoker returns the Gateway's ScheduleInvoker.
+func (g *Gateway) SchedulerInvoker() *ScheduleInvoker {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.schedulerInvoker
+}
+
+// ChatLocker returns the Gateway's ChatLocker.
+func (g *Gateway) ChatLocker() *ChatLocker {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.chatLocker
 }
 
 var (
@@ -889,12 +985,12 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 	}
 
 	// 4. Determine trigger condition
-	shouldProcess, _ := IsMentionedOrDM(g.cfg.BotHandle, msg.ChatID, msg.Content)
+	shouldProcess, promptText := IsMentionedOrDM(g.cfg.BotHandle, msg.ChatID, msg.Content)
 	if !shouldProcess && msg.ChatID == "townhall" {
 		if strings.EqualFold(g.cfg.BotHandle, "@bob") {
-			shouldProcess, _ = IsMentionedOrDM("@bot", msg.ChatID, msg.Content)
+			shouldProcess, promptText = IsMentionedOrDM("@bot", msg.ChatID, msg.Content)
 		} else if strings.EqualFold(g.cfg.BotHandle, "@bot") {
-			shouldProcess, _ = IsMentionedOrDM("@bob", msg.ChatID, msg.Content)
+			shouldProcess, promptText = IsMentionedOrDM("@bob", msg.ChatID, msg.Content)
 		}
 	}
 
@@ -927,6 +1023,14 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 		return g.handleSandboxCommand(ctx, msg, cleanText, senderName)
 	}
 
+	scheduleCmdText := cleanText
+	if strings.HasPrefix(strings.TrimSpace(promptText), "/schedule") {
+		scheduleCmdText = strings.TrimSpace(promptText)
+	}
+	if strings.HasPrefix(scheduleCmdText, "/schedule") {
+		return g.handleScheduleCommand(ctx, msg, scheduleCmdText, senderName, isDM)
+	}
+
 	return g.generateAndSendAgentReply(ctx, msg, isDM, senderName, "")
 }
 
@@ -945,6 +1049,15 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 
 	if g.llmClient == nil {
 		return nil
+	}
+
+	if g.chatLocker != nil {
+		release, err := g.chatLocker.TryAcquire(ctx, msg.ChatID, 30*time.Second)
+		if err != nil {
+			slog.Warn("chat execution lock busy for incoming message", "chat_id", msg.ChatID, "error", err)
+			return err
+		}
+		defer release()
 	}
 
 	var sandboxActive bool
@@ -1152,6 +1265,16 @@ func (g *Gateway) Start(ctx context.Context) error {
 		}
 	}
 
+	// Start scheduler engine background poller
+	g.mu.Lock()
+	schedEng := g.schedulerEngine
+	g.mu.Unlock()
+	if schedEng != nil {
+		if err := schedEng.Start(ctx); err != nil {
+			slog.Error("failed to start scheduler engine", "error", err)
+		}
+	}
+
 	// Start periodic maintenance ticker (FSM retention pruning and vacuum)
 	maintenanceDone := make(chan struct{})
 	go g.startMaintenanceLoop(ctx, maintenanceDone)
@@ -1326,7 +1449,12 @@ func (g *Gateway) Stop() {
 		g.conn = nil
 	}
 	fsmEng := g.fsmEngine
+	schedEng := g.schedulerEngine
 	g.mu.Unlock()
+
+	if schedEng != nil {
+		schedEng.Stop()
+	}
 
 	if fsmEng != nil {
 		fsmEng.Stop()
@@ -1417,6 +1545,8 @@ func (g *Gateway) RunMaintenance(ctx context.Context) {
 		retentionDays = 7
 	}
 
+	cutoffUnix := time.Now().Add(-time.Duration(retentionDays) * 24 * time.Hour).Unix()
+
 	for name, rawDB := range activeDBs {
 		if err := fsm.EnsureDBSchema(ctx, rawDB); err != nil {
 			slog.Warn("failed to ensure fsm schema during maintenance", "db", name, "error", err)
@@ -1428,6 +1558,14 @@ func (g *Gateway) RunMaintenance(ctx context.Context) {
 			slog.Warn("fsm retention maintenance failed", "db", name, "error", err)
 		} else if pruned > 0 {
 			slog.Info("fsm retention maintenance completed", "db", name, "pruned", pruned)
+		}
+
+		// Prune terminal schedules
+		if err := scheduler.EnsureScheduleSchema(ctx, rawDB); err == nil {
+			schedStore := scheduler.NewStore(rawDB)
+			if sPruned, sErr := schedStore.PruneTerminalSchedules(ctx, cutoffUnix); sErr == nil && sPruned > 0 {
+				slog.Info("scheduler retention maintenance completed", "db", name, "pruned", sPruned)
+			}
 		}
 	}
 }

@@ -1778,3 +1778,12 @@ func TestDockerDriver_Create_ContainerExitedImmediately(t *testing.T) {
 	assert.True(t, deleted, "container should be destroyed when it exited immediately")
 }
 
+func TestCheckNoExec(t *testing.T) {
+	tempDir := t.TempDir()
+	err := checkNoExec(tempDir)
+	assert.NoError(t, err)
+
+	// Non-existent path should return nil without erroring out
+	err = checkNoExec(filepath.Join(tempDir, "nonexistent"))
+	assert.NoError(t, err)
+}

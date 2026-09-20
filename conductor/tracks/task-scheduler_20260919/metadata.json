@@ -1,0 +1,8 @@
+{
+  "track_id": "task-scheduler_20260919",
+  "type": "feature",
+  "status": "completed",
+  "created_at": "2026-09-19T16:36:00Z",
+  "updated_at": "2026-09-19T22:17:00Z",
+  "description": "Task Scheduler for recurring and delayed executions with durable FSM integration, explicit human permission grants for sandbox capabilities, anti-escalation security, and per-chat data isolation."
+}
