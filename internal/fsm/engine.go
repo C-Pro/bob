@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -508,6 +509,15 @@ func (e *Engine) Recover(ctx context.Context) error {
 
 				runToRecover.Status = RunStatusRunning
 				runToRecover.ResumeAt = nil
+				if strings.HasPrefix(runToRecover.ID, "sched_") {
+					runToRecover.Status = RunStatusFailed
+					runToRecover.CurrentState = StateFailed
+					runToRecover.ErrorText = "scheduled run interrupted by service restart; ephemeral environment terminated"
+					if updateErr := s.UpdateRun(runCtx, &runToRecover); updateErr != nil {
+						slog.Error("failed to mark recovered scheduled run as failed", "run_id", runToRecover.ID, "error", updateErr)
+					}
+					return
+				}
 				if runToRecover.CurrentState == StateWaiting {
 					runToRecover.WaitCycles++
 					if runToRecover.WaitCycles >= 10 {
@@ -641,6 +651,15 @@ func (e *Engine) PollDueWaitingRuns(ctx context.Context) error {
 
 				runToResume.Status = RunStatusRunning
 				runToResume.ResumeAt = nil
+				if strings.HasPrefix(runToResume.ID, "sched_") {
+					runToResume.Status = RunStatusFailed
+					runToResume.CurrentState = StateFailed
+					runToResume.ErrorText = "scheduled run interrupted; ephemeral environment terminated"
+					if updateErr := s.UpdateRun(runCtx, &runToResume); updateErr != nil {
+						slog.Error("failed to mark resumed scheduled run as failed", "run_id", runToResume.ID, "error", updateErr)
+					}
+					return
+				}
 				if runToResume.CurrentState == StateWaiting {
 					runToResume.WaitCycles++
 					if runToResume.WaitCycles >= 10 {

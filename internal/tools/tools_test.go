@@ -519,18 +519,30 @@ func TestSandboxToolDefinitionsScope(t *testing.T) {
 
 	reg := NewRegistry(nil, nil, sandboxMgr)
 
-	// Base ToolDefinitions (or Townhall session) has 3 tools
+	// Base ToolDefinitions (or Townhall session) has 3 tools (search, fetch, recall)
 	assert.Len(t, reg.ToolDefinitions(), 3)
 	assert.Len(t, reg.ToolDefinitionsForSession(ChatSessionContext{IsDM: false}), 3)
 
-	// DM session has 6 tools (including sandbox_request, sandbox_exec, sandbox_destroy)
+	thNames := make([]string, len(reg.ToolDefinitions()))
+	for i, tool := range reg.ToolDefinitions() {
+		thNames[i] = tool.Function.Name
+	}
+	assert.NotContains(t, thNames, "schedule_task")
+	assert.NotContains(t, thNames, "list_schedules")
+	assert.NotContains(t, thNames, "cancel_schedule")
+	assert.NotContains(t, thNames, "sandbox_request")
+
+	// DM session has 9 tools (3 base + 3 scheduler + 3 sandbox)
 	dmTools := reg.ToolDefinitionsForSession(ChatSessionContext{IsDM: true})
-	assert.Len(t, dmTools, 6)
+	assert.Len(t, dmTools, 9)
 
 	names := make([]string, len(dmTools))
 	for i, tool := range dmTools {
 		names[i] = tool.Function.Name
 	}
+	assert.Contains(t, names, "schedule_task")
+	assert.Contains(t, names, "list_schedules")
+	assert.Contains(t, names, "cancel_schedule")
 	assert.Contains(t, names, "sandbox_request")
 	assert.Contains(t, names, "sandbox_exec")
 	assert.Contains(t, names, "sandbox_destroy")

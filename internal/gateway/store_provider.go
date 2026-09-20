@@ -13,23 +13,26 @@ import (
 
 	"bob/internal/fsm"
 	"bob/internal/memory"
+	"bob/internal/scheduler"
 )
 
 // MemoryStoreProvider implements fsm.StoreProvider backed by memory.Manager and per-chat SQLite databases.
 type MemoryStoreProvider struct {
-	memMgr   *memory.Manager
-	dataDir  string
-	mu       sync.RWMutex
-	stores   map[string]*fsm.Store
-	initOnce sync.Once
+	memMgr      *memory.Manager
+	dataDir     string
+	mu          sync.RWMutex
+	stores      map[string]*fsm.Store
+	schedStores map[string]*scheduler.Store
+	initOnce    sync.Once
 }
 
 // NewMemoryStoreProvider creates a new MemoryStoreProvider.
 func NewMemoryStoreProvider(memMgr *memory.Manager, dataDir string) *MemoryStoreProvider {
 	return &MemoryStoreProvider{
-		memMgr:  memMgr,
-		dataDir: dataDir,
-		stores:  make(map[string]*fsm.Store),
+		memMgr:      memMgr,
+		dataDir:     dataDir,
+		stores:      make(map[string]*fsm.Store),
+		schedStores: make(map[string]*scheduler.Store),
 	}
 }
 
@@ -71,9 +74,49 @@ func (p *MemoryStoreProvider) GetStore(ctx context.Context, chatID string, isDM 
 	if err := fsm.EnsureDBSchema(ctx, rawDB); err != nil {
 		return nil, fmt.Errorf("failed to ensure fsm schema for chat %s: %w", chatID, err)
 	}
+	if err := scheduler.EnsureScheduleSchema(ctx, rawDB); err != nil {
+		return nil, fmt.Errorf("failed to ensure scheduler schema for chat %s: %w", chatID, err)
+	}
 
 	st = fsm.NewStore(rawDB)
 	p.stores[key] = st
+	return st, nil
+}
+
+// GetSchedulerStore retrieves or initializes the isolated scheduler store for the given chat context.
+func (p *MemoryStoreProvider) GetSchedulerStore(ctx context.Context, chatID string, isDM bool) (*scheduler.Store, error) {
+	if p.memMgr == nil {
+		return nil, fmt.Errorf("memory manager is nil")
+	}
+
+	key := p.storeKey(chatID, isDM)
+
+	p.mu.RLock()
+	st, ok := p.schedStores[key]
+	p.mu.RUnlock()
+	if ok {
+		return st, nil
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if st, ok = p.schedStores[key]; ok {
+		return st, nil
+	}
+
+	cortexDB, err := p.memMgr.GetDB(ctx, chatID, isDM)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get database for chat %s: %w", chatID, err)
+	}
+
+	rawDB := cortexDB.SQL()
+	if err := scheduler.EnsureScheduleSchema(ctx, rawDB); err != nil {
+		return nil, fmt.Errorf("failed to ensure scheduler schema for chat %s: %w", chatID, err)
+	}
+
+	st = scheduler.NewStore(rawDB)
+	p.schedStores[key] = st
 	return st, nil
 }
 
@@ -178,6 +221,48 @@ func (p *MemoryStoreProvider) ActiveStores(ctx context.Context) ([]*fsm.Store, e
 
 	stores := make([]*fsm.Store, 0, len(p.stores))
 	for _, st := range p.stores {
+		stores = append(stores, st)
+	}
+
+	return stores, nil
+}
+
+// ActiveSchedulerStores discovers and returns isolated scheduler stores for all active chat databases.
+func (p *MemoryStoreProvider) ActiveSchedulerStores(ctx context.Context) ([]*scheduler.Store, error) {
+	if p.memMgr == nil {
+		return nil, nil
+	}
+
+	p.initOnce.Do(func() {
+		p.discoverStores(ctx)
+	})
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for key := range p.stores {
+		if _, ok := p.schedStores[key]; !ok {
+			isDM := key != "townhall"
+			chatID := key
+			if isDM {
+				chatID = strings.TrimPrefix(key, "dm_")
+			}
+			cortexDB, err := p.memMgr.GetDB(ctx, chatID, isDM)
+			if err != nil {
+				slog.Warn("failed to open DB for scheduler store discovery", "key", key, "error", err)
+				continue
+			}
+			rawDB := cortexDB.SQL()
+			if schErr := scheduler.EnsureScheduleSchema(ctx, rawDB); schErr != nil {
+				slog.Warn("failed to ensure scheduler schema during discovery", "key", key, "error", schErr)
+				continue
+			}
+			p.schedStores[key] = scheduler.NewStore(rawDB)
+		}
+	}
+
+	stores := make([]*scheduler.Store, 0, len(p.schedStores))
+	for _, st := range p.schedStores {
 		stores = append(stores, st)
 	}
 

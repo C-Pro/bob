@@ -143,6 +143,10 @@ func main() {
 		"dataDir", cfg.DataDir,
 		"dbPath", cfg.DBPath(mainDBFname),
 		"s3Enabled", cfg.S3Enabled(),
+		"schedulerMinRunTimeout", cfg.SchedulerMinRunTimeout,
+		"schedulerMaxRunTimeout", cfg.SchedulerMaxRunTimeout,
+		"schedulerMinMaxTurns", cfg.SchedulerMinMaxTurns,
+		"schedulerMaxMaxTurns", cfg.SchedulerMaxMaxTurns,
 	)
 
 	// Recover databases from object storage if missing locally
@@ -192,7 +196,7 @@ func main() {
 	}
 
 	// Initialize durable FSM engine and attach to Gateway
-	storeProv := gateway.NewMemoryStoreProvider(gw.MemoryManager(), cfg.DataDir)
+	storeProv := gw.StoreProvider()
 	fsmEngine := fsm.NewEngine(
 		storeProv,
 		llmClient,

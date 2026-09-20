@@ -61,6 +61,10 @@ type Config struct {
 	SandboxHostDataDir         string
 	SandboxProxyFwdPath        string
 	SandboxAllowRuntimeBuild   *bool
+	SchedulerMinRunTimeout     time.Duration
+	SchedulerMaxRunTimeout     time.Duration
+	SchedulerMinMaxTurns       int
+	SchedulerMaxMaxTurns       int
 }
 
 // DefaultSandboxAllowedImages defines standard safe container images.
@@ -118,6 +122,23 @@ func LoadFromEnv() (*Config, error) {
 		return nil, err
 	}
 
+	schedMinTimeout, err := getEnvDurationStrict("SCHEDULER_MIN_RUN_TIMEOUT", 1*time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	schedMaxTimeout, err := getEnvDurationStrict("SCHEDULER_MAX_RUN_TIMEOUT", 1*time.Hour)
+	if err != nil {
+		return nil, err
+	}
+	schedMinTurns, err := getEnvIntStrict("SCHEDULER_MIN_MAX_TURNS", 10)
+	if err != nil {
+		return nil, err
+	}
+	schedMaxTurns, err := getEnvIntStrict("SCHEDULER_MAX_MAX_TURNS", 100)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		BotHandle:                  getEnvOrDefault("BOT_HANDLE", "@bot"),
 		BesedkaURL:                 getEnvOrDefault("BESEDKA_URL", defaultBesedkaURL),
@@ -162,6 +183,10 @@ func LoadFromEnv() (*Config, error) {
 		SandboxHostDataDir:         getEnvOrDefault("SANDBOX_HOST_DATA_DIR", ""),
 		SandboxProxyFwdPath:        getEnvOrDefault("SANDBOX_PROXY_FWD_PATH", ""),
 		SandboxAllowRuntimeBuild:   &sandboxAllowRuntimeBuild,
+		SchedulerMinRunTimeout:     schedMinTimeout,
+		SchedulerMaxRunTimeout:     schedMaxTimeout,
+		SchedulerMinMaxTurns:       schedMinTurns,
+		SchedulerMaxMaxTurns:       schedMaxTurns,
 	}
 
 	if cfg.SandboxHostDataDir != "" {
@@ -242,6 +267,24 @@ func (c *Config) Validate(requireAPIKey bool) error {
 	}
 	if c.FSMRetentionDays <= 0 {
 		c.FSMRetentionDays = 7
+	}
+	if c.SchedulerMinRunTimeout <= 0 {
+		c.SchedulerMinRunTimeout = 1 * time.Minute
+	}
+	if c.SchedulerMaxRunTimeout <= 0 {
+		c.SchedulerMaxRunTimeout = 1 * time.Hour
+	}
+	if c.SchedulerMaxRunTimeout < c.SchedulerMinRunTimeout {
+		return fmt.Errorf("SCHEDULER_MAX_RUN_TIMEOUT (%v) cannot be less than SCHEDULER_MIN_RUN_TIMEOUT (%v)", c.SchedulerMaxRunTimeout, c.SchedulerMinRunTimeout)
+	}
+	if c.SchedulerMinMaxTurns <= 0 {
+		c.SchedulerMinMaxTurns = 10
+	}
+	if c.SchedulerMaxMaxTurns <= 0 {
+		c.SchedulerMaxMaxTurns = 100
+	}
+	if c.SchedulerMaxMaxTurns < c.SchedulerMinMaxTurns {
+		return fmt.Errorf("SCHEDULER_MAX_MAX_TURNS (%d) cannot be less than SCHEDULER_MIN_MAX_TURNS (%d)", c.SchedulerMaxMaxTurns, c.SchedulerMinMaxTurns)
 	}
 	if (c.S3Bucket == "") != (c.S3Endpoint == "") {
 		return errors.New("S3_BUCKET and S3_ENDPOINT must be set together")
@@ -331,6 +374,30 @@ func getEnvFloatOrDefault(key string, defaultValue float64) float64 {
 		}
 	}
 	return defaultValue
+}
+
+func getEnvDurationStrict(key string, defaultValue time.Duration) (time.Duration, error) {
+	val := strings.TrimSpace(os.Getenv(key))
+	if val == "" {
+		return defaultValue, nil
+	}
+	d, err := time.ParseDuration(val)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("invalid duration for %s: %q", key, val)
+	}
+	return d, nil
+}
+
+func getEnvIntStrict(key string, defaultValue int) (int, error) {
+	val := strings.TrimSpace(os.Getenv(key))
+	if val == "" {
+		return defaultValue, nil
+	}
+	i, err := strconv.Atoi(val)
+	if err != nil || i <= 0 {
+		return 0, fmt.Errorf("invalid integer for %s: %q", key, val)
+	}
+	return i, nil
 }
 
 // LoadDotEnv parses a simple .env file and populates environment variables that are not yet set.
