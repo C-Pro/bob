@@ -48,3 +48,7 @@
 - [x] **Track: Task Scheduler & Permission-Guarded Execution**
 *Link: [./tracks/task-scheduler_20260919/](./tracks/task-scheduler_20260919/)*
 
+---
+
+- [ ] **Track: Attachment Tools for Isolated Sandbox Execution**
+*Link: [./tracks/attachment-tools_20260921/](./tracks/attachment-tools_20260921/)*
