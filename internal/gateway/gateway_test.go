@@ -20,6 +20,7 @@ import (
 	"bob/internal/memory"
 	"bob/internal/models"
 	"bob/internal/sandbox"
+	"bob/internal/tools"
 	"bob/internal/tools/tavily"
 
 	"github.com/fasthttp/websocket"
@@ -1230,7 +1231,7 @@ func TestProcessMessage_ImageAttachment(t *testing.T) {
 	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/images/img-123") {
 			assert.Equal(t, "1", r.URL.Query().Get("thumb"))
-			w.Header().Set("Content-Type", "image/png")
+			w.Header().Set("Content-Type", "image/jpeg")
 			_, _ = w.Write(fakeImageBytes)
 			return
 		}
@@ -1318,15 +1319,15 @@ func TestProcessMessage_ImageAttachment(t *testing.T) {
 	assert.Equal(t, openai.ChatMessageRoleUser, receivedRole)
 	require.Len(t, receivedMultiContent, 2)
 	assert.Equal(t, openai.ChatMessagePartTypeText, receivedMultiContent[0].Type)
-	assert.Equal(t, "Alice: @bot what is in this picture?", receivedMultiContent[0].Text)
+	assert.Equal(t, "Alice: @bot what is in this picture?\n\n[Attachment: photo.png (id: img-123, type: image/png)]", receivedMultiContent[0].Text)
 	assert.Equal(t, openai.ChatMessagePartTypeImageURL, receivedMultiContent[1].Type)
-	assert.Equal(t, "data:image/png;base64,"+fakeImageB64, receivedMultiContent[1].ImageURL.URL)
+	assert.Equal(t, "data:image/jpeg;base64,"+fakeImageB64, receivedMultiContent[1].ImageURL.URL)
 
 	// Verify ring buffer entry
 	entries := gw.contextManager.GetOrCreate("townhall").Entries()
 	require.Len(t, entries, 2) // user + assistant
 	assert.Len(t, entries[0].Images, 1)
-	assert.Equal(t, "data:image/png;base64,"+fakeImageB64, entries[0].Images[0].URL)
+	assert.Equal(t, "data:image/jpeg;base64,"+fakeImageB64, entries[0].Images[0].URL)
 
 	gw.Stop()
 }
@@ -1450,9 +1451,9 @@ func TestProcessMessage_TextAndBinaryAttachments(t *testing.T) {
 
 	entries := gw.contextManager.GetOrCreate("dm_user1").Entries()
 	require.Len(t, entries, 2)
-	assert.Contains(t, entries[0].Content, "[Attachment settings.conf]:\n```\nconfig_key=val123\n```")
-	assert.Contains(t, entries[0].Content, "[Attachment: data.zip (application/zip, not displayed)]")
-	assert.Contains(t, entries[0].Content, "[Attachment: missing.txt (failed to download)]")
+	assert.Contains(t, entries[0].Content, "[Attachment: settings.conf (id: f-text, type: text/plain)]:\n```\nconfig_key=val123\n```")
+	assert.Contains(t, entries[0].Content, "[Attachment: data.zip (id: f-bin, type: application/zip)]")
+	assert.Contains(t, entries[0].Content, "[Attachment: missing.txt (id: f-error, type: text/plain)] (failed to download)")
 
 	gw.Stop()
 }
@@ -1511,11 +1512,12 @@ func TestWarmupChat_WithAttachments(t *testing.T) {
 	require.Len(t, entries, 2)
 
 	assert.Contains(t, entries[0].Content, "First with image")
+	assert.Contains(t, entries[0].Content, "[Attachment: shot.jpg (id: img-warmup, type: image/jpeg)]")
 	require.Len(t, entries[0].Images, 1)
 	assert.Equal(t, "data:image/jpeg;base64,dGh1bWItYnl0ZXM=", entries[0].Images[0].URL)
 
 	assert.Contains(t, entries[1].Content, "Second with log")
-	assert.Contains(t, entries[1].Content, "[Attachment app.log]:\n```\nhistorical log line\n```")
+	assert.Contains(t, entries[1].Content, "[Attachment: app.log (id: f-warmup, type: text/plain)]:\n```\nhistorical log line\n```")
 }
 
 func linkTestModels(t *testing.T, dataDir string) {
@@ -1594,6 +1596,99 @@ func TestGateway_EvictionToMemoryIndexing(t *testing.T) {
 	assert.Contains(t, hits[0].Content, "Super secret project alpha")
 }
 
+func TestGateway_AttachmentRAGDiscoverability(t *testing.T) {
+	tempDir := t.TempDir()
+	linkTestModels(t, tempDir)
+
+	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/images/rag-img":
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write([]byte("fake-png-data"))
+		case "/api/files/rag-doc":
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("quarterly financial analysis content"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer besedkaServer.Close()
+
+	cfg := &config.Config{
+		BesedkaURL:        besedkaServer.URL,
+		DataDir:           tempDir,
+		MsgRingBufferSize: 2,
+	}
+
+	gw := NewGateway(cfg, nil)
+	gw.httpClient = besedkaServer.Client()
+	defer gw.Stop()
+
+	ctx := context.Background()
+	now := time.Now().Unix()
+
+	// Push 1 message with attachments
+	extraText, images := gw.processAttachments(ctx, []models.Attachment{
+		{
+			Type:     models.AttachmentTypeImage,
+			Name:     "financial_chart.png",
+			MimeType: "image/png",
+			FileID:   "rag-img",
+		},
+		{
+			Type:     models.AttachmentTypeFile,
+			Name:     "report.txt",
+			MimeType: "text/plain",
+			FileID:   "rag-doc",
+		},
+		{
+			Type:     models.AttachmentTypeFile,
+			Name:     "archive.tar.gz",
+			MimeType: "application/gzip",
+			FileID:   "rag-bin",
+		},
+	})
+
+	gw.contextManager.Push("dm_user1", chatcontext.Entry{
+		Seq:        100,
+		Role:       "user",
+		SenderName: "Alice",
+		Content:    "Here are the quarterly attachments" + extraText,
+		Images:     images,
+		Timestamp:  now,
+	})
+
+	// Push 2 more messages to trigger eviction of msg 100 (capacity 2)
+	gw.contextManager.Push("dm_user1", chatcontext.Entry{
+		Seq:        101,
+		Role:       "assistant",
+		SenderName: "Bob",
+		Content:    "Received documents.",
+		Timestamp:  now + 1,
+	})
+	gw.contextManager.Push("dm_user1", chatcontext.Entry{
+		Seq:        102,
+		Role:       "user",
+		SenderName: "Alice",
+		Content:    "Let me know your thoughts.",
+		Timestamp:  now + 2,
+	})
+
+	// Allow async indexing to store chunk into dm_dm_user1.db
+	var hits []memory.MemoryItem
+	require.Eventually(t, func() bool {
+		var err error
+		hits, err = gw.MemoryManager().Search(ctx, "report", "dm_user1", true, 5)
+		return err == nil && len(hits) > 0
+	}, 45*time.Second, 150*time.Millisecond)
+
+	require.NotEmpty(t, hits)
+	assert.Contains(t, hits[0].Content, "[Attachment: report.txt (id: rag-doc, type: text/plain)]")
+	assert.Contains(t, hits[0].Content, "[Attachment: financial_chart.png (id: rag-img, type: image/png)]")
+	assert.Contains(t, hits[0].Content, "[Attachment: archive.tar.gz (id: rag-bin, type: application/gzip)]")
+}
+
+
 func TestGateway_StartupSequenceCatchup(t *testing.T) {
 	tempDir := t.TempDir()
 	linkTestModels(t, tempDir)
@@ -1624,9 +1719,23 @@ func TestGateway_StartupSequenceCatchup(t *testing.T) {
 			})
 			return
 		}
+		if r.URL.Path == "/api/files/catchup-file" {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("catchup notes content"))
+			return
+		}
 		if r.URL.Path == "/api/chats/dm_user1/messages" {
 			_ = json.NewEncoder(w).Encode([]models.Message{
-				{Seq: 1, ChatID: "dm_user1", UserID: "u1", Content: "Private DM catchup 1", Timestamp: 200},
+				{
+					Seq:       1,
+					ChatID:    "dm_user1",
+					UserID:    "u1",
+					Content:   "Private DM catchup 1",
+					Timestamp: 200,
+					Attachments: []models.Attachment{
+						{Type: models.AttachmentTypeFile, Name: "catchup_notes.txt", MimeType: "text/plain", FileID: "catchup-file"},
+					},
+				},
 				{Seq: 2, ChatID: "dm_user1", UserID: "bot_1", Content: "Private DM catchup 2", Timestamp: 201},
 			})
 			return
@@ -1670,6 +1779,7 @@ func TestGateway_StartupSequenceCatchup(t *testing.T) {
 	require.NoError(t, err)
 	assert.GreaterOrEqual(t, len(dmHits), 1)
 	assert.Equal(t, "[Direct Message]", dmHits[0].Source)
+	assert.Contains(t, dmHits[0].Content, "[Attachment: catchup_notes.txt (id: catchup-file, type: text/plain)]")
 }
 
 func TestProcessMessageWithRecallMemoryTool(t *testing.T) {
@@ -2786,4 +2896,155 @@ func TestGateway_DeliverFSMResult(t *testing.T) {
 	}
 }
 
+func TestGateway_SendMessageWithAttachments(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
+	receivedMsgs := make(chan models.ClientMessage, 10)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/chat":
+			upgrader := websocket.Upgrader{}
+			c, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer func() { _ = c.Close() }()
+			for {
+				var msg models.ClientMessage
+				if err := c.ReadJSON(&msg); err != nil {
+					return
+				}
+				receivedMsgs <- msg
+			}
+		}
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{
+		BesedkaURL: srv.URL,
+	}
+	gw := NewGateway(cfg, nil)
+	defer gw.Stop()
+
+	require.NoError(t, gw.DialWebSocket(ctx))
+
+	// 1. Send without attachments
+	err := gw.SendMessage("dm_chat_1", "Hello without attachments")
+	require.NoError(t, err)
+
+	select {
+	case msg := <-receivedMsgs:
+		assert.Equal(t, "dm_chat_1", msg.ChatID)
+		assert.Equal(t, "Hello without attachments", msg.Content)
+		assert.Empty(t, msg.Attachments)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for message")
+	}
+
+	// 2. Send with attachments
+	sampleAtts := []models.Attachment{
+		{
+			Type:     models.AttachmentTypeFile,
+			Name:     "data.csv",
+			MimeType: "text/csv",
+			FileID:   "fid_123",
+		},
+		{
+			Type:     models.AttachmentTypeImage,
+			Name:     "chart.png",
+			MimeType: "image/png",
+			FileID:   "fid_456",
+		},
+	}
+	err = gw.SendMessageWithAttachments("dm_chat_1", "Hello with attachments", sampleAtts)
+	require.NoError(t, err)
+
+	select {
+	case msg := <-receivedMsgs:
+		assert.Equal(t, "dm_chat_1", msg.ChatID)
+		assert.Equal(t, "Hello with attachments", msg.Content)
+		require.Len(t, msg.Attachments, 2)
+		assert.Equal(t, "fid_123", msg.Attachments[0].FileID)
+		assert.Equal(t, "data.csv", msg.Attachments[0].Name)
+		assert.Equal(t, models.AttachmentTypeFile, msg.Attachments[0].Type)
+		assert.Equal(t, "fid_456", msg.Attachments[1].FileID)
+		assert.Equal(t, "chart.png", msg.Attachments[1].Name)
+		assert.Equal(t, models.AttachmentTypeImage, msg.Attachments[1].Type)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for message with attachments")
+	}
+}
+
+func TestGateway_Deliver_WithAttachments(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	receivedMsgs := make(chan models.ClientMessage, 10)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/chat":
+			upgrader := websocket.Upgrader{}
+			c, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer func() { _ = c.Close() }()
+			for {
+				var msg models.ClientMessage
+				if err := c.ReadJSON(&msg); err != nil {
+					return
+				}
+				receivedMsgs <- msg
+			}
+		}
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{
+		BesedkaURL: srv.URL,
+	}
+	gw := NewGateway(cfg, nil)
+	defer gw.Stop()
+
+	require.NoError(t, gw.DialWebSocket(ctx))
+
+	// Attach chat session with staged attachments to ctx
+	sess := tools.NewChatSessionContext("dm_chat_99", "u1", true)
+	require.NoError(t, sess.StageAttachment(models.Attachment{
+		Type:     models.AttachmentTypeFile,
+		Name:     "report.pdf",
+		MimeType: "application/pdf",
+		FileID:   "file_pdf_77",
+	}))
+	deliverCtx := tools.WithChatSession(ctx, sess)
+
+	run := &fsm.FSMRun{
+		ID:         "run_att_123",
+		ChatID:     "dm_chat_99",
+		UserID:     "u1",
+		IsDM:       true,
+		Status:     fsm.RunStatusCompleted,
+		ResultJSON: "Here is your report.",
+	}
+
+	err := gw.Deliver(deliverCtx, run)
+	require.NoError(t, err)
+
+	select {
+	case msg := <-receivedMsgs:
+		assert.Equal(t, "dm_chat_99", msg.ChatID)
+		assert.Equal(t, "Here is your report.", msg.Content)
+		require.Len(t, msg.Attachments, 1)
+		assert.Equal(t, "file_pdf_77", msg.Attachments[0].FileID)
+		assert.Equal(t, "report.pdf", msg.Attachments[0].Name)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for delivered message with attachments")
+	}
+
+	entries := gw.contextManager.GetOrCreate("dm_chat_99").Entries()
+	require.NotEmpty(t, entries)
+	lastEntry := entries[len(entries)-1]
+	assert.Contains(t, lastEntry.Content, "Here is your report.")
+	assert.Contains(t, lastEntry.Content, "[Attachment: report.pdf (id: file_pdf_77, type: application/pdf)]")
+}

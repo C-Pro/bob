@@ -12,6 +12,7 @@ import (
 
 	"bob/internal/chatcontext"
 	"bob/internal/fsm"
+	"bob/internal/models"
 	"bob/internal/sandbox"
 	"bob/internal/scheduler"
 	"bob/internal/tools"
@@ -22,6 +23,17 @@ import (
 // MessageSender sends output messages to chat platforms.
 type MessageSender interface {
 	SendMessage(chatID, content string) error
+}
+
+// AttachmentMessageSender extends MessageSender with support for attachments.
+type AttachmentMessageSender interface {
+	MessageSender
+	SendMessageWithAttachments(chatID, content string, attachments []models.Attachment) error
+}
+
+// AttachmentProcessor processes attachments to return context formatting and images.
+type AttachmentProcessor interface {
+	ProcessAttachments(ctx context.Context, attachments []models.Attachment) (string, []chatcontext.ImageAttachment)
 }
 
 // MessageSenderFunc is an adapter for MessageSender.
@@ -99,9 +111,10 @@ func (f FSMRunnerFunc) RunToolLoop(ctx context.Context, req fsm.ToolLoopRequest)
 type InvokerConfig struct {
 	FSM                FSMRunner
 	Tools              *tools.Registry
-	Sandbox            *sandbox.Manager
-	Sender             MessageSender
-	ContextMgr         *chatcontext.Manager
+	Sandbox             *sandbox.Manager
+	Sender              MessageSender
+	AttachmentProcessor AttachmentProcessor
+	ContextMgr          *chatcontext.Manager
 	Model              string
 	BotID              string
 	BotName            string
@@ -251,11 +264,7 @@ func (inv *ScheduleInvoker) ExecuteSchedule(ctx context.Context, sched *schedule
 	}
 
 	// 4. Prepare chat context and tool definitions
-	sessionCtx := tools.ChatSessionContext{
-		ChatID: sched.ChatID,
-		UserID: sched.UserID,
-		IsDM:   isDM,
-	}
+	sessionCtx := tools.NewChatSessionContext(sched.ChatID, sched.UserID, isDM)
 	if inv.cfg.Sender != nil {
 		sessionCtx.Notifier = inv.cfg.Sender.SendMessage
 	}
@@ -321,15 +330,59 @@ func (inv *ScheduleInvoker) ExecuteSchedule(ctx context.Context, sched *schedule
 
 		if res != nil && res.Content != "" && inv.cfg.Sender != nil {
 			resultText := fmt.Sprintf("⏱️ **Scheduled Task [%s] completed:**\n%s", sched.Name, res.Content)
-			if sendErr := inv.cfg.Sender.SendMessage(sched.ChatID, resultText); sendErr != nil {
+			var stagedAtts []models.Attachment
+			if sessionCtx.StagedAttachments != nil {
+				stagedAtts = sessionCtx.GetStagedAttachments()
+			}
+			if len(stagedAtts) == 0 && len(res.Attachments) > 0 {
+				stagedAtts = res.Attachments
+			}
+
+			if attSender, ok := inv.cfg.Sender.(AttachmentMessageSender); ok && len(stagedAtts) > 0 {
+				if sendErr := attSender.SendMessageWithAttachments(sched.ChatID, resultText, stagedAtts); sendErr != nil {
+					slog.Warn("failed to send scheduled task result message with attachments", "error", sendErr)
+				}
+			} else if sendErr := inv.cfg.Sender.SendMessage(sched.ChatID, resultText); sendErr != nil {
 				slog.Warn("failed to send scheduled task result message", "error", sendErr)
 			}
 			if inv.cfg.ContextMgr != nil {
+				pushContent, pushImages := resultText, []chatcontext.ImageAttachment(nil)
+				if len(stagedAtts) > 0 {
+					var attProc AttachmentProcessor
+					if ap, ok := inv.cfg.Sender.(AttachmentProcessor); ok {
+						attProc = ap
+					} else if inv.cfg.AttachmentProcessor != nil {
+						attProc = inv.cfg.AttachmentProcessor
+					}
+
+					if attProc != nil {
+						extraText, images := attProc.ProcessAttachments(ctx, stagedAtts)
+						pushContent = strings.TrimSpace(resultText + extraText)
+						pushImages = images
+					} else {
+						var extraText strings.Builder
+						for _, att := range stagedAtts {
+							attName := strings.TrimSpace(att.Name)
+							if attName == "" {
+								attName = "attachment"
+							}
+							fileID := strings.TrimSpace(att.FileID)
+							mimeStr := att.MimeType
+							if mimeStr == "" {
+								mimeStr = "application/octet-stream"
+							}
+							fmt.Fprintf(&extraText, "\n\n[Attachment: %s (id: %s, type: %s)]", attName, fileID, mimeStr)
+						}
+						pushContent = strings.TrimSpace(resultText + extraText.String())
+					}
+				}
+
 				inv.cfg.ContextMgr.Push(sched.ChatID, chatcontext.Entry{
 					Role:       "assistant",
 					SenderID:   inv.cfg.BotID,
 					SenderName: inv.cfg.BotName,
-					Content:    resultText,
+					Content:    pushContent,
+					Images:     pushImages,
 					Timestamp:  time.Now().Unix(),
 				})
 			}
