@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -15,6 +17,7 @@ import (
 	"bob/internal/fsm"
 	"bob/internal/llm"
 	"bob/internal/models"
+	"bob/internal/sandbox"
 
 	"github.com/fasthttp/websocket"
 	openai "github.com/sashabaranov/go-openai"
@@ -590,3 +593,366 @@ func TestGateway_FSMToolLoop_FallbackToVolatileOnFSMFailure(t *testing.T) {
 	}
 }
 
+func TestGateway_FSMToolLoop_SandboxUploadAttachment_Integration(t *testing.T) {
+	tempDir := t.TempDir()
+	var llmCallCount int32
+	var uploadFileCalled int32
+
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := atomic.AddInt32(&llmCallCount, 1)
+
+		var req openai.ChatCompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		if count == 1 {
+			// First call: model decides to upload report.txt from sandbox
+			resp := openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role: openai.ChatMessageRoleAssistant,
+							ToolCalls: []openai.ToolCall{
+								{
+									ID:   "call_upload_1",
+									Type: openai.ToolTypeFunction,
+									Function: openai.FunctionCall{
+										Name:      "sandbox_upload_attachment",
+										Arguments: `{"source_path": "report.txt", "name": "final_report.txt"}`,
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		// Second call: after tool result delivered, model produces final response
+		resp := openai.ChatCompletionResponse{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Message: openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "I have uploaded the final report for you.",
+					},
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer llmServer.Close()
+
+	sentMsgs := make(chan models.ClientMessage, 10)
+	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/me":
+			_ = json.NewEncoder(w).Encode(models.User{ID: "bot_1", DisplayName: "Bob", UserName: "bot"})
+		case "/api/users":
+			_ = json.NewEncoder(w).Encode([]models.User{{ID: "u1", DisplayName: "Alice"}})
+		case "/api/chats":
+			_ = json.NewEncoder(w).Encode([]models.Chat{{ID: "townhall"}, {ID: "dm1", IsDM: true}})
+		case "/api/upload/file":
+			atomic.AddInt32(&uploadFileCalled, 1)
+			_ = json.NewEncoder(w).Encode(map[string]string{"id": "file_upl_123", "fileId": "file_upl_123"})
+		case "/api/chat":
+			upgrader := websocket.Upgrader{}
+			c, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer func() { _ = c.Close() }()
+			for {
+				var cm models.ClientMessage
+				if err := c.ReadJSON(&cm); err != nil {
+					return
+				}
+				sentMsgs <- cm
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer besedkaServer.Close()
+
+	cfg := &config.Config{
+		BesedkaURL:                besedkaServer.URL,
+		BesedkaAPIKey:             "test-key",
+		OpenAIAPIKey:              "test-key",
+		OpenAIBaseURL:             llmServer.URL,
+		OpenAIModel:               "test-model",
+		BotHandle:                 "@bot",
+		DataDir:                   tempDir,
+		TownhallToolMaxIterations: 10,
+		DMToolMaxIterations:       20,
+		TownhallMaxParagraphs:     5,
+		DMMaxParagraphs:           10,
+		MsgRingBufferSize:         10,
+		MaxAttachmentSizeBytes:    25 * 1024 * 1024,
+		SandboxEnabled:            true,
+		SandboxDrivers:            []string{"bwrap"},
+		SandboxMaxLifetime:        30 * time.Minute,
+		SandboxDefaultExecTimeout: 1 * time.Minute,
+		SandboxMaxExecTimeout:     10 * time.Minute,
+	}
+
+	llmClient := llm.NewClient(cfg, llmServer.Client())
+	gw := NewGateway(cfg, llmClient)
+	defer gw.Stop()
+	gw.httpClient = besedkaServer.Client()
+
+	storeProv := NewMemoryStoreProvider(gw.MemoryManager(), cfg.DataDir)
+	fsmEngine := fsm.NewEngine(storeProv, llmClient, gw.ToolsRegistry(), fsm.WithDefaultModel(cfg.OpenAIModel))
+	gw.SetFSMEngine(fsmEngine)
+
+	mockDriver := &mockGatewaySandboxDriver{}
+	sbxMgr := sandbox.NewManager(cfg.SandboxConfig(), []sandbox.Driver{mockDriver})
+	defer func() { _ = sbxMgr.Close() }()
+	gw.SetSandboxManager(sbxMgr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	require.NoError(t, gw.DialWebSocket(ctx))
+	_, err := gw.FetchBotUser(ctx)
+	require.NoError(t, err)
+
+	// Create running sandbox for user "u1"
+	_, err = sbxMgr.RequestSandbox(ctx, "u1", "dm1", sandbox.RequestParams{
+		Driver:      sandbox.DriverBwrap,
+		NetworkMode: sandbox.NetworkNone,
+	})
+	require.NoError(t, err)
+	_, err = sbxMgr.ApproveSandbox(ctx, "u1")
+	require.NoError(t, err)
+
+	wsDir, err := sbxMgr.UserWorkspaceDir("u1")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(wsDir, "report.txt"), []byte("Generated report content inside sandbox"), 0644))
+
+	// Send DM message to bot
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm1",
+		UserID:    "u1",
+		Content:   "Please upload report.txt",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+
+	select {
+	case reply := <-sentMsgs:
+		assert.Contains(t, reply.Content, "I have uploaded the final report for you.")
+		require.Len(t, reply.Attachments, 1)
+		assert.Equal(t, "file_upl_123", reply.Attachments[0].FileID)
+		assert.Equal(t, "final_report.txt", reply.Attachments[0].Name)
+		assert.Equal(t, models.AttachmentTypeFile, reply.Attachments[0].Type)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for bot response with attachments")
+	}
+
+	assert.Equal(t, int32(1), atomic.LoadInt32(&uploadFileCalled))
+
+	// Verify chatcontext entry includes the staged attachment descriptor
+	entries := gw.contextManager.GetOrCreate("dm1").Entries()
+	require.NotEmpty(t, entries)
+	assert.Contains(t, entries[len(entries)-1].Content, "final_report.txt")
+	assert.Contains(t, entries[len(entries)-1].Content, "file_upl_123")
+}
+
+func TestGateway_FSMToolLoop_SandboxDownloadAttachment_Integration(t *testing.T) {
+	tempDir := t.TempDir()
+	var llmCallCount int32
+	var downloadFileCalled int32
+
+	fileContent := "sample data,column1,column2\n1,alpha,100\n2,beta,200\n"
+
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := atomic.AddInt32(&llmCallCount, 1)
+
+		var req openai.ChatCompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		if count == 1 {
+			// First call: verify attachment was discoverable in LLM prompt/context messages
+			var discoveredFileID string
+			for _, m := range req.Messages {
+				if strings.Contains(m.Content, "[Attachment: input.csv (id: file_dl_42, type: text/csv)]") {
+					discoveredFileID = "file_dl_42"
+					break
+				}
+			}
+			if discoveredFileID == "" {
+				http.Error(w, "attachment descriptor not found in LLM prompt context", http.StatusBadRequest)
+				return
+			}
+
+			resp := openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role: openai.ChatMessageRoleAssistant,
+							ToolCalls: []openai.ToolCall{
+								{
+									ID:   "call_download_1",
+									Type: openai.ToolTypeFunction,
+									Function: openai.FunctionCall{
+										Name:      "sandbox_download_attachment",
+										Arguments: fmt.Sprintf(`{"file_id": %q, "destination_path": "data/input.csv"}`, discoveredFileID),
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		// Second call: final answer
+		resp := openai.ChatCompletionResponse{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Message: openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "Downloaded input.csv to data/input.csv in sandbox workspace.",
+					},
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer llmServer.Close()
+
+	sentMsgs := make(chan models.ClientMessage, 10)
+	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/me":
+			_ = json.NewEncoder(w).Encode(models.User{ID: "bot_1", DisplayName: "Bob", UserName: "bot"})
+		case "/api/users":
+			_ = json.NewEncoder(w).Encode([]models.User{{ID: "u1", DisplayName: "Alice"}})
+		case "/api/chats":
+			_ = json.NewEncoder(w).Encode([]models.Chat{{ID: "townhall"}, {ID: "dm1", IsDM: true}})
+		case "/api/files/file_dl_42":
+			atomic.AddInt32(&downloadFileCalled, 1)
+			w.Header().Set("Content-Type", "text/csv")
+			_, _ = w.Write([]byte(fileContent))
+		case "/api/chat":
+			upgrader := websocket.Upgrader{}
+			c, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer func() { _ = c.Close() }()
+			for {
+				var cm models.ClientMessage
+				if err := c.ReadJSON(&cm); err != nil {
+					return
+				}
+				sentMsgs <- cm
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer besedkaServer.Close()
+
+	cfg := &config.Config{
+		BesedkaURL:                besedkaServer.URL,
+		BesedkaAPIKey:             "test-key",
+		OpenAIAPIKey:              "test-key",
+		OpenAIBaseURL:             llmServer.URL,
+		OpenAIModel:               "test-model",
+		BotHandle:                 "@bot",
+		DataDir:                   tempDir,
+		TownhallToolMaxIterations: 10,
+		DMToolMaxIterations:       20,
+		TownhallMaxParagraphs:     5,
+		DMMaxParagraphs:           10,
+		MsgRingBufferSize:         10,
+		MaxAttachmentSizeBytes:    25 * 1024 * 1024,
+		SandboxEnabled:            true,
+		SandboxDrivers:            []string{"bwrap"},
+		SandboxMaxLifetime:        30 * time.Minute,
+		SandboxDefaultExecTimeout: 1 * time.Minute,
+		SandboxMaxExecTimeout:     10 * time.Minute,
+	}
+
+	llmClient := llm.NewClient(cfg, llmServer.Client())
+	gw := NewGateway(cfg, llmClient)
+	defer gw.Stop()
+	gw.httpClient = besedkaServer.Client()
+
+	storeProv := NewMemoryStoreProvider(gw.MemoryManager(), cfg.DataDir)
+	fsmEngine := fsm.NewEngine(storeProv, llmClient, gw.ToolsRegistry(), fsm.WithDefaultModel(cfg.OpenAIModel))
+	gw.SetFSMEngine(fsmEngine)
+
+	mockDriver := &mockGatewaySandboxDriver{}
+	sbxMgr := sandbox.NewManager(cfg.SandboxConfig(), []sandbox.Driver{mockDriver})
+	defer func() { _ = sbxMgr.Close() }()
+	gw.SetSandboxManager(sbxMgr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	require.NoError(t, gw.DialWebSocket(ctx))
+	_, err := gw.FetchBotUser(ctx)
+	require.NoError(t, err)
+
+	// Create running sandbox for user "u1"
+	_, err = sbxMgr.RequestSandbox(ctx, "u1", "dm1", sandbox.RequestParams{
+		Driver:      sandbox.DriverBwrap,
+		NetworkMode: sandbox.NetworkNone,
+	})
+	require.NoError(t, err)
+	_, err = sbxMgr.ApproveSandbox(ctx, "u1")
+	require.NoError(t, err)
+
+	wsDir, err := sbxMgr.UserWorkspaceDir("u1")
+	require.NoError(t, err)
+
+	// User sends message with attachment
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm1",
+		UserID:    "u1",
+		Content:   "Please analyze this data file",
+		Timestamp: time.Now().Unix(),
+		Attachments: []models.Attachment{
+			{
+				Type:     models.AttachmentTypeFile,
+				Name:     "input.csv",
+				MimeType: "text/csv",
+				FileID:   "file_dl_42",
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	select {
+	case reply := <-sentMsgs:
+		assert.Contains(t, reply.Content, "Downloaded input.csv to data/input.csv")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for bot response")
+	}
+
+	assert.Equal(t, int32(2), atomic.LoadInt32(&llmCallCount))
+	assert.GreaterOrEqual(t, atomic.LoadInt32(&downloadFileCalled), int32(1))
+
+	// Verify file was written inside sandbox workspace
+	savedContent, err := os.ReadFile(filepath.Join(wsDir, "data", "input.csv"))
+	require.NoError(t, err)
+	assert.Equal(t, fileContent, string(savedContent))
+
+	// Verify attachment descriptor in chatcontext
+	entries := gw.contextManager.GetOrCreate("dm1").Entries()
+	require.NotEmpty(t, entries)
+	assert.Contains(t, entries[0].Content, "file_dl_42")
+	assert.Contains(t, entries[0].Content, "[Attachment: input.csv (id: file_dl_42, type: text/csv)]")
+}

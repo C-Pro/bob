@@ -130,11 +130,15 @@ func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 		chatLocker:           chatLocker,
 	}
 
+	toolsRegistry.SetAttachmentClient(gw)
+	toolsRegistry.SetMaxAttachmentSize(cfg.MaxAttachmentSizeBytes)
+
 	invokerCfg := InvokerConfig{
 		Tools:      toolsRegistry,
 		Sandbox:    sandboxManager,
-		Sender:     gw,
-		ContextMgr: gw.contextManager,
+		Sender:              gw,
+		AttachmentProcessor: gw,
+		ContextMgr:          gw.contextManager,
 		Model:      cfg.OpenAIModel,
 		BotID:      "bot",
 		BotName:    "Bob",
@@ -201,6 +205,12 @@ func (g *Gateway) SetToolsRegistry(r *tools.Registry) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.toolsRegistry = r
+	if r != nil {
+		r.SetAttachmentClient(g)
+		if g.cfg != nil {
+			r.SetMaxAttachmentSize(g.cfg.MaxAttachmentSizeBytes)
+		}
+	}
 	if g.fsmEngine != nil {
 		g.fsmEngine.SetToolDefinitionProvider(g)
 	}
@@ -278,7 +288,18 @@ func (g *Gateway) Deliver(ctx context.Context, run *fsm.FSMRun) error {
 	}
 
 	formattedReply := FormatResponse(reply, run.IsDM, g.cfg.TownhallMaxParagraphs, g.cfg.DMMaxParagraphs)
-	if err := g.SendMessage(run.ChatID, formattedReply); err != nil {
+
+	var attachments []models.Attachment
+	if session, ok := tools.ChatSessionFromContext(ctx); ok {
+		attachments = session.GetStagedAttachments()
+	}
+	fsmEng := g.FSMEngine()
+	if len(attachments) == 0 && fsmEng != nil && run != nil {
+		restored := fsmEng.RestoreChatSessionContext(ctx, run)
+		attachments = restored.GetStagedAttachments()
+	}
+
+	if err := g.SendMessageWithAttachments(run.ChatID, formattedReply, attachments); err != nil {
 		return fmt.Errorf("failed to deliver recovered reply to chat %s: %w", run.ChatID, err)
 	}
 
@@ -288,11 +309,19 @@ func (g *Gateway) Deliver(ctx context.Context, run *fsm.FSMRun) error {
 		botName = "Bob"
 	}
 
+	pushContent, pushImages := formattedReply, []chatcontext.ImageAttachment(nil)
+	if len(attachments) > 0 {
+		extraText, images := g.processAttachments(ctx, attachments)
+		pushContent = strings.TrimSpace(formattedReply + extraText)
+		pushImages = images
+	}
+
 	g.contextManager.Push(run.ChatID, chatcontext.Entry{
 		Role:       "assistant",
 		SenderID:   botID,
 		SenderName: botName,
-		Content:    formattedReply,
+		Content:    pushContent,
+		Images:     pushImages,
 		Timestamp:  time.Now().Unix(),
 	})
 
@@ -448,46 +477,67 @@ func (g *Gateway) processAttachments(ctx context.Context, attachments []models.A
 		if attName == "" {
 			attName = "attachment"
 		}
+		fileID := strings.TrimSpace(att.FileID)
 
 		isImg := att.Type == models.AttachmentTypeImage || strings.HasPrefix(strings.ToLower(att.MimeType), "image/")
 		if isImg {
+			mimeStr := att.MimeType
 			data, mime, err := g.FetchImageThumbnail(ctx, att.FileID)
 			if err != nil {
 				slog.Warn("failed to fetch image thumbnail", "fileID", att.FileID, "error", err)
-				fmt.Fprintf(&extraText, "\n\n[Attachment: %s (failed to download)]", attName)
+				if mimeStr == "" {
+					mimeStr = "image"
+				}
+				fmt.Fprintf(&extraText, "\n\n[Attachment: %s (id: %s, type: %s)] (failed to download thumbnail)", attName, fileID, mimeStr)
 				continue
 			}
 			encoded := base64.StdEncoding.EncodeToString(data)
 			images = append(images, chatcontext.ImageAttachment{
 				URL: fmt.Sprintf("data:%s;base64,%s", mime, encoded),
 			})
+			if mimeStr == "" {
+				mimeStr = mime
+			}
+			if mimeStr == "" {
+				mimeStr = "image"
+			}
+			fmt.Fprintf(&extraText, "\n\n[Attachment: %s (id: %s, type: %s)]", attName, fileID, mimeStr)
 			continue
 		}
 
+		mimeStr := att.MimeType
+		if mimeStr == "" {
+			mimeStr = "application/octet-stream"
+		}
+
 		if isTextMimeOrExt(att.Name, att.MimeType) {
-			data, _, err := g.FetchFileContent(ctx, att.FileID, 16384)
+			data, detectedMime, err := g.FetchFileContent(ctx, att.FileID, 16384)
 			if err != nil {
 				slog.Warn("failed to fetch file attachment", "fileID", att.FileID, "error", err)
-				fmt.Fprintf(&extraText, "\n\n[Attachment: %s (failed to download)]", attName)
+				fmt.Fprintf(&extraText, "\n\n[Attachment: %s (id: %s, type: %s)] (failed to download)", attName, fileID, mimeStr)
 				continue
 			}
+			if detectedMime != "" && mimeStr == "application/octet-stream" {
+				mimeStr = detectedMime
+			}
 			if utf8.Valid(data) {
-				fmt.Fprintf(&extraText, "\n\n[Attachment %s]:\n```\n%s\n```", attName, string(data))
+				fmt.Fprintf(&extraText, "\n\n[Attachment: %s (id: %s, type: %s)]:\n```\n%s\n```", attName, fileID, mimeStr, string(data))
 			} else {
-				fmt.Fprintf(&extraText, "\n\n[Attachment: %s (binary content not displayed)]", attName)
+				fmt.Fprintf(&extraText, "\n\n[Attachment: %s (id: %s, type: %s)] (binary content not displayed)", attName, fileID, mimeStr)
 			}
 			continue
 		}
 
 		// Other binary file
-		mimeStr := att.MimeType
-		if mimeStr == "" {
-			mimeStr = "binary file"
-		}
-		fmt.Fprintf(&extraText, "\n\n[Attachment: %s (%s, not displayed)]", attName, mimeStr)
+		fmt.Fprintf(&extraText, "\n\n[Attachment: %s (id: %s, type: %s)]", attName, fileID, mimeStr)
 	}
 
 	return extraText.String(), images
+}
+
+// ProcessAttachments processes attachments to extract text representations and images for context storage.
+func (g *Gateway) ProcessAttachments(ctx context.Context, attachments []models.Attachment) (string, []chatcontext.ImageAttachment) {
+	return g.processAttachments(ctx, attachments)
 }
 
 // IsMentionedOrDM checks if a message should be handled by the bot.
@@ -557,6 +607,11 @@ func (g *Gateway) DialWebSocket(ctx context.Context) error {
 
 // SendMessage sends a response message back to Besedka.
 func (g *Gateway) SendMessage(chatID, content string) error {
+	return g.SendMessageWithAttachments(chatID, content, nil)
+}
+
+// SendMessageWithAttachments sends a response message with optional attachments back to Besedka.
+func (g *Gateway) SendMessageWithAttachments(chatID, content string, attachments []models.Attachment) error {
 	g.mu.Lock()
 	conn := g.conn
 	g.mu.Unlock()
@@ -566,9 +621,10 @@ func (g *Gateway) SendMessage(chatID, content string) error {
 	}
 
 	clientMsg := models.ClientMessage{
-		Type:    models.ClientMessageTypeSend,
-		ChatID:  chatID,
-		Content: content,
+		Type:        models.ClientMessageTypeSend,
+		ChatID:      chatID,
+		Content:     content,
+		Attachments: attachments,
 	}
 
 	g.mu.Lock()
@@ -1123,16 +1179,12 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 	defer progress.Stop()
 
 	var sandboxRequestCreated bool
-	sessionCtx := tools.ChatSessionContext{
-		ChatID: msg.ChatID,
-		UserID: msg.UserID,
-		IsDM:   isDM,
-		Notifier: func(chatID, text string) error {
-			return g.SendMessage(chatID, text)
-		},
-		Progress:              progress,
-		SandboxRequestCreated: &sandboxRequestCreated,
+	sessionCtx := tools.NewChatSessionContext(msg.ChatID, msg.UserID, isDM)
+	sessionCtx.Notifier = func(chatID, text string) error {
+		return g.SendMessage(chatID, text)
 	}
+	sessionCtx.Progress = progress
+	sessionCtx.SandboxRequestCreated = &sandboxRequestCreated
 
 	var toolDefs []openai.Tool
 	if toolsRegistry != nil {
@@ -1141,6 +1193,7 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 
 	var reply string
 	var err error
+	var fsmRes *fsm.ToolLoopResult
 	if toolsRegistry != nil && len(toolDefs) > 0 {
 		toolCtx := tools.WithChatSession(ctx, sessionCtx)
 		maxIterations := g.cfg.TownhallToolMaxIterations
@@ -1174,8 +1227,7 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 					}
 				},
 			}
-			var res *fsm.ToolLoopResult
-			res, err = fsmEng.RunToolLoop(toolCtx, fsmReq)
+			fsmRes, err = fsmEng.RunToolLoop(toolCtx, fsmReq)
 			if err != nil {
 				if toolCtx.Err() != nil {
 					// Context was cancelled or timed out; do not fall back
@@ -1189,8 +1241,8 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 						maxIterations,
 					)
 				}
-			} else if res != nil {
-				reply = res.Content
+			} else if fsmRes != nil {
+				reply = fsmRes.Content
 			}
 		} else {
 			reply, err = g.llmClient.GenerateChatResponseWithToolLoop(
@@ -1236,15 +1288,31 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 
 	progress.Stop()
 
-	if err := g.SendMessage(msg.ChatID, formattedReply); err != nil {
+	var outgoingAttachments []models.Attachment
+	if sessionCtx.StagedAttachments != nil {
+		outgoingAttachments = sessionCtx.GetStagedAttachments()
+	}
+	if len(outgoingAttachments) == 0 && fsmRes != nil && len(fsmRes.Attachments) > 0 {
+		outgoingAttachments = fsmRes.Attachments
+	}
+
+	if err := g.SendMessageWithAttachments(msg.ChatID, formattedReply, outgoingAttachments); err != nil {
 		return fmt.Errorf("failed to send reply to chat %s: %w", msg.ChatID, err)
+	}
+
+	pushContent, pushImages := formattedReply, []chatcontext.ImageAttachment(nil)
+	if len(outgoingAttachments) > 0 {
+		extraText, images := g.processAttachments(ctx, outgoingAttachments)
+		pushContent = strings.TrimSpace(formattedReply + extraText)
+		pushImages = images
 	}
 
 	g.contextManager.Push(msg.ChatID, chatcontext.Entry{
 		Role:       "assistant",
 		SenderID:   botID,
 		SenderName: botUser.GetDisplayName(),
-		Content:    formattedReply,
+		Content:    pushContent,
+		Images:     pushImages,
 		Timestamp:  time.Now().Unix(),
 	})
 

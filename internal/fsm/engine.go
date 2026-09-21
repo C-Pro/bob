@@ -3,6 +3,7 @@ package fsm
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"bob/internal/models"
 	"bob/internal/tools"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -75,6 +77,7 @@ type ToolLoopResult struct {
 	RunID           string
 	Content         string
 	TotalIterations int
+	Attachments     []models.Attachment
 }
 
 // EngineOption configures an Engine instance.
@@ -395,6 +398,49 @@ func (e *Engine) Stop() {
 	e.wg.Wait()
 }
 
+func restoreChatSessionContext(ctx context.Context, store *Store, run *FSMRun) tools.ChatSessionContext {
+	sess := tools.NewChatSessionContext(run.ChatID, run.UserID, run.IsDM)
+	if store == nil || run.ID == "" {
+		return sess
+	}
+	steps, err := store.ListStepsByRun(ctx, run.ID)
+	if err != nil {
+		return sess
+	}
+	for _, step := range steps {
+		if step.ToolName == "sandbox_upload_attachment" && step.Status == StepStatusCompleted {
+			var payload struct {
+				FileID   string `json:"file_id"`
+				Name     string `json:"name"`
+				MimeType string `json:"mime_type"`
+				Type     string `json:"type"`
+			}
+			if err := json.Unmarshal([]byte(step.ResultJSON), &payload); err == nil && payload.FileID != "" {
+				_ = sess.StageAttachment(models.Attachment{
+					FileID:   payload.FileID,
+					Name:     payload.Name,
+					MimeType: payload.MimeType,
+					Type:     models.AttachmentType(payload.Type),
+				})
+			}
+		}
+	}
+	return sess
+}
+
+// RestoreChatSessionContext reconstructs a ChatSessionContext for a run with any attachments
+// previously staged in completed sandbox_upload_attachment steps.
+func (e *Engine) RestoreChatSessionContext(ctx context.Context, run *FSMRun) tools.ChatSessionContext {
+	if run == nil || e.storeProvider == nil {
+		return tools.NewChatSessionContext("", "", false)
+	}
+	store, err := e.storeProvider.GetStore(ctx, run.ChatID, run.IsDM)
+	if err != nil {
+		return tools.NewChatSessionContext(run.ChatID, run.UserID, run.IsDM)
+	}
+	return restoreChatSessionContext(ctx, store, run)
+}
+
 // Recover scans all active stores for interrupted runs and resumes them.
 func (e *Engine) Recover(ctx context.Context) error {
 	stores, err := e.storeProvider.ActiveStores(ctx)
@@ -501,11 +547,7 @@ func (e *Engine) Recover(ctx context.Context) error {
 					return
 				}
 
-				runCtx = tools.WithChatSession(runCtx, tools.ChatSessionContext{
-					ChatID: runToRecover.ChatID,
-					UserID: runToRecover.UserID,
-					IsDM:   runToRecover.IsDM,
-				})
+				runCtx = tools.WithChatSession(runCtx, restoreChatSessionContext(runCtx, s, &runToRecover))
 
 				runToRecover.Status = RunStatusRunning
 				runToRecover.ResumeAt = nil
@@ -643,11 +685,7 @@ func (e *Engine) PollDueWaitingRuns(ctx context.Context) error {
 					return
 				}
 
-				runCtx = tools.WithChatSession(runCtx, tools.ChatSessionContext{
-					ChatID: runToResume.ChatID,
-					UserID: runToResume.UserID,
-					IsDM:   runToResume.IsDM,
-				})
+				runCtx = tools.WithChatSession(runCtx, restoreChatSessionContext(runCtx, s, &runToResume))
 
 				runToResume.Status = RunStatusRunning
 				runToResume.ResumeAt = nil
@@ -812,11 +850,21 @@ func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (*ToolLoo
 
 	sess, ok := tools.ChatSessionFromContext(ctx)
 	if !ok {
-		sess = tools.ChatSessionContext{}
+		sess = restoreChatSessionContext(runCtx, store, run)
+	} else {
+		if sess.StagedAttachments == nil {
+			sess.StagedAttachments = tools.NewStagedAttachmentCollector()
+		}
+		if len(sess.GetStagedAttachments()) == 0 && store != nil && run.ID != "" {
+			restored := restoreChatSessionContext(runCtx, store, run)
+			for _, att := range restored.GetStagedAttachments() {
+				_ = sess.StageAttachment(att)
+			}
+		}
+		sess.ChatID = req.ChatID
+		sess.UserID = req.UserID
+		sess.IsDM = req.IsDM
 	}
-	sess.ChatID = req.ChatID
-	sess.UserID = req.UserID
-	sess.IsDM = req.IsDM
 	runCtx = tools.WithChatSession(runCtx, sess)
 
 	if !e.acquireRun(run.ID, cancel) {
@@ -824,9 +872,9 @@ func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (*ToolLoo
 	}
 	defer e.releaseRun(run.ID)
 
-	tools := req.Tools
-	if len(tools) == 0 && e.toolDefProvider != nil {
-		tools = e.toolDefProvider.ToolDefinitions(ctx, req.ChatID, req.IsDM)
+	toolDefs := req.Tools
+	if len(toolDefs) == 0 && e.toolDefProvider != nil {
+		toolDefs = e.toolDefProvider.ToolDefinitions(ctx, req.ChatID, req.IsDM)
 	}
 
 	runner, err := e.getRunner(FSMTypeToolLoop)
@@ -834,7 +882,7 @@ func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (*ToolLoo
 		return nil, err
 	}
 
-	execErr := runner.Execute(runCtx, run, store, tools, model)
+	execErr := runner.Execute(runCtx, run, store, toolDefs, model)
 	if execErr != nil && runCtx.Err() != nil {
 		return nil, runCtx.Err()
 	}
@@ -898,7 +946,7 @@ func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (*ToolLoo
 				if updateErr := store.UpdateRun(runCtx, run); updateErr != nil {
 					return nil, updateErr
 				}
-				execErr = runner.Execute(runCtx, run, store, tools, model)
+				execErr = runner.Execute(runCtx, run, store, toolDefs, model)
 				if execErr != nil {
 					return nil, execErr
 				}
@@ -910,9 +958,15 @@ func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (*ToolLoo
 		return nil, fmt.Errorf("run %s failed: %s", run.ID, run.ErrorText)
 	}
 
+	var attachments []models.Attachment
+	if sess, ok := tools.ChatSessionFromContext(runCtx); ok {
+		attachments = sess.GetStagedAttachments()
+	}
+
 	return &ToolLoopResult{
 		RunID:           run.ID,
 		Content:         run.ResultJSON,
 		TotalIterations: run.Iteration,
+		Attachments:     attachments,
 	}, nil
 }

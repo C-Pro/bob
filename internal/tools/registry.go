@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"bob/internal/memory"
+	"bob/internal/models"
 	"bob/internal/sandbox"
 	"bob/internal/tools/tavily"
 	"bob/internal/tools/webfetch"
@@ -27,6 +28,33 @@ type ChatSessionContext struct {
 	Notifier              func(chatID, text string) error
 	Progress              *ProgressReporter
 	SandboxRequestCreated *bool
+	StagedAttachments     *StagedAttachmentCollector
+}
+
+// StageAttachment appends an attachment to the staged attachments collector if configured.
+func (s ChatSessionContext) StageAttachment(att models.Attachment) error {
+	if s.StagedAttachments == nil {
+		return errors.New("attachment staging collector is not configured")
+	}
+	return s.StagedAttachments.Add(att)
+}
+
+// GetStagedAttachments returns all attachments currently staged in the session context.
+func (s ChatSessionContext) GetStagedAttachments() []models.Attachment {
+	if s.StagedAttachments == nil {
+		return nil
+	}
+	return s.StagedAttachments.All()
+}
+
+// NewChatSessionContext creates a ChatSessionContext with initialized collectors.
+func NewChatSessionContext(chatID, userID string, isDM bool) ChatSessionContext {
+	return ChatSessionContext{
+		ChatID:            chatID,
+		UserID:            userID,
+		IsDM:              isDM,
+		StagedAttachments: NewStagedAttachmentCollector(),
+	}
 }
 
 // WithChatSession returns a new context with the given ChatSessionContext attached.
@@ -45,6 +73,8 @@ type Registry struct {
 	tavilyClient           *tavily.Client
 	memoryManager          *memory.Manager
 	sandboxManager         *sandbox.Manager
+	attachmentClient       AttachmentClient
+	maxAttachmentSizeBytes int64
 	schedulerStoreProvider SchedulerStoreProvider
 	schedulerMinRunTimeout time.Duration
 	schedulerMaxRunTimeout time.Duration
@@ -91,6 +121,17 @@ func (r *Registry) SetSchedulerLimits(minTimeout, maxTimeout time.Duration, minT
 	r.schedulerMaxRunTimeout = maxTimeout
 	r.schedulerMinMaxTurns = minTurns
 	r.schedulerMaxMaxTurns = maxTurns
+}
+
+// SetAttachmentClient configures the client used for attachment downloads and uploads.
+func (r *Registry) SetAttachmentClient(c AttachmentClient) {
+	r.attachmentClient = c
+}
+
+// SetMaxAttachmentSize sets the maximum attachment size boundary in bytes.
+func (r *Registry) SetMaxAttachmentSize(bytes int64) {
+	r.maxAttachmentSizeBytes = bytes
+	r.initToolDefinitions()
 }
 
 func (r *Registry) initToolDefinitions() {
@@ -319,13 +360,14 @@ func (r *Registry) ToolDefinitionsForSession(session ChatSessionContext) []opena
 	if session.IsDM {
 		if r.sandboxManager != nil && session.UserID != "" {
 			if sbx, ok := r.sandboxManager.GetStatus(session.UserID); ok && sbx.Status == sandbox.StatusRunning {
-				tools := make([]openai.Tool, 0, len(r.dmToolDefinitions)-1)
+				tools := make([]openai.Tool, 0, len(r.dmToolDefinitions)+2)
 				for _, t := range r.dmToolDefinitions {
 					if t.Function != nil && t.Function.Name == "sandbox_request" {
 						continue
 					}
 					tools = append(tools, t)
 				}
+				tools = append(tools, r.attachmentToolDefinitions()...)
 				return tools
 			}
 		}
@@ -385,6 +427,10 @@ func (r *Registry) Execute(ctx context.Context, name string, argsJSON string) (s
 		return r.executeSandboxExec(ctx, argsJSON)
 	case "sandbox_destroy":
 		return r.executeSandboxDestroy(ctx, argsJSON)
+	case "sandbox_download_attachment":
+		return r.executeSandboxDownloadAttachment(ctx, argsJSON)
+	case "sandbox_upload_attachment":
+		return r.executeSandboxUploadAttachment(ctx, argsJSON)
 	case "schedule_task":
 		return r.executeScheduleTask(ctx, argsJSON)
 	case "list_schedules":

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,6 +16,9 @@ import (
 
 // DefaultUserAgent is the standard User-Agent header used for outgoing HTTP requests.
 const DefaultUserAgent = "Besedka-Bot/1.0"
+
+// DefaultMaxAttachmentSizeBytes is the default maximum size for attachment downloads/uploads (25MB).
+const DefaultMaxAttachmentSizeBytes int64 = 25 * 1024 * 1024
 
 // Config holds runtime configuration settings for the agent.
 type Config struct {
@@ -65,6 +69,7 @@ type Config struct {
 	SchedulerMaxRunTimeout     time.Duration
 	SchedulerMinMaxTurns       int
 	SchedulerMaxMaxTurns       int
+	MaxAttachmentSizeBytes     int64
 }
 
 // DefaultSandboxAllowedImages defines standard safe container images.
@@ -139,6 +144,11 @@ func LoadFromEnv() (*Config, error) {
 		return nil, err
 	}
 
+	maxAttachmentSizeBytes, err := parseAttachmentSize(os.Getenv("MAX_ATTACHMENT_SIZE"), DefaultMaxAttachmentSizeBytes)
+	if err != nil {
+		return nil, fmt.Errorf("invalid MAX_ATTACHMENT_SIZE: %w", err)
+	}
+
 	cfg := &Config{
 		BotHandle:                  getEnvOrDefault("BOT_HANDLE", "@bot"),
 		BesedkaURL:                 getEnvOrDefault("BESEDKA_URL", defaultBesedkaURL),
@@ -187,6 +197,7 @@ func LoadFromEnv() (*Config, error) {
 		SchedulerMaxRunTimeout:     schedMaxTimeout,
 		SchedulerMinMaxTurns:       schedMinTurns,
 		SchedulerMaxMaxTurns:       schedMaxTurns,
+		MaxAttachmentSizeBytes:     maxAttachmentSizeBytes,
 	}
 
 	if cfg.SandboxHostDataDir != "" {
@@ -285,6 +296,9 @@ func (c *Config) Validate(requireAPIKey bool) error {
 	}
 	if c.SchedulerMaxMaxTurns < c.SchedulerMinMaxTurns {
 		return fmt.Errorf("SCHEDULER_MAX_MAX_TURNS (%d) cannot be less than SCHEDULER_MIN_MAX_TURNS (%d)", c.SchedulerMaxMaxTurns, c.SchedulerMinMaxTurns)
+	}
+	if c.MaxAttachmentSizeBytes <= 0 {
+		c.MaxAttachmentSizeBytes = DefaultMaxAttachmentSizeBytes
 	}
 	if (c.S3Bucket == "") != (c.S3Endpoint == "") {
 		return errors.New("S3_BUCKET and S3_ENDPOINT must be set together")
@@ -430,4 +444,54 @@ func LoadDotEnv(filename string) {
 			}
 		}
 	}
+}
+
+// parseAttachmentSize parses a byte size string like "25MB", "10M", "1024", or returns defaultValue if empty.
+func parseAttachmentSize(val string, defaultValue int64) (int64, error) {
+	s := strings.TrimSpace(val)
+	if s == "" {
+		return defaultValue, nil
+	}
+
+	var numPart strings.Builder
+	var unitPart strings.Builder
+	seenUnit := false
+	for _, r := range s {
+		if !seenUnit && r >= '0' && r <= '9' {
+			numPart.WriteRune(r)
+		} else {
+			seenUnit = true
+			unitPart.WriteRune(r)
+		}
+	}
+
+	if numPart.Len() == 0 {
+		return 0, fmt.Errorf("invalid byte size %q: missing numeric value", val)
+	}
+
+	base, err := strconv.ParseInt(numPart.String(), 10, 64)
+	if err != nil || base <= 0 {
+		return 0, fmt.Errorf("invalid byte size %q: value must be a positive integer", val)
+	}
+
+	unit := strings.ToUpper(strings.TrimSpace(unitPart.String()))
+	var multiplier int64
+	switch unit {
+	case "", "B":
+		multiplier = 1
+	case "K", "KB", "KIB":
+		multiplier = 1024
+	case "M", "MB", "MIB":
+		multiplier = 1024 * 1024
+	case "G", "GB", "GIB":
+		multiplier = 1024 * 1024 * 1024
+	default:
+		return 0, fmt.Errorf("invalid byte size unit %q in %q", unit, val)
+	}
+
+	if multiplier > 1 && base > math.MaxInt64/multiplier {
+		return 0, fmt.Errorf("byte size %q causes int64 overflow", val)
+	}
+
+	return base * multiplier, nil
 }

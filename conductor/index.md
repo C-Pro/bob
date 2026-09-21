@@ -50,5 +50,5 @@
 
 ---
 
-- [ ] **Track: Attachment Tools for Isolated Sandbox Execution**
+- [x] **Track: Attachment Tools for Isolated Sandbox Execution**
 *Link: [./tracks/attachment-tools_20260921/](./tracks/attachment-tools_20260921/)*

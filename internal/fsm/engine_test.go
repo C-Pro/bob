@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"bob/internal/models"
 	"bob/internal/tools"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -927,8 +928,49 @@ func TestEngine_DelayedTransitionTimers_CancelledOnAcquire(t *testing.T) {
 	_ = cancelCalled
 }
 
+func TestRestoreChatSessionContext_StagedAttachments(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
 
+	run := &FSMRun{
+		ID:           "run_staged_rec",
+		ChatID:       "chat_dm_1",
+		UserID:       "user_1",
+		IsDM:         true,
+		FSMType:      FSMTypeToolLoop,
+		Status:       RunStatusRunning,
+		CurrentState: StateExecuteSteps,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
 
+	// Add completed sandbox_upload_attachment step
+	uploadStep := FSMStep{
+		ID:            "step_upl_1",
+		RunID:         run.ID,
+		Iteration:     1,
+		StepIndex:     0,
+		ToolName:      "sandbox_upload_attachment",
+		ToolCallID:    "call_upl_1",
+		ExecutionMode: ExecutionModeSequential,
+		Status:        StepStatusCompleted,
+		ResultJSON:    `{"file_id":"f_staged_123","name":"plot.png","mime_type":"image/png","type":"image","status":"staged"}`,
+	}
+	require.NoError(t, store.CreateSteps(ctx, []FSMStep{uploadStep}))
+
+	sess := restoreChatSessionContext(ctx, store, run)
+	assert.Equal(t, "chat_dm_1", sess.ChatID)
+	assert.Equal(t, "user_1", sess.UserID)
+	assert.True(t, sess.IsDM)
+	require.NotNil(t, sess.StagedAttachments)
+
+	staged := sess.GetStagedAttachments()
+	require.Len(t, staged, 1)
+	assert.Equal(t, "f_staged_123", staged[0].FileID)
+	assert.Equal(t, "plot.png", staged[0].Name)
+	assert.Equal(t, "image/png", staged[0].MimeType)
+	assert.Equal(t, models.AttachmentTypeImage, staged[0].Type)
+}
 
 
 
