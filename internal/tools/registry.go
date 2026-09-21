@@ -42,11 +42,16 @@ func ChatSessionFromContext(ctx context.Context) (ChatSessionContext, bool) {
 
 // Registry manages available LLM tool definitions and executes tool calls.
 type Registry struct {
-	tavilyClient      *tavily.Client
-	memoryManager     *memory.Manager
-	sandboxManager    *sandbox.Manager
-	toolDefinitions   []openai.Tool
-	dmToolDefinitions []openai.Tool
+	tavilyClient           *tavily.Client
+	memoryManager          *memory.Manager
+	sandboxManager         *sandbox.Manager
+	schedulerStoreProvider SchedulerStoreProvider
+	schedulerMinRunTimeout time.Duration
+	schedulerMaxRunTimeout time.Duration
+	schedulerMinMaxTurns   int
+	schedulerMaxMaxTurns   int
+	toolDefinitions        []openai.Tool
+	dmToolDefinitions      []openai.Tool
 }
 
 // NewRegistry creates a new tool registry and initializes static tool definitions once.
@@ -73,6 +78,19 @@ func (r *Registry) SetMemoryManager(m *memory.Manager) {
 func (r *Registry) SetSandboxManager(sm *sandbox.Manager) {
 	r.sandboxManager = sm
 	r.initToolDefinitions()
+}
+
+// SetSchedulerStoreProvider configures the scheduler store provider for the registry.
+func (r *Registry) SetSchedulerStoreProvider(p SchedulerStoreProvider) {
+	r.schedulerStoreProvider = p
+}
+
+// SetSchedulerLimits configures validation boundaries for scheduled tasks.
+func (r *Registry) SetSchedulerLimits(minTimeout, maxTimeout time.Duration, minTurns, maxTurns int) {
+	r.schedulerMinRunTimeout = minTimeout
+	r.schedulerMaxRunTimeout = maxTimeout
+	r.schedulerMinMaxTurns = minTurns
+	r.schedulerMaxMaxTurns = maxTurns
 }
 
 func (r *Registry) initToolDefinitions() {
@@ -250,6 +268,7 @@ func (r *Registry) initToolDefinitions() {
 		},
 	}
 
+	schedTools := scheduleToolDefinitions()
 	sandboxTools := []openai.Tool{
 		{
 			Type: openai.ToolTypeFunction,
@@ -277,7 +296,13 @@ func (r *Registry) initToolDefinitions() {
 		},
 	}
 
-	r.dmToolDefinitions = append(append([]openai.Tool{}, r.toolDefinitions...), sandboxTools...)
+	dmTools := make([]openai.Tool, 0, len(r.toolDefinitions)+len(schedTools)+len(sandboxTools))
+	dmTools = append(dmTools, r.toolDefinitions...)
+	dmTools = append(dmTools, schedTools...)
+	if r.sandboxManager != nil {
+		dmTools = append(dmTools, sandboxTools...)
+	}
+	r.dmToolDefinitions = dmTools
 }
 
 // ToolDefinitions returns the cached slice of OpenAI tool definitions (for Townhall / public chats).
@@ -286,12 +311,13 @@ func (r *Registry) ToolDefinitions() []openai.Tool {
 }
 
 // ToolDefinitionsForSession returns tool definitions tailored to the session.
-// In DM chats with a configured sandboxManager, sandbox tools are included.
+// In DM chats, scheduler tools and optional sandbox tools are included.
 // When the user already has an active running sandbox, sandbox_request is excluded
 // so the agent interacts with the active sandbox rather than requesting a redundant one.
+// In Townhall, only base tools (search, fetch, recall) are provided.
 func (r *Registry) ToolDefinitionsForSession(session ChatSessionContext) []openai.Tool {
-	if session.IsDM && r.sandboxManager != nil {
-		if session.UserID != "" {
+	if session.IsDM {
+		if r.sandboxManager != nil && session.UserID != "" {
 			if sbx, ok := r.sandboxManager.GetStatus(session.UserID); ok && sbx.Status == sandbox.StatusRunning {
 				tools := make([]openai.Tool, 0, len(r.dmToolDefinitions)-1)
 				for _, t := range r.dmToolDefinitions {
@@ -359,6 +385,12 @@ func (r *Registry) Execute(ctx context.Context, name string, argsJSON string) (s
 		return r.executeSandboxExec(ctx, argsJSON)
 	case "sandbox_destroy":
 		return r.executeSandboxDestroy(ctx, argsJSON)
+	case "schedule_task":
+		return r.executeScheduleTask(ctx, argsJSON)
+	case "list_schedules":
+		return r.executeListSchedules(ctx, argsJSON)
+	case "cancel_schedule":
+		return r.executeCancelSchedule(ctx, argsJSON)
 	default:
 		return "", fmt.Errorf("unknown tool: %s", name)
 	}

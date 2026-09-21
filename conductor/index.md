@@ -43,3 +43,8 @@
 - [x] **Track: Durable FSM for Simple Tool Loops & Agentic Workflows**
 *Link: [./tracks/durable-fsm_20260913/](./tracks/durable-fsm_20260913/)*
 
+---
+
+- [x] **Track: Task Scheduler & Permission-Guarded Execution**
+*Link: [./tracks/task-scheduler_20260919/](./tracks/task-scheduler_20260919/)*
+
