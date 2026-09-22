@@ -506,7 +506,7 @@ func (s *Store) RecordExecutionResult(ctx context.Context, scheduleID string, la
 	var err error
 
 	var res sql.Result
-	// missedIncr serves double duty: when > 0 the row is a "skip" (downtime recovery),
+	// missedIncr serves double duty: when > 0 the row is an overdue or busy skip,
 	// so run_count stays unchanged and only missed_count advances. When == 0 the row is
 	// a real execution, so run_count increments by 1.
 	if shouldEnd {
