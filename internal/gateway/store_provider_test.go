@@ -200,6 +200,61 @@ func TestMemoryStoreProvider_RecoversScheduleWithoutActiveFSMRun(t *testing.T) {
 	}
 }
 
+func TestMemoryStoreProvider_ExecutesRecoveredScheduleWithoutActiveFSMRun(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &config.Config{DataDir: tempDir}
+	ctx := context.Background()
+
+	memMgr := memory.NewManager(cfg, nil)
+	provider := NewMemoryStoreProvider(memMgr, tempDir)
+	store, err := provider.GetSchedulerStore(ctx, "scheduled_chat", true)
+	require.NoError(t, err)
+	require.NoError(t, store.CreateSchedule(ctx, &scheduler.Schedule{
+		ID:                "sched_due_after_restart",
+		Name:              "due_after_restart",
+		ChatID:            "scheduled_chat",
+		UserID:            "user",
+		ScheduleType:      scheduler.ScheduleTypeInterval,
+		IntervalSeconds:   600,
+		Instruction:       "run after restart",
+		Status:            scheduler.ScheduleStatusActive,
+		NextRunAt:         time.Now().Add(-5 * time.Second).Unix(),
+		RunTimeoutSeconds: 300,
+		MaxTurns:          15,
+	}, nil))
+	require.NoError(t, memMgr.Close())
+
+	restartedMgr := memory.NewManager(cfg, nil)
+	defer func() { _ = restartedMgr.Close() }()
+	restartedProvider := NewMemoryStoreProvider(restartedMgr, tempDir)
+
+	fsmStores, err := restartedProvider.ActiveStores(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, fsmStores)
+
+	executed := make(chan string, 1)
+	engine := scheduler.NewEngine(restartedProvider, scheduler.InvokerFunc(func(_ context.Context, sched *scheduler.Schedule) error {
+		executed <- sched.ID
+		return nil
+	}))
+	engine.PollOnce(ctx)
+
+	select {
+	case scheduleID := <-executed:
+		assert.Equal(t, "sched_due_after_restart", scheduleID)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for recovered schedule execution")
+	}
+
+	schedulerStores, err := restartedProvider.ActiveSchedulerStores(ctx)
+	require.NoError(t, err)
+	require.Len(t, schedulerStores, 1)
+	require.Eventually(t, func() bool {
+		recovered, getErr := schedulerStores[0].GetSchedule(ctx, "sched_due_after_restart")
+		return getErr == nil && recovered.RunCount == 1 && recovered.LastStatus == "SUCCESS"
+	}, 2*time.Second, 10*time.Millisecond)
+}
+
 func TestMemoryStoreProvider_NilManager(t *testing.T) {
 	provider := NewMemoryStoreProvider(nil, "")
 	ctx := context.Background()
