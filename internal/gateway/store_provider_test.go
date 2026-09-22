@@ -2,11 +2,14 @@ package gateway
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"bob/internal/config"
 	"bob/internal/fsm"
 	"bob/internal/memory"
+	"bob/internal/scheduler"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -107,6 +110,96 @@ func TestMemoryStoreProvider_ActiveStores(t *testing.T) {
 	assert.Len(t, discoveredStores, 1)
 }
 
+func TestHasActiveSchedules(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &config.Config{DataDir: tempDir}
+	memMgr := memory.NewManager(cfg, nil)
+	defer func() { _ = memMgr.Close() }()
+
+	provider := NewMemoryStoreProvider(memMgr, tempDir)
+	ctx := context.Background()
+	store, err := provider.GetSchedulerStore(ctx, "probe", true)
+	require.NoError(t, err)
+
+	dbPath := filepath.Join(tempDir, "dm_probe.db")
+	active, err := hasActiveSchedules(dbPath)
+	require.NoError(t, err)
+	assert.False(t, active)
+
+	now := time.Now().Unix()
+	require.NoError(t, store.CreateSchedule(ctx, &scheduler.Schedule{
+		ID:                "sched_active_probe",
+		Name:              "active_probe",
+		ChatID:            "probe",
+		UserID:            "user",
+		ScheduleType:      scheduler.ScheduleTypeCron,
+		CronExpr:          "0 10 * * *",
+		Instruction:       "probe",
+		Status:            scheduler.ScheduleStatusActive,
+		NextRunAt:         now + 3600,
+		RunTimeoutSeconds: 300,
+		MaxTurns:          15,
+	}, nil))
+
+	active, err = hasActiveSchedules(dbPath)
+	require.NoError(t, err)
+	assert.True(t, active)
+}
+
+func TestMemoryStoreProvider_RecoversScheduleWithoutActiveFSMRun(t *testing.T) {
+	for _, schedulerFirst := range []bool{false, true} {
+		name := "fsm_discovery_first"
+		if schedulerFirst {
+			name = "scheduler_discovery_first"
+		}
+		t.Run(name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			cfg := &config.Config{DataDir: tempDir}
+			ctx := context.Background()
+
+			memMgr := memory.NewManager(cfg, nil)
+			provider := NewMemoryStoreProvider(memMgr, tempDir)
+			store, err := provider.GetSchedulerStore(ctx, "scheduled_chat", true)
+			require.NoError(t, err)
+			require.NoError(t, store.CreateSchedule(ctx, &scheduler.Schedule{
+				ID:                "sched_restart",
+				Name:              "restart_probe",
+				ChatID:            "scheduled_chat",
+				UserID:            "user",
+				ScheduleType:      scheduler.ScheduleTypeCron,
+				CronExpr:          "0 10 * * *",
+				Instruction:       "probe restart recovery",
+				Status:            scheduler.ScheduleStatusActive,
+				NextRunAt:         time.Now().Add(time.Hour).Unix(),
+				RunTimeoutSeconds: 300,
+				MaxTurns:          15,
+			}, nil))
+			require.NoError(t, memMgr.Close())
+
+			restartedMgr := memory.NewManager(cfg, nil)
+			defer func() { _ = restartedMgr.Close() }()
+			restartedProvider := NewMemoryStoreProvider(restartedMgr, tempDir)
+
+			if schedulerFirst {
+				schedulerStores, err := restartedProvider.ActiveSchedulerStores(ctx)
+				require.NoError(t, err)
+				require.Len(t, schedulerStores, 1)
+			}
+
+			fsmStores, err := restartedProvider.ActiveStores(ctx)
+			require.NoError(t, err)
+			assert.Empty(t, fsmStores)
+
+			schedulerStores, err := restartedProvider.ActiveSchedulerStores(ctx)
+			require.NoError(t, err)
+			require.Len(t, schedulerStores, 1)
+			recovered, err := schedulerStores[0].GetSchedule(ctx, "sched_restart")
+			require.NoError(t, err)
+			assert.Equal(t, scheduler.ScheduleStatusActive, recovered.Status)
+		})
+	}
+}
+
 func TestMemoryStoreProvider_NilManager(t *testing.T) {
 	provider := NewMemoryStoreProvider(nil, "")
 	ctx := context.Background()
@@ -118,4 +211,8 @@ func TestMemoryStoreProvider_NilManager(t *testing.T) {
 	stores, err := provider.ActiveStores(ctx)
 	assert.NoError(t, err)
 	assert.Nil(t, stores)
+
+	schedulerStores, err := provider.ActiveSchedulerStores(ctx)
+	assert.NoError(t, err)
+	assert.Nil(t, schedulerStores)
 }

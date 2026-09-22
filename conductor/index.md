@@ -22,6 +22,7 @@
 - **Track: SQLite Database Scaffolding & Single-Step Migration** (`sqlite-db_20260828`) - [Plan](archive/sqlite-db_20260828/plan.md) | [Spec](archive/sqlite-db_20260828/spec.md)
 - **Track: Isolated Sandbox Execution Subsystem** (`sandbox-execution_20260906`) - [Plan](archive/sandbox-execution_20260906/plan.md) | [Spec](archive/sandbox-execution_20260906/spec.md)
 - **Track: Restricted Docker Network Isolation** (`docker-restricted-net_20260911`) - [Plan](archive/docker-restricted-net_20260911/plan.md) | [Spec](archive/docker-restricted-net_20260911/spec.md)
+- **Track: Attachment Tools for Isolated Sandbox Execution** (`attachment-tools_20260921`) - [Plan](archive/attachment-tools_20260921/plan.md) | [Spec](archive/attachment-tools_20260921/spec.md)
 
 ---
 
@@ -47,8 +48,3 @@
 
 - [x] **Track: Task Scheduler & Permission-Guarded Execution**
 *Link: [./tracks/task-scheduler_20260919/](./tracks/task-scheduler_20260919/)*
-
----
-
-- [x] **Track: Attachment Tools for Isolated Sandbox Execution**
-*Link: [./tracks/attachment-tools_20260921/](./tracks/attachment-tools_20260921/)*
