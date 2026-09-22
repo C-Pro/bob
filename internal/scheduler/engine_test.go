@@ -69,14 +69,14 @@ func TestEngine_DueScheduleExecution(t *testing.T) {
 	assert.True(t, fresh.NextRunAt > now, "next_run_at must advance to future")
 }
 
-func TestEngine_DowntimeRecoveryAntiBurstSkip(t *testing.T) {
+func TestEngine_OverdueRecoveryAntiBurstSkip(t *testing.T) {
 	st, cleanup := setupEngineTestStore(t)
 	defer cleanup()
 
 	ctx := context.Background()
 	now := time.Now().Unix()
 
-	// 2 hours overdue (> 15m downtime threshold)
+	// 2 hours overdue (> 15m catch-up threshold)
 	sched := &Schedule{
 		ID:                "s_overdue_1",
 		Name:              "overdue_task",
@@ -102,11 +102,11 @@ func TestEngine_DowntimeRecoveryAntiBurstSkip(t *testing.T) {
 	engine := NewEngine(prov, invoker, WithDowntimeCutoff(15*time.Minute))
 	engine.PollOnce(ctx)
 
-	assert.False(t, executed.Load(), "overdue schedule beyond downtime cutoff must not execute")
+	assert.False(t, executed.Load(), "overdue schedule beyond catch-up cutoff must not execute")
 
 	fresh, err := st.GetSchedule(ctx, "s_overdue_1")
 	require.NoError(t, err)
-	assert.Equal(t, "SKIPPED_DOWNTIME", fresh.LastStatus)
+	assert.Equal(t, "SKIPPED_OVERDUE", fresh.LastStatus)
 	assert.True(t, fresh.MissedCount > 0, "missed_count should be incremented")
 	assert.True(t, fresh.NextRunAt > now, "next_run_at must advance to future")
 }
