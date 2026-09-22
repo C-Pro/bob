@@ -1,15 +1,20 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
+	"mime"
 	"net/http"
+	"net/url"
 	"strings"
 
+	"bob/internal/config"
 	"bob/internal/models"
 )
 
@@ -283,4 +288,164 @@ func (g *Gateway) FetchFileContent(ctx context.Context, fileID string, maxBytes 
 	}
 
 	return data, contentType, nil
+}
+
+// DownloadAttachment downloads attachment binary data from Besedka.
+// It first attempts GET /api/files/{fileID}, and falls back to GET /api/images/{fileID} ONLY if /api/files returns 404.
+func (g *Gateway) DownloadAttachment(ctx context.Context, fileID string) ([]byte, string, error) {
+	fileID = strings.TrimSpace(fileID)
+	if fileID == "" {
+		return nil, "", errors.New("empty fileID")
+	}
+
+	escapedID := url.PathEscape(fileID)
+	baseURL := strings.TrimSuffix(g.cfg.BesedkaURL, "/")
+	fileURL := fmt.Sprintf("%s/api/files/%s", baseURL, escapedID)
+
+	maxLimit := int64(config.DefaultMaxAttachmentSizeBytes)
+	if g.cfg != nil && g.cfg.MaxAttachmentSizeBytes > 0 {
+		maxLimit = g.cfg.MaxAttachmentSizeBytes
+	}
+
+	data, mimeType, status, err := g.doDownloadRequest(ctx, fileURL, maxLimit)
+	if err == nil {
+		return data, mimeType, nil
+	}
+
+	// Fall back to /api/images/{fileID} only on 404 Not Found
+	if status == http.StatusNotFound {
+		imageURL := fmt.Sprintf("%s/api/images/%s", baseURL, escapedID)
+		imgData, imgMime, _, imgErr := g.doDownloadRequest(ctx, imageURL, maxLimit)
+		if imgErr == nil {
+			return imgData, imgMime, nil
+		}
+		return nil, "", fmt.Errorf("failed to download attachment %s from /api/files (404) and /api/images: %w", fileID, imgErr)
+	}
+
+	return nil, "", fmt.Errorf("failed to download attachment %s from /api/files: %w", fileID, err)
+}
+
+func (g *Gateway) doDownloadRequest(ctx context.Context, targetURL string, maxBytes int64) ([]byte, string, int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return nil, "", 0, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	if g.cfg.BesedkaAPIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+g.cfg.BesedkaAPIKey)
+	}
+
+	resp, err := g.httpClient.Do(req)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		limitedErrBody := io.LimitReader(resp.Body, 4096)
+		bodyBytes, readErr := io.ReadAll(limitedErrBody)
+		if readErr != nil {
+			return nil, "", resp.StatusCode, fmt.Errorf("returned status %d (failed to read error body: %w)", resp.StatusCode, readErr)
+		}
+		return nil, "", resp.StatusCode, fmt.Errorf("returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+	}
+
+	readLimit := maxBytes
+	if readLimit < math.MaxInt64 {
+		readLimit++
+	}
+	limitReader := io.LimitReader(resp.Body, readLimit)
+	data, err := io.ReadAll(limitReader)
+	if err != nil {
+		return nil, "", resp.StatusCode, fmt.Errorf("failed to read response body: %w", err)
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, "", resp.StatusCode, fmt.Errorf("attachment size exceeds limit (%d bytes)", maxBytes)
+	}
+
+	mediaType := resp.Header.Get("Content-Type")
+	if parsed, _, err := mime.ParseMediaType(mediaType); err == nil && parsed != "" {
+		mediaType = parsed
+	} else if len(data) > 0 {
+		mediaType = http.DetectContentType(data)
+		if parsed, _, err := mime.ParseMediaType(mediaType); err == nil && parsed != "" {
+			mediaType = parsed
+		} else {
+			mediaType = "application/octet-stream"
+		}
+	} else {
+		mediaType = "application/octet-stream"
+	}
+
+	return data, mediaType, resp.StatusCode, nil
+}
+
+// UploadFile uploads binary file content to Besedka /api/upload/file and returns the file ID.
+func (g *Gateway) UploadFile(ctx context.Context, data []byte, filename, mimeType string) (string, error) {
+	return g.uploadPayload(ctx, "/api/upload/file", data, filename, mimeType)
+}
+
+// UploadImage uploads binary image content to Besedka /api/upload/image and returns the file ID.
+func (g *Gateway) UploadImage(ctx context.Context, data []byte, filename, mimeType string) (string, error) {
+	return g.uploadPayload(ctx, "/api/upload/image", data, filename, mimeType)
+}
+
+func (g *Gateway) uploadPayload(ctx context.Context, endpoint string, data []byte, filename, mimeType string) (string, error) {
+	targetURL := fmt.Sprintf("%s%s", strings.TrimSuffix(g.cfg.BesedkaURL, "/"), endpoint)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(data))
+	if err != nil {
+		return "", fmt.Errorf("failed to create upload request: %w", err)
+	}
+
+	if g.cfg.BesedkaAPIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+g.cfg.BesedkaAPIKey)
+	}
+
+	if strings.TrimSpace(mimeType) == "" {
+		if len(data) > 0 {
+			mimeType = http.DetectContentType(data)
+		} else {
+			mimeType = "application/octet-stream"
+		}
+	}
+	if parsed, _, err := mime.ParseMediaType(mimeType); err == nil && parsed != "" {
+		mimeType = parsed
+	} else {
+		mimeType = "application/octet-stream"
+	}
+
+	req.Header.Set("Content-Type", mimeType)
+
+	resp, err := g.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("upload to %s failed: %w", endpoint, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		errReader := io.LimitReader(resp.Body, 4096)
+		errBody, readErr := io.ReadAll(errReader)
+		if readErr != nil {
+			return "", fmt.Errorf("upload to %s returned status %d (failed to read error body: %w)", endpoint, resp.StatusCode, readErr)
+		}
+		return "", fmt.Errorf("upload to %s returned status %d: %s", endpoint, resp.StatusCode, strings.TrimSpace(string(errBody)))
+	}
+
+	var res struct {
+		ID     string `json:"id"`
+		FileID string `json:"fileId"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return "", fmt.Errorf("failed to decode upload response: %w", err)
+	}
+
+	id := strings.TrimSpace(res.ID)
+	if id == "" {
+		id = strings.TrimSpace(res.FileID)
+	}
+	if id == "" {
+		return "", fmt.Errorf("upload to %s returned empty file ID", endpoint)
+	}
+
+	return id, nil
 }

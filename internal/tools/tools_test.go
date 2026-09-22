@@ -531,8 +531,10 @@ func TestSandboxToolDefinitionsScope(t *testing.T) {
 	assert.NotContains(t, thNames, "list_schedules")
 	assert.NotContains(t, thNames, "cancel_schedule")
 	assert.NotContains(t, thNames, "sandbox_request")
+	assert.NotContains(t, thNames, "sandbox_download_attachment")
+	assert.NotContains(t, thNames, "sandbox_upload_attachment")
 
-	// DM session has 9 tools (3 base + 3 scheduler + 3 sandbox)
+	// DM session has 9 tools (3 base + 3 scheduler + 3 sandbox) when no sandbox running
 	dmTools := reg.ToolDefinitionsForSession(ChatSessionContext{IsDM: true})
 	assert.Len(t, dmTools, 9)
 
@@ -546,8 +548,10 @@ func TestSandboxToolDefinitionsScope(t *testing.T) {
 	assert.Contains(t, names, "sandbox_request")
 	assert.Contains(t, names, "sandbox_exec")
 	assert.Contains(t, names, "sandbox_destroy")
+	assert.NotContains(t, names, "sandbox_download_attachment")
+	assert.NotContains(t, names, "sandbox_upload_attachment")
 
-	// When user has an active running sandbox, sandbox_request is filtered out
+	// When user has an active running sandbox, sandbox_request is filtered out and attachment tools are added
 	_, err := sandboxMgr.RequestSandbox(context.Background(), "active_user", "chat_dm", sandbox.RequestParams{
 		Driver:      sandbox.DriverBwrap,
 		NetworkMode: sandbox.NetworkNone,
@@ -557,7 +561,7 @@ func TestSandboxToolDefinitionsScope(t *testing.T) {
 	require.NoError(t, err)
 
 	activeDMTools := reg.ToolDefinitionsForSession(ChatSessionContext{IsDM: true, UserID: "active_user"})
-	assert.Equal(t, len(dmTools)-1, len(activeDMTools))
+	assert.Equal(t, len(dmTools)+1, len(activeDMTools))
 
 	activeNames := make([]string, len(activeDMTools))
 	for i, tool := range activeDMTools {
@@ -566,6 +570,8 @@ func TestSandboxToolDefinitionsScope(t *testing.T) {
 	assert.NotContains(t, activeNames, "sandbox_request")
 	assert.Contains(t, activeNames, "sandbox_exec")
 	assert.Contains(t, activeNames, "sandbox_destroy")
+	assert.Contains(t, activeNames, "sandbox_download_attachment")
+	assert.Contains(t, activeNames, "sandbox_upload_attachment")
 
 	// ToolDefinitionsForChat preserves UserID when passed in context (e.g. from persistent FSM runCtx)
 	runCtx := WithChatSession(context.Background(), ChatSessionContext{
@@ -580,14 +586,18 @@ func TestSandboxToolDefinitionsScope(t *testing.T) {
 	}
 	assert.NotContains(t, fsmNames, "sandbox_request")
 	assert.Contains(t, fsmNames, "sandbox_exec")
+	assert.Contains(t, fsmNames, "sandbox_download_attachment")
+	assert.Contains(t, fsmNames, "sandbox_upload_attachment")
 
-	// Another user without active sandbox should still have sandbox_request available
+	// Another user without active sandbox should still have sandbox_request available and no attachment tools
 	otherUserTools := reg.ToolDefinitionsForSession(ChatSessionContext{IsDM: true, UserID: "other_user"})
 	otherNames := make([]string, len(otherUserTools))
 	for i, tool := range otherUserTools {
 		otherNames[i] = tool.Function.Name
 	}
 	assert.Contains(t, otherNames, "sandbox_request")
+	assert.NotContains(t, otherNames, "sandbox_download_attachment")
+	assert.NotContains(t, otherNames, "sandbox_upload_attachment")
 }
 
 func TestSandboxToolExecution(t *testing.T) {

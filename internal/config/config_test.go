@@ -58,6 +58,7 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	_ = os.Unsetenv("SCHEDULER_MAX_RUN_TIMEOUT")
 	_ = os.Unsetenv("SCHEDULER_MIN_MAX_TURNS")
 	_ = os.Unsetenv("SCHEDULER_MAX_MAX_TURNS")
+	_ = os.Unsetenv("MAX_ATTACHMENT_SIZE")
 
 	cfg, err := LoadFromEnv()
 	require.NoError(t, err)
@@ -100,6 +101,7 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	assert.Equal(t, 1*time.Hour, cfg.SchedulerMaxRunTimeout)
 	assert.Equal(t, 10, cfg.SchedulerMinMaxTurns)
 	assert.Equal(t, 100, cfg.SchedulerMaxMaxTurns)
+	assert.Equal(t, int64(25*1024*1024), cfg.MaxAttachmentSizeBytes)
 }
 
 func TestLoadFromEnvStandardOpenAI(t *testing.T) {
@@ -539,5 +541,83 @@ func TestConfig_SchedulerConfig(t *testing.T) {
 		t.Setenv("SCHEDULER_MIN_MAX_TURNS", "abc")
 		_, err = LoadFromEnv()
 		assert.ErrorContains(t, err, "invalid integer for SCHEDULER_MIN_MAX_TURNS")
+	})
+}
+
+func TestParseAttachmentSize(t *testing.T) {
+	const defaultVal int64 = 25 * 1024 * 1024
+
+	tests := []struct {
+		input       string
+		expected    int64
+		expectError bool
+		errContains string
+	}{
+		{input: "", expected: defaultVal},
+		{input: "   ", expected: defaultVal},
+		{input: "12345", expected: 12345},
+		{input: "1K", expected: 1024},
+		{input: "1KB", expected: 1024},
+		{input: "1KiB", expected: 1024},
+		{input: "1k", expected: 1024},
+		{input: "10M", expected: 10 * 1024 * 1024},
+		{input: "25MB", expected: 25 * 1024 * 1024},
+		{input: "25MiB", expected: 25 * 1024 * 1024},
+		{input: "25mb", expected: 25 * 1024 * 1024},
+		{input: "1G", expected: 1024 * 1024 * 1024},
+		{input: "1GB", expected: 1024 * 1024 * 1024},
+		{input: "1GiB", expected: 1024 * 1024 * 1024},
+		{input: "1Gb", expected: 1024 * 1024 * 1024},
+		{input: " 10M ", expected: 10 * 1024 * 1024},
+		{input: " 10 MB ", expected: 10 * 1024 * 1024},
+		{input: "100B", expected: 100},
+		// Invalid cases
+		{input: "0", expectError: true, errContains: "positive integer"},
+		{input: "-10MB", expectError: true, errContains: "missing numeric value"},
+		{input: "MB", expectError: true, errContains: "missing numeric value"},
+		{input: "10TB", expectError: true, errContains: "invalid byte size unit"},
+		{input: "10XB", expectError: true, errContains: "invalid byte size unit"},
+		{input: "1.5MB", expectError: true, errContains: "invalid byte size unit"},
+		{input: "abc", expectError: true, errContains: "missing numeric value"},
+		{input: "10MBfoo", expectError: true, errContains: "invalid byte size unit"},
+		{input: "+", expectError: true, errContains: "missing numeric value"},
+		{input: "9223372036854775807GB", expectError: true, errContains: "overflow"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			got, err := parseAttachmentSize(tc.input, defaultVal)
+			if tc.expectError {
+				require.Error(t, err)
+				if tc.errContains != "" {
+					assert.Contains(t, err.Error(), tc.errContains)
+				}
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tc.expected, got)
+			}
+		})
+	}
+}
+
+func TestLoadFromEnvMaxAttachmentSize(t *testing.T) {
+	t.Run("custom valid unit", func(t *testing.T) {
+		t.Setenv("MAX_ATTACHMENT_SIZE", "50MB")
+		cfg, err := LoadFromEnv()
+		require.NoError(t, err)
+		assert.Equal(t, int64(50*1024*1024), cfg.MaxAttachmentSizeBytes)
+	})
+
+	t.Run("custom valid plain bytes", func(t *testing.T) {
+		t.Setenv("MAX_ATTACHMENT_SIZE", "1048576")
+		cfg, err := LoadFromEnv()
+		require.NoError(t, err)
+		assert.Equal(t, int64(1048576), cfg.MaxAttachmentSizeBytes)
+	})
+
+	t.Run("invalid unit fails", func(t *testing.T) {
+		t.Setenv("MAX_ATTACHMENT_SIZE", "invalid-size")
+		_, err := LoadFromEnv()
+		assert.ErrorContains(t, err, "invalid MAX_ATTACHMENT_SIZE")
 	})
 }
