@@ -159,6 +159,69 @@ func hasActiveRuns(dbPath string) (bool, error) {
 	return true, nil
 }
 
+func hasActiveSchedules(dbPath string) (bool, error) {
+	fi, err := os.Stat(dbPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if fi.Size() == 0 {
+		return false, nil
+	}
+
+	dsn := fmt.Sprintf("file:%s?mode=ro", dbPath)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = db.Close() }()
+
+	var tableExists int
+	err = db.QueryRow("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schedules'").Scan(&tableExists)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	var hasActive int
+	err = db.QueryRow("SELECT 1 FROM schedules WHERE status = 'ACTIVE' LIMIT 1").Scan(&hasActive)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (p *MemoryStoreProvider) discoverStore(ctx context.Context, filePath, chatID string, isDM bool) {
+	hasFSM, err := hasActiveRuns(filePath)
+	if err != nil {
+		slog.Warn("failed to inspect chat database for active FSM runs; opening for safety", "path", filePath, "error", err)
+		hasFSM = true
+	}
+	if hasFSM {
+		if _, err := p.GetStore(ctx, chatID, isDM); err != nil {
+			slog.Warn("failed to open chat database for FSM recovery", "path", filePath, "error", err)
+		}
+	}
+
+	hasSchedules, err := hasActiveSchedules(filePath)
+	if err != nil {
+		slog.Warn("failed to inspect chat database for active schedules; opening for safety", "path", filePath, "error", err)
+		hasSchedules = true
+	}
+	if hasSchedules {
+		if _, err := p.GetSchedulerStore(ctx, chatID, isDM); err != nil {
+			slog.Warn("failed to open chat database for scheduler recovery", "path", filePath, "error", err)
+		}
+	}
+}
+
 func (p *MemoryStoreProvider) discoverStores(ctx context.Context) {
 	if p.dataDir == "" {
 		return
@@ -180,28 +243,10 @@ func (p *MemoryStoreProvider) discoverStores(ctx context.Context) {
 		filePath := filepath.Join(p.dataDir, name)
 
 		if name == "townhall.db" {
-			active, err := hasActiveRuns(filePath)
-			if err != nil {
-				slog.Warn("failed to inspect townhall.db for active runs; opening for safety", "error", err)
-				active = true
-			}
-			if active {
-				if _, err := p.GetStore(ctx, "townhall", false); err != nil {
-					slog.Warn("failed to open townhall.db during initial active store discovery", "error", err)
-				}
-			}
+			p.discoverStore(ctx, filePath, "townhall", false)
 		} else if strings.HasPrefix(name, "dm_") && strings.HasSuffix(name, ".db") {
-			active, err := hasActiveRuns(filePath)
-			if err != nil {
-				slog.Warn("failed to inspect dm db for active runs; opening for safety", "name", name, "error", err)
-				active = true
-			}
-			if active {
-				chatID := strings.TrimSuffix(strings.TrimPrefix(name, "dm_"), ".db")
-				if _, err := p.GetStore(ctx, chatID, true); err != nil {
-					slog.Warn("failed to open dm db during initial active store discovery", "chatID", chatID, "error", err)
-				}
-			}
+			chatID := strings.TrimSuffix(strings.TrimPrefix(name, "dm_"), ".db")
+			p.discoverStore(ctx, filePath, chatID, true)
 		}
 	}
 }
@@ -237,29 +282,8 @@ func (p *MemoryStoreProvider) ActiveSchedulerStores(ctx context.Context) ([]*sch
 		p.discoverStores(ctx)
 	})
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	for key := range p.stores {
-		if _, ok := p.schedStores[key]; !ok {
-			isDM := key != "townhall"
-			chatID := key
-			if isDM {
-				chatID = strings.TrimPrefix(key, "dm_")
-			}
-			cortexDB, err := p.memMgr.GetDB(ctx, chatID, isDM)
-			if err != nil {
-				slog.Warn("failed to open DB for scheduler store discovery", "key", key, "error", err)
-				continue
-			}
-			rawDB := cortexDB.SQL()
-			if schErr := scheduler.EnsureScheduleSchema(ctx, rawDB); schErr != nil {
-				slog.Warn("failed to ensure scheduler schema during discovery", "key", key, "error", schErr)
-				continue
-			}
-			p.schedStores[key] = scheduler.NewStore(rawDB)
-		}
-	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 
 	stores := make([]*scheduler.Store, 0, len(p.schedStores))
 	for _, st := range p.schedStores {

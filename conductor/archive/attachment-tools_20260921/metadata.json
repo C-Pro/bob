@@ -1,8 +1,8 @@
 {
   "track_id": "attachment-tools_20260921",
   "type": "feature",
-  "status": "new",
+  "status": "completed",
   "created_at": "2026-09-21T08:10:30Z",
-  "updated_at": "2026-09-21T08:10:30Z",
+  "updated_at": "2026-09-22T20:07:00Z",
   "description": "\"attachment tools\". Create a pair of tools to allow agent to download chat attachments into the sandbox and upload files from the sandbox as attachments to the message. These tools will be available together with sandbox - won't be included in townhall chat and won't work without the sandbox active. We need also to make sure attachments are represented in our RAG message storage, so bob can actually discover them. Upload tool description should include the attachment size limit, so Bob won't try to upload something that doesn't fit. Implementation will be executed in agentic-pair-programming mode with codex sol model as a reviewer."
 }

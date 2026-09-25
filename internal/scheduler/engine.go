@@ -80,7 +80,7 @@ func WithConcurrency(c int) EngineOption {
 	}
 }
 
-// Engine orchestrates periodic polling, atomic claiming, downtime recovery, and execution dispatch for task schedules.
+// Engine orchestrates periodic polling, atomic claiming, overdue recovery, and execution dispatch for task schedules.
 type Engine struct {
 	provider          StoreProvider
 	invoker           Invoker
@@ -219,10 +219,10 @@ func (e *Engine) handleClaimedSchedule(ctx context.Context, store *Store, sched 
 	overdue := now.Unix() - sched.NextRunAt
 
 	if overdue >= int64(e.downtimeCutoff.Seconds()) {
-		// Extended downtime: skip missed runs, increment missed_count, recalculate next future occurrence
+		// Extended delay: skip missed runs, increment missed_count, recalculate next future occurrence
 		nextTime, shouldEnd, err := CalculateNextRun(sched, now)
 		if err != nil {
-			slog.Error("failed to calculate next run after downtime skip", "name", sched.Name, "error", err)
+			slog.Error("failed to calculate next run after overdue skip", "name", sched.Name, "error", err)
 			shouldEnd = true
 		}
 
@@ -237,21 +237,21 @@ func (e *Engine) handleClaimedSchedule(ctx context.Context, store *Store, sched 
 			shouldEnd = true
 		}
 
-		slog.Info("schedule overdue beyond downtime threshold; skipping missed runs",
+		slog.Info("schedule overdue beyond catch-up threshold; skipping missed runs",
 			"name", sched.Name,
 			"overdue_seconds", overdue,
 			"missed_periods", missedPeriods,
 		)
 
 		writeCtx, writeCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := store.RecordExecutionResult(writeCtx, sched.ID, "SKIPPED_DOWNTIME", nextTime.Unix(), missedPeriods, shouldEnd); err != nil {
-			slog.Error("failed to record execution result after downtime skip", "schedule_id", sched.ID, "error", err)
+		if err := store.RecordExecutionResult(writeCtx, sched.ID, "SKIPPED_OVERDUE", nextTime.Unix(), missedPeriods, shouldEnd); err != nil {
+			slog.Error("failed to record execution result after overdue skip", "schedule_id", sched.ID, "error", err)
 		}
 		writeCancel()
 		return
 	}
 
-	// Overdue < downtimeCutoff: perform execution
+	// Overdue within the catch-up cutoff: perform execution
 	e.mu.Lock()
 	if e.stopped {
 		e.mu.Unlock()
