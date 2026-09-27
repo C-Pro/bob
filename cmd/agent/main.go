@@ -20,6 +20,7 @@ import (
 	"bob/internal/memory"
 	"bob/internal/objectstore"
 	"bob/internal/store"
+	"bob/internal/tools"
 
 	"github.com/liliang-cn/cortexdb/v2/pkg/cortexdb"
 )
@@ -205,6 +206,12 @@ func main() {
 		fsm.WithResultSink(gw),
 		fsm.WithToolDefinitionProvider(gw),
 		fsm.WithPollInterval(2*time.Second),
+		fsm.WithKnowledgeBudgetLimits(tools.KnowledgeBudgetLimits{
+			MaxLoadedMemories:    cfg.KnowledgeMaxLoadedMemories,
+			MaxLoadedMemoryBytes: cfg.KnowledgeMaxLoadedMemoryBytes,
+			MaxLoadedSkills:      cfg.KnowledgeMaxLoadedSkills,
+			MaxLoadedSkillBytes:  cfg.KnowledgeMaxLoadedSkillBytes,
+		}),
 	)
 	gw.SetFSMEngine(fsmEngine)
 

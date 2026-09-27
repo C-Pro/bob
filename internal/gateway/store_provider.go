@@ -24,20 +24,34 @@ type MemoryStoreProvider struct {
 	mu              sync.RWMutex
 	stores          map[string]*fsm.Store
 	schedStores     map[string]*scheduler.Store
-	knowledgeStores map[string]*knowledge.Store
-	indexers        map[string]*knowledge.Indexer
-	initOnce        sync.Once
+	knowledgeStores   map[string]*knowledge.Store
+	indexers          map[string]*knowledge.Indexer
+	maxDiscoveryLimit int
+	initOnce          sync.Once
 }
 
 // NewMemoryStoreProvider creates a new MemoryStoreProvider.
 func NewMemoryStoreProvider(memMgr *memory.Manager, dataDir string) *MemoryStoreProvider {
 	return &MemoryStoreProvider{
-		memMgr:          memMgr,
-		dataDir:         dataDir,
-		stores:          make(map[string]*fsm.Store),
-		schedStores:     make(map[string]*scheduler.Store),
-		knowledgeStores: make(map[string]*knowledge.Store),
-		indexers:        make(map[string]*knowledge.Indexer),
+		memMgr:            memMgr,
+		dataDir:           dataDir,
+		stores:            make(map[string]*fsm.Store),
+		schedStores:       make(map[string]*scheduler.Store),
+		knowledgeStores:   make(map[string]*knowledge.Store),
+		indexers:          make(map[string]*knowledge.Indexer),
+		maxDiscoveryLimit: 10,
+	}
+}
+
+// SetMaxDiscoveryLimit configures the maximum discovery limit for knowledge searchers.
+func (p *MemoryStoreProvider) SetMaxDiscoveryLimit(limit int) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if limit > 0 {
+		p.maxDiscoveryLimit = limit
 	}
 }
 
@@ -216,6 +230,45 @@ func (p *MemoryStoreProvider) GetKnowledgeIndexer(ctx context.Context, chatID st
 	}
 	p.indexers[key] = idx
 	return idx, nil
+}
+
+// GetKnowledgeSearcher resolves a knowledge.Searcher for a chat context and user.
+func (p *MemoryStoreProvider) GetKnowledgeSearcher(ctx context.Context, chatID string, isDM bool, userID string) (*knowledge.Searcher, error) {
+	if !isDM || chatID == "townhall" {
+		return nil, fmt.Errorf("knowledge search is only available in direct messages")
+	}
+	if p.memMgr == nil {
+		return nil, fmt.Errorf("memory manager is nil")
+	}
+
+	// Trigger bounded index reconciliation so approved versions created after restart are discoverable immediately.
+	if idx, err := p.GetKnowledgeIndexer(ctx, chatID, isDM); err == nil && idx != nil {
+		if _, recErr := idx.ReconcilePending(ctx, 100); recErr != nil {
+			slog.Warn("failed to reconcile pending knowledge index records before search", "chat_id", chatID, "error", recErr)
+		}
+	}
+
+	kStore, err := p.GetKnowledgeStore(ctx, chatID, isDM)
+	if err != nil {
+		return nil, err
+	}
+
+	cortexDB, err := p.memMgr.GetDB(ctx, chatID, isDM)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get database for chat %s: %w", chatID, err)
+	}
+
+	p.mu.RLock()
+	maxLimit := p.maxDiscoveryLimit
+	p.mu.RUnlock()
+	if maxLimit <= 0 {
+		maxLimit = 10
+	}
+
+	return knowledge.NewSearcher(kStore, cortexDB, knowledge.SessionIdentity{
+		ChatID: chatID,
+		UserID: userID,
+	}, maxLimit)
 }
 
 func hasActiveRuns(dbPath string) (bool, error) {

@@ -107,6 +107,8 @@ func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 	storeProvider := NewMemoryStoreProvider(memoryManager, cfg.DataDir)
 	toolsRegistry := tools.NewRegistry(tavilyClient, memoryManager, sandboxManager)
 	toolsRegistry.SetSchedulerStoreProvider(storeProvider)
+	toolsRegistry.SetKnowledgeStoreProvider(storeProvider)
+	toolsRegistry.SetKnowledgeSearcherProvider(storeProvider)
 	toolsRegistry.SetSchedulerLimits(
 		cfg.SchedulerMinRunTimeout,
 		cfg.SchedulerMaxRunTimeout,
@@ -134,6 +136,17 @@ func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 
 	toolsRegistry.SetAttachmentClient(gw)
 	toolsRegistry.SetMaxAttachmentSize(cfg.MaxAttachmentSizeBytes)
+	if storeProvider != nil {
+		storeProvider.SetMaxDiscoveryLimit(cfg.KnowledgeMaxDiscoveryLimit)
+		toolsRegistry.SetKnowledgeStoreProvider(storeProvider)
+		toolsRegistry.SetKnowledgeSearcherProvider(storeProvider)
+	}
+	toolsRegistry.SetKnowledgeLimits(tools.KnowledgeBudgetLimits{
+		MaxLoadedMemories:    cfg.KnowledgeMaxLoadedMemories,
+		MaxLoadedMemoryBytes: cfg.KnowledgeMaxLoadedMemoryBytes,
+		MaxLoadedSkills:      cfg.KnowledgeMaxLoadedSkills,
+		MaxLoadedSkillBytes:  cfg.KnowledgeMaxLoadedSkillBytes,
+	}, cfg.KnowledgeDefaultDiscoveryLimit, cfg.KnowledgeMaxDiscoveryLimit)
 
 	invokerCfg := InvokerConfig{
 		Tools:      toolsRegistry,
@@ -175,6 +188,11 @@ func (g *Gateway) SetMemoryManager(m *memory.Manager) {
 	g.memoryManager = m
 	if g.cfg != nil {
 		g.storeProvider = NewMemoryStoreProvider(m, g.cfg.DataDir)
+		g.storeProvider.SetMaxDiscoveryLimit(g.cfg.KnowledgeMaxDiscoveryLimit)
+		if g.toolsRegistry != nil {
+			g.toolsRegistry.SetKnowledgeStoreProvider(g.storeProvider)
+			g.toolsRegistry.SetKnowledgeSearcherProvider(g.storeProvider)
+		}
 	}
 }
 
@@ -190,8 +208,15 @@ func (g *Gateway) SetStoreProvider(p *MemoryStoreProvider) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.storeProvider = p
+	if g.cfg != nil && p != nil {
+		p.SetMaxDiscoveryLimit(g.cfg.KnowledgeMaxDiscoveryLimit)
+	}
 	if g.schedulerEngine != nil && p != nil {
 		g.schedulerEngine = scheduler.NewEngine(p, g.schedulerInvoker)
+	}
+	if g.toolsRegistry != nil && p != nil {
+		g.toolsRegistry.SetKnowledgeStoreProvider(p)
+		g.toolsRegistry.SetKnowledgeSearcherProvider(p)
 	}
 }
 
@@ -211,6 +236,16 @@ func (g *Gateway) SetToolsRegistry(r *tools.Registry) {
 		r.SetAttachmentClient(g)
 		if g.cfg != nil {
 			r.SetMaxAttachmentSize(g.cfg.MaxAttachmentSizeBytes)
+			r.SetKnowledgeLimits(tools.KnowledgeBudgetLimits{
+				MaxLoadedMemories:    g.cfg.KnowledgeMaxLoadedMemories,
+				MaxLoadedMemoryBytes: g.cfg.KnowledgeMaxLoadedMemoryBytes,
+				MaxLoadedSkills:      g.cfg.KnowledgeMaxLoadedSkills,
+				MaxLoadedSkillBytes:  g.cfg.KnowledgeMaxLoadedSkillBytes,
+			}, g.cfg.KnowledgeDefaultDiscoveryLimit, g.cfg.KnowledgeMaxDiscoveryLimit)
+		}
+		if g.storeProvider != nil {
+			r.SetKnowledgeStoreProvider(g.storeProvider)
+			r.SetKnowledgeSearcherProvider(g.storeProvider)
 		}
 	}
 	if g.fsmEngine != nil {
@@ -297,8 +332,10 @@ func (g *Gateway) Deliver(ctx context.Context, run *fsm.FSMRun) error {
 	}
 	fsmEng := g.FSMEngine()
 	if len(attachments) == 0 && fsmEng != nil && run != nil {
-		restored := fsmEng.RestoreChatSessionContext(ctx, run)
-		attachments = restored.GetStagedAttachments()
+		restored, err := fsmEng.RestoreChatSessionContext(ctx, run)
+		if err == nil {
+			attachments = restored.GetStagedAttachments()
+		}
 	}
 
 	if err := g.SendMessageWithAttachments(run.ChatID, formattedReply, attachments); err != nil {
@@ -1213,7 +1250,20 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 	defer progress.Stop()
 
 	var sandboxRequestCreated bool
-	sessionCtx := tools.NewChatSessionContext(msg.ChatID, msg.UserID, isDM)
+	var budgetLimits tools.KnowledgeBudgetLimits
+	if toolsRegistry != nil {
+		budgetLimits = toolsRegistry.KnowledgeLimits()
+	} else if g.cfg != nil {
+		budgetLimits = tools.KnowledgeBudgetLimits{
+			MaxLoadedMemories:    g.cfg.KnowledgeMaxLoadedMemories,
+			MaxLoadedMemoryBytes: g.cfg.KnowledgeMaxLoadedMemoryBytes,
+			MaxLoadedSkills:      g.cfg.KnowledgeMaxLoadedSkills,
+			MaxLoadedSkillBytes:  g.cfg.KnowledgeMaxLoadedSkillBytes,
+		}
+	} else {
+		budgetLimits = tools.DefaultKnowledgeBudgetLimits()
+	}
+	sessionCtx := tools.NewChatSessionContext(msg.ChatID, msg.UserID, isDM, budgetLimits)
 	sessionCtx.Notifier = func(chatID, text string) error {
 		return g.SendMessage(chatID, text)
 	}
@@ -1240,14 +1290,20 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 		g.mu.Unlock()
 
 		if fsmEng != nil {
+			var seq *int64
+			if msg.Seq > 0 {
+				s := msg.Seq
+				seq = &s
+			}
 			fsmReq := fsm.ToolLoopRequest{
-				ChatID:        msg.ChatID,
-				UserID:        msg.UserID,
-				IsDM:          isDM,
-				Model:         g.cfg.OpenAIModel,
-				Messages:      llmMsgs,
-				Tools:         toolDefs,
-				MaxIterations: maxIterations,
+				ChatID:           msg.ChatID,
+				UserID:           msg.UserID,
+				IsDM:             isDM,
+				Model:            g.cfg.OpenAIModel,
+				Messages:         llmMsgs,
+				Tools:            toolDefs,
+				MaxIterations:    maxIterations,
+				SourceMessageSeq: seq,
 				OnTransition: func(state fsm.RunState, run *fsm.FSMRun) {
 					switch state {
 					case fsm.StateLLMRequest:

@@ -271,3 +271,24 @@ func TestMemoryStoreProvider_NilManager(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Nil(t, schedulerStores)
 }
+
+func TestMemoryStoreProvider_KnowledgeSearcherMaxLimit(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &config.Config{DataDir: tempDir}
+	ctx := context.Background()
+
+	memMgr := memory.NewManager(cfg, nil)
+	defer func() { _ = memMgr.Close() }()
+
+	provider := NewMemoryStoreProvider(memMgr, tempDir)
+	provider.SetMaxDiscoveryLimit(25)
+
+	searcher, err := provider.GetKnowledgeSearcher(ctx, "chat_dm_max", true, "user_1")
+	require.NoError(t, err)
+	require.NotNil(t, searcher)
+
+	// Verify SearchMemories with limit > 10 succeeds and is not clamped to 10 by searcher
+	results, err := searcher.SearchMemories(ctx, "query", nil, 20)
+	require.NoError(t, err)
+	assert.Empty(t, results)
+}

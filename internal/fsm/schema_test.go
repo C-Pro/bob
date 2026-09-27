@@ -89,7 +89,7 @@ func TestEnsureDBSchema(t *testing.T) {
 		require.NoError(t, err)
 		defer func() { _ = rows.Close() }()
 
-		hasIsDM, hasWaitCycles, hasVersion := false, false, false
+		hasIsDM, hasWaitCycles, hasVersion, hasSourceMessageSeq := false, false, false, false
 		for rows.Next() {
 			var cid int
 			var name, colType string
@@ -105,9 +105,13 @@ func TestEnsureDBSchema(t *testing.T) {
 			if name == "version" {
 				hasVersion = true
 			}
+			if name == "source_message_seq" {
+				hasSourceMessageSeq = true
+			}
 		}
 		assert.True(t, hasIsDM)
 		assert.True(t, hasWaitCycles)
 		assert.True(t, hasVersion)
+		assert.True(t, hasSourceMessageSeq)
 	})
 }

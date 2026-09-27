@@ -15,6 +15,7 @@ import (
 
 	"bob/internal/config"
 	"bob/internal/fsm"
+	"bob/internal/knowledge"
 	"bob/internal/llm"
 	"bob/internal/models"
 	"bob/internal/sandbox"
@@ -955,4 +956,224 @@ func TestGateway_FSMToolLoop_SandboxDownloadAttachment_Integration(t *testing.T)
 	require.NotEmpty(t, entries)
 	assert.Contains(t, entries[0].Content, "file_dl_42")
 	assert.Contains(t, entries[0].Content, "[Attachment: input.csv (id: file_dl_42, type: text/csv)]")
+}
+
+func TestGateway_InteractiveSession_ConfiguredKnowledgeBudgetLimits(t *testing.T) {
+	tempDir := t.TempDir()
+	var llmCallCount int32
+	var secondLoadErrorSeen int32
+
+	var mem1ID, mem2ID string
+
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := atomic.AddInt32(&llmCallCount, 1)
+
+		var req openai.ChatCompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		if count == 1 {
+			// First call: call load_memory for mem1ID
+			resp := openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role: openai.ChatMessageRoleAssistant,
+							ToolCalls: []openai.ToolCall{
+								{
+									ID:   "call_load_1",
+									Type: openai.ToolTypeFunction,
+									Function: openai.FunctionCall{
+										Name:      "load_memory",
+										Arguments: fmt.Sprintf(`{"memory_id":%q}`, mem1ID),
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		if count == 2 {
+			// Verify first tool result succeeded
+			for _, m := range req.Messages {
+				if m.Role == openai.ChatMessageRoleTool && m.ToolCallID == "call_load_1" {
+					if !strings.Contains(m.Content, "First memory content") {
+						t.Errorf("expected first tool output to contain memory content, got %s", m.Content)
+					}
+				}
+			}
+
+			// Call load_memory for mem2ID
+			resp := openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role: openai.ChatMessageRoleAssistant,
+							ToolCalls: []openai.ToolCall{
+								{
+									ID:   "call_load_2",
+									Type: openai.ToolTypeFunction,
+									Function: openai.FunctionCall{
+										Name:      "load_memory",
+										Arguments: fmt.Sprintf(`{"memory_id":%q}`, mem2ID),
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		// Third call: check tool output for second tool call
+		for _, m := range req.Messages {
+			if m.Role == openai.ChatMessageRoleTool && m.ToolCallID == "call_load_2" {
+				if strings.Contains(m.Content, "budget exceeded") || strings.Contains(m.Content, "limit 1 reached") {
+					atomic.StoreInt32(&secondLoadErrorSeen, 1)
+				}
+			}
+		}
+
+		resp := openai.ChatCompletionResponse{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Message: openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "Finished testing configured memory budget limits.",
+					},
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer llmServer.Close()
+
+	upgrader := websocket.Upgrader{}
+	sentMsgs := make(chan models.ClientMessage, 10)
+
+	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/me":
+			_ = json.NewEncoder(w).Encode(models.User{
+				ID:       "bot",
+				UserName: "bot",
+			})
+		case "/api/users":
+			_ = json.NewEncoder(w).Encode([]models.User{
+				{ID: "bot", UserName: "bot"},
+				{ID: "u1", UserName: "alice"},
+			})
+		case "/api/chats":
+			_ = json.NewEncoder(w).Encode([]models.Chat{
+				{ID: "dm_custom_budget", IsDM: true},
+			})
+		case "/api/chat":
+			c, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer func() { _ = c.Close() }()
+			for {
+				var cm models.ClientMessage
+				if err := c.ReadJSON(&cm); err != nil {
+					return
+				}
+				sentMsgs <- cm
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer besedkaServer.Close()
+
+	cfg := &config.Config{
+		BesedkaURL:                  besedkaServer.URL,
+		BesedkaAPIKey:               "test-key",
+		OpenAIAPIKey:                "test-key",
+		OpenAIBaseURL:               llmServer.URL,
+		OpenAIModel:                 "test-model",
+		BotHandle:                   "@bot",
+		DataDir:                     tempDir,
+		TownhallToolMaxIterations:   10,
+		DMToolMaxIterations:         20,
+		TownhallMaxParagraphs:       5,
+		DMMaxParagraphs:             10,
+		MsgRingBufferSize:           10,
+		KnowledgeMaxLoadedMemories:  1, // Configured non-default limit: 1 memory only!
+		KnowledgeMaxDiscoveryLimit: 15,
+	}
+
+	llmClient := llm.NewClient(cfg, llmServer.Client())
+	gw := NewGateway(cfg, llmClient)
+	defer gw.Stop()
+	gw.httpClient = besedkaServer.Client()
+
+	storeProv := gw.StoreProvider()
+	fsmEngine := fsm.NewEngine(storeProv, llmClient, gw.ToolsRegistry(), fsm.WithDefaultModel(cfg.OpenAIModel), fsm.WithKnowledgeBudgetLimits(gw.ToolsRegistry().KnowledgeLimits()))
+	gw.SetFSMEngine(fsmEngine)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	require.NoError(t, gw.DialWebSocket(ctx))
+	_, err := gw.FetchBotUser(ctx)
+	require.NoError(t, err)
+
+	// Pre-seed two memories in dm_custom_budget directly via KnowledgeStore
+	kStore, err := storeProv.GetKnowledgeStore(ctx, "dm_custom_budget", true)
+	require.NoError(t, err)
+
+	seq := int64(10)
+	item1, ver1, err := kStore.ProposeMemory(ctx, &knowledge.KnowledgeItem{
+		ChatID: "dm_custom_budget",
+		UserID: "u1",
+	}, &knowledge.MemoryVersion{
+		Type:       knowledge.MemoryTypeFact,
+		Content:    "First memory content",
+		Confidence: 1.0,
+		Provenance: knowledge.Provenance{ChatID: "dm_custom_budget", UserID: "u1", SourceMessageSeq: &seq, FSMRunID: "run_init"},
+	})
+	require.NoError(t, err)
+	require.NoError(t, kStore.ApproveVersion(ctx, ver1.ID, "u1"))
+	mem1ID = item1.ID
+
+	item2, ver2, err := kStore.ProposeMemory(ctx, &knowledge.KnowledgeItem{
+		ChatID: "dm_custom_budget",
+		UserID: "u1",
+	}, &knowledge.MemoryVersion{
+		Type:       knowledge.MemoryTypeFact,
+		Content:    "Second memory content",
+		Confidence: 1.0,
+		Provenance: knowledge.Provenance{ChatID: "dm_custom_budget", UserID: "u1", SourceMessageSeq: &seq, FSMRunID: "run_init"},
+	})
+	require.NoError(t, err)
+	require.NoError(t, kStore.ApproveVersion(ctx, ver2.ID, "u1"))
+	mem2ID = item2.ID
+
+	// Trigger interactive message in DM
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_custom_budget",
+		UserID:    "u1",
+		Content:   "load memories for me",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+
+	select {
+	case reply := <-sentMsgs:
+		assert.Contains(t, reply.Content, "Finished testing configured memory budget limits")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for bot response")
+	}
+
+	assert.Equal(t, int32(3), atomic.LoadInt32(&llmCallCount))
+	assert.Equal(t, int32(1), atomic.LoadInt32(&secondLoadErrorSeen), "second load_memory must fail with budget exceeded in interactive session")
 }

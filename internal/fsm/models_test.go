@@ -105,4 +105,13 @@ func TestNewStepFromToolCall(t *testing.T) {
 	assert.Equal(t, 0, step.Attempt)
 	assert.Equal(t, 3, step.MaxAttempts)
 	assert.Equal(t, 30, step.TimeoutSeconds)
+
+	// Propose tools have MaxAttempts = 1 to prevent non-idempotent retries after timeout
+	tcMem := openai.ToolCall{Function: openai.FunctionCall{Name: "propose_memory"}}
+	stepMem := NewStepFromToolCall("run_1", 2, 1, tcMem, ExecutionModeSequential)
+	assert.Equal(t, 1, stepMem.MaxAttempts)
+
+	tcSkill := openai.ToolCall{Function: openai.FunctionCall{Name: "propose_skill"}}
+	stepSkill := NewStepFromToolCall("run_1", 2, 2, tcSkill, ExecutionModeSequential)
+	assert.Equal(t, 1, stepSkill.MaxAttempts)
 }

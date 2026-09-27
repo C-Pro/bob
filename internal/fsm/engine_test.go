@@ -958,7 +958,8 @@ func TestRestoreChatSessionContext_StagedAttachments(t *testing.T) {
 	}
 	require.NoError(t, store.CreateSteps(ctx, []FSMStep{uploadStep}))
 
-	sess := restoreChatSessionContext(ctx, store, run)
+	sess, err := restoreChatSessionContext(ctx, store, run)
+	require.NoError(t, err)
 	assert.Equal(t, "chat_dm_1", sess.ChatID)
 	assert.Equal(t, "user_1", sess.UserID)
 	assert.True(t, sess.IsDM)
@@ -970,6 +971,198 @@ func TestRestoreChatSessionContext_StagedAttachments(t *testing.T) {
 	assert.Equal(t, "plot.png", staged[0].Name)
 	assert.Equal(t, "image/png", staged[0].MimeType)
 	assert.Equal(t, models.AttachmentTypeImage, staged[0].Type)
+}
+
+func TestRestoreChatSessionContext_KnowledgeBudget(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	seq := int64(101)
+	run := &FSMRun{
+		ID:               "run_kb_rec",
+		ChatID:           "chat_dm_kb",
+		UserID:           "user_kb",
+		IsDM:             true,
+		FSMType:          FSMTypeToolLoop,
+		Status:           RunStatusRunning,
+		CurrentState:     StateExecuteSteps,
+		SourceMessageSeq: &seq,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	// Add completed load_memory and load_skill steps
+	memStep := FSMStep{
+		ID:            "step_mem_1",
+		RunID:         run.ID,
+		Iteration:     1,
+		StepIndex:     0,
+		ToolName:      "load_memory",
+		ToolCallID:    "call_mem_1",
+		ExecutionMode: ExecutionModeSequential,
+		Status:        StepStatusCompleted,
+		ResultJSON:    `{"item_id":"mem_123","version_id":"mem_123@1","content":"user preference text","content_bytes":20}`,
+	}
+	skillStep := FSMStep{
+		ID:            "step_skill_1",
+		RunID:         run.ID,
+		Iteration:     1,
+		StepIndex:     1,
+		ToolName:      "load_skill",
+		ToolCallID:    "call_skill_1",
+		ExecutionMode: ExecutionModeSequential,
+		Status:        StepStatusCompleted,
+		ResultJSON:    `{"item_id":"skill_abc","version_id":"skill_abc@1","instructions_markdown":"# Skill guide","content_bytes":13}`,
+	}
+	require.NoError(t, store.CreateSteps(ctx, []FSMStep{memStep, skillStep}))
+
+	sess, err := restoreChatSessionContext(ctx, store, run)
+	require.NoError(t, err)
+	assert.Equal(t, "run_kb_rec", sess.FSMRunID)
+	require.NotNil(t, sess.SourceMessageSeq)
+	assert.Equal(t, int64(101), *sess.SourceMessageSeq)
+	require.NotNil(t, sess.KnowledgeBudget)
+
+	memCount, memBytes, skillCount, skillBytes := sess.KnowledgeBudget.Stats()
+	assert.Equal(t, 1, memCount)
+	assert.Equal(t, 20, memBytes)
+	assert.Equal(t, 1, skillCount)
+	assert.Equal(t, 13, skillBytes)
+
+	// Verify cached loads
+	verID, content, cBytes, ok := sess.KnowledgeBudget.GetCached("mem_123")
+	assert.True(t, ok)
+	assert.Equal(t, "mem_123@1", verID)
+	assert.Equal(t, "user preference text", content)
+	assert.Equal(t, 20, cBytes)
+}
+
+func TestRestoreChatSessionContext_FailClosedOnMalformedResult(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	run := &FSMRun{
+		ID:           "run_malformed_rec",
+		ChatID:       "chat_dm_bad",
+		UserID:       "user_bad",
+		IsDM:         true,
+		FSMType:      FSMTypeToolLoop,
+		Status:       RunStatusRunning,
+		CurrentState: StateExecuteSteps,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	// Malformed JSON for load_memory
+	badStep := FSMStep{
+		ID:            "step_bad_1",
+		RunID:         run.ID,
+		Iteration:     1,
+		StepIndex:     0,
+		ToolName:      "load_memory",
+		ToolCallID:    "call_bad_1",
+		ExecutionMode: ExecutionModeSequential,
+		Status:        StepStatusCompleted,
+		ResultJSON:    `{invalid-json`,
+	}
+	require.NoError(t, store.CreateSteps(ctx, []FSMStep{badStep}))
+
+	_, err := restoreChatSessionContext(ctx, store, run)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to parse load_memory result")
+}
+
+func TestRestoreChatSessionContext_FailClosedOnValidationFailure(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	t.Run("mismatched version item ID", func(t *testing.T) {
+		run := &FSMRun{
+			ID:           "run_val_rec_1",
+			ChatID:       "chat_dm_val",
+			UserID:       "user_val",
+			IsDM:         true,
+			FSMType:      FSMTypeToolLoop,
+			Status:       RunStatusRunning,
+			CurrentState: StateExecuteSteps,
+		}
+		require.NoError(t, store.CreateRun(ctx, run))
+
+		step := FSMStep{
+			ID:            "step_mismatch_item",
+			RunID:         run.ID,
+			Iteration:     1,
+			StepIndex:     0,
+			ToolName:      "load_memory",
+			ToolCallID:    "call_mismatch",
+			ExecutionMode: ExecutionModeSequential,
+			Status:        StepStatusCompleted,
+			ResultJSON:    `{"item_id":"mem_123","version_id":"mem_999@1","content":"text","content_bytes":4}`,
+		}
+		require.NoError(t, store.CreateSteps(ctx, []FSMStep{step}))
+		_, err := restoreChatSessionContext(ctx, store, run)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "does not match item_id")
+	})
+
+	t.Run("mismatched content bytes", func(t *testing.T) {
+		run := &FSMRun{
+			ID:           "run_val_rec_2",
+			ChatID:       "chat_dm_val",
+			UserID:       "user_val",
+			IsDM:         true,
+			FSMType:      FSMTypeToolLoop,
+			Status:       RunStatusRunning,
+			CurrentState: StateExecuteSteps,
+		}
+		require.NoError(t, store.CreateRun(ctx, run))
+
+		step := FSMStep{
+			ID:            "step_mismatch_bytes",
+			RunID:         run.ID,
+			Iteration:     1,
+			StepIndex:     1,
+			ToolName:      "load_skill",
+			ToolCallID:    "call_mismatch_b",
+			ExecutionMode: ExecutionModeSequential,
+			Status:        StepStatusCompleted,
+			ResultJSON:    `{"item_id":"skill_abc","version_id":"skill_abc@1","instructions_markdown":"short","content_bytes":999}`,
+		}
+		require.NoError(t, store.CreateSteps(ctx, []FSMStep{step}))
+		_, err := restoreChatSessionContext(ctx, store, run)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "content_bytes mismatch")
+	})
+
+	t.Run("invalid item prefix", func(t *testing.T) {
+		run := &FSMRun{
+			ID:           "run_val_rec_3",
+			ChatID:       "chat_dm_val",
+			UserID:       "user_val",
+			IsDM:         true,
+			FSMType:      FSMTypeToolLoop,
+			Status:       RunStatusRunning,
+			CurrentState: StateExecuteSteps,
+		}
+		require.NoError(t, store.CreateRun(ctx, run))
+
+		step := FSMStep{
+			ID:            "step_invalid_prefix",
+			RunID:         run.ID,
+			Iteration:     1,
+			StepIndex:     2,
+			ToolName:      "load_memory",
+			ToolCallID:    "call_bad_pfx",
+			ExecutionMode: ExecutionModeSequential,
+			Status:        StepStatusCompleted,
+			ResultJSON:    `{"item_id":"invalid_123","version_id":"invalid_123@1","content":"text","content_bytes":4}`,
+		}
+		require.NoError(t, store.CreateSteps(ctx, []FSMStep{step}))
+		_, err := restoreChatSessionContext(ctx, store, run)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid item_id")
+	})
 }
 
 

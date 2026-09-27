@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"bob/internal/knowledge"
 	"bob/internal/models"
 	"bob/internal/tools"
 
@@ -61,15 +62,16 @@ type Runner interface {
 
 // ToolLoopRequest encapsulates all parameters needed to execute a tool loop.
 type ToolLoopRequest struct {
-	RunID         string
-	ChatID        string
-	UserID        string
-	IsDM          bool
-	Model         string
-	Messages      []openai.ChatCompletionMessage
-	Tools         []openai.Tool
-	MaxIterations int
-	OnTransition  func(state RunState, run *FSMRun)
+	RunID            string
+	ChatID           string
+	UserID           string
+	IsDM             bool
+	Model            string
+	Messages         []openai.ChatCompletionMessage
+	Tools            []openai.Tool
+	MaxIterations    int
+	SourceMessageSeq *int64
+	OnTransition     func(state RunState, run *FSMRun)
 }
 
 // ToolLoopResult contains the outcome of a completed tool loop run.
@@ -145,6 +147,13 @@ func WithMaxRecoveryConcurrency(n int) EngineOption {
 	}
 }
 
+// WithKnowledgeBudgetLimits configures the knowledge budget limits used during context restoration and execution.
+func WithKnowledgeBudgetLimits(limits tools.KnowledgeBudgetLimits) EngineOption {
+	return func(e *Engine) {
+		e.knowledgeLimits = limits
+	}
+}
+
 // Engine coordinates durable FSM workflow executions, state dispatching, delayed transitions, and crash recovery.
 type Engine struct {
 	storeProvider           StoreProvider
@@ -157,6 +166,7 @@ type Engine struct {
 	defaultModel            string
 	recoveryStalenessCutoff time.Duration
 	maxRecoveryConcurrency  int
+	knowledgeLimits         tools.KnowledgeBudgetLimits
 
 	runnersMu sync.RWMutex
 	runners   map[FSMType]Runner
@@ -183,6 +193,7 @@ func NewEngine(storeProvider StoreProvider, llmClient LLMClient, invoker ToolInv
 		pollInterval:            2 * time.Second,
 		recoveryStalenessCutoff: 15 * time.Minute,
 		maxRecoveryConcurrency:  4,
+		knowledgeLimits:         tools.DefaultKnowledgeBudgetLimits(),
 		runners:                 make(map[FSMType]Runner),
 		running:                 make(map[string]context.CancelFunc),
 		timers:                  make(map[string]*time.Timer),
@@ -398,47 +409,125 @@ func (e *Engine) Stop() {
 	e.wg.Wait()
 }
 
-func restoreChatSessionContext(ctx context.Context, store *Store, run *FSMRun) tools.ChatSessionContext {
-	sess := tools.NewChatSessionContext(run.ChatID, run.UserID, run.IsDM)
+func restoreChatSessionContext(ctx context.Context, store *Store, run *FSMRun, limits ...tools.KnowledgeBudgetLimits) (tools.ChatSessionContext, error) {
+	lim := tools.DefaultKnowledgeBudgetLimits()
+	if len(limits) > 0 {
+		lim = limits[0]
+	}
+	sess := tools.NewChatSessionContext(run.ChatID, run.UserID, run.IsDM, lim)
+	sess.FSMRunID = run.ID
+	sess.SourceMessageSeq = run.SourceMessageSeq
 	if store == nil || run.ID == "" {
-		return sess
+		return sess, nil
 	}
 	steps, err := store.ListStepsByRun(ctx, run.ID)
 	if err != nil {
-		return sess
+		return sess, fmt.Errorf("failed to list steps for run %s: %w", run.ID, err)
 	}
 	for _, step := range steps {
-		if step.ToolName == "sandbox_upload_attachment" && step.Status == StepStatusCompleted {
+		if step.Status != StepStatusCompleted {
+			continue
+		}
+		switch step.ToolName {
+		case "sandbox_upload_attachment":
 			var payload struct {
 				FileID   string `json:"file_id"`
 				Name     string `json:"name"`
 				MimeType string `json:"mime_type"`
 				Type     string `json:"type"`
 			}
-			if err := json.Unmarshal([]byte(step.ResultJSON), &payload); err == nil && payload.FileID != "" {
-				_ = sess.StageAttachment(models.Attachment{
-					FileID:   payload.FileID,
-					Name:     payload.Name,
-					MimeType: payload.MimeType,
-					Type:     models.AttachmentType(payload.Type),
-				})
+			if err := json.Unmarshal([]byte(step.ResultJSON), &payload); err != nil {
+				return sess, fmt.Errorf("failed to parse sandbox_upload_attachment result for step %s: %w", step.ID, err)
+			}
+			if payload.FileID == "" {
+				return sess, fmt.Errorf("invalid sandbox_upload_attachment result for step %s: missing file_id", step.ID)
+			}
+			if err := sess.StageAttachment(models.Attachment{
+				FileID:   payload.FileID,
+				Name:     payload.Name,
+				MimeType: payload.MimeType,
+				Type:     models.AttachmentType(payload.Type),
+			}); err != nil {
+				return sess, fmt.Errorf("failed to stage attachment for step %s: %w", step.ID, err)
+			}
+		case "load_memory":
+			var payload struct {
+				ItemID       string `json:"item_id"`
+				VersionID    string `json:"version_id"`
+				Content      string `json:"content"`
+				ContentBytes int    `json:"content_bytes"`
+			}
+			if err := json.Unmarshal([]byte(step.ResultJSON), &payload); err != nil {
+				return sess, fmt.Errorf("failed to parse load_memory result for step %s: %w", step.ID, err)
+			}
+			if payload.ItemID == "" || !strings.HasPrefix(payload.ItemID, "mem_") {
+				return sess, fmt.Errorf("invalid load_memory result for step %s: invalid item_id %q", step.ID, payload.ItemID)
+			}
+			if payload.VersionID == "" {
+				return sess, fmt.Errorf("invalid load_memory result for step %s: missing version_id", step.ID)
+			}
+			itemID, _, err := knowledge.ParseVersionID(payload.VersionID)
+			if err != nil || itemID != payload.ItemID {
+				return sess, fmt.Errorf("invalid load_memory result for step %s: version_id %q does not match item_id %q", step.ID, payload.VersionID, payload.ItemID)
+			}
+			if strings.TrimSpace(payload.Content) == "" {
+				return sess, fmt.Errorf("invalid load_memory result for step %s: empty content", step.ID)
+			}
+			actualBytes := len([]byte(payload.Content))
+			if payload.ContentBytes != actualBytes {
+				return sess, fmt.Errorf("invalid load_memory result for step %s: content_bytes mismatch (recorded %d, actual %d)", step.ID, payload.ContentBytes, actualBytes)
+			}
+			if err := sess.KnowledgeBudget.RestoreItem("memory", payload.ItemID, payload.VersionID, payload.Content, payload.ContentBytes, step.ResultJSON); err != nil {
+				return sess, fmt.Errorf("failed to restore memory item for step %s: %w", step.ID, err)
+			}
+		case "load_skill":
+			var payload struct {
+				ItemID               string `json:"item_id"`
+				VersionID            string `json:"version_id"`
+				Name                 string `json:"name"`
+				Description          string `json:"description"`
+				InstructionsMarkdown string `json:"instructions_markdown"`
+				ContentBytes         int    `json:"content_bytes"`
+			}
+			if err := json.Unmarshal([]byte(step.ResultJSON), &payload); err != nil {
+				return sess, fmt.Errorf("failed to parse load_skill result for step %s: %w", step.ID, err)
+			}
+			if payload.ItemID == "" || !strings.HasPrefix(payload.ItemID, "skill_") {
+				return sess, fmt.Errorf("invalid load_skill result for step %s: invalid item_id %q", step.ID, payload.ItemID)
+			}
+			if payload.VersionID == "" {
+				return sess, fmt.Errorf("invalid load_skill result for step %s: missing version_id", step.ID)
+			}
+			itemID, _, err := knowledge.ParseVersionID(payload.VersionID)
+			if err != nil || itemID != payload.ItemID {
+				return sess, fmt.Errorf("invalid load_skill result for step %s: version_id %q does not match item_id %q", step.ID, payload.VersionID, payload.ItemID)
+			}
+			if strings.TrimSpace(payload.InstructionsMarkdown) == "" {
+				return sess, fmt.Errorf("invalid load_skill result for step %s: empty instructions_markdown", step.ID)
+			}
+			actualBytes := len([]byte(payload.Name)) + len([]byte(payload.Description)) + len([]byte(payload.InstructionsMarkdown))
+			if payload.ContentBytes != actualBytes {
+				return sess, fmt.Errorf("invalid load_skill result for step %s: content_bytes mismatch (recorded %d, actual %d)", step.ID, payload.ContentBytes, actualBytes)
+			}
+			if err := sess.KnowledgeBudget.RestoreItem("skill", payload.ItemID, payload.VersionID, payload.InstructionsMarkdown, payload.ContentBytes, step.ResultJSON); err != nil {
+				return sess, fmt.Errorf("failed to restore skill item for step %s: %w", step.ID, err)
 			}
 		}
 	}
-	return sess
+	return sess, nil
 }
 
 // RestoreChatSessionContext reconstructs a ChatSessionContext for a run with any attachments
-// previously staged in completed sandbox_upload_attachment steps.
-func (e *Engine) RestoreChatSessionContext(ctx context.Context, run *FSMRun) tools.ChatSessionContext {
+// previously staged in completed sandbox_upload_attachment steps and budget usage.
+func (e *Engine) RestoreChatSessionContext(ctx context.Context, run *FSMRun) (tools.ChatSessionContext, error) {
 	if run == nil || e.storeProvider == nil {
-		return tools.NewChatSessionContext("", "", false)
+		return tools.NewChatSessionContext("", "", false, e.knowledgeLimits), nil
 	}
 	store, err := e.storeProvider.GetStore(ctx, run.ChatID, run.IsDM)
 	if err != nil {
-		return tools.NewChatSessionContext(run.ChatID, run.UserID, run.IsDM)
+		return tools.NewChatSessionContext(run.ChatID, run.UserID, run.IsDM, e.knowledgeLimits), err
 	}
-	return restoreChatSessionContext(ctx, store, run)
+	return restoreChatSessionContext(ctx, store, run, e.knowledgeLimits)
 }
 
 // Recover scans all active stores for interrupted runs and resumes them.
@@ -547,7 +636,16 @@ func (e *Engine) Recover(ctx context.Context) error {
 					return
 				}
 
-				runCtx = tools.WithChatSession(runCtx, restoreChatSessionContext(runCtx, s, &runToRecover))
+				restoredSess, err := restoreChatSessionContext(runCtx, s, &runToRecover, e.knowledgeLimits)
+				if err != nil {
+					slog.Error("failed to restore chat session context on recovery", "run_id", runToRecover.ID, "error", err)
+					runToRecover.Status = RunStatusFailed
+					runToRecover.CurrentState = StateFailed
+					runToRecover.ErrorText = fmt.Sprintf("failed to restore session context: %v", err)
+					_ = s.UpdateRun(runCtx, &runToRecover)
+					return
+				}
+				runCtx = tools.WithChatSession(runCtx, restoredSess)
 
 				runToRecover.Status = RunStatusRunning
 				runToRecover.ResumeAt = nil
@@ -685,7 +783,16 @@ func (e *Engine) PollDueWaitingRuns(ctx context.Context) error {
 					return
 				}
 
-				runCtx = tools.WithChatSession(runCtx, restoreChatSessionContext(runCtx, s, &runToResume))
+				restoredSess, err := restoreChatSessionContext(runCtx, s, &runToResume, e.knowledgeLimits)
+				if err != nil {
+					slog.Error("failed to restore chat session context on resume", "run_id", runToResume.ID, "error", err)
+					runToResume.Status = RunStatusFailed
+					runToResume.CurrentState = StateFailed
+					runToResume.ErrorText = fmt.Sprintf("failed to restore session context: %v", err)
+					_ = s.UpdateRun(runCtx, &runToResume)
+					return
+				}
+				runCtx = tools.WithChatSession(runCtx, restoredSess)
 
 				runToResume.Status = RunStatusRunning
 				runToResume.ResumeAt = nil
@@ -818,16 +925,17 @@ func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (*ToolLoo
 	}
 
 	run := &FSMRun{
-		ID:            req.RunID,
-		ChatID:        req.ChatID,
-		UserID:        req.UserID,
-		IsDM:          req.IsDM,
-		FSMType:       FSMTypeToolLoop,
-		Status:        RunStatusRunning,
-		CurrentState:  StateInit,
-		Iteration:     0,
-		MaxIterations: req.MaxIterations,
-		ContextJSON:   contextJSON,
+		ID:               req.RunID,
+		ChatID:           req.ChatID,
+		UserID:           req.UserID,
+		IsDM:             req.IsDM,
+		FSMType:          FSMTypeToolLoop,
+		Status:           RunStatusRunning,
+		CurrentState:     StateInit,
+		Iteration:        0,
+		MaxIterations:    req.MaxIterations,
+		ContextJSON:      contextJSON,
+		SourceMessageSeq: req.SourceMessageSeq,
 	}
 
 	if err := store.CreateRun(ctx, run); err != nil {
@@ -850,13 +958,23 @@ func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (*ToolLoo
 
 	sess, ok := tools.ChatSessionFromContext(ctx)
 	if !ok {
-		sess = restoreChatSessionContext(runCtx, store, run)
+		var err error
+		sess, err = restoreChatSessionContext(runCtx, store, run, e.knowledgeLimits)
+		if err != nil {
+			return nil, fmt.Errorf("failed to restore chat session context: %w", err)
+		}
 	} else {
 		if sess.StagedAttachments == nil {
 			sess.StagedAttachments = tools.NewStagedAttachmentCollector()
 		}
+		if sess.KnowledgeBudget == nil {
+			sess.KnowledgeBudget = tools.NewKnowledgeBudgetTracker(e.knowledgeLimits)
+		}
 		if len(sess.GetStagedAttachments()) == 0 && store != nil && run.ID != "" {
-			restored := restoreChatSessionContext(runCtx, store, run)
+			restored, err := restoreChatSessionContext(runCtx, store, run, e.knowledgeLimits)
+			if err != nil {
+				return nil, fmt.Errorf("failed to restore chat session context: %w", err)
+			}
 			for _, att := range restored.GetStagedAttachments() {
 				_ = sess.StageAttachment(att)
 			}
@@ -865,6 +983,8 @@ func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (*ToolLoo
 		sess.UserID = req.UserID
 		sess.IsDM = req.IsDM
 	}
+	sess.FSMRunID = run.ID
+	sess.SourceMessageSeq = run.SourceMessageSeq
 	runCtx = tools.WithChatSession(runCtx, sess)
 
 	if !e.acquireRun(run.ID, cancel) {

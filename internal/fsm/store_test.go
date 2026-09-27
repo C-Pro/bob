@@ -38,6 +38,7 @@ func TestStore_RunCRUD(t *testing.T) {
 
 	now := time.Now().Unix()
 	futureResume := now + 60
+	seq := int64(777)
 
 	run := &FSMRun{
 		ID:            "run_test_1",
@@ -47,13 +48,14 @@ func TestStore_RunCRUD(t *testing.T) {
 		Status:        RunStatusRunning,
 		CurrentState:  StateLLMRequest,
 		Iteration:     1,
-		MaxIterations: 20,
-		ContextJSON:   `[{"role":"user","content":"hello"}]`,
-		ResultJSON:    "",
-		ErrorText:     "",
-		ResumeAt:      &futureResume,
-		CreatedAt:     now,
-		UpdatedAt:     now,
+		MaxIterations:    20,
+		ContextJSON:      `[{"role":"user","content":"hello"}]`,
+		ResultJSON:       "",
+		ErrorText:        "",
+		ResumeAt:         &futureResume,
+		SourceMessageSeq: &seq,
+		CreatedAt:        now,
+		UpdatedAt:        now,
 	}
 
 	// Create
@@ -74,6 +76,8 @@ func TestStore_RunCRUD(t *testing.T) {
 	assert.Equal(t, run.ContextJSON, fetched.ContextJSON)
 	require.NotNil(t, fetched.ResumeAt)
 	assert.Equal(t, futureResume, *fetched.ResumeAt)
+	require.NotNil(t, fetched.SourceMessageSeq)
+	assert.Equal(t, seq, *fetched.SourceMessageSeq)
 
 	// Update
 	fetched.Status = RunStatusCompleted
@@ -88,6 +92,8 @@ func TestStore_RunCRUD(t *testing.T) {
 	assert.Equal(t, RunStatusCompleted, updated.Status)
 	assert.Equal(t, StateCompleted, updated.CurrentState)
 	assert.Equal(t, `{"response":"Hello there!"}`, updated.ResultJSON)
+	require.NotNil(t, updated.SourceMessageSeq)
+	assert.Equal(t, seq, *updated.SourceMessageSeq)
 	assert.Nil(t, updated.ResumeAt)
 
 	// Not found
@@ -209,9 +215,11 @@ func TestStore_ListActiveAndDueWaitingRuns(t *testing.T) {
 	now := time.Now().Unix()
 	pastResume := now - 10
 	futureResume := now + 100
+	seq1 := int64(101)
+	seq2 := int64(102)
 
-	r1 := &FSMRun{ID: "run_active_1", ChatID: "c1", UserID: "u1", Status: RunStatusRunning, ContextJSON: "{}"}
-	r2 := &FSMRun{ID: "run_waiting_due", ChatID: "c1", UserID: "u1", Status: RunStatusWaiting, ResumeAt: &pastResume, ContextJSON: "{}"}
+	r1 := &FSMRun{ID: "run_active_1", ChatID: "c1", UserID: "u1", Status: RunStatusRunning, SourceMessageSeq: &seq1, ContextJSON: "{}"}
+	r2 := &FSMRun{ID: "run_waiting_due", ChatID: "c1", UserID: "u1", Status: RunStatusWaiting, ResumeAt: &pastResume, SourceMessageSeq: &seq2, ContextJSON: "{}"}
 	r3 := &FSMRun{ID: "run_waiting_future", ChatID: "c1", UserID: "u1", Status: RunStatusWaiting, ResumeAt: &futureResume, ContextJSON: "{}"}
 	r4 := &FSMRun{ID: "run_completed", ChatID: "c1", UserID: "u1", Status: RunStatusCompleted, ContextJSON: "{}"}
 	r5 := &FSMRun{ID: "run_failed", ChatID: "c1", UserID: "u1", Status: RunStatusFailed, ContextJSON: "{}"}
@@ -224,10 +232,22 @@ func TestStore_ListActiveAndDueWaitingRuns(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, active, 3) // r1, r2, r3
 
+	foundActiveSeq := false
+	for _, run := range active {
+		if run.ID == "run_active_1" {
+			require.NotNil(t, run.SourceMessageSeq)
+			assert.Equal(t, seq1, *run.SourceMessageSeq)
+			foundActiveSeq = true
+		}
+	}
+	assert.True(t, foundActiveSeq, "run_active_1 with SourceMessageSeq found in ListActiveRuns")
+
 	dueWaiting, err := store.ListDueWaitingRuns(ctx, now)
 	require.NoError(t, err)
 	require.Len(t, dueWaiting, 1)
 	assert.Equal(t, "run_waiting_due", dueWaiting[0].ID)
+	require.NotNil(t, dueWaiting[0].SourceMessageSeq)
+	assert.Equal(t, seq2, *dueWaiting[0].SourceMessageSeq)
 }
 
 func TestStore_CascadeDeleteStepsOnRunDeletion(t *testing.T) {
