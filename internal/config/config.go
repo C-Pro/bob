@@ -70,6 +70,12 @@ type Config struct {
 	SchedulerMinMaxTurns       int
 	SchedulerMaxMaxTurns       int
 	MaxAttachmentSizeBytes     int64
+	KnowledgeMaxLoadedMemories     int
+	KnowledgeMaxLoadedMemoryBytes  int
+	KnowledgeMaxLoadedSkills       int
+	KnowledgeMaxLoadedSkillBytes   int
+	KnowledgeDefaultDiscoveryLimit int
+	KnowledgeMaxDiscoveryLimit     int
 }
 
 // DefaultSandboxAllowedImages defines standard safe container images.
@@ -149,6 +155,31 @@ func LoadFromEnv() (*Config, error) {
 		return nil, fmt.Errorf("invalid MAX_ATTACHMENT_SIZE: %w", err)
 	}
 
+	knowledgeMaxMemories, err := getEnvIntStrict("KNOWLEDGE_MAX_LOADED_MEMORIES", 8)
+	if err != nil {
+		return nil, err
+	}
+	knowledgeMaxMemoryBytes, err := getEnvIntStrict("KNOWLEDGE_MAX_LOADED_MEMORY_BYTES", 16384)
+	if err != nil {
+		return nil, err
+	}
+	knowledgeMaxSkills, err := getEnvIntStrict("KNOWLEDGE_MAX_LOADED_SKILLS", 3)
+	if err != nil {
+		return nil, err
+	}
+	knowledgeMaxSkillBytes, err := getEnvIntStrict("KNOWLEDGE_MAX_LOADED_SKILL_BYTES", 24576)
+	if err != nil {
+		return nil, err
+	}
+	knowledgeDefaultLimit, err := getEnvIntStrict("KNOWLEDGE_DEFAULT_DISCOVERY_LIMIT", 5)
+	if err != nil {
+		return nil, err
+	}
+	knowledgeMaxLimit, err := getEnvIntStrict("KNOWLEDGE_MAX_DISCOVERY_LIMIT", 10)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		BotHandle:                  getEnvOrDefault("BOT_HANDLE", "@bot"),
 		BesedkaURL:                 getEnvOrDefault("BESEDKA_URL", defaultBesedkaURL),
@@ -198,6 +229,12 @@ func LoadFromEnv() (*Config, error) {
 		SchedulerMinMaxTurns:       schedMinTurns,
 		SchedulerMaxMaxTurns:       schedMaxTurns,
 		MaxAttachmentSizeBytes:     maxAttachmentSizeBytes,
+		KnowledgeMaxLoadedMemories:     knowledgeMaxMemories,
+		KnowledgeMaxLoadedMemoryBytes:  knowledgeMaxMemoryBytes,
+		KnowledgeMaxLoadedSkills:       knowledgeMaxSkills,
+		KnowledgeMaxLoadedSkillBytes:   knowledgeMaxSkillBytes,
+		KnowledgeDefaultDiscoveryLimit: knowledgeDefaultLimit,
+		KnowledgeMaxDiscoveryLimit:     knowledgeMaxLimit,
 	}
 
 	if cfg.SandboxHostDataDir != "" {
@@ -299,6 +336,27 @@ func (c *Config) Validate(requireAPIKey bool) error {
 	}
 	if c.MaxAttachmentSizeBytes <= 0 {
 		c.MaxAttachmentSizeBytes = DefaultMaxAttachmentSizeBytes
+	}
+	if c.KnowledgeMaxLoadedMemories <= 0 {
+		c.KnowledgeMaxLoadedMemories = 8
+	}
+	if c.KnowledgeMaxLoadedMemoryBytes <= 0 {
+		c.KnowledgeMaxLoadedMemoryBytes = 16384
+	}
+	if c.KnowledgeMaxLoadedSkills <= 0 {
+		c.KnowledgeMaxLoadedSkills = 3
+	}
+	if c.KnowledgeMaxLoadedSkillBytes <= 0 {
+		c.KnowledgeMaxLoadedSkillBytes = 24576
+	}
+	if c.KnowledgeDefaultDiscoveryLimit <= 0 {
+		c.KnowledgeDefaultDiscoveryLimit = 5
+	}
+	if c.KnowledgeMaxDiscoveryLimit <= 0 {
+		c.KnowledgeMaxDiscoveryLimit = 10
+	}
+	if c.KnowledgeMaxDiscoveryLimit < c.KnowledgeDefaultDiscoveryLimit {
+		return fmt.Errorf("KNOWLEDGE_MAX_DISCOVERY_LIMIT (%d) cannot be less than KNOWLEDGE_DEFAULT_DISCOVERY_LIMIT (%d)", c.KnowledgeMaxDiscoveryLimit, c.KnowledgeDefaultDiscoveryLimit)
 	}
 	if (c.S3Bucket == "") != (c.S3Endpoint == "") {
 		return errors.New("S3_BUCKET and S3_ENDPOINT must be set together")

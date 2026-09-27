@@ -63,6 +63,7 @@ type Gateway struct {
 	schedulerEngine      *scheduler.Engine
 	schedulerInvoker     *ScheduleInvoker
 	chatLocker           *ChatLocker
+	chatCache            *ChatCache
 }
 
 // NewGateway creates a new Besedka Gateway instance.
@@ -128,6 +129,7 @@ func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 		locationInterval:     9 * time.Minute,
 		initialLocationDelay: 1 * time.Second,
 		chatLocker:           chatLocker,
+		chatCache:            NewChatCache(),
 	}
 
 	toolsRegistry.SetAttachmentClient(gw)
@@ -957,6 +959,7 @@ func (g *Gateway) WarmupContext(ctx context.Context) error {
 			g.WarmupChat(ctx, chat.ID, int64(chat.LastSeq))
 		}
 	}
+	g.chatCache.SetAll(chats)
 
 	slog.Info("completed context warmup for active chats", "chatCount", len(chats))
 	return nil
@@ -1074,17 +1077,48 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 	cleanText = strings.Trim(cleanText, "`")
 	cleanText = strings.TrimSpace(cleanText)
 
+	fields := strings.Fields(cleanText)
+	var rootCommand string
+	if len(fields) > 0 {
+		rootCommand = fields[0]
+	}
+
+	promptFields := strings.Fields(strings.TrimSpace(promptText))
+	var promptRootCommand string
+	if len(promptFields) > 0 {
+		promptRootCommand = promptFields[0]
+	}
+
 	isDM := msg.ChatID != "townhall"
-	if isDM && strings.HasPrefix(cleanText, "/sandbox") {
+	if isDM && strings.EqualFold(rootCommand, "/sandbox") {
 		return g.handleSandboxCommand(ctx, msg, cleanText, senderName)
 	}
 
 	scheduleCmdText := cleanText
-	if strings.HasPrefix(strings.TrimSpace(promptText), "/schedule") {
+	if strings.EqualFold(promptRootCommand, "/schedule") {
 		scheduleCmdText = strings.TrimSpace(promptText)
+		rootCommand = promptRootCommand
 	}
-	if strings.HasPrefix(scheduleCmdText, "/schedule") {
+	if strings.EqualFold(rootCommand, "/schedule") {
 		return g.handleScheduleCommand(ctx, msg, scheduleCmdText, senderName, isDM)
+	}
+
+	memoryCmdText := cleanText
+	if strings.EqualFold(promptRootCommand, "/memory") {
+		memoryCmdText = strings.TrimSpace(promptText)
+		rootCommand = promptRootCommand
+	}
+	if strings.EqualFold(rootCommand, "/memory") {
+		return g.handleMemoryCommand(ctx, msg, memoryCmdText, senderName, isDM)
+	}
+
+	skillCmdText := cleanText
+	if strings.EqualFold(promptRootCommand, "/skill") {
+		skillCmdText = strings.TrimSpace(promptText)
+		rootCommand = promptRootCommand
+	}
+	if strings.EqualFold(rootCommand, "/skill") {
+		return g.handleSkillCommand(ctx, msg, skillCmdText, senderName, isDM)
 	}
 
 	return g.generateAndSendAgentReply(ctx, msg, isDM, senderName, "")
@@ -1788,4 +1822,68 @@ func (g *Gateway) appendSandboxDetails(b *strings.Builder, sbx *sandbox.UserSand
 		remaining = 0
 	}
 	fmt.Fprintf(b, "- **Time Remaining:** %s\n", remaining)
+}
+
+// GetChat retrieves a chat from the cache, fetching chats from the API if missing.
+func (g *Gateway) GetChat(ctx context.Context, chatID string) (models.Chat, error) {
+	if ch, ok := g.chatCache.Get(chatID); ok {
+		return ch, nil
+	}
+	chats, err := g.FetchChats(ctx)
+	if err != nil {
+		return models.Chat{}, err
+	}
+	g.chatCache.SetAll(chats)
+	if ch, ok := g.chatCache.Get(chatID); ok {
+		return ch, nil
+	}
+	return models.Chat{}, fmt.Errorf("chat %q not found", chatID)
+}
+
+// VerifyDMOwner checks whether chatID is an authorized 1-on-1 DM owned by userID.
+// Returns an error if the chat is not a DM or if the sender is not the DM owner.
+func (g *Gateway) VerifyDMOwner(ctx context.Context, chatID, userID string) error {
+	if chatID == "townhall" {
+		return fmt.Errorf("command is only available in private Direct Messages (DMs)")
+	}
+
+	chat, err := g.GetChat(ctx, chatID)
+	if err != nil {
+		return fmt.Errorf("authorization check failed: unable to verify chat metadata: %w", err)
+	}
+
+	// Must be an authoritative 1:1 DM
+	if !chat.IsDM && chat.Type != "dm" {
+		return fmt.Errorf("command is only available in private Direct Messages (DMs)")
+	}
+
+	var ownerID string
+	if chat.TargetUserID != "" {
+		ownerID = chat.TargetUserID
+	} else if len(chat.UserIDs) > 0 {
+		g.mu.Lock()
+		botID := g.botUserID
+		g.mu.Unlock()
+
+		humanCount := 0
+		for _, uid := range chat.UserIDs {
+			if uid != botID {
+				ownerID = uid
+				humanCount++
+			}
+		}
+		if humanCount != 1 {
+			return fmt.Errorf("unauthorized: memory/skill management requires a 1-on-1 DM with exactly one human participant")
+		}
+	}
+
+	if ownerID == "" {
+		return fmt.Errorf("unauthorized: unable to verify human owner of this DM")
+	}
+
+	if userID != ownerID {
+		return fmt.Errorf("unauthorized: only the owner of this DM can manage memories and skills")
+	}
+
+	return nil
 }

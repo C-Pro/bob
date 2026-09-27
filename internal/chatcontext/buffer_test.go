@@ -212,6 +212,39 @@ func TestRingBuffer_ToLLMMessages_Multimodal(t *testing.T) {
 	assert.Equal(t, "data:image/webp;base64,UklGRkAAAABXRUJQVlA4IDQAAADwAQCdASoBAAEAAQAcJaACdLoB+AA/v2AAA", msgs[2].MultiContent[2].ImageURL.URL)
 }
 
+func TestRingBuffer_ToLLMMessages_AssistantImagesOmitted(t *testing.T) {
+	rb := NewRingBuffer(5)
+
+	// Assistant message with images (e.g. from sandbox_upload_attachment)
+	// should NOT produce image_url parts — only text.
+	rb.Push(Entry{
+		Role:    "assistant",
+		Content: "Here is the chart you requested",
+		Images: []ImageAttachment{
+			{URL: "data:image/png;base64,fakedata"},
+		},
+	})
+
+	// Assistant message with images but no text content.
+	rb.Push(Entry{
+		Role: "assistant",
+		Images: []ImageAttachment{
+			{URL: "data:image/png;base64,moredata"},
+		},
+	})
+
+	msgs := rb.ToLLMMessages()
+	require.Len(t, msgs, 2)
+
+	assert.Equal(t, openai.ChatMessageRoleAssistant, msgs[0].Role)
+	assert.Equal(t, "Here is the chart you requested", msgs[0].Content)
+	assert.Nil(t, msgs[0].MultiContent)
+
+	assert.Equal(t, openai.ChatMessageRoleAssistant, msgs[1].Role)
+	assert.Empty(t, msgs[1].Content)
+	assert.Nil(t, msgs[1].MultiContent)
+}
+
 func TestRingBuffer_Clear(t *testing.T) {
 	rb := NewRingBuffer(5)
 	rb.Push(Entry{Role: "user", Content: "test"})

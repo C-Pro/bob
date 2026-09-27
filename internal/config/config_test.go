@@ -59,6 +59,12 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	_ = os.Unsetenv("SCHEDULER_MIN_MAX_TURNS")
 	_ = os.Unsetenv("SCHEDULER_MAX_MAX_TURNS")
 	_ = os.Unsetenv("MAX_ATTACHMENT_SIZE")
+	_ = os.Unsetenv("KNOWLEDGE_MAX_LOADED_MEMORIES")
+	_ = os.Unsetenv("KNOWLEDGE_MAX_LOADED_MEMORY_BYTES")
+	_ = os.Unsetenv("KNOWLEDGE_MAX_LOADED_SKILLS")
+	_ = os.Unsetenv("KNOWLEDGE_MAX_LOADED_SKILL_BYTES")
+	_ = os.Unsetenv("KNOWLEDGE_DEFAULT_DISCOVERY_LIMIT")
+	_ = os.Unsetenv("KNOWLEDGE_MAX_DISCOVERY_LIMIT")
 
 	cfg, err := LoadFromEnv()
 	require.NoError(t, err)
@@ -102,6 +108,12 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	assert.Equal(t, 10, cfg.SchedulerMinMaxTurns)
 	assert.Equal(t, 100, cfg.SchedulerMaxMaxTurns)
 	assert.Equal(t, int64(25*1024*1024), cfg.MaxAttachmentSizeBytes)
+	assert.Equal(t, 8, cfg.KnowledgeMaxLoadedMemories)
+	assert.Equal(t, 16384, cfg.KnowledgeMaxLoadedMemoryBytes)
+	assert.Equal(t, 3, cfg.KnowledgeMaxLoadedSkills)
+	assert.Equal(t, 24576, cfg.KnowledgeMaxLoadedSkillBytes)
+	assert.Equal(t, 5, cfg.KnowledgeDefaultDiscoveryLimit)
+	assert.Equal(t, 10, cfg.KnowledgeMaxDiscoveryLimit)
 }
 
 func TestLoadFromEnvStandardOpenAI(t *testing.T) {
@@ -619,5 +631,73 @@ func TestLoadFromEnvMaxAttachmentSize(t *testing.T) {
 		t.Setenv("MAX_ATTACHMENT_SIZE", "invalid-size")
 		_, err := LoadFromEnv()
 		assert.ErrorContains(t, err, "invalid MAX_ATTACHMENT_SIZE")
+	})
+}
+
+func TestLoadFromEnvKnowledge(t *testing.T) {
+	t.Run("custom valid values", func(t *testing.T) {
+		t.Setenv("KNOWLEDGE_MAX_LOADED_MEMORIES", "12")
+		t.Setenv("KNOWLEDGE_MAX_LOADED_MEMORY_BYTES", "32768")
+		t.Setenv("KNOWLEDGE_MAX_LOADED_SKILLS", "5")
+		t.Setenv("KNOWLEDGE_MAX_LOADED_SKILL_BYTES", "49152")
+		t.Setenv("KNOWLEDGE_DEFAULT_DISCOVERY_LIMIT", "8")
+		t.Setenv("KNOWLEDGE_MAX_DISCOVERY_LIMIT", "20")
+
+		cfg, err := LoadFromEnv()
+		require.NoError(t, err)
+		assert.Equal(t, 12, cfg.KnowledgeMaxLoadedMemories)
+		assert.Equal(t, 32768, cfg.KnowledgeMaxLoadedMemoryBytes)
+		assert.Equal(t, 5, cfg.KnowledgeMaxLoadedSkills)
+		assert.Equal(t, 49152, cfg.KnowledgeMaxLoadedSkillBytes)
+		assert.Equal(t, 8, cfg.KnowledgeDefaultDiscoveryLimit)
+		assert.Equal(t, 20, cfg.KnowledgeMaxDiscoveryLimit)
+		require.NoError(t, cfg.Validate(false))
+	})
+
+	t.Run("invalid non-integer", func(t *testing.T) {
+		t.Setenv("KNOWLEDGE_MAX_LOADED_MEMORIES", "abc")
+		_, err := LoadFromEnv()
+		assert.ErrorContains(t, err, "invalid integer for KNOWLEDGE_MAX_LOADED_MEMORIES")
+	})
+
+	t.Run("invalid non-positive", func(t *testing.T) {
+		t.Setenv("KNOWLEDGE_MAX_LOADED_SKILLS", "0")
+		_, err := LoadFromEnv()
+		assert.ErrorContains(t, err, "invalid integer for KNOWLEDGE_MAX_LOADED_SKILLS")
+	})
+}
+
+func TestValidateKnowledgeBoundaries(t *testing.T) {
+	baseCfg := func() *Config {
+		cfg, err := LoadFromEnv()
+		if err != nil {
+			panic(err)
+		}
+		return cfg
+	}
+
+	t.Run("zero values fallback to defaults in validate", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.KnowledgeMaxLoadedMemories = 0
+		cfg.KnowledgeMaxLoadedMemoryBytes = 0
+		cfg.KnowledgeMaxLoadedSkills = 0
+		cfg.KnowledgeMaxLoadedSkillBytes = 0
+		cfg.KnowledgeDefaultDiscoveryLimit = 0
+		cfg.KnowledgeMaxDiscoveryLimit = 0
+
+		require.NoError(t, cfg.Validate(false))
+		assert.Equal(t, 8, cfg.KnowledgeMaxLoadedMemories)
+		assert.Equal(t, 16384, cfg.KnowledgeMaxLoadedMemoryBytes)
+		assert.Equal(t, 3, cfg.KnowledgeMaxLoadedSkills)
+		assert.Equal(t, 24576, cfg.KnowledgeMaxLoadedSkillBytes)
+		assert.Equal(t, 5, cfg.KnowledgeDefaultDiscoveryLimit)
+		assert.Equal(t, 10, cfg.KnowledgeMaxDiscoveryLimit)
+	})
+
+	t.Run("max discovery limit less than default", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.KnowledgeDefaultDiscoveryLimit = 10
+		cfg.KnowledgeMaxDiscoveryLimit = 5
+		assert.ErrorContains(t, cfg.Validate(false), "KNOWLEDGE_MAX_DISCOVERY_LIMIT (5) cannot be less than KNOWLEDGE_DEFAULT_DISCOVERY_LIMIT (10)")
 	})
 }

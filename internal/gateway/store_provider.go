@@ -12,27 +12,32 @@ import (
 	"sync"
 
 	"bob/internal/fsm"
+	"bob/internal/knowledge"
 	"bob/internal/memory"
 	"bob/internal/scheduler"
 )
 
 // MemoryStoreProvider implements fsm.StoreProvider backed by memory.Manager and per-chat SQLite databases.
 type MemoryStoreProvider struct {
-	memMgr      *memory.Manager
-	dataDir     string
-	mu          sync.RWMutex
-	stores      map[string]*fsm.Store
-	schedStores map[string]*scheduler.Store
-	initOnce    sync.Once
+	memMgr          *memory.Manager
+	dataDir         string
+	mu              sync.RWMutex
+	stores          map[string]*fsm.Store
+	schedStores     map[string]*scheduler.Store
+	knowledgeStores map[string]*knowledge.Store
+	indexers        map[string]*knowledge.Indexer
+	initOnce        sync.Once
 }
 
 // NewMemoryStoreProvider creates a new MemoryStoreProvider.
 func NewMemoryStoreProvider(memMgr *memory.Manager, dataDir string) *MemoryStoreProvider {
 	return &MemoryStoreProvider{
-		memMgr:      memMgr,
-		dataDir:     dataDir,
-		stores:      make(map[string]*fsm.Store),
-		schedStores: make(map[string]*scheduler.Store),
+		memMgr:          memMgr,
+		dataDir:         dataDir,
+		stores:          make(map[string]*fsm.Store),
+		schedStores:     make(map[string]*scheduler.Store),
+		knowledgeStores: make(map[string]*knowledge.Store),
+		indexers:        make(map[string]*knowledge.Indexer),
 	}
 }
 
@@ -77,6 +82,11 @@ func (p *MemoryStoreProvider) GetStore(ctx context.Context, chatID string, isDM 
 	if err := scheduler.EnsureScheduleSchema(ctx, rawDB); err != nil {
 		return nil, fmt.Errorf("failed to ensure scheduler schema for chat %s: %w", chatID, err)
 	}
+	if isDM && chatID != "townhall" {
+		if err := knowledge.EnsureKnowledgeSchema(ctx, rawDB); err != nil {
+			return nil, fmt.Errorf("failed to ensure knowledge schema for chat %s: %w", chatID, err)
+		}
+	}
 
 	st = fsm.NewStore(rawDB)
 	p.stores[key] = st
@@ -118,6 +128,94 @@ func (p *MemoryStoreProvider) GetSchedulerStore(ctx context.Context, chatID stri
 	st = scheduler.NewStore(rawDB)
 	p.schedStores[key] = st
 	return st, nil
+}
+
+// GetKnowledgeStore retrieves or initializes the isolated knowledge store for the given chat context.
+func (p *MemoryStoreProvider) GetKnowledgeStore(ctx context.Context, chatID string, isDM bool) (*knowledge.Store, error) {
+	if !isDM || chatID == "townhall" {
+		return nil, fmt.Errorf("knowledge storage is only available in direct messages")
+	}
+	if p.memMgr == nil {
+		return nil, fmt.Errorf("memory manager is nil")
+	}
+
+	key := p.storeKey(chatID, isDM)
+
+	p.mu.RLock()
+	st, ok := p.knowledgeStores[key]
+	p.mu.RUnlock()
+	if ok {
+		return st, nil
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.getKnowledgeStoreLocked(ctx, chatID, isDM)
+}
+
+func (p *MemoryStoreProvider) getKnowledgeStoreLocked(ctx context.Context, chatID string, isDM bool) (*knowledge.Store, error) {
+	key := p.storeKey(chatID, isDM)
+	if st, ok := p.knowledgeStores[key]; ok {
+		return st, nil
+	}
+
+	cortexDB, err := p.memMgr.GetDB(ctx, chatID, isDM)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get database for chat %s: %w", chatID, err)
+	}
+
+	rawDB := cortexDB.SQL()
+	if err := knowledge.EnsureKnowledgeSchema(ctx, rawDB); err != nil {
+		return nil, fmt.Errorf("failed to ensure knowledge schema for chat %s: %w", chatID, err)
+	}
+
+	st := knowledge.NewStore(rawDB)
+	p.knowledgeStores[key] = st
+	return st, nil
+}
+
+// GetKnowledgeIndexer retrieves or initializes the knowledge indexer for the given chat context.
+func (p *MemoryStoreProvider) GetKnowledgeIndexer(ctx context.Context, chatID string, isDM bool) (*knowledge.Indexer, error) {
+	if !isDM || chatID == "townhall" {
+		return nil, fmt.Errorf("knowledge indexer is only available in direct messages")
+	}
+	if p.memMgr == nil {
+		return nil, fmt.Errorf("memory manager is nil")
+	}
+
+	key := p.storeKey(chatID, isDM)
+
+	p.mu.RLock()
+	idx, ok := p.indexers[key]
+	p.mu.RUnlock()
+	if ok {
+		return idx, nil
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if idx, ok = p.indexers[key]; ok {
+		return idx, nil
+	}
+
+	kStore, err := p.getKnowledgeStoreLocked(ctx, chatID, isDM)
+	if err != nil {
+		return nil, err
+	}
+
+	cortexDB, err := p.memMgr.GetDB(ctx, chatID, isDM)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get database for chat %s: %w", chatID, err)
+	}
+
+	idx = knowledge.NewIndexer(kStore, cortexDB)
+	if _, recErr := idx.ReconcilePending(ctx, 100); recErr != nil {
+		slog.Error("failed to reconcile pending knowledge index records", "chat_id", chatID, "error", recErr)
+	}
+	p.indexers[key] = idx
+	return idx, nil
 }
 
 func hasActiveRuns(dbPath string) (bool, error) {
