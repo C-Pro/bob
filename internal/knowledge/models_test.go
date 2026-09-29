@@ -120,6 +120,7 @@ func TestEnumValidations(t *testing.T) {
 	assert.True(t, IsValidItemStatus("disabled"))
 	assert.True(t, IsValidItemStatus("archived"))
 	assert.True(t, IsValidItemStatus("forgotten"))
+	assert.True(t, IsValidItemStatus("rejected"))
 	assert.False(t, IsValidItemStatus("unknown"))
 
 	// VersionStatus

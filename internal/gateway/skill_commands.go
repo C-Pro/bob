@@ -355,11 +355,8 @@ func (g *Gateway) handleSkillApprove(ctx context.Context, msg models.Message, st
 			return g.SendMessage(msg.ChatID, fmt.Sprintf("✅ Skill version `%s` approved, but indexing failed: %v", versionID, idxErr))
 		}
 		if prevActiveID != "" && prevActiveID != versionID {
-			_ = store.EnqueueIndexDeletion(ctx, prevActiveID, knowledge.NamespaceSkills)
-			if remErr := indexer.RemoveFromIndex(ctx, prevActiveID); remErr != nil {
-				slog.Error("failed to remove superseded skill version from index", "version_id", prevActiveID, "error", remErr)
-			} else {
-				_ = store.RemovePendingIndexDeletion(ctx, prevActiveID)
+			if _, purgeErr := indexer.PurgePendingDeletion(ctx, prevActiveID); purgeErr != nil {
+				slog.Warn("failed to purge superseded skill version from index", "version_id", prevActiveID, "error", purgeErr)
 			}
 		}
 	}
@@ -436,9 +433,6 @@ func (g *Gateway) handleSkillDisable(ctx context.Context, msg models.Message, st
 	}
 
 	activeVerID := item.ActiveVersionID
-	if activeVerID != "" {
-		_ = store.EnqueueIndexDeletion(ctx, activeVerID, knowledge.NamespaceSkills)
-	}
 
 	if err := store.DisableSkill(ctx, itemID, msg.UserID); err != nil {
 		if errors.Is(err, knowledge.ErrNotFound) {
@@ -448,10 +442,8 @@ func (g *Gateway) handleSkillDisable(ctx context.Context, msg models.Message, st
 	}
 
 	if indexer != nil && activeVerID != "" {
-		if remErr := indexer.RemoveFromIndex(ctx, activeVerID); remErr != nil {
-			slog.Error("failed to remove disabled skill from index", "version_id", activeVerID, "error", remErr)
-		} else {
-			_ = store.RemovePendingIndexDeletion(ctx, activeVerID)
+		if _, purgeErr := indexer.PurgePendingDeletion(ctx, activeVerID); purgeErr != nil {
+			slog.Warn("failed to purge disabled skill from index", "version_id", activeVerID, "error", purgeErr)
 		}
 	}
 
@@ -533,9 +525,6 @@ func (g *Gateway) handleSkillArchive(ctx context.Context, msg models.Message, st
 	}
 
 	activeVerID := item.ActiveVersionID
-	if activeVerID != "" {
-		_ = store.EnqueueIndexDeletion(ctx, activeVerID, knowledge.NamespaceSkills)
-	}
 
 	if err := store.ArchiveSkill(ctx, itemID, msg.UserID); err != nil {
 		if errors.Is(err, knowledge.ErrNotFound) {
@@ -545,10 +534,8 @@ func (g *Gateway) handleSkillArchive(ctx context.Context, msg models.Message, st
 	}
 
 	if indexer != nil && activeVerID != "" {
-		if remErr := indexer.RemoveFromIndex(ctx, activeVerID); remErr != nil {
-			slog.Error("failed to remove archived skill from index", "version_id", activeVerID, "error", remErr)
-		} else {
-			_ = store.RemovePendingIndexDeletion(ctx, activeVerID)
+		if _, purgeErr := indexer.PurgePendingDeletion(ctx, activeVerID); purgeErr != nil {
+			slog.Warn("failed to purge archived skill from index", "version_id", activeVerID, "error", purgeErr)
 		}
 	}
 
@@ -584,11 +571,8 @@ func (g *Gateway) handleSkillDelete(ctx context.Context, msg models.Message, sto
 		return g.SendMessage(msg.ChatID, fmt.Sprintf("⚠️ Skill `%s` not found.", itemID))
 	}
 
-	// Capture all version IDs before deletion so all indexed records are purged durably
+	// Capture all version IDs before deletion so all indexed records can be purged immediately
 	vers, _ := store.ListVersions(ctx, itemID)
-	for _, v := range vers {
-		_ = store.EnqueueIndexDeletion(ctx, v.GetID(), knowledge.NamespaceSkills)
-	}
 
 	if err := store.DeleteSkill(ctx, itemID, msg.UserID); err != nil {
 		if errors.Is(err, knowledge.ErrNotFound) {
@@ -600,11 +584,9 @@ func (g *Gateway) handleSkillDelete(ctx context.Context, msg models.Message, sto
 	allPurged := true
 	if indexer != nil {
 		for _, v := range vers {
-			if remErr := indexer.RemoveFromIndex(ctx, v.GetID()); remErr != nil {
-				slog.Error("failed to remove deleted skill version from index", "version_id", v.GetID(), "error", remErr)
+			if _, purgeErr := indexer.PurgePendingDeletion(ctx, v.GetID()); purgeErr != nil {
+				slog.Warn("failed to purge deleted skill version from index", "version_id", v.GetID(), "error", purgeErr)
 				allPurged = false
-			} else {
-				_ = store.RemovePendingIndexDeletion(ctx, v.GetID())
 			}
 		}
 	} else {

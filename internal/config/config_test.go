@@ -642,6 +642,7 @@ func TestLoadFromEnvKnowledge(t *testing.T) {
 		t.Setenv("KNOWLEDGE_MAX_LOADED_SKILL_BYTES", "49152")
 		t.Setenv("KNOWLEDGE_DEFAULT_DISCOVERY_LIMIT", "8")
 		t.Setenv("KNOWLEDGE_MAX_DISCOVERY_LIMIT", "20")
+		t.Setenv("KNOWLEDGE_RECONCILE_INTERVAL", "45s")
 
 		cfg, err := LoadFromEnv()
 		require.NoError(t, err)
@@ -651,7 +652,14 @@ func TestLoadFromEnvKnowledge(t *testing.T) {
 		assert.Equal(t, 49152, cfg.KnowledgeMaxLoadedSkillBytes)
 		assert.Equal(t, 8, cfg.KnowledgeDefaultDiscoveryLimit)
 		assert.Equal(t, 20, cfg.KnowledgeMaxDiscoveryLimit)
+		assert.Equal(t, 45*time.Second, cfg.KnowledgeReconcileInterval)
 		require.NoError(t, cfg.Validate(false))
+	})
+
+	t.Run("default values when unset", func(t *testing.T) {
+		cfg, err := LoadFromEnv()
+		require.NoError(t, err)
+		assert.Equal(t, 1*time.Minute, cfg.KnowledgeReconcileInterval)
 	})
 
 	t.Run("invalid non-integer", func(t *testing.T) {
@@ -664,6 +672,12 @@ func TestLoadFromEnvKnowledge(t *testing.T) {
 		t.Setenv("KNOWLEDGE_MAX_LOADED_SKILLS", "0")
 		_, err := LoadFromEnv()
 		assert.ErrorContains(t, err, "invalid integer for KNOWLEDGE_MAX_LOADED_SKILLS")
+	})
+
+	t.Run("invalid duration", func(t *testing.T) {
+		t.Setenv("KNOWLEDGE_RECONCILE_INTERVAL", "not-a-duration")
+		_, err := LoadFromEnv()
+		assert.ErrorContains(t, err, "invalid duration for KNOWLEDGE_RECONCILE_INTERVAL")
 	})
 }
 
@@ -684,6 +698,7 @@ func TestValidateKnowledgeBoundaries(t *testing.T) {
 		cfg.KnowledgeMaxLoadedSkillBytes = 0
 		cfg.KnowledgeDefaultDiscoveryLimit = 0
 		cfg.KnowledgeMaxDiscoveryLimit = 0
+		cfg.KnowledgeReconcileInterval = 0
 
 		require.NoError(t, cfg.Validate(false))
 		assert.Equal(t, 8, cfg.KnowledgeMaxLoadedMemories)
@@ -692,6 +707,7 @@ func TestValidateKnowledgeBoundaries(t *testing.T) {
 		assert.Equal(t, 24576, cfg.KnowledgeMaxLoadedSkillBytes)
 		assert.Equal(t, 5, cfg.KnowledgeDefaultDiscoveryLimit)
 		assert.Equal(t, 10, cfg.KnowledgeMaxDiscoveryLimit)
+		assert.Equal(t, 1*time.Minute, cfg.KnowledgeReconcileInterval)
 	})
 
 	t.Run("max discovery limit less than default", func(t *testing.T) {

@@ -114,6 +114,8 @@ func (g *Gateway) handleMemoryList(ctx context.Context, msg models.Message, stor
 	b.WriteString("| ID | Type | Snippet | Rev | Status |\n")
 	b.WriteString("|---|---|---|---|---|\n")
 
+	now := time.Now().Unix()
+
 	for _, item := range items {
 		vers, err := store.ListVersions(ctx, item.ID)
 		var targetVer *knowledge.MemoryVersion
@@ -136,7 +138,7 @@ func (g *Gateway) handleMemoryList(ctx context.Context, msg models.Message, stor
 						break findMemVer
 					}
 				case "expired":
-					if mv.Status == knowledge.VersionStatusExpired {
+					if mv.Status == knowledge.VersionStatusExpired || (mv.ExpiresAt != nil && *mv.ExpiresAt <= now) {
 						targetVer = mv
 						break findMemVer
 					}
@@ -152,7 +154,7 @@ func (g *Gateway) handleMemoryList(ctx context.Context, msg models.Message, stor
 					}
 				}
 			}
-			if targetVer == nil {
+			if targetVer == nil && statusFilter != "expired" {
 				// Fallback to active version
 				if item.ActiveVersionID != "" {
 					for _, v := range vers {
@@ -182,7 +184,9 @@ func (g *Gateway) handleMemoryList(ctx context.Context, msg models.Message, stor
 			snippet = strings.ReplaceAll(snippet, "|", "\\|")
 			snippet = strings.ReplaceAll(snippet, "\n", " ")
 			revStr = fmt.Sprintf("@%d", targetVer.Revision)
-			if statusFilter == "pending" || statusFilter == "rejected" || statusFilter == "expired" || item.Status == knowledge.ItemStatusPending {
+			if statusFilter == "expired" || (targetVer.ExpiresAt != nil && *targetVer.ExpiresAt <= now) {
+				statusStr = "expired"
+			} else if statusFilter == "pending" || statusFilter == "rejected" || item.Status == knowledge.ItemStatusPending {
 				statusStr = string(targetVer.Status)
 			}
 		}
@@ -353,11 +357,8 @@ func (g *Gateway) handleMemoryApprove(ctx context.Context, msg models.Message, s
 			return g.SendMessage(msg.ChatID, fmt.Sprintf("✅ Memory version `%s` approved, but indexing failed: %v", versionID, idxErr))
 		}
 		if prevActiveID != "" && prevActiveID != versionID {
-			_ = store.EnqueueIndexDeletion(ctx, prevActiveID, knowledge.NamespaceMemories)
-			if remErr := indexer.RemoveFromIndex(ctx, prevActiveID); remErr != nil {
-				slog.Error("failed to remove superseded memory version from index", "version_id", prevActiveID, "error", remErr)
-			} else {
-				_ = store.RemovePendingIndexDeletion(ctx, prevActiveID)
+			if _, purgeErr := indexer.PurgePendingDeletion(ctx, prevActiveID); purgeErr != nil {
+				slog.Warn("failed to purge superseded memory version from index", "version_id", prevActiveID, "error", purgeErr)
 			}
 		}
 	}
@@ -433,11 +434,8 @@ func (g *Gateway) handleMemoryForget(ctx context.Context, msg models.Message, st
 		return g.SendMessage(msg.ChatID, fmt.Sprintf("⚠️ Memory `%s` not found.", itemID))
 	}
 
-	// Capture all version IDs before deletion so all indexed records are purged durably
+	// Capture all version IDs before deletion so all indexed records can be purged immediately
 	vers, _ := store.ListVersions(ctx, itemID)
-	for _, v := range vers {
-		_ = store.EnqueueIndexDeletion(ctx, v.GetID(), knowledge.NamespaceMemories)
-	}
 
 	if err := store.ForgetItem(ctx, itemID, msg.UserID); err != nil {
 		if errors.Is(err, knowledge.ErrNotFound) {
@@ -449,11 +447,9 @@ func (g *Gateway) handleMemoryForget(ctx context.Context, msg models.Message, st
 	allPurged := true
 	if indexer != nil {
 		for _, v := range vers {
-			if remErr := indexer.RemoveFromIndex(ctx, v.GetID()); remErr != nil {
-				slog.Error("failed to remove forgotten memory version from index", "version_id", v.GetID(), "error", remErr)
+			if _, purgeErr := indexer.PurgePendingDeletion(ctx, v.GetID()); purgeErr != nil {
+				slog.Warn("failed to purge forgotten memory version from index", "version_id", v.GetID(), "error", purgeErr)
 				allPurged = false
-			} else {
-				_ = store.RemovePendingIndexDeletion(ctx, v.GetID())
 			}
 		}
 	} else {

@@ -94,9 +94,18 @@ type Registry struct {
 	knowledgeLimits                KnowledgeBudgetLimits
 	knowledgeDefaultDiscoveryLimit int
 	knowledgeMaxDiscoveryLimit     int
+	dmAuthorizer                   DMAuthorizer
 	toolDefinitions                []openai.Tool
 	dmToolDefinitions              []openai.Tool
 	knowledgeToolDefs              []openai.Tool
+}
+
+// DMAuthorizer validates that chatID is an authorized 1-on-1 DM owned by userID.
+type DMAuthorizer func(ctx context.Context, chatID, userID string) error
+
+// SetDMAuthorizer sets the authoritative DM validator function for knowledge tools.
+func (r *Registry) SetDMAuthorizer(authorizer DMAuthorizer) {
+	r.dmAuthorizer = authorizer
 }
 
 // NewRegistry creates a new tool registry and initializes static tool definitions once.

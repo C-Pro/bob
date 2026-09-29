@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/liliang-cn/cortexdb/v2/pkg/core"
 	"github.com/liliang-cn/cortexdb/v2/pkg/cortexdb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -420,3 +422,237 @@ func TestIndexer_ExpiredMemoryRejection(t *testing.T) {
 	assert.True(t, deletedFromVector, "expired memory must be purged from vector database via compensating deletion")
 }
 
+func TestIndexer_RemoveFromIndex_MissingRecordTreatedAsSuccess(t *testing.T) {
+	ctx := context.Background()
+	kStore, rawDB := setupTestStore(t)
+	defer func() { _ = rawDB.Close() }()
+
+	require.NoError(t, kStore.EnqueueIndexDeletion(ctx, "mem_test_missing@1", NamespaceMemories))
+
+	deleteCalled := false
+	mockV := &mockVectorDB{
+		deleteFn: func(ctx context.Context, req cortexdb.MemoryDeleteRequest) (*cortexdb.MemoryDeleteResponse, error) {
+			deleteCalled = true
+			return nil, core.ErrNotFound
+		},
+	}
+
+	indexer := NewIndexer(kStore, mockV)
+	n, err := indexer.ReconcilePending(ctx, 10)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+	assert.True(t, deleteCalled)
+
+	// Queue must now be drained
+	deletions, err := kStore.GetPendingIndexDeletions(ctx, 10)
+	require.NoError(t, err)
+	assert.Empty(t, deletions, "absent records must be cleared from the pending index deletions queue")
+}
+
+func TestIndexer_ReconcilePending_StaleDeletionDiscardedOnReenable(t *testing.T) {
+	ctx := context.Background()
+	kStore, rawDB := setupTestStore(t)
+	defer func() { _ = rawDB.Close() }()
+
+	item, ver, err := kStore.ProposeSkill(ctx, &KnowledgeItem{
+		ChatID: "chat_reenable",
+		UserID: "user_reenable",
+	}, &SkillVersion{
+		Name:                 "skill_stale_del",
+		Description:          "desc",
+		InstructionsMarkdown: "# instructions",
+	})
+	require.NoError(t, err)
+	require.NoError(t, kStore.ApproveVersion(ctx, ver.ID, "user_reenable"))
+
+	// Disable skill -> queues active version for deletion
+	require.NoError(t, kStore.DisableSkill(ctx, item.ID, "user_reenable"))
+
+	// Re-enable skill -> clears deletion, marks version pending
+	require.NoError(t, kStore.EnableSkill(ctx, item.ID, "user_reenable"))
+	// Artificially re-enqueue deletion to simulate worker with already fetched stale item
+	require.NoError(t, kStore.EnqueueIndexDeletion(ctx, ver.ID, NamespaceSkills))
+
+	deleteCalled := false
+	mockV := &mockVectorDB{
+		deleteFn: func(ctx context.Context, req cortexdb.MemoryDeleteRequest) (*cortexdb.MemoryDeleteResponse, error) {
+			deleteCalled = true
+			return &cortexdb.MemoryDeleteResponse{Deleted: true}, nil
+		},
+	}
+
+	indexer := NewIndexer(kStore, mockV)
+	_, err = indexer.ReconcilePending(ctx, 10)
+	require.NoError(t, err)
+	assert.False(t, deleteCalled, "stale deletion must NOT delete re-enabled active version from vector DB")
+
+	// Queue must be drained
+	deletions, err := kStore.GetPendingIndexDeletions(ctx, 10)
+	require.NoError(t, err)
+	assert.Empty(t, deletions)
+
+	// Version index status must be ready after same-pass re-indexing
+	sv, err := kStore.GetSkillVersion(ctx, ver.ID)
+	require.NoError(t, err)
+	assert.Equal(t, IndexStatusReady, sv.IndexStatus)
+}
+
+func TestIndexer_ReconcilePending_ConcurrentReenableDuringDeletionPurge(t *testing.T) {
+	ctx := context.Background()
+	kStore, rawDB := setupTestStore(t)
+	defer func() { _ = rawDB.Close() }()
+
+	item, ver, err := kStore.ProposeSkill(ctx, &KnowledgeItem{
+		ChatID: "chat_concurrent",
+		UserID: "user_concurrent",
+	}, &SkillVersion{
+		Name:                 "skill_race_del",
+		Description:          "desc",
+		InstructionsMarkdown: "# instructions",
+	})
+	require.NoError(t, err)
+	require.NoError(t, kStore.ApproveVersion(ctx, ver.ID, "user_concurrent"))
+
+	// Disable skill -> queues active version for index deletion
+	require.NoError(t, kStore.DisableSkill(ctx, item.ID, "user_concurrent"))
+
+	inDeleteCh := make(chan struct{})
+	releaseDeleteCh := make(chan struct{})
+	var saveCalled atomic.Bool
+	var deleteCalled atomic.Bool
+
+	mockV := &mockVectorDB{
+		deleteFn: func(ctx context.Context, req cortexdb.MemoryDeleteRequest) (*cortexdb.MemoryDeleteResponse, error) {
+			deleteCalled.Store(true)
+			close(inDeleteCh)
+			<-releaseDeleteCh
+			return &cortexdb.MemoryDeleteResponse{Deleted: true}, nil
+		},
+		saveFn: func(ctx context.Context, req cortexdb.MemorySaveRequest) (*cortexdb.MemorySaveResponse, error) {
+			saveCalled.Store(true)
+			return &cortexdb.MemorySaveResponse{}, nil
+		},
+	}
+
+	indexer := NewIndexer(kStore, mockV)
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, recErr := indexer.ReconcilePending(ctx, 10)
+		errCh <- recErr
+	}()
+
+	// Wait until deletion is in-flight
+	select {
+	case <-inDeleteCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for deleteFn to be entered")
+	}
+
+	// While deleteFn is blocked, re-enable skill
+	require.NoError(t, kStore.EnableSkill(ctx, item.ID, "user_concurrent"))
+
+	// Release deletion
+	close(releaseDeleteCh)
+
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for ReconcilePending to complete")
+	}
+
+	assert.True(t, deleteCalled.Load(), "vector delete was called")
+	assert.True(t, saveCalled.Load(), "vector save was called in same pass to reindex re-enabled skill")
+
+	// Queue must be empty
+	deletions, err := kStore.GetPendingIndexDeletions(ctx, 10)
+	require.NoError(t, err)
+	assert.Empty(t, deletions)
+
+	// Version status must be ready
+	sv, err := kStore.GetSkillVersion(ctx, ver.ID)
+	require.NoError(t, err)
+	assert.Equal(t, IndexStatusReady, sv.IndexStatus)
+}
+
+func TestIndexer_PurgePendingDeletion_AuthoritativePreAndPostChecks(t *testing.T) {
+	ctx := context.Background()
+	kStore, rawDB := setupTestStore(t)
+	defer func() { _ = rawDB.Close() }()
+
+	item, ver, err := kStore.ProposeSkill(ctx, &KnowledgeItem{
+		ChatID: "chat_purge",
+		UserID: "user_purge",
+	}, &SkillVersion{
+		Name:                 "skill_purge_test",
+		Description:          "desc",
+		InstructionsMarkdown: "# instructions",
+	})
+	require.NoError(t, err)
+	require.NoError(t, kStore.ApproveVersion(ctx, ver.ID, "user_purge"))
+
+	// 1. Test Pre-Check: Skill is disabled then re-enabled before PurgePendingDeletion runs
+	require.NoError(t, kStore.DisableSkill(ctx, item.ID, "user_purge"))
+	require.NoError(t, kStore.EnableSkill(ctx, item.ID, "user_purge"))
+	// Artificially queue a deletion job for this active version
+	require.NoError(t, kStore.EnqueueIndexDeletion(ctx, ver.ID, NamespaceSkills))
+
+	var deleteCalled atomic.Bool
+	mockV := &mockVectorDB{
+		deleteFn: func(ctx context.Context, req cortexdb.MemoryDeleteRequest) (*cortexdb.MemoryDeleteResponse, error) {
+			deleteCalled.Store(true)
+			return &cortexdb.MemoryDeleteResponse{Deleted: true}, nil
+		},
+	}
+	indexer := NewIndexer(kStore, mockV)
+
+	purged, err := indexer.PurgePendingDeletion(ctx, ver.ID)
+	require.NoError(t, err)
+	assert.False(t, purged, "pre-check must discard purge because version is active and approved")
+	assert.False(t, deleteCalled.Load(), "vector delete must NOT be called when pre-check discards deletion")
+
+	// 2. Test In-Flight Concurrent Re-Enable: Skill is disabled, deleteFn blocks, concurrent enable occurs
+	require.NoError(t, kStore.DisableSkill(ctx, item.ID, "user_purge"))
+
+	inDeleteCh := make(chan struct{})
+	releaseDeleteCh := make(chan struct{})
+
+	mockV.deleteFn = func(ctx context.Context, req cortexdb.MemoryDeleteRequest) (*cortexdb.MemoryDeleteResponse, error) {
+		close(inDeleteCh)
+		<-releaseDeleteCh
+		return &cortexdb.MemoryDeleteResponse{Deleted: true}, nil
+	}
+
+	resCh := make(chan bool, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		p, pErr := indexer.PurgePendingDeletion(ctx, ver.ID)
+		resCh <- p
+		errCh <- pErr
+	}()
+
+	select {
+	case <-inDeleteCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for deleteFn")
+	}
+
+	// While in-flight, re-enable skill
+	require.NoError(t, kStore.EnableSkill(ctx, item.ID, "user_purge"))
+	close(releaseDeleteCh)
+
+	select {
+	case p := <-resCh:
+		pErr := <-errCh
+		require.NoError(t, pErr)
+		assert.False(t, p, "post-check must discard purge and mark pending when concurrent re-enable occurred")
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for PurgePendingDeletion to complete")
+	}
+
+	// Active version index_status must be pending for re-indexing
+	sv, err := kStore.GetSkillVersion(ctx, ver.ID)
+	require.NoError(t, err)
+	assert.Equal(t, IndexStatusPending, sv.IndexStatus)
+}

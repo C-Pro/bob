@@ -178,8 +178,46 @@ func (t *KnowledgeBudgetTracker) ChargeSkill(itemID, versionID, content string) 
 	return nil
 }
 
+// Evict removes a loaded item from the tracker and releases its budget reservation.
+// Returns true if the item was present and evicted.
+func (t *KnowledgeBudgetTracker) Evict(itemID string) bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	item, exists := t.loadedItems[itemID]
+	if !exists {
+		return false
+	}
+	delete(t.loadedItems, itemID)
+	switch item.Kind {
+	case "memory":
+		t.loadedMemoriesCount--
+		if t.loadedMemoriesCount < 0 {
+			t.loadedMemoriesCount = 0
+		}
+		t.loadedMemoriesBytes -= item.ContentBytes
+		if t.loadedMemoriesBytes < 0 {
+			t.loadedMemoriesBytes = 0
+		}
+	case "skill":
+		t.loadedSkillsCount--
+		if t.loadedSkillsCount < 0 {
+			t.loadedSkillsCount = 0
+		}
+		t.loadedSkillsBytes -= item.ContentBytes
+		if t.loadedSkillsBytes < 0 {
+			t.loadedSkillsBytes = 0
+		}
+	}
+	return true
+}
+
 // ChargeOrGetMemory atomically checks if the memory is already cached.
-// If already cached, it returns (cachedResult, true, nil).
+// If already cached with the same versionID, it returns (cachedResult, true, nil).
+// If cached with a different versionID, it atomically replaces the version, adjusting byte usage under lock.
 // If not loaded and within budget limits, it reserves the budget, caches the item with resultJSON,
 // and returns (resultJSON, false, nil).
 // If budget limits are exceeded, it returns ("", false, err).
@@ -190,16 +228,35 @@ func (t *KnowledgeBudgetTracker) ChargeOrGetMemory(itemID, versionID, content, r
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	contentBytes := len([]byte(content))
 	if item, exists := t.loadedItems[itemID]; exists {
-		if item.ResultJSON != "" {
-			return item.ResultJSON, true, nil
+		if item.VersionID == versionID {
+			if item.ResultJSON != "" {
+				return item.ResultJSON, true, nil
+			}
+			item.ResultJSON = resultJSON
+			t.loadedItems[itemID] = item
+			return resultJSON, true, nil
 		}
-		item.ResultJSON = resultJSON
-		t.loadedItems[itemID] = item
-		return resultJSON, true, nil
+
+		// Version changed: atomic replacement under same lock
+		newBytes := t.loadedMemoriesBytes - item.ContentBytes + contentBytes
+		if newBytes > t.limits.MaxLoadedMemoryBytes {
+			return "", false, fmt.Errorf("memory load budget exceeded: byte limit %d bytes exceeded (%d already loaded - %d old + %d requested = %d bytes)",
+				t.limits.MaxLoadedMemoryBytes, t.loadedMemoriesBytes, item.ContentBytes, contentBytes, newBytes)
+		}
+		t.loadedMemoriesBytes = newBytes
+		t.loadedItems[itemID] = cachedItem{
+			ItemID:       itemID,
+			VersionID:    versionID,
+			Kind:         "memory",
+			Content:      content,
+			ContentBytes: contentBytes,
+			ResultJSON:   resultJSON,
+		}
+		return resultJSON, false, nil
 	}
 
-	contentBytes := len([]byte(content))
 	if t.loadedMemoriesCount+1 > t.limits.MaxLoadedMemories {
 		return "", false, fmt.Errorf("memory load budget exceeded: count limit %d reached (%d loaded)", t.limits.MaxLoadedMemories, t.loadedMemoriesCount)
 	}
@@ -222,7 +279,8 @@ func (t *KnowledgeBudgetTracker) ChargeOrGetMemory(itemID, versionID, content, r
 }
 
 // ChargeOrGetSkill atomically checks if the skill is already cached.
-// If already cached, it returns (cachedResult, true, nil).
+// If already cached with the same versionID, it returns (cachedResult, true, nil).
+// If cached with a different versionID, it atomically replaces the version, adjusting byte usage under lock.
 // If not loaded and within budget limits, it reserves the budget, caches the item with resultJSON,
 // and returns (resultJSON, false, nil).
 // If budget limits are exceeded, it returns ("", false, err).
@@ -233,17 +291,36 @@ func (t *KnowledgeBudgetTracker) ChargeOrGetSkill(itemID, versionID, instruction
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if item, exists := t.loadedItems[itemID]; exists {
-		if item.ResultJSON != "" {
-			return item.ResultJSON, true, nil
-		}
-		item.ResultJSON = resultJSON
-		t.loadedItems[itemID] = item
-		return resultJSON, true, nil
-	}
-
 	if totalContentBytes <= 0 {
 		totalContentBytes = len([]byte(instructionsMarkdown))
+	}
+
+	if item, exists := t.loadedItems[itemID]; exists {
+		if item.VersionID == versionID {
+			if item.ResultJSON != "" {
+				return item.ResultJSON, true, nil
+			}
+			item.ResultJSON = resultJSON
+			t.loadedItems[itemID] = item
+			return resultJSON, true, nil
+		}
+
+		// Version changed: atomic replacement under same lock
+		newBytes := t.loadedSkillsBytes - item.ContentBytes + totalContentBytes
+		if newBytes > t.limits.MaxLoadedSkillBytes {
+			return "", false, fmt.Errorf("skill load budget exceeded: byte limit %d bytes exceeded (%d already loaded - %d old + %d requested = %d bytes)",
+				t.limits.MaxLoadedSkillBytes, t.loadedSkillsBytes, item.ContentBytes, totalContentBytes, newBytes)
+		}
+		t.loadedSkillsBytes = newBytes
+		t.loadedItems[itemID] = cachedItem{
+			ItemID:       itemID,
+			VersionID:    versionID,
+			Kind:         "skill",
+			Content:      instructionsMarkdown,
+			ContentBytes: totalContentBytes,
+			ResultJSON:   resultJSON,
+		}
+		return resultJSON, false, nil
 	}
 
 	if t.loadedSkillsCount+1 > t.limits.MaxLoadedSkills {
@@ -268,7 +345,8 @@ func (t *KnowledgeBudgetTracker) ChargeOrGetSkill(itemID, versionID, instruction
 }
 
 // RestoreItem restores a previously loaded item into the tracker during crash recovery / run resumption.
-// Returns an error if the item kind is unknown, identifiers are empty, or byte length mismatches actual UTF-8 length.
+// Returns an error if the item kind is unknown, identifiers are empty, byte length mismatches actual UTF-8 length,
+// or restoring the item exceeds configured budget limits.
 func (t *KnowledgeBudgetTracker) RestoreItem(kind, itemID, versionID, content string, contentBytes int, resultJSON ...string) error {
 	if t == nil {
 		return errors.New("knowledge budget tracker is nil")
@@ -302,9 +380,21 @@ func (t *KnowledgeBudgetTracker) RestoreItem(kind, itemID, versionID, content st
 
 	switch kind {
 	case "memory":
+		if t.loadedMemoriesCount+1 > t.limits.MaxLoadedMemories {
+			return fmt.Errorf("restored memory %s exceeds count limit %d", itemID, t.limits.MaxLoadedMemories)
+		}
+		if t.loadedMemoriesBytes+contentBytes > t.limits.MaxLoadedMemoryBytes {
+			return fmt.Errorf("restored memory %s exceeds byte limit %d", itemID, t.limits.MaxLoadedMemoryBytes)
+		}
 		t.loadedMemoriesCount++
 		t.loadedMemoriesBytes += contentBytes
 	case "skill":
+		if t.loadedSkillsCount+1 > t.limits.MaxLoadedSkills {
+			return fmt.Errorf("restored skill %s exceeds count limit %d", itemID, t.limits.MaxLoadedSkills)
+		}
+		if t.loadedSkillsBytes+contentBytes > t.limits.MaxLoadedSkillBytes {
+			return fmt.Errorf("restored skill %s exceeds byte limit %d", itemID, t.limits.MaxLoadedSkillBytes)
+		}
 		t.loadedSkillsCount++
 		t.loadedSkillsBytes += contentBytes
 	}

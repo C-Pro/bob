@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/liliang-cn/cortexdb/v2/pkg/core"
 	"github.com/liliang-cn/cortexdb/v2/pkg/cortexdb"
 )
 
@@ -168,6 +169,7 @@ func (idx *Indexer) indexSkillVersion(ctx context.Context, item *KnowledgeItem, 
 }
 
 // RemoveFromIndex best-effort removes an entry from the vector database by its version ID.
+// If the record is already absent (core.ErrNotFound), it is treated as successfully removed.
 func (idx *Indexer) RemoveFromIndex(ctx context.Context, versionID string) error {
 	if idx.vector == nil {
 		return nil
@@ -175,7 +177,50 @@ func (idx *Indexer) RemoveFromIndex(ctx context.Context, versionID string) error
 	_, err := idx.vector.DeleteMemory(ctx, cortexdb.MemoryDeleteRequest{
 		MemoryID: versionID,
 	})
+	if err != nil && errors.Is(err, core.ErrNotFound) {
+		return nil
+	}
 	return err
+}
+
+// PurgePendingDeletion safely processes a durable index deletion job with authoritative pre- and post-checks.
+// If the version is active and approved (e.g. was re-enabled concurrently), the deletion job is discarded and
+// the version is marked pending for re-indexing, returning (false, nil).
+// If the version is not active, it is purged from the vector index and removed from the pending deletion queue, returning (true, nil).
+func (idx *Indexer) PurgePendingDeletion(ctx context.Context, versionID string) (bool, error) {
+	if idx.store == nil || idx.vector == nil {
+		return false, nil
+	}
+
+	// 1. Authoritative pre-check
+	discarded, err := idx.store.DiscardStaleDeletionJob(ctx, versionID)
+	if err != nil {
+		return false, fmt.Errorf("failed authoritative pre-delete check: %w", err)
+	}
+	if discarded {
+		return false, nil
+	}
+
+	// 2. Perform vector database deletion
+	if err := idx.RemoveFromIndex(ctx, versionID); err != nil {
+		return false, fmt.Errorf("failed to remove from vector index: %w", err)
+	}
+
+	// 3. Authoritative post-check for concurrent re-enable while RemoveFromIndex was in-flight
+	discarded, err = idx.store.DiscardStaleDeletionJob(ctx, versionID)
+	if err != nil {
+		return false, fmt.Errorf("failed authoritative post-delete check: %w", err)
+	}
+	if discarded {
+		return false, nil
+	}
+
+	// 4. Drain from pending deletion queue
+	if err := idx.store.RemovePendingIndexDeletion(ctx, versionID); err != nil {
+		return false, fmt.Errorf("failed to remove pending index deletion: %w", err)
+	}
+
+	return true, nil
 }
 
 // ReconcilePending processes unindexed or errored candidates from SQLite and indexes them into VectorDB.
@@ -188,13 +233,36 @@ func (idx *Indexer) ReconcilePending(ctx context.Context, limit int) (int, error
 		limit = 50
 	}
 
-	candidates, err := idx.store.GetPendingIndexVersions(ctx, limit)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get pending index versions: %w", err)
-	}
-
 	successCount := 0
 	var allErrs []error
+
+	// 1. Reconcile pending index deletions first so re-enabled items can be reindexed in this pass
+	deletions, delErr := idx.store.GetPendingIndexDeletions(ctx, limit)
+	if delErr != nil {
+		allErrs = append(allErrs, fmt.Errorf("failed to get pending index deletions: %w", delErr))
+	} else {
+		for _, d := range deletions {
+			if ctx.Err() != nil {
+				return successCount, errors.Join(append(allErrs, ctx.Err())...)
+			}
+			purged, purgeErr := idx.PurgePendingDeletion(ctx, d.VersionID)
+			if purgeErr != nil {
+				allErrs = append(allErrs, purgeErr)
+				continue
+			}
+			if purged {
+				successCount++
+			}
+		}
+	}
+
+	// 2. Reconcile pending and errored candidates
+	candidates, err := idx.store.GetPendingIndexVersions(ctx, limit)
+	if err != nil {
+		allErrs = append(allErrs, fmt.Errorf("failed to get pending index versions: %w", err))
+		return successCount, errors.Join(allErrs...)
+	}
+
 	for _, cand := range candidates {
 		if ctx.Err() != nil {
 			return successCount, errors.Join(append(allErrs, ctx.Err())...)
@@ -204,24 +272,6 @@ func (idx *Indexer) ReconcilePending(ctx context.Context, limit int) (int, error
 			continue
 		}
 		successCount++
-	}
-
-	// Reconcile pending index deletions
-	deletions, delErr := idx.store.GetPendingIndexDeletions(ctx, limit)
-	if delErr != nil {
-		allErrs = append(allErrs, fmt.Errorf("failed to get pending index deletions: %w", delErr))
-	} else {
-		for _, d := range deletions {
-			if ctx.Err() != nil {
-				return successCount, errors.Join(append(allErrs, ctx.Err())...)
-			}
-			if remErr := idx.RemoveFromIndex(ctx, d.VersionID); remErr != nil {
-				allErrs = append(allErrs, remErr)
-				continue
-			}
-			_ = idx.store.RemovePendingIndexDeletion(ctx, d.VersionID)
-			successCount++
-		}
 	}
 
 	return successCount, errors.Join(allErrs...)

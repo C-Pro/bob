@@ -456,6 +456,7 @@ func restoreChatSessionContext(ctx context.Context, store *Store, run *FSMRun, l
 				VersionID    string `json:"version_id"`
 				Content      string `json:"content"`
 				ContentBytes int    `json:"content_bytes"`
+				ExpiresAt    *int64 `json:"expires_at,omitempty"`
 			}
 			if err := json.Unmarshal([]byte(step.ResultJSON), &payload); err != nil {
 				return sess, fmt.Errorf("failed to parse load_memory result for step %s: %w", step.ID, err)
@@ -476,6 +477,10 @@ func restoreChatSessionContext(ctx context.Context, store *Store, run *FSMRun, l
 			actualBytes := len([]byte(payload.Content))
 			if payload.ContentBytes != actualBytes {
 				return sess, fmt.Errorf("invalid load_memory result for step %s: content_bytes mismatch (recorded %d, actual %d)", step.ID, payload.ContentBytes, actualBytes)
+			}
+			if payload.ExpiresAt != nil && time.Now().Unix() >= *payload.ExpiresAt {
+				// Expired before recovery; skip restoring into budget tracker so stale item is not cached.
+				continue
 			}
 			if err := sess.KnowledgeBudget.RestoreItem("memory", payload.ItemID, payload.VersionID, payload.Content, payload.ContentBytes, step.ResultJSON); err != nil {
 				return sess, fmt.Errorf("failed to restore memory item for step %s: %w", step.ID, err)

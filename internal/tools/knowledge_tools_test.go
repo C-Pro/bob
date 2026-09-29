@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"bob/internal/knowledge"
 
@@ -66,6 +67,12 @@ func setupKnowledgeTestRegistry(t *testing.T) (*Registry, *mockKnowledgeStorePro
 	kProv := newMockKnowledgeStoreProvider(t)
 	reg := NewRegistry(nil, nil)
 	reg.SetKnowledgeStoreProvider(kProv)
+	reg.SetDMAuthorizer(func(ctx context.Context, chatID, userID string) error {
+		if strings.HasPrefix(chatID, "dm_") && userID != "" && userID != "unauthorized" {
+			return nil
+		}
+		return errors.New("unauthorized: not a DM owner")
+	})
 	return reg, kProv
 }
 
@@ -674,7 +681,9 @@ func TestKnowledgeTools_SecurityAndBounds(t *testing.T) {
 		// Alice proposes memory
 		res, err := reg.Execute(ctx, "propose_memory", `{"type":"fact","content":"Secret fact"}`)
 		require.NoError(t, err)
-		var m struct{ ItemID string `json:"item_id"` }
+		var m struct {
+			ItemID string `json:"item_id"`
+		}
 		require.NoError(t, json.Unmarshal([]byte(res), &m))
 
 		// Bob tries to revise Alice's memory in his DM
@@ -768,4 +777,420 @@ func TestKnowledgeTools_SecurityAndBounds(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "not the active version")
 	})
+}
+
+func TestKnowledgeTools_DMAuthorization_FailClosed(t *testing.T) {
+	kProv := newMockKnowledgeStoreProvider(t)
+	reg := NewRegistry(nil, nil)
+	reg.SetKnowledgeStoreProvider(kProv)
+
+	sessionCtx := ChatSessionContext{
+		ChatID:          "dm_alice",
+		UserID:          "alice",
+		IsDM:            true,
+		KnowledgeBudget: NewKnowledgeBudgetTracker(DefaultKnowledgeBudgetLimits()),
+	}
+	ctx := WithChatSession(context.Background(), sessionCtx)
+
+	knowledgeTools := []string{
+		"propose_memory", "discover_memories", "load_memory",
+		"propose_skill", "discover_skills", "load_skill",
+	}
+
+	// 1. Nil dmAuthorizer must fail closed on all knowledge tools
+	for _, tool := range knowledgeTools {
+		var args string
+		switch tool {
+		case "propose_memory":
+			args = `{"type":"fact","content":"hello"}`
+		case "discover_memories":
+			args = `{"query":"test"}`
+		case "load_memory":
+			args = `{"memory_id":"mem_123"}`
+		case "propose_skill":
+			args = `{"name":"test_sk","description":"desc","triggers":["trig"],"tags":["tag"],"instructions_markdown":"echo"}`
+		case "discover_skills":
+			args = `{"query":"test"}`
+		case "load_skill":
+			args = `{"skill_id":"skill_123"}`
+		}
+		_, err := reg.Execute(ctx, tool, args)
+		require.Error(t, err, "tool %s must fail when authorizer is nil", tool)
+		assert.Contains(t, err.Error(), "DM authorization is not configured", "tool %s error", tool)
+	}
+
+	// 2. Wire authorizer that rejects unauthorized user
+	reg.SetDMAuthorizer(func(ctx context.Context, chatID, userID string) error {
+		if userID == "unauthorized_user" {
+			return errors.New("unauthorized: not the DM owner")
+		}
+		if chatID == "group_chat" {
+			return errors.New("command is only available in private Direct Messages")
+		}
+		return nil
+	})
+
+	unauthCtx := WithChatSession(context.Background(), ChatSessionContext{
+		ChatID:          "dm_alice",
+		UserID:          "unauthorized_user",
+		IsDM:            true,
+		KnowledgeBudget: NewKnowledgeBudgetTracker(DefaultKnowledgeBudgetLimits()),
+	})
+	_, err := reg.Execute(unauthCtx, "discover_memories", `{"query":"secret"}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "verified DM owners")
+
+	// 3. Forged IsDM=true on group chat
+	groupCtx := WithChatSession(context.Background(), ChatSessionContext{
+		ChatID:          "group_chat",
+		UserID:          "alice",
+		IsDM:            true, // forged
+		KnowledgeBudget: NewKnowledgeBudgetTracker(DefaultKnowledgeBudgetLimits()),
+	})
+	_, err = reg.Execute(groupCtx, "discover_skills", `{"query":"test"}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "verified DM owners")
+
+	// 4. Missing UserID or ChatID
+	emptyUserCtx := WithChatSession(context.Background(), ChatSessionContext{
+		ChatID:          "dm_alice",
+		UserID:          "",
+		IsDM:            true,
+		KnowledgeBudget: NewKnowledgeBudgetTracker(DefaultKnowledgeBudgetLimits()),
+	})
+	_, err = reg.Execute(emptyUserCtx, "discover_memories", `{"query":"test"}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "missing user_id or chat_id")
+}
+
+func TestExecuteLoadMemory_RevalidationAndRevocation(t *testing.T) {
+	reg, prov := setupKnowledgeTestRegistry(t)
+	tracker := NewKnowledgeBudgetTracker(KnowledgeBudgetLimits{
+		MaxLoadedMemories:    2,
+		MaxLoadedMemoryBytes: 200,
+	})
+
+	session := ChatSessionContext{
+		ChatID:          "dm_alice",
+		UserID:          "alice",
+		IsDM:            true,
+		KnowledgeBudget: tracker,
+	}
+	ctx := WithChatSession(context.Background(), session)
+	store, err := prov.GetKnowledgeStore(ctx, "dm_alice", true)
+	require.NoError(t, err)
+
+	// 1. Propose and approve memory v1
+	item, ver1, err := store.ProposeMemory(ctx, &knowledge.KnowledgeItem{
+		ChatID: "dm_alice",
+		UserID: "alice",
+	}, &knowledge.MemoryVersion{
+		Type:    knowledge.MemoryTypeFact,
+		Content: "Alice lives in Zurich",
+		Provenance: knowledge.Provenance{
+			ChatID: "dm_alice",
+			UserID: "alice",
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ApproveVersion(ctx, ver1.ID, "alice"))
+
+	// Initial load succeeds and populates cache
+	loadRes, err := reg.Execute(ctx, "load_memory", fmt.Sprintf(`{"memory_id":%q}`, item.ID))
+	require.NoError(t, err)
+	assert.Contains(t, loadRes, "Alice lives in Zurich")
+	memCount, memBytes, _, _ := tracker.Stats()
+	assert.Equal(t, 1, memCount)
+	assert.Equal(t, len("Alice lives in Zurich"), memBytes)
+
+	// Second load is cache hit
+	loadRes2, err := reg.Execute(ctx, "load_memory", fmt.Sprintf(`{"memory_id":%q}`, item.ID))
+	require.NoError(t, err)
+	assert.Equal(t, loadRes, loadRes2)
+
+	// 2. Forget memory -> authoritative revalidation detects inactive, evicts cache and returns error
+	require.NoError(t, store.ForgetItem(ctx, item.ID, "alice"))
+	_, err = reg.Execute(ctx, "load_memory", fmt.Sprintf(`{"memory_id":%q}`, item.ID))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not active")
+	memCount, memBytes, _, _ = tracker.Stats()
+	assert.Equal(t, 0, memCount, "eviction must reset loaded count")
+	assert.Equal(t, 0, memBytes, "eviction must reset loaded bytes")
+
+	// Subsequent load attempt still fails (not resurrected by cache)
+	_, err = reg.Execute(ctx, "load_memory", fmt.Sprintf(`{"memory_id":%q}`, item.ID))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not active")
+
+	// 3. Expiration revalidation: load memory -> memory expires -> next load fails and evicts
+	itemExp, verExp, err := store.ProposeMemory(ctx, &knowledge.KnowledgeItem{
+		ChatID: "dm_alice",
+		UserID: "alice",
+	}, &knowledge.MemoryVersion{
+		Type:    knowledge.MemoryTypePreference,
+		Content: "Temporary preference",
+		Provenance: knowledge.Provenance{
+			ChatID: "dm_alice",
+			UserID: "alice",
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ApproveVersion(ctx, verExp.ID, "alice"))
+
+	// Load temporary preference
+	_, err = reg.Execute(ctx, "load_memory", fmt.Sprintf(`{"memory_id":%q}`, itemExp.ID))
+	require.NoError(t, err)
+	memCount, _, _, _ = tracker.Stats()
+	assert.Equal(t, 1, memCount)
+
+	// Set expires_at in the past
+	pastTime := time.Now().Unix() - 100
+	_, err = store.DB().ExecContext(ctx, "UPDATE memory_versions SET expires_at = ? WHERE id = ?", pastTime, verExp.ID)
+	require.NoError(t, err)
+
+	// Loading expired memory revalidates with store, rejects, and evicts from budget
+	_, err = reg.Execute(ctx, "load_memory", fmt.Sprintf(`{"memory_id":%q}`, itemExp.ID))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "has expired")
+	memCount, _, _, _ = tracker.Stats()
+	assert.Equal(t, 0, memCount, "expired memory must be evicted from budget")
+
+	// 4. Expiration exactly at current timestamp (boundary condition: now >= expires_at)
+	itemExpNow, verExpNow, err := store.ProposeMemory(ctx, &knowledge.KnowledgeItem{
+		ChatID: "dm_alice",
+		UserID: "alice",
+	}, &knowledge.MemoryVersion{
+		Type:    knowledge.MemoryTypeFact,
+		Content: "Expires exactly now",
+		Provenance: knowledge.Provenance{
+			ChatID: "dm_alice",
+			UserID: "alice",
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ApproveVersion(ctx, verExpNow.ID, "alice"))
+	nowTime := time.Now().Unix()
+	_, err = store.DB().ExecContext(ctx, "UPDATE memory_versions SET expires_at = ? WHERE id = ?", nowTime, verExpNow.ID)
+	require.NoError(t, err)
+
+	_, err = reg.Execute(ctx, "load_memory", fmt.Sprintf(`{"memory_id":%q}`, itemExpNow.ID))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "has expired")
+
+	// 5. Version replacement: approve revision 2 -> load replaces revision 1 in cache atomically
+	itemV, verV1, err := store.ProposeMemory(ctx, &knowledge.KnowledgeItem{
+		ChatID: "dm_alice",
+		UserID: "alice",
+	}, &knowledge.MemoryVersion{
+		Type:    knowledge.MemoryTypeFact,
+		Content: "Initial version content",
+		Provenance: knowledge.Provenance{
+			ChatID: "dm_alice",
+			UserID: "alice",
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ApproveVersion(ctx, verV1.ID, "alice"))
+
+	// Load v1
+	v1Res, err := reg.Execute(ctx, "load_memory", fmt.Sprintf(`{"memory_id":%q}`, itemV.ID))
+	require.NoError(t, err)
+	assert.Contains(t, v1Res, "Initial version content")
+	memCount, memBytes, _, _ = tracker.Stats()
+	assert.Equal(t, 1, memCount)
+	assert.Equal(t, len("Initial version content"), memBytes)
+
+	// Propose and approve revision 2
+	_, verV2, err := store.ProposeMemory(ctx, itemV, &knowledge.MemoryVersion{
+		ItemID:  itemV.ID,
+		Type:    knowledge.MemoryTypeFact,
+		Content: "Updated version 2 content with more detail",
+		Provenance: knowledge.Provenance{
+			ChatID: "dm_alice",
+			UserID: "alice",
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ApproveVersion(ctx, verV2.ID, "alice"))
+
+	// Load again: must revalidate store, detect v2 is active, atomically replace v1 in tracker
+	v2Res, err := reg.Execute(ctx, "load_memory", fmt.Sprintf(`{"memory_id":%q}`, itemV.ID))
+	require.NoError(t, err)
+	assert.Contains(t, v2Res, "Updated version 2 content with more detail")
+	memCount, memBytes, _, _ = tracker.Stats()
+	assert.Equal(t, 1, memCount, "count must stay 1 after version replacement")
+	assert.Equal(t, len("Updated version 2 content with more detail"), memBytes)
+
+	// Stale revision request (itemV.ID@1) is rejected because v2 is active
+	_, err = reg.Execute(ctx, "load_memory", fmt.Sprintf(`{"memory_id":%q}`, verV1.ID))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not the active version")
+
+	// 6. Provider/Store failure never falls back to cached content
+	failingProv := &mockKnowledgeStoreProvider{
+		dir:    t.TempDir(),
+		stores: map[string]*knowledge.Store{}, // empty, will fail on lookup
+	}
+	failingReg := NewRegistry(nil, nil)
+	failingReg.SetKnowledgeStoreProvider(failingProv)
+	failingReg.SetDMAuthorizer(func(ctx context.Context, chatID, userID string) error { return nil })
+	_, err = failingReg.Execute(ctx, "load_memory", fmt.Sprintf(`{"memory_id":%q}`, itemV.ID))
+	require.Error(t, err)
+}
+
+func TestExecuteLoadSkill_RevalidationAndRevocation(t *testing.T) {
+	reg, prov := setupKnowledgeTestRegistry(t)
+	tracker := NewKnowledgeBudgetTracker(KnowledgeBudgetLimits{
+		MaxLoadedSkills:     2,
+		MaxLoadedSkillBytes: 500,
+	})
+
+	session := ChatSessionContext{
+		ChatID:          "dm_alice",
+		UserID:          "alice",
+		IsDM:            true,
+		KnowledgeBudget: tracker,
+	}
+	ctx := WithChatSession(context.Background(), session)
+	store, err := prov.GetKnowledgeStore(ctx, "dm_alice", true)
+	require.NoError(t, err)
+
+	// 1. Propose and approve skill
+	item, ver, err := store.ProposeSkill(ctx, &knowledge.KnowledgeItem{
+		ChatID: "dm_alice",
+		UserID: "alice",
+	}, &knowledge.SkillVersion{
+		Name:                 "deploy_app",
+		Description:          "Deploys application",
+		Triggers:             []string{"deploy"},
+		Tags:                 []string{"devops"},
+		InstructionsMarkdown: "```bash\nmake deploy\n```",
+		Provenance: knowledge.Provenance{
+			ChatID: "dm_alice",
+			UserID: "alice",
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ApproveVersion(ctx, ver.ID, "alice"))
+
+	// Load skill succeeds and charges budget
+	loadRes, err := reg.Execute(ctx, "load_skill", fmt.Sprintf(`{"skill_id":%q}`, item.ID))
+	require.NoError(t, err)
+	assert.Contains(t, loadRes, "make deploy")
+	_, _, skillCount, skillBytes := tracker.Stats()
+	assert.Equal(t, 1, skillCount)
+	assert.True(t, skillBytes > 0)
+
+	// Cache hit
+	loadRes2, err := reg.Execute(ctx, "load_skill", fmt.Sprintf(`{"skill_id":%q}`, item.ID))
+	require.NoError(t, err)
+	assert.Equal(t, loadRes, loadRes2)
+
+	// 2. Disable skill -> load_skill fails and evicts budget
+	require.NoError(t, store.DisableSkill(ctx, item.ID, "alice"))
+	_, err = reg.Execute(ctx, "load_skill", fmt.Sprintf(`{"skill_id":%q}`, item.ID))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not active")
+	_, _, skillCount, skillBytes = tracker.Stats()
+	assert.Equal(t, 0, skillCount)
+	assert.Equal(t, 0, skillBytes)
+
+	// 3. Re-enable skill -> load_skill succeeds again
+	require.NoError(t, store.EnableSkill(ctx, item.ID, "alice"))
+	loadRes3, err := reg.Execute(ctx, "load_skill", fmt.Sprintf(`{"skill_id":%q}`, item.ID))
+	require.NoError(t, err)
+	assert.Contains(t, loadRes3, "make deploy")
+	_, _, skillCount, skillBytes = tracker.Stats()
+	assert.Equal(t, 1, skillCount)
+	assert.True(t, skillBytes > 0)
+
+	// 4. Delete skill -> load_skill fails and evicts budget
+	require.NoError(t, store.DeleteSkill(ctx, item.ID, "alice"))
+	_, err = reg.Execute(ctx, "load_skill", fmt.Sprintf(`{"skill_id":%q}`, item.ID))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not active")
+	_, _, skillCount, skillBytes = tracker.Stats()
+	assert.Equal(t, 0, skillCount)
+	assert.Equal(t, 0, skillBytes)
+
+	// Non-existent skill returns not found
+	_, err = reg.Execute(ctx, "load_skill", `{"skill_id":"skill_nonexistent"}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not found")
+}
+
+func TestKnowledgeTools_RecoveryRevalidation_ForgottenAndExpired(t *testing.T) {
+	reg, prov := setupKnowledgeTestRegistry(t)
+
+	tracker := NewKnowledgeBudgetTracker(DefaultKnowledgeBudgetLimits())
+	session := ChatSessionContext{
+		ChatID:          "dm_alice",
+		UserID:          "alice",
+		IsDM:            true,
+		KnowledgeBudget: tracker,
+	}
+	ctx := WithChatSession(context.Background(), session)
+	store, err := prov.GetKnowledgeStore(ctx, "dm_alice", true)
+	require.NoError(t, err)
+
+	// 1. Create a memory in store that gets forgotten
+	item1, ver1, err := store.ProposeMemory(ctx, &knowledge.KnowledgeItem{
+		ChatID: "dm_alice",
+		UserID: "alice",
+	}, &knowledge.MemoryVersion{
+		Type:    knowledge.MemoryTypeFact,
+		Content: "forgotten memory content",
+		Provenance: knowledge.Provenance{
+			ChatID: "dm_alice",
+			UserID: "alice",
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ApproveVersion(ctx, ver1.ID, "alice"))
+
+	// 2. Simulate session recovery having previously restored this item into tracker
+	err = tracker.RestoreItem("memory", item1.ID, ver1.ID, "forgotten memory content", len("forgotten memory content"))
+	require.NoError(t, err)
+	_, _, _, ok := tracker.GetCached(item1.ID)
+	require.True(t, ok, "item must be cached initially after restore")
+
+	// Forget memory in store before subsequent tool load
+	require.NoError(t, store.ForgetItem(ctx, item1.ID, "alice"))
+
+	// Subsequent load_memory must revalidate against store, fail, and evict from cache
+	_, err = reg.Execute(ctx, "load_memory", fmt.Sprintf(`{"memory_id":%q}`, item1.ID))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not active")
+
+	_, _, _, ok = tracker.GetCached(item1.ID)
+	assert.False(t, ok, "forgotten memory must be evicted from budget tracker cache")
+
+	// 3. Create an expired memory in store
+	pastExpiry := time.Now().Unix() - 10
+	item2, ver2, err := store.ProposeMemory(ctx, &knowledge.KnowledgeItem{
+		ChatID: "dm_alice",
+		UserID: "alice",
+	}, &knowledge.MemoryVersion{
+		Type:      knowledge.MemoryTypeFact,
+		Content:   "expired memory content",
+		ExpiresAt: &pastExpiry,
+		Provenance: knowledge.Provenance{
+			ChatID: "dm_alice",
+			UserID: "alice",
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ApproveVersion(ctx, ver2.ID, "alice"))
+
+	// Restore into tracker
+	err = tracker.RestoreItem("memory", item2.ID, ver2.ID, "expired memory content", len("expired memory content"))
+	require.NoError(t, err)
+
+	// Subsequent load_memory must revalidate against store, detect expiry, fail, and evict
+	_, err = reg.Execute(ctx, "load_memory", fmt.Sprintf(`{"memory_id":%q}`, item2.ID))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "expired")
+
+	_, _, _, ok = tracker.GetCached(item2.ID)
+	assert.False(t, ok, "expired memory must be evicted from budget tracker cache")
 }

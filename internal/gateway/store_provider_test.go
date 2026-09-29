@@ -2,12 +2,14 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"bob/internal/config"
 	"bob/internal/fsm"
+	"bob/internal/knowledge"
 	"bob/internal/memory"
 	"bob/internal/scheduler"
 
@@ -283,12 +285,32 @@ func TestMemoryStoreProvider_KnowledgeSearcherMaxLimit(t *testing.T) {
 	provider := NewMemoryStoreProvider(memMgr, tempDir)
 	provider.SetMaxDiscoveryLimit(25)
 
+	kStore, err := provider.GetKnowledgeStore(ctx, "chat_dm_max", true)
+	require.NoError(t, err)
+
+	for i := 1; i <= 15; i++ {
+		_, ver, err := kStore.ProposeMemory(ctx, &knowledge.KnowledgeItem{
+			ChatID: "chat_dm_max",
+			UserID: "user_1",
+		}, &knowledge.MemoryVersion{
+			Type:       knowledge.MemoryTypeFact,
+			Content:    fmt.Sprintf("User profile fact item %d with query keyword for discovery testing", i),
+			Confidence: 0.9,
+		})
+		require.NoError(t, err)
+		require.NoError(t, kStore.ApproveVersion(ctx, ver.ID, "user_1"))
+	}
+
+	reconciled, err := provider.ReconcileChat(ctx, "chat_dm_max", true, 20)
+	require.NoError(t, err)
+	assert.Equal(t, 15, reconciled)
+
 	searcher, err := provider.GetKnowledgeSearcher(ctx, "chat_dm_max", true, "user_1")
 	require.NoError(t, err)
 	require.NotNil(t, searcher)
 
-	// Verify SearchMemories with limit > 10 succeeds and is not clamped to 10 by searcher
+	// Verify SearchMemories with limit > 10 returns all 15 populated items rather than being clamped to 10
 	results, err := searcher.SearchMemories(ctx, "query", nil, 20)
 	require.NoError(t, err)
-	assert.Empty(t, results)
+	assert.Len(t, results, 15)
 }

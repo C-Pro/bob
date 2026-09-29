@@ -30,6 +30,7 @@ const (
 	ItemStatusDisabled  ItemStatus = "disabled"
 	ItemStatusArchived  ItemStatus = "archived"
 	ItemStatusForgotten ItemStatus = "forgotten"
+	ItemStatusRejected  ItemStatus = "rejected"
 )
 
 // VersionStatus represents the approval and deployment state of a specific revision.
@@ -275,7 +276,7 @@ func IsValidMemoryType(t MemoryType) bool {
 // IsValidItemStatus validates if the item status represents a supported ItemStatus.
 func IsValidItemStatus(s ItemStatus) bool {
 	switch s {
-	case ItemStatusPending, ItemStatusActive, ItemStatusDisabled, ItemStatusArchived, ItemStatusForgotten:
+	case ItemStatusPending, ItemStatusActive, ItemStatusDisabled, ItemStatusArchived, ItemStatusForgotten, ItemStatusRejected:
 		return true
 	default:
 		return false
@@ -342,4 +343,3 @@ type PendingIndexDeletion struct {
 	Namespace string `json:"namespace"`
 	CreatedAt int64  `json:"created_at"`
 }
-

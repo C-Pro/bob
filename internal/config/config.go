@@ -76,6 +76,7 @@ type Config struct {
 	KnowledgeMaxLoadedSkillBytes   int
 	KnowledgeDefaultDiscoveryLimit int
 	KnowledgeMaxDiscoveryLimit     int
+	KnowledgeReconcileInterval     time.Duration
 }
 
 // DefaultSandboxAllowedImages defines standard safe container images.
@@ -179,6 +180,10 @@ func LoadFromEnv() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	knowledgeReconcileInterval, err := getEnvDurationStrict("KNOWLEDGE_RECONCILE_INTERVAL", 1*time.Minute)
+	if err != nil {
+		return nil, err
+	}
 
 	cfg := &Config{
 		BotHandle:                  getEnvOrDefault("BOT_HANDLE", "@bot"),
@@ -235,6 +240,7 @@ func LoadFromEnv() (*Config, error) {
 		KnowledgeMaxLoadedSkillBytes:   knowledgeMaxSkillBytes,
 		KnowledgeDefaultDiscoveryLimit: knowledgeDefaultLimit,
 		KnowledgeMaxDiscoveryLimit:     knowledgeMaxLimit,
+		KnowledgeReconcileInterval:     knowledgeReconcileInterval,
 	}
 
 	if cfg.SandboxHostDataDir != "" {
@@ -357,6 +363,9 @@ func (c *Config) Validate(requireAPIKey bool) error {
 	}
 	if c.KnowledgeMaxDiscoveryLimit < c.KnowledgeDefaultDiscoveryLimit {
 		return fmt.Errorf("KNOWLEDGE_MAX_DISCOVERY_LIMIT (%d) cannot be less than KNOWLEDGE_DEFAULT_DISCOVERY_LIMIT (%d)", c.KnowledgeMaxDiscoveryLimit, c.KnowledgeDefaultDiscoveryLimit)
+	}
+	if c.KnowledgeReconcileInterval <= 0 {
+		c.KnowledgeReconcileInterval = 1 * time.Minute
 	}
 	if (c.S3Bucket == "") != (c.S3Endpoint == "") {
 		return errors.New("S3_BUCKET and S3_ENDPOINT must be set together")

@@ -178,3 +178,125 @@ func TestKnowledgeBudgetTracker_Concurrency(t *testing.T) {
 	memCount, _, _, _ := tracker.Stats()
 	assert.Equal(t, 1, memCount, "idempotent concurrent charges of same item must count once")
 }
+
+func TestKnowledgeBudgetTracker_Eviction(t *testing.T) {
+	tracker := NewKnowledgeBudgetTracker(KnowledgeBudgetLimits{
+		MaxLoadedMemories:    2,
+		MaxLoadedMemoryBytes: 100,
+		MaxLoadedSkills:      2,
+		MaxLoadedSkillBytes:  100,
+	})
+
+	// Charge a memory
+	_, _, err := tracker.ChargeOrGetMemory("mem_1", "mem_1@1", "hello world", `{"result":1}`)
+	require.NoError(t, err)
+	memCount, memBytes, _, _ := tracker.Stats()
+	assert.Equal(t, 1, memCount)
+	assert.Equal(t, 11, memBytes)
+
+	// Charge a skill
+	_, _, err = tracker.ChargeOrGetSkill("skill_1", "skill_1@1", "echo hi", 20, `{"result":2}`)
+	require.NoError(t, err)
+	_, _, skillCount, skillBytes := tracker.Stats()
+	assert.Equal(t, 1, skillCount)
+	assert.Equal(t, 20, skillBytes)
+
+	// Evict memory
+	evicted := tracker.Evict("mem_1")
+	assert.True(t, evicted)
+	memCount, memBytes, _, _ = tracker.Stats()
+	assert.Equal(t, 0, memCount)
+	assert.Equal(t, 0, memBytes)
+
+	// Evicting non-existent item returns false
+	assert.False(t, tracker.Evict("mem_1"))
+
+	// Evict skill
+	evicted = tracker.Evict("skill_1")
+	assert.True(t, evicted)
+	_, _, skillCount, skillBytes = tracker.Stats()
+	assert.Equal(t, 0, skillCount)
+	assert.Equal(t, 0, skillBytes)
+}
+
+func TestKnowledgeBudgetTracker_VersionReplacement(t *testing.T) {
+	tracker := NewKnowledgeBudgetTracker(KnowledgeBudgetLimits{
+		MaxLoadedMemories:    2,
+		MaxLoadedMemoryBytes: 30,
+		MaxLoadedSkills:      2,
+		MaxLoadedSkillBytes:  50,
+	})
+
+	// 1. Initial memory v1
+	res, loaded, err := tracker.ChargeOrGetMemory("mem_1", "mem_1@1", "12345", `{"v":1}`)
+	require.NoError(t, err)
+	assert.False(t, loaded)
+	assert.Equal(t, `{"v":1}`, res)
+	memCount, memBytes, _, _ := tracker.Stats()
+	assert.Equal(t, 1, memCount)
+	assert.Equal(t, 5, memBytes)
+
+	// 2. Same version returns cached
+	res, loaded, err = tracker.ChargeOrGetMemory("mem_1", "mem_1@1", "12345", `{"v":1_new}`)
+	require.NoError(t, err)
+	assert.True(t, loaded)
+	assert.Equal(t, `{"v":1}`, res)
+
+	// 3. New version v2 replaces atomically (count stays 1, byte delta adjusted)
+	res, loaded, err = tracker.ChargeOrGetMemory("mem_1", "mem_1@2", "1234567890", `{"v":2}`)
+	require.NoError(t, err)
+	assert.False(t, loaded)
+	assert.Equal(t, `{"v":2}`, res)
+	memCount, memBytes, _, _ = tracker.Stats()
+	assert.Equal(t, 1, memCount)
+	assert.Equal(t, 10, memBytes)
+
+	verID, content, _, ok := tracker.GetCached("mem_1")
+	assert.True(t, ok)
+	assert.Equal(t, "mem_1@2", verID)
+	assert.Equal(t, "1234567890", content)
+
+	// 4. Replacement exceeding byte limit is rejected and preserves old version
+	tooLarge := strings.Repeat("A", 35) // 10 - 10 + 35 = 35 > 30 exceeds
+	_, _, err = tracker.ChargeOrGetMemory("mem_1", "mem_1@3", tooLarge, `{"v":3}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "byte limit")
+	verID, _, _, _ = tracker.GetCached("mem_1")
+	assert.Equal(t, "mem_1@2", verID) // unchanged
+
+	// 5. Skill replacement
+	_, _, err = tracker.ChargeOrGetSkill("skill_1", "skill_1@1", "cmd1", 10, `{"sk":1}`)
+	require.NoError(t, err)
+	_, _, skillCount, skillBytes := tracker.Stats()
+	assert.Equal(t, 1, skillCount)
+	assert.Equal(t, 10, skillBytes)
+
+	_, _, err = tracker.ChargeOrGetSkill("skill_1", "skill_1@2", "cmd2_longer", 25, `{"sk":2}`)
+	require.NoError(t, err)
+	_, _, skillCount, skillBytes = tracker.Stats()
+	assert.Equal(t, 1, skillCount)
+	assert.Equal(t, 25, skillBytes)
+}
+
+func TestKnowledgeBudgetTracker_RestoreItem_BudgetEnforcement(t *testing.T) {
+	tracker := NewKnowledgeBudgetTracker(KnowledgeBudgetLimits{
+		MaxLoadedMemories:    1,
+		MaxLoadedMemoryBytes: 20,
+		MaxLoadedSkills:      1,
+		MaxLoadedSkillBytes:  20,
+	})
+
+	// First restore within limits
+	err := tracker.RestoreItem("memory", "mem_1", "mem_1@1", "hello", 5)
+	require.NoError(t, err)
+
+	// Second restore exceeds count limit
+	err = tracker.RestoreItem("memory", "mem_2", "mem_2@1", "world", 5)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "count limit")
+
+	// Skill exceeding byte limit
+	err = tracker.RestoreItem("skill", "skill_1", "skill_1@1", strings.Repeat("x", 25), 25)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "byte limit")
+}

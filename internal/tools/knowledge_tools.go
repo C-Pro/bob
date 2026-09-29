@@ -218,13 +218,31 @@ func isValidSkillName(name string) bool {
 	return true
 }
 
+// authorizeKnowledgeAccess validates that the session is an authorized 1-on-1 DM owned by the session user.
+// Fails closed if dmAuthorizer is nil, session is not DM, or authorization fails.
+func (r *Registry) authorizeKnowledgeAccess(ctx context.Context, session ChatSessionContext) error {
+	if !session.IsDM {
+		return errors.New("knowledge tools are only available in direct messages")
+	}
+	if strings.TrimSpace(session.ChatID) == "" || strings.TrimSpace(session.UserID) == "" {
+		return errors.New("missing user_id or chat_id in session context")
+	}
+	if r.dmAuthorizer == nil {
+		return errors.New("DM authorization is not configured; refusing access to knowledge tools")
+	}
+	if err := r.dmAuthorizer(ctx, session.ChatID, session.UserID); err != nil {
+		return fmt.Errorf("knowledge tools are only available to verified DM owners: %w", err)
+	}
+	return nil
+}
+
 func (r *Registry) knowledgeToolDefinitions() []openai.Tool {
 	return []openai.Tool{
 		{
 			Type: openai.ToolTypeFunction,
 			Function: &openai.FunctionDefinition{
 				Name:        "propose_memory",
-				Description: "Propose a structured memory (preference, fact, decision, ongoing task) to be stored in long-term memory for this DM. Requires user confirmation before activation.",
+				Description: "Propose a structured memory (preference, fact, decision, ongoing task) to be stored in long-term memory for this DM. Use ONLY upon explicit user request or durable user preference/correction. Requires user confirmation before activation.",
 				Parameters:  proposeMemoryToolSchema,
 			},
 		},
@@ -248,7 +266,7 @@ func (r *Registry) knowledgeToolDefinitions() []openai.Tool {
 			Type: openai.ToolTypeFunction,
 			Function: &openai.FunctionDefinition{
 				Name:        "propose_skill",
-				Description: "Propose a reusable procedural skill with triggers and step-by-step instructions. Requires user confirmation before activation.",
+				Description: "Propose a reusable procedural skill with triggers and step-by-step instructions. Use ONLY upon explicit user request or durable workflow guidance. Requires user confirmation before activation.",
 				Parameters:  proposeSkillToolSchema,
 			},
 		},
@@ -264,7 +282,7 @@ func (r *Registry) knowledgeToolDefinitions() []openai.Tool {
 			Type: openai.ToolTypeFunction,
 			Function: &openai.FunctionDefinition{
 				Name:        "load_skill",
-				Description: "Load the full procedural instructions of an active approved skill by ID into context. Subject to skill budget limits.",
+				Description: "Load the full procedural instructions of an active approved skill by ID / revision into context. Subject to skill budget limits.",
 				Parameters:  loadSkillToolSchema,
 			},
 		},
@@ -276,8 +294,8 @@ func (r *Registry) executeProposeMemory(ctx context.Context, argsJSON string) (s
 	if !ok {
 		return "", errors.New("chat session context missing")
 	}
-	if !session.IsDM {
-		return "", errors.New("knowledge tools are only available in direct messages")
+	if err := r.authorizeKnowledgeAccess(ctx, session); err != nil {
+		return "", err
 	}
 	if session.IsScheduled {
 		return "", errors.New("knowledge proposals cannot be created from scheduled tasks")
@@ -287,9 +305,6 @@ func (r *Registry) executeProposeMemory(ctx context.Context, argsJSON string) (s
 	}
 	if strings.TrimSpace(session.FSMRunID) == "" {
 		return "", errors.New("knowledge proposals require an active FSM run ID")
-	}
-	if strings.TrimSpace(session.UserID) == "" || strings.TrimSpace(session.ChatID) == "" {
-		return "", errors.New("missing user_id or chat_id in session context")
 	}
 
 	var args ProposeMemoryArgs
@@ -400,14 +415,11 @@ func (r *Registry) executeDiscoverMemories(ctx context.Context, argsJSON string)
 	if !ok {
 		return "", errors.New("chat session context missing")
 	}
-	if !session.IsDM {
-		return "", errors.New("knowledge tools are only available in direct messages")
+	if err := r.authorizeKnowledgeAccess(ctx, session); err != nil {
+		return "", err
 	}
 	if session.IsScheduled {
 		return "", errors.New("knowledge tools are not available in scheduled tasks")
-	}
-	if strings.TrimSpace(session.UserID) == "" || strings.TrimSpace(session.ChatID) == "" {
-		return "", errors.New("missing user_id or chat_id in session context")
 	}
 
 	var args DiscoverMemoriesArgs
@@ -475,14 +487,11 @@ func (r *Registry) executeLoadMemory(ctx context.Context, argsJSON string) (stri
 	if !ok {
 		return "", errors.New("chat session context missing")
 	}
-	if !session.IsDM {
-		return "", errors.New("knowledge tools are only available in direct messages")
+	if err := r.authorizeKnowledgeAccess(ctx, session); err != nil {
+		return "", err
 	}
 	if session.IsScheduled {
 		return "", errors.New("knowledge tools are not available in scheduled tasks")
-	}
-	if strings.TrimSpace(session.UserID) == "" || strings.TrimSpace(session.ChatID) == "" {
-		return "", errors.New("missing user_id or chat_id in session context")
 	}
 	if session.KnowledgeBudget == nil {
 		return "", errors.New("knowledge budget tracker is not initialized")
@@ -502,40 +511,35 @@ func (r *Registry) executeLoadMemory(ctx context.Context, argsJSON string) (stri
 		return "", fmt.Errorf("invalid memory_id %q: must start with 'mem_'", memID)
 	}
 
-	// Check cache in session knowledge budget
-	if cached, ok := session.KnowledgeBudget.GetCachedResult(itemID); ok {
-		if hasRev {
-			cachedVerID, _, _, ok := session.KnowledgeBudget.GetCached(itemID)
-			if ok && cachedVerID != knowledge.FormatVersionID(itemID, rev) {
-				return "", fmt.Errorf("version %s is not the active version for memory %s", memID, itemID)
-			}
-		}
-		return cached, nil
-	}
-
 	if r.knowledgeStoreProvider == nil {
 		return "", errors.New("knowledge store provider is not configured")
 	}
 
 	store, err := r.knowledgeStoreProvider.GetKnowledgeStore(ctx, session.ChatID, session.IsDM)
 	if err != nil {
+		session.KnowledgeBudget.Evict(itemID)
 		return "", fmt.Errorf("failed to get knowledge store: %w", err)
 	}
 
 	item, err := store.GetItem(ctx, itemID)
 	if err != nil {
+		session.KnowledgeBudget.Evict(itemID)
 		return "", fmt.Errorf("memory %s not found: %w", itemID, err)
 	}
 	if item.Kind != knowledge.KindMemory {
+		session.KnowledgeBudget.Evict(itemID)
 		return "", fmt.Errorf("item %s is not a memory", itemID)
 	}
 	if item.Status != knowledge.ItemStatusActive {
+		session.KnowledgeBudget.Evict(itemID)
 		return "", fmt.Errorf("memory %s is not active (status: %s)", itemID, item.Status)
 	}
 	if item.ChatID != session.ChatID || item.UserID != session.UserID {
+		session.KnowledgeBudget.Evict(itemID)
 		return "", fmt.Errorf("memory %s not found", itemID)
 	}
 	if item.ActiveVersionID == "" {
+		session.KnowledgeBudget.Evict(itemID)
 		return "", fmt.Errorf("memory %s has no active version", itemID)
 	}
 
@@ -548,21 +552,27 @@ func (r *Registry) executeLoadMemory(ctx context.Context, argsJSON string) (stri
 
 	ver, err := store.GetMemoryVersion(ctx, item.ActiveVersionID)
 	if err != nil {
+		session.KnowledgeBudget.Evict(itemID)
 		return "", fmt.Errorf("failed to get active version for memory %s: %w", itemID, err)
 	}
 	if ver.ItemID != item.ID {
+		session.KnowledgeBudget.Evict(itemID)
 		return "", fmt.Errorf("memory version %s item mismatch: expected %s, got %s", ver.ID, item.ID, ver.ItemID)
 	}
 	if ver.ID != item.ActiveVersionID {
+		session.KnowledgeBudget.Evict(itemID)
 		return "", fmt.Errorf("memory version %s is not active version %s", ver.ID, item.ActiveVersionID)
 	}
 	if ver.Provenance.ChatID != session.ChatID || ver.Provenance.UserID != session.UserID {
+		session.KnowledgeBudget.Evict(itemID)
 		return "", fmt.Errorf("memory %s provenance mismatch with session", itemID)
 	}
 	if ver.Status != knowledge.VersionStatusApproved {
+		session.KnowledgeBudget.Evict(itemID)
 		return "", fmt.Errorf("memory version %s is not approved (status: %s)", ver.ID, ver.Status)
 	}
 	if ver.ExpiresAt != nil && time.Now().Unix() >= *ver.ExpiresAt {
+		session.KnowledgeBudget.Evict(itemID)
 		return "", fmt.Errorf("memory %s has expired", itemID)
 	}
 
@@ -573,20 +583,20 @@ func (r *Registry) executeLoadMemory(ctx context.Context, argsJSON string) (stri
 		"content":       ver.Content,
 		"content_bytes": len([]byte(ver.Content)),
 	}
+	if ver.ExpiresAt != nil {
+		resp["expires_at"] = *ver.ExpiresAt
+	}
 	out, err := json.Marshal(resp)
 	if err != nil {
 		return "", fmt.Errorf("failed to serialize load_memory response: %w", err)
 	}
 	outStr := string(out)
 
-	resultJSON, alreadyLoaded, err := session.KnowledgeBudget.ChargeOrGetMemory(item.ID, ver.ID, ver.Content, outStr)
+	resultJSON, _, err := session.KnowledgeBudget.ChargeOrGetMemory(item.ID, ver.ID, ver.Content, outStr)
 	if err != nil {
 		return "", fmt.Errorf("budget exceeded: %w", err)
 	}
-	if alreadyLoaded {
-		return resultJSON, nil
-	}
-	return outStr, nil
+	return resultJSON, nil
 }
 
 func (r *Registry) executeProposeSkill(ctx context.Context, argsJSON string) (string, error) {
@@ -594,8 +604,8 @@ func (r *Registry) executeProposeSkill(ctx context.Context, argsJSON string) (st
 	if !ok {
 		return "", errors.New("chat session context missing")
 	}
-	if !session.IsDM {
-		return "", errors.New("knowledge tools are only available in direct messages")
+	if err := r.authorizeKnowledgeAccess(ctx, session); err != nil {
+		return "", err
 	}
 	if session.IsScheduled {
 		return "", errors.New("knowledge proposals cannot be created from scheduled tasks")
@@ -605,9 +615,6 @@ func (r *Registry) executeProposeSkill(ctx context.Context, argsJSON string) (st
 	}
 	if strings.TrimSpace(session.FSMRunID) == "" {
 		return "", errors.New("knowledge proposals require an active FSM run ID")
-	}
-	if strings.TrimSpace(session.UserID) == "" || strings.TrimSpace(session.ChatID) == "" {
-		return "", errors.New("missing user_id or chat_id in session context")
 	}
 
 	var args ProposeSkillArgs
@@ -750,14 +757,11 @@ func (r *Registry) executeDiscoverSkills(ctx context.Context, argsJSON string) (
 	if !ok {
 		return "", errors.New("chat session context missing")
 	}
-	if !session.IsDM {
-		return "", errors.New("knowledge tools are only available in direct messages")
+	if err := r.authorizeKnowledgeAccess(ctx, session); err != nil {
+		return "", err
 	}
 	if session.IsScheduled {
 		return "", errors.New("knowledge tools are not available in scheduled tasks")
-	}
-	if strings.TrimSpace(session.UserID) == "" || strings.TrimSpace(session.ChatID) == "" {
-		return "", errors.New("missing user_id or chat_id in session context")
 	}
 
 	var args DiscoverSkillsArgs
@@ -816,14 +820,11 @@ func (r *Registry) executeLoadSkill(ctx context.Context, argsJSON string) (strin
 	if !ok {
 		return "", errors.New("chat session context missing")
 	}
-	if !session.IsDM {
-		return "", errors.New("knowledge tools are only available in direct messages")
+	if err := r.authorizeKnowledgeAccess(ctx, session); err != nil {
+		return "", err
 	}
 	if session.IsScheduled {
 		return "", errors.New("knowledge tools are not available in scheduled tasks")
-	}
-	if strings.TrimSpace(session.UserID) == "" || strings.TrimSpace(session.ChatID) == "" {
-		return "", errors.New("missing user_id or chat_id in session context")
 	}
 	if session.KnowledgeBudget == nil {
 		return "", errors.New("knowledge budget tracker is not initialized")
@@ -843,40 +844,35 @@ func (r *Registry) executeLoadSkill(ctx context.Context, argsJSON string) (strin
 		return "", fmt.Errorf("invalid skill_id %q: must start with 'skill_'", skillID)
 	}
 
-	// Check cache in session knowledge budget
-	if cached, ok := session.KnowledgeBudget.GetCachedResult(itemID); ok {
-		if hasRev {
-			cachedVerID, _, _, ok := session.KnowledgeBudget.GetCached(itemID)
-			if ok && cachedVerID != knowledge.FormatVersionID(itemID, rev) {
-				return "", fmt.Errorf("version %s is not the active version for skill %s", skillID, itemID)
-			}
-		}
-		return cached, nil
-	}
-
 	if r.knowledgeStoreProvider == nil {
 		return "", errors.New("knowledge store provider is not configured")
 	}
 
 	store, err := r.knowledgeStoreProvider.GetKnowledgeStore(ctx, session.ChatID, session.IsDM)
 	if err != nil {
+		session.KnowledgeBudget.Evict(itemID)
 		return "", fmt.Errorf("failed to get knowledge store: %w", err)
 	}
 
 	item, err := store.GetItem(ctx, itemID)
 	if err != nil {
+		session.KnowledgeBudget.Evict(itemID)
 		return "", fmt.Errorf("skill %s not found: %w", itemID, err)
 	}
 	if item.Kind != knowledge.KindSkill {
+		session.KnowledgeBudget.Evict(itemID)
 		return "", fmt.Errorf("item %s is not a skill", itemID)
 	}
 	if item.Status != knowledge.ItemStatusActive {
+		session.KnowledgeBudget.Evict(itemID)
 		return "", fmt.Errorf("skill %s is not active (status: %s)", itemID, item.Status)
 	}
 	if item.ChatID != session.ChatID || item.UserID != session.UserID {
+		session.KnowledgeBudget.Evict(itemID)
 		return "", fmt.Errorf("skill %s not found", itemID)
 	}
 	if item.ActiveVersionID == "" {
+		session.KnowledgeBudget.Evict(itemID)
 		return "", fmt.Errorf("skill %s has no active version", itemID)
 	}
 
@@ -889,18 +885,23 @@ func (r *Registry) executeLoadSkill(ctx context.Context, argsJSON string) (strin
 
 	ver, err := store.GetSkillVersion(ctx, item.ActiveVersionID)
 	if err != nil {
+		session.KnowledgeBudget.Evict(itemID)
 		return "", fmt.Errorf("failed to get active version for skill %s: %w", itemID, err)
 	}
 	if ver.ItemID != item.ID {
+		session.KnowledgeBudget.Evict(itemID)
 		return "", fmt.Errorf("skill version %s item mismatch: expected %s, got %s", ver.ID, item.ID, ver.ItemID)
 	}
 	if ver.ID != item.ActiveVersionID {
+		session.KnowledgeBudget.Evict(itemID)
 		return "", fmt.Errorf("skill version %s is not active version %s", ver.ID, item.ActiveVersionID)
 	}
 	if ver.Provenance.ChatID != session.ChatID || ver.Provenance.UserID != session.UserID {
+		session.KnowledgeBudget.Evict(itemID)
 		return "", fmt.Errorf("skill %s provenance mismatch with session", itemID)
 	}
 	if ver.Status != knowledge.VersionStatusApproved {
+		session.KnowledgeBudget.Evict(itemID)
 		return "", fmt.Errorf("skill version %s is not approved (status: %s)", ver.ID, ver.Status)
 	}
 
@@ -920,12 +921,9 @@ func (r *Registry) executeLoadSkill(ctx context.Context, argsJSON string) (strin
 	}
 	outStr := string(out)
 
-	resultJSON, alreadyLoaded, err := session.KnowledgeBudget.ChargeOrGetSkill(item.ID, ver.ID, ver.InstructionsMarkdown, totalBytes, outStr)
+	resultJSON, _, err := session.KnowledgeBudget.ChargeOrGetSkill(item.ID, ver.ID, ver.InstructionsMarkdown, totalBytes, outStr)
 	if err != nil {
 		return "", fmt.Errorf("budget exceeded: %w", err)
 	}
-	if alreadyLoaded {
-		return resultJSON, nil
-	}
-	return outStr, nil
+	return resultJSON, nil
 }

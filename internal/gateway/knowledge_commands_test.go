@@ -14,8 +14,10 @@ import (
 	"bob/internal/config"
 	"bob/internal/knowledge"
 	"bob/internal/models"
+	"bob/internal/tools"
 
 	"github.com/fasthttp/websocket"
+	openai "github.com/sashabaranov/go-openai"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -88,6 +90,9 @@ func setupKnowledgeTestGateway(t *testing.T) (*Gateway, *knowledge.Store, chan m
 	defer cancel()
 
 	err := gw.DialWebSocket(ctx)
+	require.NoError(t, err)
+
+	_, err = gw.FetchBotUser(ctx)
 	require.NoError(t, err)
 
 	kStore, err := gw.StoreProvider().GetKnowledgeStore(ctx, "dm_user_alice", true)
@@ -384,6 +389,15 @@ func TestSkillCommands_Lifecycle(t *testing.T) {
 	msg = recvKnowledgeMsg(t, ch)
 	assert.Contains(t, msg.Content, "approved and activated")
 
+	// Verify discoverable via SearchSkills when active
+	_, err = gw.StoreProvider().ReconcileChat(ctx, "dm_user_alice", true, 10)
+	require.NoError(t, err)
+	searcher, err := gw.StoreProvider().GetKnowledgeSearcher(ctx, "dm_user_alice", true, "user_alice")
+	require.NoError(t, err)
+	skills, err := searcher.SearchSkills(ctx, "integration", nil, 10)
+	require.NoError(t, err)
+	assert.Len(t, skills, 1)
+
 	// 7. Disable skill
 	err = gw.ProcessMessage(ctx, models.Message{
 		ChatID:    "dm_user_alice",
@@ -395,6 +409,11 @@ func TestSkillCommands_Lifecycle(t *testing.T) {
 	msg = recvKnowledgeMsg(t, ch)
 	assert.Contains(t, msg.Content, "has been disabled")
 
+	// Verify undiscoverable when disabled
+	skills, err = searcher.SearchSkills(ctx, "integration", nil, 10)
+	require.NoError(t, err)
+	assert.Empty(t, skills)
+
 	// 8. Enable skill
 	err = gw.ProcessMessage(ctx, models.Message{
 		ChatID:    "dm_user_alice",
@@ -405,6 +424,13 @@ func TestSkillCommands_Lifecycle(t *testing.T) {
 	require.NoError(t, err)
 	msg = recvKnowledgeMsg(t, ch)
 	assert.Contains(t, msg.Content, "has been enabled")
+
+	// Reconcile and verify discoverable again
+	_, err = gw.StoreProvider().ReconcileChat(ctx, "dm_user_alice", true, 10)
+	require.NoError(t, err)
+	skills, err = searcher.SearchSkills(ctx, "integration", nil, 10)
+	require.NoError(t, err)
+	assert.Len(t, skills, 1)
 
 	// 9. Archive skill
 	err = gw.ProcessMessage(ctx, models.Message{
@@ -427,6 +453,16 @@ func TestSkillCommands_Lifecycle(t *testing.T) {
 	require.NoError(t, err)
 	msg = recvKnowledgeMsg(t, ch)
 	assert.Contains(t, msg.Content, "has been permanently deleted")
+
+	// Verify deletion queue drains and vector records are removed
+	_, err = gw.StoreProvider().ReconcileChat(ctx, "dm_user_alice", true, 10)
+	require.NoError(t, err)
+	skills, err = searcher.SearchSkills(ctx, "integration", nil, 10)
+	require.NoError(t, err)
+	assert.Empty(t, skills)
+	pendingDels, err := kStore.GetPendingIndexDeletions(ctx, 10)
+	require.NoError(t, err)
+	assert.Empty(t, pendingDels)
 
 	// 11. Reject flow
 	_, ver2, err := kStore.ProposeSkill(ctx, &knowledge.KnowledgeItem{
@@ -788,4 +824,367 @@ func TestKnowledgeCommands_TranscriptPreservation(t *testing.T) {
 	assert.Equal(t, "Remember that my secret code is 4242", entries[0].Content)
 	assert.Equal(t, "I have recorded that.", entries[1].Content)
 	assert.Contains(t, entries[2].Content, "/memory forget")
+}
+
+func TestKnowledgeCommands_ListExpiredMemory_NotFallbackToActive(t *testing.T) {
+	gw, kStore, ch, cleanup := setupKnowledgeTestGateway(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	pastTime := time.Now().Unix() - 3600
+	item, ver, err := kStore.ProposeMemory(ctx, &knowledge.KnowledgeItem{
+		ChatID: "dm_user_alice",
+		UserID: "user_alice",
+	}, &knowledge.MemoryVersion{
+		Type:      knowledge.MemoryTypeFact,
+		Content:   "Ephemeral temporary code 9999",
+		ExpiresAt: &pastTime,
+	})
+	require.NoError(t, err)
+
+	err = kStore.ApproveVersion(ctx, ver.ID, "user_alice")
+	require.NoError(t, err)
+
+	// 1. /memory list expired should find the memory and render its status as expired
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_user_alice",
+		UserID:    "user_alice",
+		Content:   "/memory list expired",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+	msg := recvKnowledgeMsg(t, ch)
+	assert.Contains(t, msg.Content, "🧠 **Memories** (expired)")
+	assert.Contains(t, msg.Content, item.ID)
+	assert.Contains(t, msg.Content, "Ephemeral temporary code 9999")
+	assert.Contains(t, msg.Content, "| expired |")
+
+	// 2. /memory list active should NOT find this memory because it is timestamp-expired
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_user_alice",
+		UserID:    "user_alice",
+		Content:   "/memory list active",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+	msg = recvKnowledgeMsg(t, ch)
+	assert.Contains(t, msg.Content, `No memories found with status "active"`)
+}
+
+func TestGateway_SkillDisable_Enable_LatePurgeSafe(t *testing.T) {
+	gw, kStore, ch, cleanup := setupKnowledgeTestGateway(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Propose and approve skill
+	item, ver, err := kStore.ProposeSkill(ctx, &knowledge.KnowledgeItem{
+		ChatID: "dm_user_alice",
+		UserID: "user_alice",
+	}, &knowledge.SkillVersion{
+		Name:                 "race_skill",
+		Description:          "testing concurrent enable vs purge",
+		InstructionsMarkdown: "# instructions",
+	})
+	require.NoError(t, err)
+
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_user_alice",
+		UserID:    "user_alice",
+		Content:   "/skill approve " + ver.ID,
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+	_ = recvKnowledgeMsg(t, ch)
+
+	// Now disable skill
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_user_alice",
+		UserID:    "user_alice",
+		Content:   "/skill disable " + item.ID,
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+	msg := recvKnowledgeMsg(t, ch)
+	assert.Contains(t, msg.Content, "has been disabled")
+
+	// Immediately re-enable skill
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_user_alice",
+		UserID:    "user_alice",
+		Content:   "/skill enable " + item.ID,
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+	msg = recvKnowledgeMsg(t, ch)
+	assert.Contains(t, msg.Content, "has been enabled")
+
+	// Even if delayed purge of disabled skill runs now:
+	indexer, err := gw.StoreProvider().GetKnowledgeIndexer(ctx, "dm_user_alice", true)
+	require.NoError(t, err)
+	purged, err := indexer.PurgePendingDeletion(ctx, ver.ID)
+	require.NoError(t, err)
+	assert.False(t, purged, "delayed purge must not purge active re-enabled skill")
+
+	// /skill list active must list the skill
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_user_alice",
+		UserID:    "user_alice",
+		Content:   "/skill list active",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+	msg = recvKnowledgeMsg(t, ch)
+	assert.Contains(t, msg.Content, "race_skill")
+	assert.Contains(t, msg.Content, "| active |")
+}
+
+func TestGateway_VerifyDMOwner_EdgeCases(t *testing.T) {
+	gw, _, _, cleanup := setupKnowledgeTestGateway(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// 1. Empty chatID or townhall
+	assert.ErrorContains(t, gw.VerifyDMOwner(ctx, "", "user_alice"), "only available in private Direct Messages")
+	assert.ErrorContains(t, gw.VerifyDMOwner(ctx, "   ", "user_alice"), "only available in private Direct Messages")
+	assert.ErrorContains(t, gw.VerifyDMOwner(ctx, "townhall", "user_alice"), "only available in private Direct Messages")
+
+	// 2. Empty userID
+	assert.ErrorContains(t, gw.VerifyDMOwner(ctx, "dm_chat", ""), "empty user identity")
+	assert.ErrorContains(t, gw.VerifyDMOwner(ctx, "dm_chat", "   "), "empty user identity")
+
+	// 3. Chat not in cache and no http client -> fetch error
+	assert.ErrorContains(t, gw.VerifyDMOwner(ctx, "non_existent_chat", "user_alice"), "unable to verify chat metadata")
+
+	// 4. Chat is group chat (not DM)
+	gw.chatCache.Set(models.Chat{
+		ID:      "group_1",
+		Type:    "group",
+		IsDM:    false,
+		UserIDs: []string{"bot-id-qa", "user_alice"},
+	})
+	assert.ErrorContains(t, gw.VerifyDMOwner(ctx, "group_1", "user_alice"), "only available in private Direct Messages")
+
+	// 5. Multi-human participants (2 humans in UserIDs)
+	gw.chatCache.Set(models.Chat{
+		ID:           "multi_dm",
+		Type:         "dm",
+		IsDM:         true,
+		TargetUserID: "user_alice",
+		UserIDs:      []string{"bot-id-qa", "user_alice", "user_eve"},
+	})
+	assert.ErrorContains(t, gw.VerifyDMOwner(ctx, "multi_dm", "user_alice"), "exactly one human participant")
+
+	// 6. Zero human participants in UserIDs
+	gw.chatCache.Set(models.Chat{
+		ID:           "zero_human_dm",
+		Type:         "dm",
+		IsDM:         true,
+		TargetUserID: "user_alice",
+		UserIDs:      []string{"bot-id-qa"},
+	})
+	assert.ErrorContains(t, gw.VerifyDMOwner(ctx, "zero_human_dm", "user_alice"), "exactly one human participant")
+
+	// 7. TargetUserID mismatch with single human in UserIDs
+	gw.chatCache.Set(models.Chat{
+		ID:           "mismatch_dm",
+		Type:         "dm",
+		IsDM:         true,
+		TargetUserID: "user_alice",
+		UserIDs:      []string{"bot-id-qa", "user_eve"},
+	})
+	assert.ErrorContains(t, gw.VerifyDMOwner(ctx, "mismatch_dm", "user_alice"), "target user mismatch with chat participant list")
+
+	// 8. No TargetUserID and no UserIDs (unconstrained DM)
+	gw.chatCache.Set(models.Chat{
+		ID:   "no_owner_dm",
+		Type: "dm",
+		IsDM: true,
+	})
+	assert.ErrorContains(t, gw.VerifyDMOwner(ctx, "no_owner_dm", "user_alice"), "unable to verify human owner of this DM")
+
+	// 9. Non-owner caller
+	gw.chatCache.Set(models.Chat{
+		ID:           "valid_dm",
+		Type:         "dm",
+		IsDM:         true,
+		TargetUserID: "user_alice",
+		UserIDs:      []string{"bot-id-qa", "user_alice"},
+	})
+	assert.ErrorContains(t, gw.VerifyDMOwner(ctx, "valid_dm", "user_eve"), "only the owner of this DM can manage memories and skills")
+
+	// 10. Valid owner caller
+	assert.NoError(t, gw.VerifyDMOwner(ctx, "valid_dm", "user_alice"))
+
+	// 11. Valid owner caller where TargetUserID is empty but UserIDs has single human
+	gw.chatCache.Set(models.Chat{
+		ID:      "inferred_owner_dm",
+		Type:    "dm",
+		IsDM:    true,
+		UserIDs: []string{"bot-id-qa", "user_alice"},
+	})
+	assert.NoError(t, gw.VerifyDMOwner(ctx, "inferred_owner_dm", "user_alice"))
+}
+
+func TestKnowledgeTools_GroupChatRejection_DefinitionsAndExecution(t *testing.T) {
+	gw, _, _, cleanup := setupKnowledgeTestGateway(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	knowledgeToolNames := []string{
+		"propose_memory", "discover_memories", "load_memory",
+		"propose_skill", "discover_skills", "load_skill",
+	}
+
+	hasKnowledgeTool := func(defs []openai.Tool) bool {
+		for _, d := range defs {
+			if d.Function != nil {
+				for _, name := range knowledgeToolNames {
+					if d.Function.Name == name {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+
+	// 1. Group chat tool definitions must not expose any knowledge tools
+	groupDefs := gw.ToolDefinitions(ctx, "group_chat_1", false)
+	assert.False(t, hasKnowledgeTool(groupDefs), "group chat must not expose knowledge tools")
+
+	// 2. Townhall tool definitions must not expose any knowledge tools
+	townhallDefs := gw.ToolDefinitions(ctx, "townhall", false)
+	assert.False(t, hasKnowledgeTool(townhallDefs), "townhall must not expose knowledge tools")
+
+	// 3. Spoofed DM in context for group chat: ToolDefinitions must fail-closed via VerifyDMOwner
+	spoofedSession := tools.ChatSessionContext{
+		ChatID: "group_chat_1",
+		UserID: "user_alice",
+		IsDM:   true,
+	}
+	spoofedCtx := tools.WithChatSession(ctx, spoofedSession)
+	spoofedDefs := gw.ToolDefinitions(spoofedCtx, "group_chat_1", true)
+	assert.False(t, hasKnowledgeTool(spoofedDefs), "spoofed group chat must have knowledge tools stripped")
+
+	// 4. Direct execution of knowledge tools in non-DM session must fail closed
+	nonDMSession := tools.NewChatSessionContext("group_chat_1", "user_alice", false, tools.DefaultKnowledgeBudgetLimits())
+	nonDMCtx := tools.WithChatSession(ctx, nonDMSession)
+
+	gw.mu.Lock()
+	registry := gw.toolsRegistry
+	gw.mu.Unlock()
+	require.NotNil(t, registry)
+
+	_, err := registry.Execute(nonDMCtx, "propose_memory", `{"content":"secret preference"}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "only available in direct messages")
+
+	_, err = registry.Execute(nonDMCtx, "load_memory", `{"item_id":"mem_123"}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "only available in direct messages")
+
+	// 5. Direct execution with spoofed isDM=true in group chat must fail via DMAuthorizer
+	spoofedExecSession := tools.NewChatSessionContext("group_chat_1", "user_alice", true, tools.DefaultKnowledgeBudgetLimits())
+	spoofedExecCtx := tools.WithChatSession(ctx, spoofedExecSession)
+
+	_, err = registry.Execute(spoofedExecCtx, "propose_memory", `{"content":"secret preference"}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "only available in private Direct Messages")
+
+	_, err = registry.Execute(spoofedExecCtx, "load_memory", `{"item_id":"mem_123"}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "only available in private Direct Messages")
+
+	// 6. Mismatched session.ChatID between method argument and context must fail closed
+	mismatchedSession := tools.ChatSessionContext{
+		ChatID: "dm_user_alice",
+		UserID: "user_alice",
+		IsDM:   true,
+	}
+	mismatchedCtx := tools.WithChatSession(ctx, mismatchedSession)
+	mismatchedDefs := gw.ToolDefinitions(mismatchedCtx, "group_chat_1", false)
+	assert.False(t, hasKnowledgeTool(mismatchedDefs), "mismatched chatID must fail closed and strip knowledge tools")
+}
+
+func TestProcessMessage_UncachedGroupChat_NoMention(t *testing.T) {
+	gw, _, ch, cleanup := setupKnowledgeTestGateway(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Send an unmentioned message in an uncached chat ("new_group_chat")
+	err := gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "new_group_chat",
+		UserID:    "user_alice",
+		Content:   "Hello everyone in this new group!",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+
+	// Since it is an uncached non-DM chat without mention, no reply should be sent
+	select {
+	case msg := <-ch:
+		t.Fatalf("unexpected message sent for unmentioned uncached chat: %s", msg.Content)
+	case <-time.After(200 * time.Millisecond):
+		// Expected: no reply triggered
+	}
+}
+
+func TestProcessMessage_UnknownDMChat_NoMention(t *testing.T) {
+	gw, _, ch, cleanup := setupKnowledgeTestGateway(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// An unknown chat whose ID begins with "dm_" ("dm_unknown_channel") not in cache or server
+	err := gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_unknown_channel",
+		UserID:    "user_alice",
+		Content:   "Hello in unknown chat",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+
+	// Since lookup fails, must fail closed to public/group behavior and NOT reply without mention
+	select {
+	case msg := <-ch:
+		t.Fatalf("unexpected message sent for unmentioned unknown dm_* chat: %s", msg.Content)
+	case <-time.After(200 * time.Millisecond):
+		// Expected: no reply triggered
+	}
+}
+
+func TestProcessMessage_GroupChatWithDMPrefix_NoMention(t *testing.T) {
+	gw, _, ch, cleanup := setupKnowledgeTestGateway(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// A chat whose ID begins with "dm_" but authoritative metadata marks it as a group chat
+	gw.chatCache.Set(models.Chat{
+		ID:      "dm_project_group",
+		Type:    "group",
+		IsDM:    false,
+		UserIDs: []string{"bot-id-qa", "user_alice", "user_bob"},
+	})
+
+	err := gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_project_group",
+		UserID:    "user_alice",
+		Content:   "Status update for the project team",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+
+	// Authoritative group chat must not trigger reply without mention despite "dm_" prefix
+	select {
+	case msg := <-ch:
+		t.Fatalf("unexpected message sent for group chat with dm_ prefix: %s", msg.Content)
+	case <-time.After(200 * time.Millisecond):
+		// Expected: no reply triggered
+	}
 }

@@ -66,6 +66,18 @@ BOT_HANDLE=@botname
 | `EMBEDDING_PRECISION` | `bf16` | Precision mode for local embeddings (`bf16`, `fp32`, `int8`) |
 | `SECRET` / `AUTH_SECRET` | `""` | Secret key used for database backup encryption |
 
+#### User-Validated Skills & Structured Memory
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `KNOWLEDGE_MAX_LOADED_MEMORIES` | `8` | Maximum number of active memories loaded into LLM context per turn |
+| `KNOWLEDGE_MAX_LOADED_MEMORY_BYTES` | `16384` | Maximum total byte budget for loaded memories |
+| `KNOWLEDGE_MAX_LOADED_SKILLS` | `3` | Maximum number of active skills loaded into LLM context per turn |
+| `KNOWLEDGE_MAX_LOADED_SKILL_BYTES` | `24576` | Maximum total byte budget for loaded skills |
+| `KNOWLEDGE_DEFAULT_DISCOVERY_LIMIT` | `5` | Default number of items returned by memory/skill discovery search |
+| `KNOWLEDGE_MAX_DISCOVERY_LIMIT` | `10` | Hard upper bound on items returned by memory/skill discovery search |
+| `KNOWLEDGE_RECONCILE_INTERVAL` | `1m` | Duration between background knowledge reconciliation runs |
+
 #### Web Tools
 
 | Variable | Default | Description |

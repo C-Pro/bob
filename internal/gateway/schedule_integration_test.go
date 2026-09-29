@@ -47,7 +47,7 @@ func TestSchedule_EndToEndLifecycle(t *testing.T) {
 		if r.URL.Path == "/api/chats" {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode([]models.Chat{
-				{ID: "dm_user1", Name: "Alice"},
+				{ID: "dm_user1", Name: "Alice", Type: "dm", IsDM: true, TargetUserID: "user1"},
 			})
 			return
 		}
@@ -286,7 +286,7 @@ func TestSchedule_NoSandbox_RequiresApproval(t *testing.T) {
 		if r.URL.Path == "/api/chats" {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode([]models.Chat{
-				{ID: "dm_user_bob", Name: "Bob Tester"},
+				{ID: "dm_user_bob", Name: "Bob Tester", Type: "dm", IsDM: true, TargetUserID: "user_bob"},
 			})
 			return
 		}
@@ -318,10 +318,10 @@ func TestSchedule_NoSandbox_RequiresApproval(t *testing.T) {
 		BesedkaURL:             server.URL,
 		BesedkaAPIKey:          "test-token",
 		BotHandle:              "@bot",
-		TownhallMaxParagraphs: 3,
-		DMMaxParagraphs:       5,
-		MsgRingBufferSize:     20,
-		DataDir:               dataDir,
+		TownhallMaxParagraphs:  3,
+		DMMaxParagraphs:        5,
+		MsgRingBufferSize:      20,
+		DataDir:                dataDir,
 		SchedulerMinRunTimeout: time.Minute,
 		SchedulerMaxRunTimeout: time.Hour,
 		SchedulerMinMaxTurns:   10,

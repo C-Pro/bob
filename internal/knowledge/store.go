@@ -25,6 +25,13 @@ func (s *Store) DB() *sql.DB {
 	return s.db
 }
 
+func validateActor(userID string) error {
+	if strings.TrimSpace(userID) == "" {
+		return fmt.Errorf("%w: user id cannot be empty", ErrUnauthorized)
+	}
+	return nil
+}
+
 // ProposeMemory creates a new memory item or appends a new proposed revision to an existing memory item.
 func (s *Store) ProposeMemory(ctx context.Context, item *KnowledgeItem, version *MemoryVersion) (*KnowledgeItem, *MemoryVersion, error) {
 	if s.db == nil {
@@ -82,8 +89,29 @@ func (s *Store) ProposeMemory(ctx context.Context, item *KnowledgeItem, version 
 		if existing.Status == ItemStatusForgotten || existing.Status == ItemStatusArchived {
 			return nil, nil, fmt.Errorf("%w: cannot propose revision for %s item %s", ErrInvalidStatus, existing.Status, targetItemID)
 		}
-		if version.Provenance.UserID != "" && version.Provenance.UserID != existing.UserID {
-			return nil, nil, fmt.Errorf("%w: user %s cannot propose revision for item owned by %s", ErrUnauthorized, version.Provenance.UserID, existing.UserID)
+		actorID := version.Provenance.UserID
+		if actorID == "" && item != nil {
+			actorID = item.UserID
+		}
+		if err := validateActor(actorID); err != nil {
+			return nil, nil, err
+		}
+		if actorID != existing.UserID {
+			return nil, nil, fmt.Errorf("%w: user %s cannot propose revision for item owned by %s", ErrUnauthorized, actorID, existing.UserID)
+		}
+		actorChatID := version.Provenance.ChatID
+		if actorChatID == "" && item != nil {
+			actorChatID = item.ChatID
+		}
+		if actorChatID != "" && actorChatID != existing.ChatID {
+			return nil, nil, fmt.Errorf("%w: chat %s cannot propose revision for item in chat %s", ErrUnauthorized, actorChatID, existing.ChatID)
+		}
+		if existing.Status == ItemStatusRejected && (!activeVer.Valid || activeVer.String == "") {
+			_, err = tx.ExecContext(ctx, "UPDATE knowledge_items SET status = 'pending', updated_at = ? WHERE id = ?", now, targetItemID)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to transition rejected item to pending: %w", err)
+			}
+			existing.Status = ItemStatusPending
 		}
 		if activeVer.Valid {
 			existing.ActiveVersionID = activeVer.String
@@ -94,6 +122,12 @@ func (s *Store) ProposeMemory(ctx context.Context, item *KnowledgeItem, version 
 		isNewItem = true
 		if item == nil {
 			item = &KnowledgeItem{}
+		}
+		if err := validateActor(item.UserID); err != nil {
+			return nil, nil, err
+		}
+		if strings.TrimSpace(item.ChatID) == "" {
+			return nil, nil, fmt.Errorf("%w: chat id cannot be empty", ErrUnauthorized)
 		}
 		if item.ID == "" {
 			generatedID, err := GenerateItemID(KindMemory)
@@ -144,8 +178,6 @@ func (s *Store) ProposeMemory(ctx context.Context, item *KnowledgeItem, version 
 		}
 		exp := now + int64(*version.TTLDays)*86400
 		version.ExpiresAt = &exp
-	} else {
-		version.ExpiresAt = nil
 	}
 
 	_, err = tx.ExecContext(ctx, `
@@ -235,8 +267,29 @@ func (s *Store) ProposeSkill(ctx context.Context, item *KnowledgeItem, version *
 		if existing.Status == ItemStatusForgotten || existing.Status == ItemStatusArchived {
 			return nil, nil, fmt.Errorf("%w: cannot propose revision for %s item %s", ErrInvalidStatus, existing.Status, targetItemID)
 		}
-		if version.Provenance.UserID != "" && version.Provenance.UserID != existing.UserID {
-			return nil, nil, fmt.Errorf("%w: user %s cannot propose revision for item owned by %s", ErrUnauthorized, version.Provenance.UserID, existing.UserID)
+		actorID := version.Provenance.UserID
+		if actorID == "" && item != nil {
+			actorID = item.UserID
+		}
+		if err := validateActor(actorID); err != nil {
+			return nil, nil, err
+		}
+		if actorID != existing.UserID {
+			return nil, nil, fmt.Errorf("%w: user %s cannot propose revision for item owned by %s", ErrUnauthorized, actorID, existing.UserID)
+		}
+		actorChatID := version.Provenance.ChatID
+		if actorChatID == "" && item != nil {
+			actorChatID = item.ChatID
+		}
+		if actorChatID != "" && actorChatID != existing.ChatID {
+			return nil, nil, fmt.Errorf("%w: chat %s cannot propose revision for item in chat %s", ErrUnauthorized, actorChatID, existing.ChatID)
+		}
+		if existing.Status == ItemStatusRejected && (!activeVer.Valid || activeVer.String == "") {
+			_, err = tx.ExecContext(ctx, "UPDATE knowledge_items SET status = 'pending', updated_at = ? WHERE id = ?", now, targetItemID)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to transition rejected item to pending: %w", err)
+			}
+			existing.Status = ItemStatusPending
 		}
 		if activeVer.Valid {
 			existing.ActiveVersionID = activeVer.String
@@ -246,6 +299,12 @@ func (s *Store) ProposeSkill(ctx context.Context, item *KnowledgeItem, version *
 		isNewItem = true
 		if item == nil {
 			item = &KnowledgeItem{}
+		}
+		if err := validateActor(item.UserID); err != nil {
+			return nil, nil, err
+		}
+		if strings.TrimSpace(item.ChatID) == "" {
+			return nil, nil, fmt.Errorf("%w: chat id cannot be empty", ErrUnauthorized)
 		}
 		if item.ID == "" {
 			generatedID, err := GenerateItemID(KindSkill)
@@ -541,14 +600,16 @@ func (s *Store) ListItems(ctx context.Context, chatID string, kind ItemKind, sta
 			query = `
 				SELECT id, chat_id, user_id, kind, status, active_version_id, created_at, updated_at
 				FROM knowledge_items
-				WHERE chat_id = ? AND kind = ? AND (status = 'pending' OR id IN (SELECT item_id FROM memory_versions WHERE status = 'proposed'))
+				WHERE chat_id = ? AND kind = ? AND status NOT IN ('forgotten', 'archived')
+				  AND id IN (SELECT item_id FROM memory_versions WHERE status = 'proposed')
 				ORDER BY updated_at DESC
 			`
 		} else {
 			query = `
 				SELECT id, chat_id, user_id, kind, status, active_version_id, created_at, updated_at
 				FROM knowledge_items
-				WHERE chat_id = ? AND kind = ? AND (status = 'pending' OR id IN (SELECT item_id FROM skill_versions WHERE status = 'proposed'))
+				WHERE chat_id = ? AND kind = ? AND status NOT IN ('forgotten', 'archived')
+				  AND id IN (SELECT item_id FROM skill_versions WHERE status = 'proposed')
 				ORDER BY updated_at DESC
 			`
 		}
@@ -575,7 +636,7 @@ func (s *Store) ListItems(ctx context.Context, chatID string, kind ItemKind, sta
 			query = `
 				SELECT id, chat_id, user_id, kind, status, active_version_id, created_at, updated_at
 				FROM knowledge_items
-				WHERE chat_id = ? AND kind = 'memory' AND (
+				WHERE chat_id = ? AND kind = 'memory' AND status NOT IN ('forgotten', 'archived') AND (
 					id IN (SELECT item_id FROM memory_versions WHERE status = 'expired' OR (expires_at IS NOT NULL AND expires_at <= ?))
 				)
 				ORDER BY updated_at DESC
@@ -805,27 +866,18 @@ func (s *Store) ListVersions(ctx context.Context, itemID string) ([]Version, err
 }
 
 // ApproveVersion transitions a proposed version to approved, supersedes prior approved versions,
-// activates the parent item, and flags the version for index synchronization.
+// activates the parent item, enqueues superseded version for index removal, and flags the version for index synchronization.
 func (s *Store) ApproveVersion(ctx context.Context, versionID string, userID string) error {
 	if s.db == nil {
 		return errors.New("database connection is nil")
+	}
+	if err := validateActor(userID); err != nil {
+		return err
 	}
 
 	itemID, _, err := ParseVersionID(versionID)
 	if err != nil {
 		return err
-	}
-
-	item, err := s.GetItem(ctx, itemID)
-	if err != nil {
-		return err
-	}
-
-	if userID != "" && item.UserID != userID {
-		return fmt.Errorf("%w: user %s cannot approve item owned by %s", ErrUnauthorized, userID, item.UserID)
-	}
-	if item.Status == ItemStatusForgotten || item.Status == ItemStatusArchived {
-		return fmt.Errorf("%w: cannot approve version for %s item %s", ErrInvalidStatus, item.Status, itemID)
 	}
 
 	now := time.Now().Unix()
@@ -835,90 +887,104 @@ func (s *Store) ApproveVersion(ctx context.Context, versionID string, userID str
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if item.Kind == KindMemory {
-		var status string
-		err := tx.QueryRowContext(ctx, "SELECT status FROM memory_versions WHERE id = ?", versionID).Scan(&status)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("%w: version %s", ErrNotFound, versionID)
-			}
-			return err
+	var itemStatus, itemUserID, itemKind, prevActiveID string
+	var activeVerNull sql.NullString
+	err = tx.QueryRowContext(ctx, `
+		SELECT status, user_id, kind, active_version_id
+		FROM knowledge_items
+		WHERE id = ?
+	`, itemID).Scan(&itemStatus, &itemUserID, &itemKind, &activeVerNull)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: item %s", ErrNotFound, itemID)
 		}
-		if status != string(VersionStatusProposed) {
-			return fmt.Errorf("version %s has status %s, cannot approve: %w", versionID, status, ErrInvalidStatus)
-		}
+		return fmt.Errorf("failed to query knowledge item: %w", err)
+	}
+	if activeVerNull.Valid {
+		prevActiveID = activeVerNull.String
+	}
 
-		// Supersede previous approved versions
+	if itemUserID != userID {
+		return fmt.Errorf("%w: user %s cannot approve item owned by %s", ErrUnauthorized, userID, itemUserID)
+	}
+	if itemStatus == string(ItemStatusForgotten) || itemStatus == string(ItemStatusArchived) {
+		return fmt.Errorf("%w: cannot approve version for %s item %s", ErrInvalidStatus, itemStatus, itemID)
+	}
+
+	table := "memory_versions"
+	namespace := NamespaceMemories
+	if itemKind == string(KindSkill) {
+		table = "skill_versions"
+		namespace = NamespaceSkills
+	}
+
+	var status, verItemID string
+	err = tx.QueryRowContext(ctx, fmt.Sprintf("SELECT item_id, status FROM %s WHERE id = ?", table), versionID).Scan(&verItemID, &status)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: version %s", ErrNotFound, versionID)
+		}
+		return err
+	}
+	if verItemID != itemID {
+		return fmt.Errorf("%w: version %s belongs to item %s, not %s", ErrNotFound, versionID, verItemID, itemID)
+	}
+	if status != string(VersionStatusProposed) {
+		return fmt.Errorf("version %s has status %s, cannot approve: %w", versionID, status, ErrInvalidStatus)
+	}
+
+	// Supersede previous approved versions
+	_, err = tx.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE %s SET status = 'superseded' WHERE item_id = ? AND status = 'approved'
+	`, table), itemID)
+	if err != nil {
+		return fmt.Errorf("failed to supersede prior versions: %w", err)
+	}
+
+	// Enqueue previous active version for index deletion if being replaced
+	if prevActiveID != "" && prevActiveID != versionID {
 		_, err = tx.ExecContext(ctx, `
-			UPDATE memory_versions SET status = 'superseded' WHERE item_id = ? AND status = 'approved'
-		`, itemID)
+			INSERT INTO pending_index_deletions (version_id, namespace, created_at)
+			VALUES (?, ?, ?)
+			ON CONFLICT(version_id) DO NOTHING
+		`, prevActiveID, namespace, now)
 		if err != nil {
-			return fmt.Errorf("failed to supersede prior versions: %w", err)
-		}
-
-		// Approve target version
-		res, err := tx.ExecContext(ctx, `
-			UPDATE memory_versions
-			SET status = 'approved', reviewed_at = ?, reviewed_by = ?, index_status = 'pending'
-			WHERE id = ? AND status = 'proposed'
-		`, now, userID, versionID)
-		if err != nil {
-			return fmt.Errorf("failed to approve version: %w", err)
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return fmt.Errorf("version %s is no longer proposed: %w", versionID, ErrInvalidStatus)
-		}
-	} else {
-		var status string
-		err := tx.QueryRowContext(ctx, "SELECT status FROM skill_versions WHERE id = ?", versionID).Scan(&status)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("%w: version %s", ErrNotFound, versionID)
-			}
-			return err
-		}
-		if status != string(VersionStatusProposed) {
-			return fmt.Errorf("version %s has status %s, cannot approve: %w", versionID, status, ErrInvalidStatus)
-		}
-
-		// Supersede previous approved versions
-		_, err = tx.ExecContext(ctx, `
-			UPDATE skill_versions SET status = 'superseded' WHERE item_id = ? AND status = 'approved'
-		`, itemID)
-		if err != nil {
-			return fmt.Errorf("failed to supersede prior versions: %w", err)
-		}
-
-		// Approve target version
-		res, err := tx.ExecContext(ctx, `
-			UPDATE skill_versions
-			SET status = 'approved', reviewed_at = ?, reviewed_by = ?, index_status = 'pending'
-			WHERE id = ? AND status = 'proposed'
-		`, now, userID, versionID)
-		if err != nil {
-			return fmt.Errorf("failed to approve version: %w", err)
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return fmt.Errorf("version %s is no longer proposed: %w", versionID, ErrInvalidStatus)
+			return fmt.Errorf("failed to enqueue superseded version for deletion: %w", err)
 		}
 	}
 
-	// Update item
-	_, err = tx.ExecContext(ctx, `
+	// Approve target version
+	res, err := tx.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE %s
+		SET status = 'approved', reviewed_at = ?, reviewed_by = ?, index_status = 'pending'
+		WHERE id = ? AND status = 'proposed'
+	`, table), now, userID, versionID)
+	if err != nil {
+		return fmt.Errorf("failed to approve version: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("version %s is no longer proposed: %w", versionID, ErrInvalidStatus)
+	}
+
+	// Guarded item activation
+	res, err = tx.ExecContext(ctx, `
 		UPDATE knowledge_items
 		SET status = 'active', active_version_id = ?, updated_at = ?
-		WHERE id = ?
-	`, versionID, now, itemID)
+		WHERE id = ? AND user_id = ? AND status NOT IN ('forgotten', 'archived')
+	`, versionID, now, itemID, userID)
 	if err != nil {
 		return fmt.Errorf("failed to update knowledge item to active: %w", err)
+	}
+	n, err = res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("%w: item %s is not in an approvable state", ErrInvalidStatus, itemID)
 	}
 
 	return tx.Commit()
@@ -929,22 +995,13 @@ func (s *Store) RejectVersion(ctx context.Context, versionID string, userID stri
 	if s.db == nil {
 		return errors.New("database connection is nil")
 	}
+	if err := validateActor(userID); err != nil {
+		return err
+	}
 
 	itemID, _, err := ParseVersionID(versionID)
 	if err != nil {
 		return err
-	}
-
-	item, err := s.GetItem(ctx, itemID)
-	if err != nil {
-		return err
-	}
-
-	if userID != "" && item.UserID != userID {
-		return fmt.Errorf("%w: user %s cannot reject item owned by %s", ErrUnauthorized, userID, item.UserID)
-	}
-	if item.Status == ItemStatusForgotten || item.Status == ItemStatusArchived {
-		return fmt.Errorf("%w: cannot reject version for %s item %s", ErrInvalidStatus, item.Status, itemID)
 	}
 
 	now := time.Now().Unix()
@@ -954,18 +1011,42 @@ func (s *Store) RejectVersion(ctx context.Context, versionID string, userID stri
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	var itemStatus, itemUserID, itemKind string
+	var activeVerNull sql.NullString
+	err = tx.QueryRowContext(ctx, `
+		SELECT status, user_id, kind, active_version_id
+		FROM knowledge_items
+		WHERE id = ?
+	`, itemID).Scan(&itemStatus, &itemUserID, &itemKind, &activeVerNull)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: item %s", ErrNotFound, itemID)
+		}
+		return fmt.Errorf("failed to query knowledge item: %w", err)
+	}
+
+	if itemUserID != userID {
+		return fmt.Errorf("%w: user %s cannot reject item owned by %s", ErrUnauthorized, userID, itemUserID)
+	}
+	if itemStatus == string(ItemStatusForgotten) || itemStatus == string(ItemStatusArchived) {
+		return fmt.Errorf("%w: cannot reject version for %s item %s", ErrInvalidStatus, itemStatus, itemID)
+	}
+
 	table := "memory_versions"
-	if item.Kind == KindSkill {
+	if itemKind == string(KindSkill) {
 		table = "skill_versions"
 	}
 
-	var status string
-	err = tx.QueryRowContext(ctx, fmt.Sprintf("SELECT status FROM %s WHERE id = ?", table), versionID).Scan(&status)
+	var status, verItemID string
+	err = tx.QueryRowContext(ctx, fmt.Sprintf("SELECT item_id, status FROM %s WHERE id = ?", table), versionID).Scan(&verItemID, &status)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("%w: version %s", ErrNotFound, versionID)
 		}
 		return err
+	}
+	if verItemID != itemID {
+		return fmt.Errorf("%w: version %s belongs to item %s, not %s", ErrNotFound, versionID, verItemID, itemID)
 	}
 	if status != string(VersionStatusProposed) {
 		return fmt.Errorf("version %s has status %s, cannot reject: %w", versionID, status, ErrInvalidStatus)
@@ -987,36 +1068,86 @@ func (s *Store) RejectVersion(ctx context.Context, versionID string, userID stri
 		return fmt.Errorf("version %s is no longer proposed: %w", versionID, ErrInvalidStatus)
 	}
 
-	_, err = tx.ExecContext(ctx, `
-		UPDATE knowledge_items SET updated_at = ? WHERE id = ?
-	`, now, itemID)
+	// Check remaining proposed versions for itemID
+	var remainingProposed int
+	err = tx.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE item_id = ? AND status = 'proposed'", table), itemID).Scan(&remainingProposed)
 	if err != nil {
-		return fmt.Errorf("failed to update item updated_at: %w", err)
+		return err
+	}
+
+	hasActive := activeVerNull.Valid && activeVerNull.String != ""
+	if !hasActive && remainingProposed == 0 {
+		_, err = tx.ExecContext(ctx, `
+			UPDATE knowledge_items SET status = 'rejected', updated_at = ? WHERE id = ?
+		`, now, itemID)
+		if err != nil {
+			return fmt.Errorf("failed to update item status to rejected: %w", err)
+		}
+	} else {
+		_, err = tx.ExecContext(ctx, `
+			UPDATE knowledge_items SET updated_at = ? WHERE id = ?
+		`, now, itemID)
+		if err != nil {
+			return fmt.Errorf("failed to update item updated_at: %w", err)
+		}
 	}
 
 	return tx.Commit()
 }
 
-// DisableSkill sets an active skill's status to disabled.
+// DisableSkill sets an active skill's status to disabled and enqueues its active version for index removal.
 func (s *Store) DisableSkill(ctx context.Context, itemID string, userID string) error {
-	item, err := s.GetItem(ctx, itemID)
-	if err != nil {
+	if s.db == nil {
+		return errors.New("database connection is nil")
+	}
+	if err := validateActor(userID); err != nil {
 		return err
-	}
-	if item.Kind != KindSkill {
-		return fmt.Errorf("item %s is not a skill", itemID)
-	}
-	if userID != "" && item.UserID != userID {
-		return fmt.Errorf("%w: user %s cannot disable item owned by %s", ErrUnauthorized, userID, item.UserID)
-	}
-	if item.Status != ItemStatusActive {
-		return fmt.Errorf("%w: cannot disable skill with status %s", ErrInvalidStatus, item.Status)
 	}
 
 	now := time.Now().Unix()
-	res, err := s.db.ExecContext(ctx, `
-		UPDATE knowledge_items SET status = 'disabled', updated_at = ? WHERE id = ? AND status = 'active'
-	`, now, itemID)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var itemStatus, itemUserID, itemKind string
+	var activeVerNull sql.NullString
+	err = tx.QueryRowContext(ctx, `
+		SELECT status, user_id, kind, active_version_id
+		FROM knowledge_items
+		WHERE id = ?
+	`, itemID).Scan(&itemStatus, &itemUserID, &itemKind, &activeVerNull)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: skill %s", ErrNotFound, itemID)
+		}
+		return fmt.Errorf("failed to query knowledge item: %w", err)
+	}
+	if itemKind != string(KindSkill) {
+		return fmt.Errorf("item %s is not a skill", itemID)
+	}
+	if itemUserID != userID {
+		return fmt.Errorf("%w: user %s cannot disable item owned by %s", ErrUnauthorized, userID, itemUserID)
+	}
+	if itemStatus != string(ItemStatusActive) {
+		return fmt.Errorf("%w: cannot disable skill with status %s", ErrInvalidStatus, itemStatus)
+	}
+
+	if activeVerNull.Valid && activeVerNull.String != "" {
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO pending_index_deletions (version_id, namespace, created_at)
+			VALUES (?, ?, ?)
+			ON CONFLICT(version_id) DO NOTHING
+		`, activeVerNull.String, NamespaceSkills, now)
+		if err != nil {
+			return fmt.Errorf("failed to enqueue index deletion: %w", err)
+		}
+	}
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE knowledge_items SET status = 'disabled', updated_at = ? WHERE id = ? AND status = 'active' AND user_id = ?
+	`, now, itemID, userID)
 	if err != nil {
 		return err
 	}
@@ -1027,32 +1158,77 @@ func (s *Store) DisableSkill(ctx context.Context, itemID string, userID string) 
 	if n == 0 {
 		return fmt.Errorf("%w: skill %s is not active", ErrInvalidStatus, itemID)
 	}
-	return nil
+
+	return tx.Commit()
 }
 
-// EnableSkill sets a disabled skill's status back to active.
+// EnableSkill sets a disabled skill's status back to active, cancels pending index deletion, and schedules reindexing.
 func (s *Store) EnableSkill(ctx context.Context, itemID string, userID string) error {
-	item, err := s.GetItem(ctx, itemID)
-	if err != nil {
+	if s.db == nil {
+		return errors.New("database connection is nil")
+	}
+	if err := validateActor(userID); err != nil {
 		return err
-	}
-	if item.Kind != KindSkill {
-		return fmt.Errorf("item %s is not a skill", itemID)
-	}
-	if userID != "" && item.UserID != userID {
-		return fmt.Errorf("%w: user %s cannot enable item owned by %s", ErrUnauthorized, userID, item.UserID)
-	}
-	if item.Status != ItemStatusDisabled {
-		return fmt.Errorf("%w: cannot enable skill with status %s", ErrInvalidStatus, item.Status)
-	}
-	if item.ActiveVersionID == "" {
-		return fmt.Errorf("%w: cannot enable skill without active version", ErrInvalidStatus)
 	}
 
 	now := time.Now().Unix()
-	res, err := s.db.ExecContext(ctx, `
-		UPDATE knowledge_items SET status = 'active', updated_at = ? WHERE id = ? AND status = 'disabled'
-	`, now, itemID)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var itemStatus, itemUserID, itemKind string
+	var activeVerNull sql.NullString
+	err = tx.QueryRowContext(ctx, `
+		SELECT status, user_id, kind, active_version_id
+		FROM knowledge_items
+		WHERE id = ?
+	`, itemID).Scan(&itemStatus, &itemUserID, &itemKind, &activeVerNull)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: skill %s", ErrNotFound, itemID)
+		}
+		return fmt.Errorf("failed to query knowledge item: %w", err)
+	}
+	if itemKind != string(KindSkill) {
+		return fmt.Errorf("item %s is not a skill", itemID)
+	}
+	if itemUserID != userID {
+		return fmt.Errorf("%w: user %s cannot enable item owned by %s", ErrUnauthorized, userID, itemUserID)
+	}
+	if itemStatus != string(ItemStatusDisabled) {
+		return fmt.Errorf("%w: cannot enable skill with status %s", ErrInvalidStatus, itemStatus)
+	}
+	if !activeVerNull.Valid || activeVerNull.String == "" {
+		return fmt.Errorf("%w: cannot enable skill without active version", ErrInvalidStatus)
+	}
+	activeVerID := activeVerNull.String
+
+	// Cancel pending index deletion for this active version
+	_, err = tx.ExecContext(ctx, "DELETE FROM pending_index_deletions WHERE version_id = ?", activeVerID)
+	if err != nil {
+		return fmt.Errorf("failed to clear pending index deletion: %w", err)
+	}
+
+	// Mark active version index_status as pending so indexer reconciles it
+	verRes, err := tx.ExecContext(ctx, `
+		UPDATE skill_versions SET index_status = 'pending' WHERE id = ? AND item_id = ? AND status = 'approved'
+	`, activeVerID, itemID)
+	if err != nil {
+		return fmt.Errorf("failed to mark skill version pending for indexing: %w", err)
+	}
+	verRows, err := verRes.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check rows affected: %w", err)
+	}
+	if verRows != 1 {
+		return fmt.Errorf("%w: active version %s is not an approved version of skill %s", ErrInvalidStatus, activeVerID, itemID)
+	}
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE knowledge_items SET status = 'active', updated_at = ? WHERE id = ? AND status = 'disabled' AND user_id = ?
+	`, now, itemID, userID)
 	if err != nil {
 		return err
 	}
@@ -1063,23 +1239,17 @@ func (s *Store) EnableSkill(ctx context.Context, itemID string, userID string) e
 	if n == 0 {
 		return fmt.Errorf("%w: skill %s is not disabled", ErrInvalidStatus, itemID)
 	}
-	return nil
+
+	return tx.Commit()
 }
 
-// ArchiveSkill marks a skill item and its active version as archived.
+// ArchiveSkill marks a skill item and its active version as archived, and enqueues index deletion.
 func (s *Store) ArchiveSkill(ctx context.Context, itemID string, userID string) error {
-	item, err := s.GetItem(ctx, itemID)
-	if err != nil {
+	if s.db == nil {
+		return errors.New("database connection is nil")
+	}
+	if err := validateActor(userID); err != nil {
 		return err
-	}
-	if item.Kind != KindSkill {
-		return fmt.Errorf("item %s is not a skill", itemID)
-	}
-	if userID != "" && item.UserID != userID {
-		return fmt.Errorf("%w: user %s cannot archive item owned by %s", ErrUnauthorized, userID, item.UserID)
-	}
-	if item.Status != ItemStatusActive && item.Status != ItemStatusDisabled {
-		return fmt.Errorf("%w: cannot archive skill with status %s", ErrInvalidStatus, item.Status)
 	}
 
 	now := time.Now().Unix()
@@ -1089,9 +1259,43 @@ func (s *Store) ArchiveSkill(ctx context.Context, itemID string, userID string) 
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	var itemStatus, itemUserID, itemKind string
+	var activeVerNull sql.NullString
+	err = tx.QueryRowContext(ctx, `
+		SELECT status, user_id, kind, active_version_id
+		FROM knowledge_items
+		WHERE id = ?
+	`, itemID).Scan(&itemStatus, &itemUserID, &itemKind, &activeVerNull)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: skill %s", ErrNotFound, itemID)
+		}
+		return fmt.Errorf("failed to query knowledge item: %w", err)
+	}
+	if itemKind != string(KindSkill) {
+		return fmt.Errorf("item %s is not a skill", itemID)
+	}
+	if itemUserID != userID {
+		return fmt.Errorf("%w: user %s cannot archive item owned by %s", ErrUnauthorized, userID, itemUserID)
+	}
+	if itemStatus != string(ItemStatusActive) && itemStatus != string(ItemStatusDisabled) {
+		return fmt.Errorf("%w: cannot archive skill with status %s", ErrInvalidStatus, itemStatus)
+	}
+
+	if activeVerNull.Valid && activeVerNull.String != "" {
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO pending_index_deletions (version_id, namespace, created_at)
+			VALUES (?, ?, ?)
+			ON CONFLICT(version_id) DO NOTHING
+		`, activeVerNull.String, NamespaceSkills, now)
+		if err != nil {
+			return fmt.Errorf("failed to enqueue index deletion: %w", err)
+		}
+	}
+
 	res, err := tx.ExecContext(ctx, `
-		UPDATE knowledge_items SET status = 'archived', updated_at = ? WHERE id = ? AND status IN ('active', 'disabled')
-	`, now, itemID)
+		UPDATE knowledge_items SET status = 'archived', updated_at = ? WHERE id = ? AND status IN ('active', 'disabled') AND user_id = ?
+	`, now, itemID, userID)
 	if err != nil {
 		return err
 	}
@@ -1113,20 +1317,13 @@ func (s *Store) ArchiveSkill(ctx context.Context, itemID string, userID string) 
 	return tx.Commit()
 }
 
-// ForgetItem permanently erases all versions for a memory item, records a tombstone, and updates the item status.
+// ForgetItem permanently erases all versions for a memory item, records a tombstone, queues all versions for index deletion, and updates the item status.
 func (s *Store) ForgetItem(ctx context.Context, itemID string, userID string) error {
-	item, err := s.GetItem(ctx, itemID)
-	if err != nil {
+	if s.db == nil {
+		return errors.New("database connection is nil")
+	}
+	if err := validateActor(userID); err != nil {
 		return err
-	}
-	if item.Kind != KindMemory {
-		return fmt.Errorf("item %s is not a memory", itemID)
-	}
-	if userID != "" && item.UserID != userID {
-		return fmt.Errorf("%w: user %s cannot forget item owned by %s", ErrUnauthorized, userID, item.UserID)
-	}
-	if item.Status == ItemStatusForgotten {
-		return fmt.Errorf("%w: item %s is already forgotten", ErrInvalidStatus, itemID)
 	}
 
 	now := time.Now().Unix()
@@ -1136,12 +1333,67 @@ func (s *Store) ForgetItem(ctx context.Context, itemID string, userID string) er
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	var itemStatus, itemUserID, itemKind, itemChatID string
+	err = tx.QueryRowContext(ctx, `
+		SELECT status, user_id, kind, chat_id
+		FROM knowledge_items
+		WHERE id = ?
+	`, itemID).Scan(&itemStatus, &itemUserID, &itemKind, &itemChatID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: memory %s", ErrNotFound, itemID)
+		}
+		return fmt.Errorf("failed to query knowledge item: %w", err)
+	}
+	if itemKind != string(KindMemory) {
+		return fmt.Errorf("item %s is not a memory", itemID)
+	}
+	if itemUserID != userID {
+		return fmt.Errorf("%w: user %s cannot forget item owned by %s", ErrUnauthorized, userID, itemUserID)
+	}
+	if itemStatus == string(ItemStatusForgotten) {
+		return fmt.Errorf("%w: item %s is already forgotten", ErrInvalidStatus, itemID)
+	}
+
+	// Enumerate all version IDs to enqueue for index deletion
+	rows, err := tx.QueryContext(ctx, "SELECT id FROM memory_versions WHERE item_id = ?", itemID)
+	if err != nil {
+		return fmt.Errorf("failed to query memory versions: %w", err)
+	}
+	var verIDs []string
+	for rows.Next() {
+		var vid string
+		if err := rows.Scan(&vid); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		verIDs = append(verIDs, vid)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("failed to iterate memory versions: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("failed to close memory version rows: %w", err)
+	}
+
+	for _, vid := range verIDs {
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO pending_index_deletions (version_id, namespace, created_at)
+			VALUES (?, ?, ?)
+			ON CONFLICT(version_id) DO NOTHING
+		`, vid, NamespaceMemories, now)
+		if err != nil {
+			return fmt.Errorf("failed to enqueue index deletion for version %s: %w", vid, err)
+		}
+	}
+
 	// Record tombstone
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO knowledge_tombstones (item_id, kind, chat_id, user_id, deleted_by, deleted_at, reason)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(item_id) DO UPDATE SET deleted_by=excluded.deleted_by, deleted_at=excluded.deleted_at
-	`, itemID, KindMemory, item.ChatID, item.UserID, userID, now, "forgotten via slash command")
+	`, itemID, KindMemory, itemChatID, itemUserID, userID, now, "forgotten via slash command")
 	if err != nil {
 		return fmt.Errorf("failed to insert tombstone: %w", err)
 	}
@@ -1156,8 +1408,8 @@ func (s *Store) ForgetItem(ctx context.Context, itemID string, userID string) er
 	res, err := tx.ExecContext(ctx, `
 		UPDATE knowledge_items
 		SET status = 'forgotten', active_version_id = NULL, updated_at = ?
-		WHERE id = ? AND status != 'forgotten'
-	`, now, itemID)
+		WHERE id = ? AND status != 'forgotten' AND user_id = ?
+	`, now, itemID, userID)
 	if err != nil {
 		return fmt.Errorf("failed to mark item forgotten: %w", err)
 	}
@@ -1172,20 +1424,13 @@ func (s *Store) ForgetItem(ctx context.Context, itemID string, userID string) er
 	return tx.Commit()
 }
 
-// DeleteSkill permanently erases all versions for a skill item, records a tombstone, and updates the item status.
+// DeleteSkill permanently erases all versions for a skill item, records a tombstone, queues all versions for index deletion, and updates the item status.
 func (s *Store) DeleteSkill(ctx context.Context, itemID string, userID string) error {
-	item, err := s.GetItem(ctx, itemID)
-	if err != nil {
+	if s.db == nil {
+		return errors.New("database connection is nil")
+	}
+	if err := validateActor(userID); err != nil {
 		return err
-	}
-	if item.Kind != KindSkill {
-		return fmt.Errorf("item %s is not a skill", itemID)
-	}
-	if userID != "" && item.UserID != userID {
-		return fmt.Errorf("%w: user %s cannot delete item owned by %s", ErrUnauthorized, userID, item.UserID)
-	}
-	if item.Status == ItemStatusForgotten {
-		return fmt.Errorf("%w: skill %s is already deleted", ErrInvalidStatus, itemID)
 	}
 
 	now := time.Now().Unix()
@@ -1195,25 +1440,83 @@ func (s *Store) DeleteSkill(ctx context.Context, itemID string, userID string) e
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	var itemStatus, itemUserID, itemKind, itemChatID string
+	err = tx.QueryRowContext(ctx, `
+		SELECT status, user_id, kind, chat_id
+		FROM knowledge_items
+		WHERE id = ?
+	`, itemID).Scan(&itemStatus, &itemUserID, &itemKind, &itemChatID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: skill %s", ErrNotFound, itemID)
+		}
+		return fmt.Errorf("failed to query knowledge item: %w", err)
+	}
+	if itemKind != string(KindSkill) {
+		return fmt.Errorf("item %s is not a skill", itemID)
+	}
+	if itemUserID != userID {
+		return fmt.Errorf("%w: user %s cannot delete item owned by %s", ErrUnauthorized, userID, itemUserID)
+	}
+	if itemStatus == string(ItemStatusForgotten) {
+		return fmt.Errorf("%w: skill %s is already deleted", ErrInvalidStatus, itemID)
+	}
+
+	// Enumerate all version IDs to enqueue for index deletion
+	rows, err := tx.QueryContext(ctx, "SELECT id FROM skill_versions WHERE item_id = ?", itemID)
+	if err != nil {
+		return fmt.Errorf("failed to query skill versions: %w", err)
+	}
+	var verIDs []string
+	for rows.Next() {
+		var vid string
+		if err := rows.Scan(&vid); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		verIDs = append(verIDs, vid)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("failed to iterate skill versions: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("failed to close skill version rows: %w", err)
+	}
+
+	for _, vid := range verIDs {
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO pending_index_deletions (version_id, namespace, created_at)
+			VALUES (?, ?, ?)
+			ON CONFLICT(version_id) DO NOTHING
+		`, vid, NamespaceSkills, now)
+		if err != nil {
+			return fmt.Errorf("failed to enqueue index deletion for version %s: %w", vid, err)
+		}
+	}
+
+	// Record tombstone
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO knowledge_tombstones (item_id, kind, chat_id, user_id, deleted_by, deleted_at, reason)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(item_id) DO UPDATE SET deleted_by=excluded.deleted_by, deleted_at=excluded.deleted_at
-	`, itemID, KindSkill, item.ChatID, item.UserID, userID, now, "deleted via slash command")
+	`, itemID, KindSkill, itemChatID, itemUserID, userID, now, "deleted via slash command")
 	if err != nil {
 		return fmt.Errorf("failed to insert tombstone: %w", err)
 	}
 
+	// Delete all content versions
 	_, err = tx.ExecContext(ctx, "DELETE FROM skill_versions WHERE item_id = ?", itemID)
 	if err != nil {
 		return fmt.Errorf("failed to erase skill versions: %w", err)
 	}
 
+	// Mark item as forgotten
 	res, err := tx.ExecContext(ctx, `
 		UPDATE knowledge_items
 		SET status = 'forgotten', active_version_id = NULL, updated_at = ?
-		WHERE id = ? AND status != 'forgotten'
-	`, now, itemID)
+		WHERE id = ? AND status != 'forgotten' AND user_id = ?
+	`, now, itemID, userID)
 	if err != nil {
 		return fmt.Errorf("failed to mark skill item forgotten: %w", err)
 	}
@@ -1683,3 +1986,115 @@ func (s *Store) GetPendingIndexDeletions(ctx context.Context, limit int) ([]Pend
 	return items, rows.Err()
 }
 
+// IsVersionActiveAndApproved checks whether a version currently belongs to an active item,
+// is the item's active_version_id, and has status 'approved'.
+func (s *Store) IsVersionActiveAndApproved(ctx context.Context, versionID string) (bool, error) {
+	if s.db == nil {
+		return false, errors.New("database connection is nil")
+	}
+	itemID, _, err := ParseVersionID(versionID)
+	if err != nil {
+		return false, nil
+	}
+
+	var itemStatus, activeVerID, kind string
+	err = s.db.QueryRowContext(ctx, `
+		SELECT status, COALESCE(active_version_id, ''), kind
+		FROM knowledge_items
+		WHERE id = ?
+	`, itemID).Scan(&itemStatus, &activeVerID, &kind)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	if itemStatus != string(ItemStatusActive) || activeVerID != versionID {
+		return false, nil
+	}
+
+	table := "memory_versions"
+	if kind == string(KindSkill) {
+		table = "skill_versions"
+	}
+
+	var verStatus string
+	err = s.db.QueryRowContext(ctx, fmt.Sprintf("SELECT status FROM %s WHERE id = ?", table), versionID).Scan(&verStatus)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	return verStatus == string(VersionStatusApproved), nil
+}
+
+// DiscardStaleDeletionJob checks whether a version is currently the active approved version of an active item.
+// If it is, it atomically removes the version from pending_index_deletions and marks its index status as pending,
+// returning (true, nil). If the version is not active and approved, the deletion job is retained and it returns (false, nil).
+func (s *Store) DiscardStaleDeletionJob(ctx context.Context, versionID string) (bool, error) {
+	if s.db == nil {
+		return false, errors.New("database connection is nil")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("failed to begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var updateQuery string
+	if strings.HasPrefix(versionID, PrefixMemory) {
+		updateQuery = `
+			UPDATE memory_versions
+			SET index_status = 'pending'
+			WHERE id = ?
+			  AND status = 'approved'
+			  AND EXISTS (
+				SELECT 1 FROM knowledge_items
+				WHERE id = memory_versions.item_id
+				  AND status = 'active'
+				  AND active_version_id = ?
+			  )
+		`
+	} else if strings.HasPrefix(versionID, PrefixSkill) {
+		updateQuery = `
+			UPDATE skill_versions
+			SET index_status = 'pending'
+			WHERE id = ?
+			  AND status = 'approved'
+			  AND EXISTS (
+				SELECT 1 FROM knowledge_items
+				WHERE id = skill_versions.item_id
+				  AND status = 'active'
+				  AND active_version_id = ?
+			  )
+		`
+	} else {
+		return false, fmt.Errorf("unknown version prefix for %s", versionID)
+	}
+
+	res, err := tx.ExecContext(ctx, updateQuery, versionID, versionID)
+	if err != nil {
+		return false, fmt.Errorf("failed to check and update version index status: %w", err)
+	}
+
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	if n == 0 {
+		return false, nil
+	}
+
+	if _, err := tx.ExecContext(ctx, "DELETE FROM pending_index_deletions WHERE version_id = ?", versionID); err != nil {
+		return false, fmt.Errorf("failed to delete pending index deletion: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("failed to commit tx: %w", err)
+	}
+	return true, nil
+}

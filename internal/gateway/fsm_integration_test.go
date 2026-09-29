@@ -236,7 +236,10 @@ func TestGateway_FSMToolLoop_DMIterationCap(t *testing.T) {
 		case "/api/users":
 			_ = json.NewEncoder(w).Encode([]models.User{{ID: "u1", DisplayName: "Alice"}})
 		case "/api/chats":
-			_ = json.NewEncoder(w).Encode([]models.Chat{{ID: "dm_user1"}})
+			_ = json.NewEncoder(w).Encode([]models.Chat{
+				{ID: "user1", Type: "dm", IsDM: true, TargetUserID: "u1"},
+				{ID: "dm_user1", Type: "dm", IsDM: true, TargetUserID: "u1"},
+			})
 		case "/api/chat":
 			upgrader := websocket.Upgrader{}
 			c, err := upgrader.Upgrade(w, r, nil)
@@ -1073,7 +1076,7 @@ func TestGateway_InteractiveSession_ConfiguredKnowledgeBudgetLimits(t *testing.T
 			})
 		case "/api/chats":
 			_ = json.NewEncoder(w).Encode([]models.Chat{
-				{ID: "dm_custom_budget", IsDM: true},
+				{ID: "dm_custom_budget", IsDM: true, TargetUserID: "u1"},
 			})
 		case "/api/chat":
 			c, err := upgrader.Upgrade(w, r, nil)
@@ -1095,19 +1098,19 @@ func TestGateway_InteractiveSession_ConfiguredKnowledgeBudgetLimits(t *testing.T
 	defer besedkaServer.Close()
 
 	cfg := &config.Config{
-		BesedkaURL:                  besedkaServer.URL,
-		BesedkaAPIKey:               "test-key",
-		OpenAIAPIKey:                "test-key",
-		OpenAIBaseURL:               llmServer.URL,
-		OpenAIModel:                 "test-model",
-		BotHandle:                   "@bot",
-		DataDir:                     tempDir,
-		TownhallToolMaxIterations:   10,
-		DMToolMaxIterations:         20,
-		TownhallMaxParagraphs:       5,
-		DMMaxParagraphs:             10,
-		MsgRingBufferSize:           10,
-		KnowledgeMaxLoadedMemories:  1, // Configured non-default limit: 1 memory only!
+		BesedkaURL:                 besedkaServer.URL,
+		BesedkaAPIKey:              "test-key",
+		OpenAIAPIKey:               "test-key",
+		OpenAIBaseURL:              llmServer.URL,
+		OpenAIModel:                "test-model",
+		BotHandle:                  "@bot",
+		DataDir:                    tempDir,
+		TownhallToolMaxIterations:  10,
+		DMToolMaxIterations:        20,
+		TownhallMaxParagraphs:      5,
+		DMMaxParagraphs:            10,
+		MsgRingBufferSize:          10,
+		KnowledgeMaxLoadedMemories: 1, // Configured non-default limit: 1 memory only!
 		KnowledgeMaxDiscoveryLimit: 15,
 	}
 

@@ -91,6 +91,10 @@ func TestStore_ProposeAndApproveMemory(t *testing.T) {
 		ItemID:  item.ID,
 		Type:    MemoryTypePreference,
 		Content: "Alice prefers idiomatic Go with table-driven tests",
+		Provenance: Provenance{
+			UserID: "user_alice",
+			ChatID: "chat_dm_1",
+		},
 	})
 	require.NoError(t, err)
 	assert.Equal(t, 2, ver2.Revision)
@@ -752,4 +756,337 @@ func TestStore_ListFilteringAndExpiry(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, cands, 1)
 	assert.Equal(t, verValid.ID, cands[0].VersionID)
+}
+
+func TestStore_ActorValidation_RejectsEmptyAndWhitespace(t *testing.T) {
+	ctx := context.Background()
+	store, rawDB := setupTestStore(t)
+	defer func() { _ = rawDB.Close() }()
+
+	// Propose memory with empty/whitespace actor
+	_, _, err := store.ProposeMemory(ctx, &KnowledgeItem{
+		ChatID: "chat_1",
+		UserID: "   ",
+	}, &MemoryVersion{
+		Type:    MemoryTypeFact,
+		Content: "Valid content",
+	})
+	assert.ErrorIs(t, err, ErrUnauthorized)
+
+	// Propose skill with empty actor
+	_, _, err = store.ProposeSkill(ctx, &KnowledgeItem{
+		ChatID: "chat_1",
+		UserID: "",
+	}, &SkillVersion{
+		Name:                 "skill_1",
+		InstructionsMarkdown: "# instructions",
+	})
+	assert.ErrorIs(t, err, ErrUnauthorized)
+
+	// Valid creation
+	memItem, memVer, err := store.ProposeMemory(ctx, &KnowledgeItem{
+		ChatID: "chat_1",
+		UserID: "user_valid",
+	}, &MemoryVersion{
+		Type:    MemoryTypeFact,
+		Content: "Valid content",
+	})
+	require.NoError(t, err)
+
+	// Approve with empty/whitespace actor
+	assert.ErrorIs(t, store.ApproveVersion(ctx, memVer.ID, ""), ErrUnauthorized)
+	assert.ErrorIs(t, store.ApproveVersion(ctx, memVer.ID, "   "), ErrUnauthorized)
+
+	// Reject with empty/whitespace actor
+	assert.ErrorIs(t, store.RejectVersion(ctx, memVer.ID, ""), ErrUnauthorized)
+
+	// Approve validly
+	require.NoError(t, store.ApproveVersion(ctx, memVer.ID, "user_valid"))
+
+	// Propose revision with empty actor in provenance
+	_, _, err = store.ProposeMemory(ctx, nil, &MemoryVersion{
+		ItemID:  memItem.ID,
+		Type:    MemoryTypeFact,
+		Content: "Revision without user",
+		Provenance: Provenance{
+			UserID: "  ",
+			ChatID: "chat_1",
+		},
+	})
+	assert.ErrorIs(t, err, ErrUnauthorized)
+
+	// Propose valid skill
+	skillItem, skillVer, err := store.ProposeSkill(ctx, &KnowledgeItem{
+		ChatID: "chat_1",
+		UserID: "user_valid",
+	}, &SkillVersion{
+		Name:                 "skill_1",
+		InstructionsMarkdown: "# instructions",
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ApproveVersion(ctx, skillVer.ID, "user_valid"))
+
+	// Disable with empty actor
+	assert.ErrorIs(t, store.DisableSkill(ctx, skillItem.ID, ""), ErrUnauthorized)
+	assert.ErrorIs(t, store.DisableSkill(ctx, skillItem.ID, "  "), ErrUnauthorized)
+
+	// Enable with empty actor
+	require.NoError(t, store.DisableSkill(ctx, skillItem.ID, "user_valid"))
+	assert.ErrorIs(t, store.EnableSkill(ctx, skillItem.ID, ""), ErrUnauthorized)
+
+	// Archive with empty actor
+	assert.ErrorIs(t, store.ArchiveSkill(ctx, skillItem.ID, " "), ErrUnauthorized)
+
+	// Forget with empty actor
+	assert.ErrorIs(t, store.ForgetItem(ctx, memItem.ID, ""), ErrUnauthorized)
+
+	// Delete with empty actor
+	assert.ErrorIs(t, store.DeleteSkill(ctx, skillItem.ID, "  "), ErrUnauthorized)
+}
+
+func TestStore_RejectionLifecycle(t *testing.T) {
+	ctx := context.Background()
+	store, rawDB := setupTestStore(t)
+	defer func() { _ = rawDB.Close() }()
+
+	// 1. Propose memory item -> reject sole proposal -> item status becomes 'rejected'
+	item1, ver1, err := store.ProposeMemory(ctx, &KnowledgeItem{
+		ChatID: "chat_rej",
+		UserID: "user_rej",
+	}, &MemoryVersion{
+		Type:    MemoryTypePreference,
+		Content: "Likes apples",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, ItemStatusPending, item1.Status)
+
+	require.NoError(t, store.RejectVersion(ctx, ver1.ID, "user_rej"))
+
+	item1After, err := store.GetItem(ctx, item1.ID)
+	require.NoError(t, err)
+	assert.Equal(t, ItemStatusRejected, item1After.Status, "rejecting sole proposed version must mark item as rejected")
+
+	// 2. Propose revision on rejected item (no active version) -> item transitions back to pending
+	_, ver1Rev2, err := store.ProposeMemory(ctx, nil, &MemoryVersion{
+		ItemID:  item1.ID,
+		Type:    MemoryTypePreference,
+		Content: "Likes green apples",
+		Provenance: Provenance{
+			UserID: "user_rej",
+			ChatID: "chat_rej",
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 2, ver1Rev2.Revision)
+
+	item1Reproposed, err := store.GetItem(ctx, item1.ID)
+	require.NoError(t, err)
+	assert.Equal(t, ItemStatusPending, item1Reproposed.Status, "proposing revision on rejected item must transition item back to pending")
+
+	// 3. Propose two revisions on pending item: rejecting one leaves item pending
+	_, ver1Rev3, err := store.ProposeMemory(ctx, nil, &MemoryVersion{
+		ItemID:  item1.ID,
+		Type:    MemoryTypePreference,
+		Content: "Likes honeycrisp apples",
+		Provenance: Provenance{
+			UserID: "user_rej",
+			ChatID: "chat_rej",
+		},
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, store.RejectVersion(ctx, ver1Rev2.ID, "user_rej"))
+	itemWithOneRemaining, err := store.GetItem(ctx, item1.ID)
+	require.NoError(t, err)
+	assert.Equal(t, ItemStatusPending, itemWithOneRemaining.Status, "item must remain pending while another proposal exists")
+
+	// Approve remaining proposal -> item becomes active
+	require.NoError(t, store.ApproveVersion(ctx, ver1Rev3.ID, "user_rej"))
+	itemActive, err := store.GetItem(ctx, item1.ID)
+	require.NoError(t, err)
+	assert.Equal(t, ItemStatusActive, itemActive.Status)
+
+	// 4. Propose revision to active item -> reject revision -> item remains active
+	_, ver1Rev4, err := store.ProposeMemory(ctx, nil, &MemoryVersion{
+		ItemID:  item1.ID,
+		Type:    MemoryTypePreference,
+		Content: "Dislikes sour apples",
+		Provenance: Provenance{
+			UserID: "user_rej",
+			ChatID: "chat_rej",
+		},
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, store.RejectVersion(ctx, ver1Rev4.ID, "user_rej"))
+	itemStillActive, err := store.GetItem(ctx, item1.ID)
+	require.NoError(t, err)
+	assert.Equal(t, ItemStatusActive, itemStillActive.Status, "rejecting revision of active item must not change active item status")
+	assert.Equal(t, ver1Rev3.ID, itemStillActive.ActiveVersionID)
+}
+
+func TestStore_ApproveGuards_AgainstArchivedOrForgotten(t *testing.T) {
+	ctx := context.Background()
+	store, rawDB := setupTestStore(t)
+	defer func() { _ = rawDB.Close() }()
+
+	skillItem, skillVer1, err := store.ProposeSkill(ctx, &KnowledgeItem{
+		ChatID: "chat_guard",
+		UserID: "user_guard",
+	}, &SkillVersion{
+		Name:                 "skill_guard",
+		InstructionsMarkdown: "# instructions",
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ApproveVersion(ctx, skillVer1.ID, "user_guard"))
+
+	// Propose revision 2
+	_, skillVer2, err := store.ProposeSkill(ctx, nil, &SkillVersion{
+		ItemID:               skillItem.ID,
+		Name:                 "skill_guard",
+		InstructionsMarkdown: "# updated instructions",
+		Provenance: Provenance{
+			UserID: "user_guard",
+			ChatID: "chat_guard",
+		},
+	})
+	require.NoError(t, err)
+
+	// Archive the skill while revision 2 is pending
+	require.NoError(t, store.ArchiveSkill(ctx, skillItem.ID, "user_guard"))
+
+	// Attempting to approve revision 2 must be rejected
+	err = store.ApproveVersion(ctx, skillVer2.ID, "user_guard")
+	assert.ErrorIs(t, err, ErrInvalidStatus, "cannot approve revision for archived skill")
+
+	// Verify skill item remains archived
+	itemAfter, err := store.GetItem(ctx, skillItem.ID)
+	require.NoError(t, err)
+	assert.Equal(t, ItemStatusArchived, itemAfter.Status)
+}
+
+func TestStore_AtomicIndexDeletionQueues(t *testing.T) {
+	ctx := context.Background()
+	store, rawDB := setupTestStore(t)
+	defer func() { _ = rawDB.Close() }()
+
+	// 1. Approve revision superseding previous active version
+	memItem, memVer1, err := store.ProposeMemory(ctx, &KnowledgeItem{
+		ChatID: "chat_del_queue",
+		UserID: "user_del_queue",
+	}, &MemoryVersion{
+		Type:    MemoryTypeFact,
+		Content: "Fact v1",
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ApproveVersion(ctx, memVer1.ID, "user_del_queue"))
+
+	// Propose and approve v2
+	_, memVer2, err := store.ProposeMemory(ctx, nil, &MemoryVersion{
+		ItemID:  memItem.ID,
+		Type:    MemoryTypeFact,
+		Content: "Fact v2",
+		Provenance: Provenance{
+			UserID: "user_del_queue",
+			ChatID: "chat_del_queue",
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ApproveVersion(ctx, memVer2.ID, "user_del_queue"))
+
+	// memVer1 must be atomically queued in pending_index_deletions
+	dels, err := store.GetPendingIndexDeletions(ctx, 50)
+	require.NoError(t, err)
+	require.Len(t, dels, 1)
+	assert.Equal(t, memVer1.ID, dels[0].VersionID)
+	assert.Equal(t, NamespaceMemories, dels[0].Namespace)
+
+	// Clean queue
+	require.NoError(t, store.RemovePendingIndexDeletion(ctx, memVer1.ID))
+
+	// 2. DisableSkill enqueues active version
+	skillItem, skillVer1, err := store.ProposeSkill(ctx, &KnowledgeItem{
+		ChatID: "chat_del_queue",
+		UserID: "user_del_queue",
+	}, &SkillVersion{
+		Name:                 "skill_del_test",
+		InstructionsMarkdown: "# instructions",
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ApproveVersion(ctx, skillVer1.ID, "user_del_queue"))
+
+	require.NoError(t, store.DisableSkill(ctx, skillItem.ID, "user_del_queue"))
+	dels, err = store.GetPendingIndexDeletions(ctx, 50)
+	require.NoError(t, err)
+	require.Len(t, dels, 1)
+	assert.Equal(t, skillVer1.ID, dels[0].VersionID)
+	assert.Equal(t, NamespaceSkills, dels[0].Namespace)
+
+	// 3. EnableSkill removes from pending_index_deletions and marks index_status pending
+	require.NoError(t, store.EnableSkill(ctx, skillItem.ID, "user_del_queue"))
+	dels, err = store.GetPendingIndexDeletions(ctx, 50)
+	require.NoError(t, err)
+	assert.Empty(t, dels, "EnableSkill must cancel pending index deletion")
+
+	sv, err := store.GetSkillVersion(ctx, skillVer1.ID)
+	require.NoError(t, err)
+	assert.Equal(t, IndexStatusPending, sv.IndexStatus, "EnableSkill must mark active version index_status as pending")
+
+	// 4. ArchiveSkill enqueues active version
+	require.NoError(t, store.ArchiveSkill(ctx, skillItem.ID, "user_del_queue"))
+	dels, err = store.GetPendingIndexDeletions(ctx, 50)
+	require.NoError(t, err)
+	require.Len(t, dels, 1)
+	assert.Equal(t, skillVer1.ID, dels[0].VersionID)
+
+	// Clean queue
+	require.NoError(t, store.RemovePendingIndexDeletion(ctx, skillVer1.ID))
+
+	// 5. ForgetItem enqueues all versions
+	require.NoError(t, store.ForgetItem(ctx, memItem.ID, "user_del_queue"))
+	dels, err = store.GetPendingIndexDeletions(ctx, 50)
+	require.NoError(t, err)
+	// memItem has memVer1 and memVer2
+	require.Len(t, dels, 2)
+}
+
+func TestStore_AtomicIndexDeletionQueues_RollbackOnQueueFailure(t *testing.T) {
+	ctx := context.Background()
+	store, rawDB := setupTestStore(t)
+	defer func() { _ = rawDB.Close() }()
+
+	skillItem, skillVer, err := store.ProposeSkill(ctx, &KnowledgeItem{
+		ChatID: "chat_rollback",
+		UserID: "user_rollback",
+	}, &SkillVersion{
+		Name:                 "skill_rb_test",
+		InstructionsMarkdown: "# instructions",
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ApproveVersion(ctx, skillVer.ID, "user_rollback"))
+
+	// Attach abort trigger on pending_index_deletions
+	_, err = rawDB.Exec(`
+		CREATE TRIGGER fail_pending_insert
+		BEFORE INSERT ON pending_index_deletions
+		BEGIN
+			SELECT RAISE(ABORT, 'forced pending index deletion failure');
+		END;
+	`)
+	require.NoError(t, err)
+
+	// Attempt DisableSkill: should fail due to trigger and rollback completely
+	err = store.DisableSkill(ctx, skillItem.ID, "user_rollback")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "forced pending index deletion failure")
+
+	// State must still be active
+	item, err := store.GetItem(ctx, skillItem.ID)
+	require.NoError(t, err)
+	assert.Equal(t, ItemStatusActive, item.Status, "DisableSkill state must be rolled back on queue error")
+
+	// Drop trigger and verify DisableSkill succeeds
+	_, err = rawDB.Exec("DROP TRIGGER fail_pending_insert")
+	require.NoError(t, err)
+	require.NoError(t, store.DisableSkill(ctx, skillItem.ID, "user_rollback"))
 }

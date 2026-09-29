@@ -33,7 +33,7 @@ func TestIsMentionedOrDM(t *testing.T) {
 	tests := []struct {
 		name          string
 		handle        string
-		chatID        string
+		isDM          bool
 		content       string
 		wantProcessed bool
 		wantPrompt    string
@@ -41,7 +41,7 @@ func TestIsMentionedOrDM(t *testing.T) {
 		{
 			name:          "Townhall direct mention @bot",
 			handle:        "@bot",
-			chatID:        "townhall",
+			isDM:          false,
 			content:       "Hello @bot, how are you?",
 			wantProcessed: true,
 			wantPrompt:    "Hello  how are you?",
@@ -49,7 +49,7 @@ func TestIsMentionedOrDM(t *testing.T) {
 		{
 			name:          "Townhall mention with colon",
 			handle:        "@assistant",
-			chatID:        "townhall",
+			isDM:          false,
 			content:       "@assistant: explain quantum physics",
 			wantProcessed: true,
 			wantPrompt:    "explain quantum physics",
@@ -57,15 +57,31 @@ func TestIsMentionedOrDM(t *testing.T) {
 		{
 			name:          "Townhall without mention",
 			handle:        "@bot",
-			chatID:        "townhall",
+			isDM:          false,
 			content:       "Hey everyone in townhall",
 			wantProcessed: false,
 			wantPrompt:    "",
 		},
 		{
+			name:          "Group chat without mention",
+			handle:        "@bot",
+			isDM:          false,
+			content:       "Hey everyone in the team channel",
+			wantProcessed: false,
+			wantPrompt:    "",
+		},
+		{
+			name:          "Group chat with mention",
+			handle:        "@bot",
+			isDM:          false,
+			content:       "@bot please help us debug this",
+			wantProcessed: true,
+			wantPrompt:    "please help us debug this",
+		},
+		{
 			name:          "DM chat without mention",
 			handle:        "@bot",
-			chatID:        "dm_user1_user2",
+			isDM:          true,
 			content:       "What is the weather?",
 			wantProcessed: true,
 			wantPrompt:    "What is the weather?",
@@ -73,7 +89,7 @@ func TestIsMentionedOrDM(t *testing.T) {
 		{
 			name:          "DM chat with mention",
 			handle:        "@bot",
-			chatID:        "dm_user1_user2",
+			isDM:          true,
 			content:       "@bot tell me a joke",
 			wantProcessed: true,
 			wantPrompt:    "tell me a joke",
@@ -82,7 +98,7 @@ func TestIsMentionedOrDM(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			processed, prompt := IsMentionedOrDM(tt.handle, tt.chatID, tt.content)
+			processed, prompt := IsMentionedOrDM(tt.handle, tt.isDM, tt.content)
 			assert.Equal(t, tt.wantProcessed, processed)
 			assert.Equal(t, tt.wantPrompt, prompt)
 		})
@@ -465,6 +481,17 @@ func TestProcessMessage_DMChat(t *testing.T) {
 
 	upgrader := websocket.Upgrader{}
 	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/chats" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.Chat{
+				{ID: "dm_user3_bot", Type: "dm", IsDM: true, TargetUserID: "user-3"},
+			})
+			return
+		}
+		if !websocket.IsWebSocketUpgrade(r) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		conn, err := upgrader.Upgrade(w, r, nil)
 		require.NoError(t, err)
 		defer func() { _ = conn.Close() }()
@@ -597,6 +624,13 @@ func TestProcessMessage_OnDemandBackfill(t *testing.T) {
 
 	upgrader := websocket.Upgrader{}
 	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/chats" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.Chat{
+				{ID: "dm_user_bot", Type: "dm", IsDM: true, TargetUserID: "user-1"},
+			})
+			return
+		}
 		if r.URL.Path == "/api/chats/dm_user_bot/messages" {
 			assert.Equal(t, "1", r.URL.Query().Get("fromSeq"))
 			assert.Equal(t, "12", r.URL.Query().Get("toSeq"))
@@ -607,6 +641,10 @@ func TestProcessMessage_OnDemandBackfill(t *testing.T) {
 			return
 		}
 
+		if !websocket.IsWebSocketUpgrade(r) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		conn, err := upgrader.Upgrade(w, r, nil)
 		require.NoError(t, err)
 		defer func() { _ = conn.Close() }()
@@ -1352,6 +1390,12 @@ func TestProcessMessage_TextAndBinaryAttachments(t *testing.T) {
 			_ = json.NewEncoder(w).Encode([]models.User{{ID: "u1", DisplayName: "Alice"}})
 			return
 		}
+		if r.URL.Path == "/api/chats" {
+			_ = json.NewEncoder(w).Encode([]models.Chat{
+				{ID: "dm_user1", Type: "dm", IsDM: true, TargetUserID: "u1"},
+			})
+			return
+		}
 		if r.URL.Path == "/api/chat" {
 			upgrader := websocket.Upgrader{}
 			c, err := upgrader.Upgrade(w, r, nil)
@@ -1687,7 +1731,6 @@ func TestGateway_AttachmentRAGDiscoverability(t *testing.T) {
 	assert.Contains(t, hits[0].Content, "[Attachment: financial_chart.png (id: rag-img, type: image/png)]")
 	assert.Contains(t, hits[0].Content, "[Attachment: archive.tar.gz (id: rag-bin, type: application/gzip)]")
 }
-
 
 func TestGateway_StartupSequenceCatchup(t *testing.T) {
 	tempDir := t.TempDir()
@@ -2113,7 +2156,10 @@ func TestGateway_SandboxSlashCommands(t *testing.T) {
 		}
 		if r.URL.Path == "/api/chats" {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode([]models.Chat{{ID: "townhall", Type: "townhall"}})
+			_ = json.NewEncoder(w).Encode([]models.Chat{
+				{ID: "townhall", Type: "townhall"},
+				{ID: "dm_user1", Type: "dm", IsDM: true, TargetUserID: "user1"},
+			})
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/api/chats/") && strings.HasSuffix(r.URL.Path, "/messages") {
@@ -2386,7 +2432,10 @@ func TestGateway_SandboxApproveAutoResumesTask(t *testing.T) {
 		}
 		if r.URL.Path == "/api/chats" {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode([]models.Chat{{ID: "townhall", Type: "townhall"}})
+			_ = json.NewEncoder(w).Encode([]models.Chat{
+				{ID: "townhall", Type: "townhall"},
+				{ID: "dm_user1", Type: "dm", IsDM: true, TargetUserID: "user1"},
+			})
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/api/chats/") && strings.HasSuffix(r.URL.Path, "/messages") {
@@ -2527,7 +2576,10 @@ func TestGateway_SandboxApproveGeminiResumption_NoTrailingAssistant(t *testing.T
 		}
 		if r.URL.Path == "/api/chats" {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode([]models.Chat{{ID: "townhall", Type: "townhall"}})
+			_ = json.NewEncoder(w).Encode([]models.Chat{
+				{ID: "townhall", Type: "townhall"},
+				{ID: "dm_user1", Type: "dm", IsDM: true, TargetUserID: "user1"},
+			})
 			return
 		}
 		if r.URL.Path == "/api/chat" {
@@ -2678,7 +2730,10 @@ func TestGateway_SandboxRequestSuppressesRedundantReply(t *testing.T) {
 		}
 		if r.URL.Path == "/api/chats" {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode([]models.Chat{{ID: "townhall", Type: "townhall"}})
+			_ = json.NewEncoder(w).Encode([]models.Chat{
+				{ID: "townhall", Type: "townhall"},
+				{ID: "dm_user1", Type: "dm", IsDM: true, TargetUserID: "user1"},
+			})
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/api/chats/") && strings.HasSuffix(r.URL.Path, "/messages") {

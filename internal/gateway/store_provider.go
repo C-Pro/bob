@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"bob/internal/fsm"
 	"bob/internal/knowledge"
@@ -17,15 +18,27 @@ import (
 	"bob/internal/scheduler"
 )
 
+type storeEntry struct {
+	mu     sync.Mutex
+	store  *fsm.Store
+	sStore *scheduler.Store
+}
+
+type knowledgeEntry struct {
+	chatID        string
+	initMu        sync.Mutex
+	reconcileGate chan struct{}
+	store         *knowledge.Store
+	indexer       *knowledge.Indexer
+}
+
 // MemoryStoreProvider implements fsm.StoreProvider backed by memory.Manager and per-chat SQLite databases.
 type MemoryStoreProvider struct {
-	memMgr          *memory.Manager
-	dataDir         string
-	mu              sync.RWMutex
-	stores          map[string]*fsm.Store
-	schedStores     map[string]*scheduler.Store
-	knowledgeStores   map[string]*knowledge.Store
-	indexers          map[string]*knowledge.Indexer
+	memMgr            *memory.Manager
+	dataDir           string
+	mu                sync.RWMutex
+	storeEntries      map[string]*storeEntry
+	knowledgeEntries  map[string]*knowledgeEntry
 	maxDiscoveryLimit int
 	initOnce          sync.Once
 }
@@ -35,10 +48,8 @@ func NewMemoryStoreProvider(memMgr *memory.Manager, dataDir string) *MemoryStore
 	return &MemoryStoreProvider{
 		memMgr:            memMgr,
 		dataDir:           dataDir,
-		stores:            make(map[string]*fsm.Store),
-		schedStores:       make(map[string]*scheduler.Store),
-		knowledgeStores:   make(map[string]*knowledge.Store),
-		indexers:          make(map[string]*knowledge.Indexer),
+		storeEntries:      make(map[string]*storeEntry),
+		knowledgeEntries:  make(map[string]*knowledgeEntry),
 		maxDiscoveryLimit: 10,
 	}
 }
@@ -62,26 +73,45 @@ func (p *MemoryStoreProvider) storeKey(chatID string, isDM bool) string {
 	return "dm_" + memory.SanitizeChatID(chatID)
 }
 
+func (p *MemoryStoreProvider) getOrCreateStoreEntry(chatID string, isDM bool) *storeEntry {
+	key := p.storeKey(chatID, isDM)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	entry, ok := p.storeEntries[key]
+	if !ok {
+		entry = &storeEntry{}
+		p.storeEntries[key] = entry
+	}
+	return entry
+}
+
+func (p *MemoryStoreProvider) getOrCreateKnowledgeEntry(chatID string, isDM bool) *knowledgeEntry {
+	key := p.storeKey(chatID, isDM)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	entry, ok := p.knowledgeEntries[key]
+	if !ok {
+		entry = &knowledgeEntry{
+			chatID:        chatID,
+			reconcileGate: make(chan struct{}, 1),
+		}
+		p.knowledgeEntries[key] = entry
+	}
+	return entry
+}
+
 // GetStore retrieves or initializes the durable FSM store for the given chat context.
 func (p *MemoryStoreProvider) GetStore(ctx context.Context, chatID string, isDM bool) (*fsm.Store, error) {
 	if p.memMgr == nil {
 		return nil, fmt.Errorf("memory manager is nil")
 	}
 
-	key := p.storeKey(chatID, isDM)
+	entry := p.getOrCreateStoreEntry(chatID, isDM)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
 
-	p.mu.RLock()
-	st, ok := p.stores[key]
-	p.mu.RUnlock()
-	if ok {
-		return st, nil
-	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if st, ok = p.stores[key]; ok {
-		return st, nil
+	if entry.store != nil {
+		return entry.store, nil
 	}
 
 	cortexDB, err := p.memMgr.GetDB(ctx, chatID, isDM)
@@ -102,9 +132,8 @@ func (p *MemoryStoreProvider) GetStore(ctx context.Context, chatID string, isDM 
 		}
 	}
 
-	st = fsm.NewStore(rawDB)
-	p.stores[key] = st
-	return st, nil
+	entry.store = fsm.NewStore(rawDB)
+	return entry.store, nil
 }
 
 // GetSchedulerStore retrieves or initializes the isolated scheduler store for the given chat context.
@@ -113,20 +142,12 @@ func (p *MemoryStoreProvider) GetSchedulerStore(ctx context.Context, chatID stri
 		return nil, fmt.Errorf("memory manager is nil")
 	}
 
-	key := p.storeKey(chatID, isDM)
+	entry := p.getOrCreateStoreEntry(chatID, isDM)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
 
-	p.mu.RLock()
-	st, ok := p.schedStores[key]
-	p.mu.RUnlock()
-	if ok {
-		return st, nil
-	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if st, ok = p.schedStores[key]; ok {
-		return st, nil
+	if entry.sStore != nil {
+		return entry.sStore, nil
 	}
 
 	cortexDB, err := p.memMgr.GetDB(ctx, chatID, isDM)
@@ -139,9 +160,8 @@ func (p *MemoryStoreProvider) GetSchedulerStore(ctx context.Context, chatID stri
 		return nil, fmt.Errorf("failed to ensure scheduler schema for chat %s: %w", chatID, err)
 	}
 
-	st = scheduler.NewStore(rawDB)
-	p.schedStores[key] = st
-	return st, nil
+	entry.sStore = scheduler.NewStore(rawDB)
+	return entry.sStore, nil
 }
 
 // GetKnowledgeStore retrieves or initializes the isolated knowledge store for the given chat context.
@@ -153,25 +173,12 @@ func (p *MemoryStoreProvider) GetKnowledgeStore(ctx context.Context, chatID stri
 		return nil, fmt.Errorf("memory manager is nil")
 	}
 
-	key := p.storeKey(chatID, isDM)
+	entry := p.getOrCreateKnowledgeEntry(chatID, isDM)
+	entry.initMu.Lock()
+	defer entry.initMu.Unlock()
 
-	p.mu.RLock()
-	st, ok := p.knowledgeStores[key]
-	p.mu.RUnlock()
-	if ok {
-		return st, nil
-	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	return p.getKnowledgeStoreLocked(ctx, chatID, isDM)
-}
-
-func (p *MemoryStoreProvider) getKnowledgeStoreLocked(ctx context.Context, chatID string, isDM bool) (*knowledge.Store, error) {
-	key := p.storeKey(chatID, isDM)
-	if st, ok := p.knowledgeStores[key]; ok {
-		return st, nil
+	if entry.store != nil {
+		return entry.store, nil
 	}
 
 	cortexDB, err := p.memMgr.GetDB(ctx, chatID, isDM)
@@ -184,9 +191,8 @@ func (p *MemoryStoreProvider) getKnowledgeStoreLocked(ctx context.Context, chatI
 		return nil, fmt.Errorf("failed to ensure knowledge schema for chat %s: %w", chatID, err)
 	}
 
-	st := knowledge.NewStore(rawDB)
-	p.knowledgeStores[key] = st
-	return st, nil
+	entry.store = knowledge.NewStore(rawDB)
+	return entry.store, nil
 }
 
 // GetKnowledgeIndexer retrieves or initializes the knowledge indexer for the given chat context.
@@ -198,25 +204,12 @@ func (p *MemoryStoreProvider) GetKnowledgeIndexer(ctx context.Context, chatID st
 		return nil, fmt.Errorf("memory manager is nil")
 	}
 
-	key := p.storeKey(chatID, isDM)
+	entry := p.getOrCreateKnowledgeEntry(chatID, isDM)
+	entry.initMu.Lock()
+	defer entry.initMu.Unlock()
 
-	p.mu.RLock()
-	idx, ok := p.indexers[key]
-	p.mu.RUnlock()
-	if ok {
-		return idx, nil
-	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if idx, ok = p.indexers[key]; ok {
-		return idx, nil
-	}
-
-	kStore, err := p.getKnowledgeStoreLocked(ctx, chatID, isDM)
-	if err != nil {
-		return nil, err
+	if entry.indexer != nil {
+		return entry.indexer, nil
 	}
 
 	cortexDB, err := p.memMgr.GetDB(ctx, chatID, isDM)
@@ -224,12 +217,39 @@ func (p *MemoryStoreProvider) GetKnowledgeIndexer(ctx context.Context, chatID st
 		return nil, fmt.Errorf("failed to get database for chat %s: %w", chatID, err)
 	}
 
-	idx = knowledge.NewIndexer(kStore, cortexDB)
-	if _, recErr := idx.ReconcilePending(ctx, 100); recErr != nil {
-		slog.Error("failed to reconcile pending knowledge index records", "chat_id", chatID, "error", recErr)
+	if entry.store == nil {
+		rawDB := cortexDB.SQL()
+		if err := knowledge.EnsureKnowledgeSchema(ctx, rawDB); err != nil {
+			return nil, fmt.Errorf("failed to ensure knowledge schema for chat %s: %w", chatID, err)
+		}
+		entry.store = knowledge.NewStore(rawDB)
 	}
-	p.indexers[key] = idx
-	return idx, nil
+
+	entry.indexer = knowledge.NewIndexer(entry.store, cortexDB)
+	return entry.indexer, nil
+}
+
+// ReconcileChat serializes reconciliation per chat, ensuring search-triggered, background,
+// and startup passes for the same chat do not overlap while allowing different chats to proceed concurrently.
+func (p *MemoryStoreProvider) ReconcileChat(ctx context.Context, chatID string, isDM bool, limit int) (int, error) {
+	if !isDM || chatID == "townhall" {
+		return 0, nil
+	}
+
+	entry := p.getOrCreateKnowledgeEntry(chatID, isDM)
+	select {
+	case entry.reconcileGate <- struct{}{}:
+		defer func() { <-entry.reconcileGate }()
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+
+	idx, err := p.GetKnowledgeIndexer(ctx, chatID, isDM)
+	if err != nil {
+		return 0, err
+	}
+
+	return idx.ReconcilePending(ctx, limit)
 }
 
 // GetKnowledgeSearcher resolves a knowledge.Searcher for a chat context and user.
@@ -241,11 +261,9 @@ func (p *MemoryStoreProvider) GetKnowledgeSearcher(ctx context.Context, chatID s
 		return nil, fmt.Errorf("memory manager is nil")
 	}
 
-	// Trigger bounded index reconciliation so approved versions created after restart are discoverable immediately.
-	if idx, err := p.GetKnowledgeIndexer(ctx, chatID, isDM); err == nil && idx != nil {
-		if _, recErr := idx.ReconcilePending(ctx, 100); recErr != nil {
-			slog.Warn("failed to reconcile pending knowledge index records before search", "chat_id", chatID, "error", recErr)
-		}
+	// Trigger bounded index reconciliation serialized per chat via ReconcileChat
+	if _, recErr := p.ReconcileChat(ctx, chatID, isDM, 100); recErr != nil {
+		slog.Warn("failed to reconcile pending knowledge index records before search", "chat_id", chatID, "error", recErr)
 	}
 
 	kStore, err := p.GetKnowledgeStore(ctx, chatID, isDM)
@@ -349,6 +367,81 @@ func hasActiveSchedules(dbPath string) (bool, error) {
 	return true, nil
 }
 
+func hasPendingKnowledgeWork(dbPath string) (bool, error) {
+	fi, err := os.Stat(dbPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if fi.Size() == 0 {
+		return false, nil
+	}
+
+	dsn := fmt.Sprintf("file:%s?mode=ro", dbPath)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = db.Close() }()
+
+	var tableExists int
+	err = db.QueryRow("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pending_index_deletions'").Scan(&tableExists)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	// 1. Pending index deletions
+	var hasDeletions int
+	err = db.QueryRow("SELECT 1 FROM pending_index_deletions LIMIT 1").Scan(&hasDeletions)
+	if err == nil {
+		return true, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+
+	// 2. Unindexed active approved memories (excluding already expired memories)
+	var hasMemories int
+	err = db.QueryRow(`
+		SELECT 1 FROM memory_versions mv
+		JOIN knowledge_items ki ON ki.id = mv.item_id
+		WHERE ki.status = 'active'
+		  AND ki.active_version_id = mv.id
+		  AND mv.status = 'approved'
+		  AND mv.index_status IN ('pending', 'error')
+		  AND (mv.expires_at IS NULL OR mv.expires_at > ?)
+		LIMIT 1
+	`, time.Now().Unix()).Scan(&hasMemories)
+	if err == nil {
+		return true, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+
+	// 3. Unindexed active approved skills
+	var hasSkills int
+	err = db.QueryRow(`
+		SELECT 1 FROM skill_versions sv
+		JOIN knowledge_items ki ON ki.id = sv.item_id
+		WHERE ki.status = 'active'
+		  AND ki.active_version_id = sv.id
+		  AND sv.status = 'approved'
+		  AND sv.index_status IN ('pending', 'error')
+		LIMIT 1
+	`).Scan(&hasSkills)
+	if err == nil {
+		return true, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+
+	return false, nil
+}
+
 func (p *MemoryStoreProvider) discoverStore(ctx context.Context, filePath, chatID string, isDM bool) {
 	hasFSM, err := hasActiveRuns(filePath)
 	if err != nil {
@@ -369,6 +462,19 @@ func (p *MemoryStoreProvider) discoverStore(ctx context.Context, filePath, chatI
 	if hasSchedules {
 		if _, err := p.GetSchedulerStore(ctx, chatID, isDM); err != nil {
 			slog.Warn("failed to open chat database for scheduler recovery", "path", filePath, "error", err)
+		}
+	}
+
+	if isDM && chatID != "townhall" {
+		hasWork, err := hasPendingKnowledgeWork(filePath)
+		if err != nil {
+			slog.Warn("failed to inspect chat database for pending knowledge work; opening for safety", "path", filePath, "error", err)
+			hasWork = true
+		}
+		if hasWork {
+			if _, err := p.GetKnowledgeIndexer(ctx, chatID, isDM); err != nil {
+				slog.Warn("failed to open chat database for knowledge indexer recovery", "path", filePath, "error", err)
+			}
 		}
 	}
 }
@@ -402,6 +508,61 @@ func (p *MemoryStoreProvider) discoverStores(ctx context.Context) {
 	}
 }
 
+// DiscoverKnowledgeTargets returns all DM chat IDs that currently have active knowledge indexers
+// or unopened databases with pending index deletions or unindexed active versions.
+func (p *MemoryStoreProvider) DiscoverKnowledgeTargets(ctx context.Context) []string {
+	if p == nil {
+		return nil
+	}
+
+	p.mu.RLock()
+	knownTargets := make(map[string]struct{}, len(p.knowledgeEntries))
+	for _, entry := range p.knowledgeEntries {
+		if entry.chatID != "" && entry.chatID != "townhall" {
+			knownTargets[entry.chatID] = struct{}{}
+		}
+	}
+	dataDir := p.dataDir
+	p.mu.RUnlock()
+
+	if dataDir != "" {
+		entries, err := os.ReadDir(dataDir)
+		if err == nil {
+			for _, entry := range entries {
+				if entry.IsDir() {
+					continue
+				}
+				name := entry.Name()
+				if strings.HasPrefix(name, "dm_") && strings.HasSuffix(name, ".db") {
+					rawChatID := strings.TrimSuffix(strings.TrimPrefix(name, "dm_"), ".db")
+					if rawChatID == "" {
+						continue
+					}
+					if _, alreadyKnown := knownTargets[rawChatID]; !alreadyKnown {
+						filePath := filepath.Join(dataDir, name)
+						hasWork, checkErr := hasPendingKnowledgeWork(filePath)
+						if checkErr != nil {
+							slog.Warn("failed to check pending knowledge work on dm db; targeting for safety", "path", filePath, "error", checkErr)
+							hasWork = true
+						}
+						if hasWork {
+							if _, openErr := p.GetKnowledgeIndexer(ctx, rawChatID, true); openErr == nil {
+								knownTargets[rawChatID] = struct{}{}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	targets := make([]string, 0, len(knownTargets))
+	for cid := range knownTargets {
+		targets = append(targets, cid)
+	}
+	return targets
+}
+
 // ActiveStores discovers and returns durable FSM stores for all existing or active chat databases.
 func (p *MemoryStoreProvider) ActiveStores(ctx context.Context) ([]*fsm.Store, error) {
 	if p.memMgr == nil {
@@ -413,11 +574,20 @@ func (p *MemoryStoreProvider) ActiveStores(ctx context.Context) ([]*fsm.Store, e
 	})
 
 	p.mu.RLock()
-	defer p.mu.RUnlock()
+	entries := make([]*storeEntry, 0, len(p.storeEntries))
+	for _, entry := range p.storeEntries {
+		entries = append(entries, entry)
+	}
+	p.mu.RUnlock()
 
-	stores := make([]*fsm.Store, 0, len(p.stores))
-	for _, st := range p.stores {
-		stores = append(stores, st)
+	stores := make([]*fsm.Store, 0, len(entries))
+	for _, entry := range entries {
+		entry.mu.Lock()
+		st := entry.store
+		entry.mu.Unlock()
+		if st != nil {
+			stores = append(stores, st)
+		}
 	}
 
 	return stores, nil
@@ -434,11 +604,20 @@ func (p *MemoryStoreProvider) ActiveSchedulerStores(ctx context.Context) ([]*sch
 	})
 
 	p.mu.RLock()
-	defer p.mu.RUnlock()
+	entries := make([]*storeEntry, 0, len(p.storeEntries))
+	for _, entry := range p.storeEntries {
+		entries = append(entries, entry)
+	}
+	p.mu.RUnlock()
 
-	stores := make([]*scheduler.Store, 0, len(p.schedStores))
-	for _, st := range p.schedStores {
-		stores = append(stores, st)
+	stores := make([]*scheduler.Store, 0, len(entries))
+	for _, entry := range entries {
+		entry.mu.Lock()
+		st := entry.sStore
+		entry.mu.Unlock()
+		if st != nil {
+			stores = append(stores, st)
+		}
 	}
 
 	return stores, nil
