@@ -134,7 +134,7 @@ func (rb *RingBuffer) ToLLMMessages() []openai.ChatCompletionMessage {
 			content = e.Content
 		}
 
-		if len(e.Images) > 0 {
+		if len(e.Images) > 0 && role == openai.ChatMessageRoleUser {
 			parts := make([]openai.ChatMessagePart, 0, 1+len(e.Images))
 			if content != "" {
 				parts = append(parts, openai.ChatMessagePart{

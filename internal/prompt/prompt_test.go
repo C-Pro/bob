@@ -48,6 +48,13 @@ func TestRenderDMPrompt(t *testing.T) {
 	assert.Contains(t, prompt, "Alice Wonder")
 	assert.Contains(t, prompt, "maximum 5 paragraphs")
 	assert.Contains(t, prompt, "direct message conversation")
+	assert.Contains(t, prompt, "discover_memories")
+	assert.Contains(t, prompt, "load_memory")
+	assert.Contains(t, prompt, "discover_skills")
+	assert.Contains(t, prompt, "load_skill")
+	assert.Contains(t, prompt, "propose_memory")
+	assert.Contains(t, prompt, "propose_skill")
+	assert.Contains(t, prompt, "explicit user request")
 
 	// Fallback user display name should fall back to username or "the user", never expose raw UUID user-99
 	userWithUsername := models.User{ID: "user-99", UserName: "alice99"}

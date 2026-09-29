@@ -8,9 +8,9 @@ import (
 
 const (
 	// SchemaVersion is the current schema version for FSM tables.
-	SchemaVersion = 1
+	SchemaVersion = 2
 	// SchemaDescription describes the current FSM schema.
-	SchemaDescription = "initial fsm schema"
+	SchemaDescription = "add source_message_seq to fsm_runs"
 )
 
 // EnsureDBSchema ensures that the namespaced FSM tables and version markers
@@ -61,6 +61,7 @@ func EnsureDBSchema(ctx context.Context, db *sql.DB) error {
 			error_text TEXT,
 			resume_at INTEGER,
 			version INTEGER NOT NULL DEFAULT 0,
+			source_message_seq INTEGER,
 			created_at INTEGER NOT NULL,
 			updated_at INTEGER NOT NULL
 		);
@@ -105,12 +106,19 @@ func EnsureDBSchema(ctx context.Context, db *sql.DB) error {
 	}
 
 	// Record version in fsm_schema_version
-	_, err = db.ExecContext(ctx, `
-		INSERT OR IGNORE INTO fsm_schema_version (version, description, applied_at)
-		VALUES (?, ?, strftime('%s', 'now'));
-	`, SchemaVersion, SchemaDescription)
+	var currentVersion int
+	err = db.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM fsm_schema_version").Scan(&currentVersion)
 	if err != nil {
-		return fmt.Errorf("failed to record fsm schema version: %w", err)
+		return fmt.Errorf("failed to check fsm schema version: %w", err)
+	}
+	if currentVersion < SchemaVersion {
+		_, err = db.ExecContext(ctx, `
+			INSERT OR REPLACE INTO fsm_schema_version (version, description, applied_at)
+			VALUES (?, ?, strftime('%s', 'now'));
+		`, SchemaVersion, SchemaDescription)
+		if err != nil {
+			return fmt.Errorf("failed to record fsm schema version: %w", err)
+		}
 	}
 
 	return nil
@@ -132,13 +140,14 @@ func GetSchemaVersion(ctx context.Context, db *sql.DB) (int, error) {
 func ensureFSMColumns(ctx context.Context, db *sql.DB) error {
 	rows, err := db.QueryContext(ctx, "PRAGMA table_info(fsm_runs)")
 	if err != nil {
-		return nil
+		return fmt.Errorf("failed to query table info for fsm_runs: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
 	hasIsDM := false
 	hasWaitCycles := false
 	hasVersion := false
+	hasSourceMessageSeq := false
 	for rows.Next() {
 		var cid int
 		var name, colType string
@@ -154,7 +163,13 @@ func ensureFSMColumns(ctx context.Context, db *sql.DB) error {
 			if name == "version" {
 				hasVersion = true
 			}
+			if name == "source_message_seq" {
+				hasSourceMessageSeq = true
+			}
 		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed scanning table info for fsm_runs: %w", err)
 	}
 	if !hasIsDM {
 		if _, err := db.ExecContext(ctx, "ALTER TABLE fsm_runs ADD COLUMN is_dm INTEGER NOT NULL DEFAULT 0"); err != nil {
@@ -169,6 +184,11 @@ func ensureFSMColumns(ctx context.Context, db *sql.DB) error {
 	if !hasVersion {
 		if _, err := db.ExecContext(ctx, "ALTER TABLE fsm_runs ADD COLUMN version INTEGER NOT NULL DEFAULT 0"); err != nil {
 			return fmt.Errorf("failed to add version column to fsm_runs: %w", err)
+		}
+	}
+	if !hasSourceMessageSeq {
+		if _, err := db.ExecContext(ctx, "ALTER TABLE fsm_runs ADD COLUMN source_message_seq INTEGER"); err != nil {
+			return fmt.Errorf("failed to add source_message_seq column to fsm_runs: %w", err)
 		}
 	}
 	return nil

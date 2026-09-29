@@ -62,7 +62,11 @@ type Gateway struct {
 	recentProgress       sync.Map
 	schedulerEngine      *scheduler.Engine
 	schedulerInvoker     *ScheduleInvoker
+	knowledgeWorker      *KnowledgeWorker
+	lifecycleCtx         context.Context
+	lifecycleID          uint64
 	chatLocker           *ChatLocker
+	chatCache            *ChatCache
 }
 
 // NewGateway creates a new Besedka Gateway instance.
@@ -106,12 +110,23 @@ func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 	storeProvider := NewMemoryStoreProvider(memoryManager, cfg.DataDir)
 	toolsRegistry := tools.NewRegistry(tavilyClient, memoryManager, sandboxManager)
 	toolsRegistry.SetSchedulerStoreProvider(storeProvider)
+	toolsRegistry.SetKnowledgeStoreProvider(storeProvider)
+	toolsRegistry.SetKnowledgeSearcherProvider(storeProvider)
 	toolsRegistry.SetSchedulerLimits(
 		cfg.SchedulerMinRunTimeout,
 		cfg.SchedulerMaxRunTimeout,
 		cfg.SchedulerMinMaxTurns,
 		cfg.SchedulerMaxMaxTurns,
 	)
+
+	var kw *KnowledgeWorker
+	if storeProvider != nil {
+		workerCfg := DefaultKnowledgeWorkerConfig()
+		if cfg.KnowledgeReconcileInterval > 0 {
+			workerCfg.Interval = cfg.KnowledgeReconcileInterval
+		}
+		kw = NewKnowledgeWorker(storeProvider, workerCfg)
+	}
 
 	chatLocker := NewChatLocker()
 	gw := &Gateway{
@@ -122,26 +137,40 @@ func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 		memoryManager:        memoryManager,
 		sandboxManager:       sandboxManager,
 		storeProvider:        storeProvider,
+		knowledgeWorker:      kw,
 		userCache:            NewUserCache(),
 		contextManager:       chatcontext.NewManager(cfg.MsgRingBufferSize),
 		startTime:            time.Now(),
 		locationInterval:     9 * time.Minute,
 		initialLocationDelay: 1 * time.Second,
 		chatLocker:           chatLocker,
+		chatCache:            NewChatCache(),
 	}
 
 	toolsRegistry.SetAttachmentClient(gw)
 	toolsRegistry.SetMaxAttachmentSize(cfg.MaxAttachmentSizeBytes)
+	toolsRegistry.SetDMAuthorizer(gw.VerifyDMOwner)
+	if storeProvider != nil {
+		storeProvider.SetMaxDiscoveryLimit(cfg.KnowledgeMaxDiscoveryLimit)
+		toolsRegistry.SetKnowledgeStoreProvider(storeProvider)
+		toolsRegistry.SetKnowledgeSearcherProvider(storeProvider)
+	}
+	toolsRegistry.SetKnowledgeLimits(tools.KnowledgeBudgetLimits{
+		MaxLoadedMemories:    cfg.KnowledgeMaxLoadedMemories,
+		MaxLoadedMemoryBytes: cfg.KnowledgeMaxLoadedMemoryBytes,
+		MaxLoadedSkills:      cfg.KnowledgeMaxLoadedSkills,
+		MaxLoadedSkillBytes:  cfg.KnowledgeMaxLoadedSkillBytes,
+	}, cfg.KnowledgeDefaultDiscoveryLimit, cfg.KnowledgeMaxDiscoveryLimit)
 
 	invokerCfg := InvokerConfig{
-		Tools:      toolsRegistry,
-		Sandbox:    sandboxManager,
+		Tools:               toolsRegistry,
+		Sandbox:             sandboxManager,
 		Sender:              gw,
 		AttachmentProcessor: gw,
 		ContextMgr:          gw.contextManager,
-		Model:      cfg.OpenAIModel,
-		BotID:      "bot",
-		BotName:    "Bob",
+		Model:               cfg.OpenAIModel,
+		BotID:               "bot",
+		BotName:             "Bob",
 		SchedulerStoreProv: func(ctx context.Context, chatID string, isDM bool) (*scheduler.Store, error) {
 			if gw.storeProvider != nil {
 				return gw.storeProvider.GetSchedulerStore(ctx, chatID, isDM)
@@ -169,10 +198,37 @@ func (g *Gateway) MemoryManager() *memory.Manager {
 // SetMemoryManager sets the memory Manager for the gateway.
 func (g *Gateway) SetMemoryManager(m *memory.Manager) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
+	oldKW := g.knowledgeWorker
 	g.memoryManager = m
+	var newKW *KnowledgeWorker
 	if g.cfg != nil {
 		g.storeProvider = NewMemoryStoreProvider(m, g.cfg.DataDir)
+		g.storeProvider.SetMaxDiscoveryLimit(g.cfg.KnowledgeMaxDiscoveryLimit)
+		if g.toolsRegistry != nil {
+			g.toolsRegistry.SetKnowledgeStoreProvider(g.storeProvider)
+			g.toolsRegistry.SetKnowledgeSearcherProvider(g.storeProvider)
+		}
+		workerCfg := DefaultKnowledgeWorkerConfig()
+		if g.cfg.KnowledgeReconcileInterval > 0 {
+			workerCfg.Interval = g.cfg.KnowledgeReconcileInterval
+		}
+		newKW = NewKnowledgeWorker(g.storeProvider, workerCfg)
+	} else {
+		g.storeProvider = nil
+	}
+	g.knowledgeWorker = newKW
+	g.mu.Unlock()
+
+	if oldKW != nil {
+		oldKW.Stop()
+	}
+
+	if newKW != nil {
+		g.mu.Lock()
+		if g.running && g.knowledgeWorker == newKW && g.lifecycleCtx != nil && g.lifecycleCtx.Err() == nil {
+			newKW.Start(g.lifecycleCtx)
+		}
+		g.mu.Unlock()
 	}
 }
 
@@ -186,10 +242,39 @@ func (g *Gateway) StoreProvider() *MemoryStoreProvider {
 // SetStoreProvider sets the MemoryStoreProvider for the gateway.
 func (g *Gateway) SetStoreProvider(p *MemoryStoreProvider) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
+	oldKW := g.knowledgeWorker
 	g.storeProvider = p
+	if g.cfg != nil && p != nil {
+		p.SetMaxDiscoveryLimit(g.cfg.KnowledgeMaxDiscoveryLimit)
+	}
 	if g.schedulerEngine != nil && p != nil {
 		g.schedulerEngine = scheduler.NewEngine(p, g.schedulerInvoker)
+	}
+	if g.toolsRegistry != nil && p != nil {
+		g.toolsRegistry.SetKnowledgeStoreProvider(p)
+		g.toolsRegistry.SetKnowledgeSearcherProvider(p)
+	}
+	var newKW *KnowledgeWorker
+	if p != nil && g.cfg != nil {
+		workerCfg := DefaultKnowledgeWorkerConfig()
+		if g.cfg.KnowledgeReconcileInterval > 0 {
+			workerCfg.Interval = g.cfg.KnowledgeReconcileInterval
+		}
+		newKW = NewKnowledgeWorker(p, workerCfg)
+	}
+	g.knowledgeWorker = newKW
+	g.mu.Unlock()
+
+	if oldKW != nil {
+		oldKW.Stop()
+	}
+
+	if newKW != nil {
+		g.mu.Lock()
+		if g.running && g.knowledgeWorker == newKW && g.lifecycleCtx != nil && g.lifecycleCtx.Err() == nil {
+			newKW.Start(g.lifecycleCtx)
+		}
+		g.mu.Unlock()
 	}
 }
 
@@ -207,8 +292,19 @@ func (g *Gateway) SetToolsRegistry(r *tools.Registry) {
 	g.toolsRegistry = r
 	if r != nil {
 		r.SetAttachmentClient(g)
+		r.SetDMAuthorizer(g.VerifyDMOwner)
 		if g.cfg != nil {
 			r.SetMaxAttachmentSize(g.cfg.MaxAttachmentSizeBytes)
+			r.SetKnowledgeLimits(tools.KnowledgeBudgetLimits{
+				MaxLoadedMemories:    g.cfg.KnowledgeMaxLoadedMemories,
+				MaxLoadedMemoryBytes: g.cfg.KnowledgeMaxLoadedMemoryBytes,
+				MaxLoadedSkills:      g.cfg.KnowledgeMaxLoadedSkills,
+				MaxLoadedSkillBytes:  g.cfg.KnowledgeMaxLoadedSkillBytes,
+			}, g.cfg.KnowledgeDefaultDiscoveryLimit, g.cfg.KnowledgeMaxDiscoveryLimit)
+		}
+		if g.storeProvider != nil {
+			r.SetKnowledgeStoreProvider(g.storeProvider)
+			r.SetKnowledgeSearcherProvider(g.storeProvider)
 		}
 	}
 	if g.fsmEngine != nil {
@@ -255,11 +351,24 @@ func (g *Gateway) ToolDefinitions(ctx context.Context, chatID string, isDM bool)
 			IsDM:   isDM,
 		}
 	} else {
-		if session.ChatID == "" {
+		if session.ChatID != "" && chatID != "" && session.ChatID != chatID {
+			session.IsDM = false
+			session.ChatID = chatID
+		} else if session.ChatID == "" {
 			session.ChatID = chatID
 		}
-		session.IsDM = isDM
+		session.IsDM = session.IsDM && isDM
 	}
+
+	// Authoritative verification for DM tool exposure:
+	// If marked as DM, verify DM ownership against authoritative metadata.
+	// Fails closed if session.UserID is empty, session.ChatID is townhall, or VerifyDMOwner fails.
+	if session.IsDM {
+		if session.ChatID == "" || session.ChatID == "townhall" || strings.TrimSpace(session.UserID) == "" || g.VerifyDMOwner(ctx, session.ChatID, session.UserID) != nil {
+			session.IsDM = false
+		}
+	}
+
 	return r.ToolDefinitionsForSession(session)
 }
 
@@ -295,8 +404,10 @@ func (g *Gateway) Deliver(ctx context.Context, run *fsm.FSMRun) error {
 	}
 	fsmEng := g.FSMEngine()
 	if len(attachments) == 0 && fsmEng != nil && run != nil {
-		restored := fsmEng.RestoreChatSessionContext(ctx, run)
-		attachments = restored.GetStagedAttachments()
+		restored, err := fsmEng.RestoreChatSessionContext(ctx, run)
+		if err == nil {
+			attachments = restored.GetStagedAttachments()
+		}
 	}
 
 	if err := g.SendMessageWithAttachments(run.ChatID, formattedReply, attachments); err != nil {
@@ -374,6 +485,33 @@ func (g *Gateway) ChatLocker() *ChatLocker {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.chatLocker
+}
+
+// KnowledgeWorker returns the Gateway's background knowledge worker.
+func (g *Gateway) KnowledgeWorker() *KnowledgeWorker {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.knowledgeWorker
+}
+
+// SetKnowledgeWorker sets the background knowledge worker for the gateway.
+func (g *Gateway) SetKnowledgeWorker(w *KnowledgeWorker) {
+	g.mu.Lock()
+	oldKW := g.knowledgeWorker
+	g.knowledgeWorker = w
+	g.mu.Unlock()
+
+	if oldKW != nil {
+		oldKW.Stop()
+	}
+
+	if w != nil {
+		g.mu.Lock()
+		if g.running && g.knowledgeWorker == w && g.lifecycleCtx != nil && g.lifecycleCtx.Err() == nil {
+			w.Start(g.lifecycleCtx)
+		}
+		g.mu.Unlock()
+	}
 }
 
 var (
@@ -540,10 +678,9 @@ func (g *Gateway) ProcessAttachments(ctx context.Context, attachments []models.A
 	return g.processAttachments(ctx, attachments)
 }
 
-// IsMentionedOrDM checks if a message should be handled by the bot.
-func IsMentionedOrDM(handle, chatID, content string) (bool, string) {
+// IsMentionedOrDM checks if a message should be handled by the bot based on mention or verified DM status.
+func IsMentionedOrDM(handle string, isDM bool, content string) (bool, string) {
 	plainText := StripHTML(content)
-	isDM := chatID != "townhall" && (strings.HasPrefix(chatID, "dm_") || chatID != "")
 	cleanHandle := strings.TrimPrefix(handle, "@")
 
 	// Match handle case-insensitively
@@ -957,6 +1094,7 @@ func (g *Gateway) WarmupContext(ctx context.Context) error {
 			g.WarmupChat(ctx, chat.ID, int64(chat.LastSeq))
 		}
 	}
+	g.chatCache.SetAll(chats)
 
 	slog.Info("completed context warmup for active chats", "chatCount", len(chats))
 	return nil
@@ -1041,12 +1179,57 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 	}
 
 	// 4. Determine trigger condition
-	shouldProcess, promptText := IsMentionedOrDM(g.cfg.BotHandle, msg.ChatID, msg.Content)
+	// Determine DM status strictly from authoritative metadata before checking IsMentionedOrDM.
+	// On lookup or verification failure, fail closed and treat as public/group chat behavior.
+	isChatDM := false
+	if msg.ChatID != "townhall" && strings.TrimSpace(msg.ChatID) != "" {
+		chat, ok := g.chatCache.Get(msg.ChatID)
+		if !ok {
+			var err error
+			chat, err = g.GetChat(ctx, msg.ChatID)
+			if err != nil {
+				slog.Debug("could not fetch chat metadata, defaulting to group chat behavior", "chatID", msg.ChatID, "error", err)
+			}
+		}
+		if chat.ID != "" && (chat.IsDM || chat.Type == "dm") && chat.Type != "group" {
+			isChatDM = true
+		}
+	}
+
+	shouldProcess, promptText := IsMentionedOrDM(g.cfg.BotHandle, isChatDM, msg.Content)
 	if !shouldProcess && msg.ChatID == "townhall" {
 		if strings.EqualFold(g.cfg.BotHandle, "@bob") {
-			shouldProcess, promptText = IsMentionedOrDM("@bot", msg.ChatID, msg.Content)
+			shouldProcess, promptText = IsMentionedOrDM("@bot", isChatDM, msg.Content)
 		} else if strings.EqualFold(g.cfg.BotHandle, "@bot") {
-			shouldProcess, promptText = IsMentionedOrDM("@bob", msg.ChatID, msg.Content)
+			shouldProcess, promptText = IsMentionedOrDM("@bob", isChatDM, msg.Content)
+		}
+	}
+
+	cleanText := strings.TrimSpace(fullContent)
+	cleanText = strings.Trim(cleanText, "`")
+	cleanText = strings.TrimSpace(cleanText)
+
+	fields := strings.Fields(cleanText)
+	var rootCommand string
+	if len(fields) > 0 {
+		rootCommand = fields[0]
+	}
+
+	promptFields := strings.Fields(strings.TrimSpace(promptText))
+	var promptRootCommand string
+	if len(promptFields) > 0 {
+		promptRootCommand = promptFields[0]
+	}
+
+	// Always trigger on bot slash commands (even in group chats or townhall) so appropriate rejection/guidance is sent
+	cmdToCheck := strings.ToLower(rootCommand)
+	if cmdToCheck == "" {
+		cmdToCheck = strings.ToLower(promptRootCommand)
+	}
+	if cmdToCheck == "/memory" || cmdToCheck == "/skill" || cmdToCheck == "/schedule" || cmdToCheck == "/sandbox" {
+		shouldProcess = true
+		if promptText == "" {
+			promptText = cleanText
 		}
 	}
 
@@ -1070,24 +1253,38 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 		return nil
 	}
 
-	cleanText := strings.TrimSpace(fullContent)
-	cleanText = strings.Trim(cleanText, "`")
-	cleanText = strings.TrimSpace(cleanText)
-
-	isDM := msg.ChatID != "townhall"
-	if isDM && strings.HasPrefix(cleanText, "/sandbox") {
+	if isChatDM && strings.EqualFold(rootCommand, "/sandbox") {
 		return g.handleSandboxCommand(ctx, msg, cleanText, senderName)
 	}
 
 	scheduleCmdText := cleanText
-	if strings.HasPrefix(strings.TrimSpace(promptText), "/schedule") {
+	if strings.EqualFold(promptRootCommand, "/schedule") {
 		scheduleCmdText = strings.TrimSpace(promptText)
+		rootCommand = promptRootCommand
 	}
-	if strings.HasPrefix(scheduleCmdText, "/schedule") {
-		return g.handleScheduleCommand(ctx, msg, scheduleCmdText, senderName, isDM)
+	if strings.EqualFold(rootCommand, "/schedule") {
+		return g.handleScheduleCommand(ctx, msg, scheduleCmdText, senderName, isChatDM)
 	}
 
-	return g.generateAndSendAgentReply(ctx, msg, isDM, senderName, "")
+	memoryCmdText := cleanText
+	if strings.EqualFold(promptRootCommand, "/memory") {
+		memoryCmdText = strings.TrimSpace(promptText)
+		rootCommand = promptRootCommand
+	}
+	if strings.EqualFold(rootCommand, "/memory") {
+		return g.handleMemoryCommand(ctx, msg, memoryCmdText, senderName, isChatDM)
+	}
+
+	skillCmdText := cleanText
+	if strings.EqualFold(promptRootCommand, "/skill") {
+		skillCmdText = strings.TrimSpace(promptText)
+		rootCommand = promptRootCommand
+	}
+	if strings.EqualFold(rootCommand, "/skill") {
+		return g.handleSkillCommand(ctx, msg, skillCmdText, senderName, isChatDM)
+	}
+
+	return g.generateAndSendAgentReply(ctx, msg, isChatDM, senderName, "")
 }
 
 func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Message, isDM bool, senderName, currentTask string) error {
@@ -1116,9 +1313,13 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 		defer release()
 	}
 
+	// Authoritative verification for knowledge and sandbox capabilities:
+	// A session is granted DM privileges only if it is an authoritative 1-on-1 DM owned by msg.UserID.
+	isAuthorizedDMOwner := isDM && g.VerifyDMOwner(ctx, msg.ChatID, msg.UserID) == nil
+
 	var sandboxActive bool
 	var sandboxTTL string
-	if sm != nil && isDM {
+	if sm != nil && isAuthorizedDMOwner {
 		if sbx, ok := sm.GetStatus(msg.UserID); ok && sbx != nil && sbx.Status == sandbox.StatusRunning {
 			sandboxActive = true
 			rem := time.Until(sbx.ExpiresAt).Round(time.Minute)
@@ -1179,7 +1380,20 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 	defer progress.Stop()
 
 	var sandboxRequestCreated bool
-	sessionCtx := tools.NewChatSessionContext(msg.ChatID, msg.UserID, isDM)
+	var budgetLimits tools.KnowledgeBudgetLimits
+	if toolsRegistry != nil {
+		budgetLimits = toolsRegistry.KnowledgeLimits()
+	} else if g.cfg != nil {
+		budgetLimits = tools.KnowledgeBudgetLimits{
+			MaxLoadedMemories:    g.cfg.KnowledgeMaxLoadedMemories,
+			MaxLoadedMemoryBytes: g.cfg.KnowledgeMaxLoadedMemoryBytes,
+			MaxLoadedSkills:      g.cfg.KnowledgeMaxLoadedSkills,
+			MaxLoadedSkillBytes:  g.cfg.KnowledgeMaxLoadedSkillBytes,
+		}
+	} else {
+		budgetLimits = tools.DefaultKnowledgeBudgetLimits()
+	}
+	sessionCtx := tools.NewChatSessionContext(msg.ChatID, msg.UserID, isAuthorizedDMOwner, budgetLimits)
 	sessionCtx.Notifier = func(chatID, text string) error {
 		return g.SendMessage(chatID, text)
 	}
@@ -1206,14 +1420,20 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 		g.mu.Unlock()
 
 		if fsmEng != nil {
+			var seq *int64
+			if msg.Seq > 0 {
+				s := msg.Seq
+				seq = &s
+			}
 			fsmReq := fsm.ToolLoopRequest{
-				ChatID:        msg.ChatID,
-				UserID:        msg.UserID,
-				IsDM:          isDM,
-				Model:         g.cfg.OpenAIModel,
-				Messages:      llmMsgs,
-				Tools:         toolDefs,
-				MaxIterations: maxIterations,
+				ChatID:           msg.ChatID,
+				UserID:           msg.UserID,
+				IsDM:             isDM,
+				Model:            g.cfg.OpenAIModel,
+				Messages:         llmMsgs,
+				Tools:            toolDefs,
+				MaxIterations:    maxIterations,
+				SourceMessageSeq: seq,
 				OnTransition: func(state fsm.RunState, run *fsm.FSMRun) {
 					switch state {
 					case fsm.StateLLMRequest:
@@ -1322,9 +1542,30 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 // Start listens for incoming WebSocket messages and processes them until context is cancelled.
 func (g *Gateway) Start(ctx context.Context) error {
 	g.mu.Lock()
+	if g.running {
+		g.mu.Unlock()
+		return errors.New("gateway is already running")
+	}
 	g.running = true
+	g.lifecycleID++
+	curGen := g.lifecycleID
+	g.lifecycleCtx = ctx
 	fsmEng := g.fsmEngine
+	schedEng := g.schedulerEngine
+	kw := g.knowledgeWorker
+	if kw != nil {
+		kw.Start(ctx)
+	}
 	g.mu.Unlock()
+
+	defer func() {
+		g.mu.Lock()
+		if g.lifecycleID == curGen {
+			g.running = false
+			g.lifecycleCtx = nil
+		}
+		g.mu.Unlock()
+	}()
 
 	// Start FSM engine background poller and recover interrupted runs
 	if fsmEng != nil {
@@ -1334,9 +1575,6 @@ func (g *Gateway) Start(ctx context.Context) error {
 	}
 
 	// Start scheduler engine background poller
-	g.mu.Lock()
-	schedEng := g.schedulerEngine
-	g.mu.Unlock()
 	if schedEng != nil {
 		if err := schedEng.Start(ctx); err != nil {
 			slog.Error("failed to start scheduler engine", "error", err)
@@ -1510,6 +1748,8 @@ func (g *Gateway) Start(ctx context.Context) error {
 func (g *Gateway) Stop() {
 	g.mu.Lock()
 	g.running = false
+	g.lifecycleCtx = nil
+	g.lifecycleID++
 	if g.conn != nil {
 		if err := g.conn.Close(); err != nil {
 			slog.Warn("error closing websocket connection on gateway stop", "error", err)
@@ -1518,7 +1758,12 @@ func (g *Gateway) Stop() {
 	}
 	fsmEng := g.fsmEngine
 	schedEng := g.schedulerEngine
+	kw := g.knowledgeWorker
 	g.mu.Unlock()
+
+	if kw != nil {
+		kw.Stop()
+	}
 
 	if schedEng != nil {
 		schedEng.Stop()
@@ -1788,4 +2033,87 @@ func (g *Gateway) appendSandboxDetails(b *strings.Builder, sbx *sandbox.UserSand
 		remaining = 0
 	}
 	fmt.Fprintf(b, "- **Time Remaining:** %s\n", remaining)
+}
+
+// GetChat retrieves a chat from the cache, fetching chats from the API if missing.
+func (g *Gateway) GetChat(ctx context.Context, chatID string) (models.Chat, error) {
+	if ch, ok := g.chatCache.Get(chatID); ok {
+		return ch, nil
+	}
+	chats, err := g.FetchChats(ctx)
+	if err != nil {
+		return models.Chat{}, err
+	}
+	g.chatCache.SetAll(chats)
+	if ch, ok := g.chatCache.Get(chatID); ok {
+		return ch, nil
+	}
+	return models.Chat{}, fmt.Errorf("chat %q not found", chatID)
+}
+
+// VerifyDMOwner checks whether chatID is an authorized 1-on-1 DM owned by userID.
+// Returns an error if the chat is not a DM or if the sender is not the DM owner.
+func (g *Gateway) VerifyDMOwner(ctx context.Context, chatID, userID string) error {
+	if strings.TrimSpace(chatID) == "" || chatID == "townhall" {
+		return fmt.Errorf("command is only available in private Direct Messages (DMs)")
+	}
+	if strings.TrimSpace(userID) == "" {
+		return fmt.Errorf("unauthorized: empty user identity")
+	}
+
+	chat, ok := g.chatCache.Get(chatID)
+	if !ok {
+		var err error
+		chat, err = g.GetChat(ctx, chatID)
+		if err != nil {
+			return fmt.Errorf("authorization check failed: unable to verify chat metadata: %w", err)
+		}
+	}
+
+	// Must be an authoritative 1:1 DM
+	if chat.ID != "" && !chat.IsDM && chat.Type != "dm" {
+		return fmt.Errorf("command is only available in private Direct Messages (DMs)")
+	}
+
+	g.mu.Lock()
+	botID := g.botUserID
+	g.mu.Unlock()
+	if botID == "" {
+		if _, err := g.FetchBotUser(ctx); err == nil {
+			g.mu.Lock()
+			botID = g.botUserID
+			g.mu.Unlock()
+		}
+	}
+
+	var humanOwnerFromUsers string
+	if len(chat.UserIDs) > 0 {
+		humanCount := 0
+		for _, uid := range chat.UserIDs {
+			if uid != botID {
+				humanOwnerFromUsers = uid
+				humanCount++
+			}
+		}
+		if humanCount != 1 {
+			return fmt.Errorf("unauthorized: memory/skill management requires a 1-on-1 DM with exactly one human participant")
+		}
+	}
+
+	ownerID := chat.TargetUserID
+	if ownerID == "" {
+		ownerID = humanOwnerFromUsers
+	} else if humanOwnerFromUsers != "" && ownerID != humanOwnerFromUsers {
+		return fmt.Errorf("unauthorized: target user mismatch with chat participant list")
+	}
+
+	if ownerID == "" {
+		return fmt.Errorf("unauthorized: unable to verify human owner of this DM")
+	}
+
+	if userID != ownerID {
+		return fmt.Errorf("unauthorized: only the owner of this DM can manage memories and skills")
+	}
+
+	return nil
 }

@@ -25,10 +25,14 @@ type ChatSessionContext struct {
 	ChatID                string
 	UserID                string
 	IsDM                  bool
+	IsScheduled           bool
+	SourceMessageSeq      *int64
+	FSMRunID              string
 	Notifier              func(chatID, text string) error
 	Progress              *ProgressReporter
 	SandboxRequestCreated *bool
 	StagedAttachments     *StagedAttachmentCollector
+	KnowledgeBudget       *KnowledgeBudgetTracker
 }
 
 // StageAttachment appends an attachment to the staged attachments collector if configured.
@@ -48,12 +52,17 @@ func (s ChatSessionContext) GetStagedAttachments() []models.Attachment {
 }
 
 // NewChatSessionContext creates a ChatSessionContext with initialized collectors.
-func NewChatSessionContext(chatID, userID string, isDM bool) ChatSessionContext {
+func NewChatSessionContext(chatID, userID string, isDM bool, limits ...KnowledgeBudgetLimits) ChatSessionContext {
+	lim := DefaultKnowledgeBudgetLimits()
+	if len(limits) > 0 {
+		lim = limits[0]
+	}
 	return ChatSessionContext{
 		ChatID:            chatID,
 		UserID:            userID,
 		IsDM:              isDM,
 		StagedAttachments: NewStagedAttachmentCollector(),
+		KnowledgeBudget:   NewKnowledgeBudgetTracker(lim),
 	}
 }
 
@@ -70,18 +79,33 @@ func ChatSessionFromContext(ctx context.Context) (ChatSessionContext, bool) {
 
 // Registry manages available LLM tool definitions and executes tool calls.
 type Registry struct {
-	tavilyClient           *tavily.Client
-	memoryManager          *memory.Manager
-	sandboxManager         *sandbox.Manager
-	attachmentClient       AttachmentClient
-	maxAttachmentSizeBytes int64
-	schedulerStoreProvider SchedulerStoreProvider
-	schedulerMinRunTimeout time.Duration
-	schedulerMaxRunTimeout time.Duration
-	schedulerMinMaxTurns   int
-	schedulerMaxMaxTurns   int
-	toolDefinitions        []openai.Tool
-	dmToolDefinitions      []openai.Tool
+	tavilyClient                   *tavily.Client
+	memoryManager                  *memory.Manager
+	sandboxManager                 *sandbox.Manager
+	attachmentClient               AttachmentClient
+	maxAttachmentSizeBytes         int64
+	schedulerStoreProvider         SchedulerStoreProvider
+	schedulerMinRunTimeout         time.Duration
+	schedulerMaxRunTimeout         time.Duration
+	schedulerMinMaxTurns           int
+	schedulerMaxMaxTurns           int
+	knowledgeStoreProvider         KnowledgeStoreProvider
+	knowledgeSearcherProvider      KnowledgeSearcherProvider
+	knowledgeLimits                KnowledgeBudgetLimits
+	knowledgeDefaultDiscoveryLimit int
+	knowledgeMaxDiscoveryLimit     int
+	dmAuthorizer                   DMAuthorizer
+	toolDefinitions                []openai.Tool
+	dmToolDefinitions              []openai.Tool
+	knowledgeToolDefs              []openai.Tool
+}
+
+// DMAuthorizer validates that chatID is an authorized 1-on-1 DM owned by userID.
+type DMAuthorizer func(ctx context.Context, chatID, userID string) error
+
+// SetDMAuthorizer sets the authoritative DM validator function for knowledge tools.
+func (r *Registry) SetDMAuthorizer(authorizer DMAuthorizer) {
+	r.dmAuthorizer = authorizer
 }
 
 // NewRegistry creates a new tool registry and initializes static tool definitions once.
@@ -91,9 +115,12 @@ func NewRegistry(tavilyClient *tavily.Client, memoryManager *memory.Manager, san
 		sm = sandboxManager[0]
 	}
 	r := &Registry{
-		tavilyClient:   tavilyClient,
-		memoryManager:  memoryManager,
-		sandboxManager: sm,
+		tavilyClient:                   tavilyClient,
+		memoryManager:                  memoryManager,
+		sandboxManager:                 sm,
+		knowledgeLimits:                DefaultKnowledgeBudgetLimits(),
+		knowledgeDefaultDiscoveryLimit: KnowledgeDefaultDiscoveryLimit,
+		knowledgeMaxDiscoveryLimit:     KnowledgeMaxDiscoveryLimit,
 	}
 	r.initToolDefinitions()
 	return r
@@ -132,6 +159,43 @@ func (r *Registry) SetAttachmentClient(c AttachmentClient) {
 func (r *Registry) SetMaxAttachmentSize(bytes int64) {
 	r.maxAttachmentSizeBytes = bytes
 	r.initToolDefinitions()
+}
+
+// SetKnowledgeStoreProvider configures the knowledge store provider for the registry.
+func (r *Registry) SetKnowledgeStoreProvider(p KnowledgeStoreProvider) {
+	r.knowledgeStoreProvider = p
+}
+
+// SetKnowledgeSearcherProvider configures the knowledge searcher provider for the registry.
+func (r *Registry) SetKnowledgeSearcherProvider(p KnowledgeSearcherProvider) {
+	r.knowledgeSearcherProvider = p
+}
+
+// SetKnowledgeLimits configures budget and discovery boundaries for knowledge tools.
+func (r *Registry) SetKnowledgeLimits(limits KnowledgeBudgetLimits, defaultDiscoveryLimit, maxDiscoveryLimit int) {
+	if limits.MaxLoadedMemories > 0 {
+		r.knowledgeLimits.MaxLoadedMemories = limits.MaxLoadedMemories
+	}
+	if limits.MaxLoadedMemoryBytes > 0 {
+		r.knowledgeLimits.MaxLoadedMemoryBytes = limits.MaxLoadedMemoryBytes
+	}
+	if limits.MaxLoadedSkills > 0 {
+		r.knowledgeLimits.MaxLoadedSkills = limits.MaxLoadedSkills
+	}
+	if limits.MaxLoadedSkillBytes > 0 {
+		r.knowledgeLimits.MaxLoadedSkillBytes = limits.MaxLoadedSkillBytes
+	}
+	if defaultDiscoveryLimit > 0 {
+		r.knowledgeDefaultDiscoveryLimit = defaultDiscoveryLimit
+	}
+	if maxDiscoveryLimit > 0 {
+		r.knowledgeMaxDiscoveryLimit = maxDiscoveryLimit
+	}
+}
+
+// KnowledgeLimits returns the currently configured knowledge budget limits.
+func (r *Registry) KnowledgeLimits() KnowledgeBudgetLimits {
+	return r.knowledgeLimits
 }
 
 func (r *Registry) initToolDefinitions() {
@@ -344,6 +408,7 @@ func (r *Registry) initToolDefinitions() {
 		dmTools = append(dmTools, sandboxTools...)
 	}
 	r.dmToolDefinitions = dmTools
+	r.knowledgeToolDefs = r.knowledgeToolDefinitions()
 }
 
 // ToolDefinitions returns the cached slice of OpenAI tool definitions (for Townhall / public chats).
@@ -353,14 +418,17 @@ func (r *Registry) ToolDefinitions() []openai.Tool {
 
 // ToolDefinitionsForSession returns tool definitions tailored to the session.
 // In DM chats, scheduler tools and optional sandbox tools are included.
+// Knowledge tools (propose/discover/load for memories and skills) are only included in
+// interactive DM chats and excluded from scheduled background runs.
 // When the user already has an active running sandbox, sandbox_request is excluded
 // so the agent interacts with the active sandbox rather than requesting a redundant one.
 // In Townhall, only base tools (search, fetch, recall) are provided.
 func (r *Registry) ToolDefinitionsForSession(session ChatSessionContext) []openai.Tool {
 	if session.IsDM {
+		var tools []openai.Tool
 		if r.sandboxManager != nil && session.UserID != "" {
 			if sbx, ok := r.sandboxManager.GetStatus(session.UserID); ok && sbx.Status == sandbox.StatusRunning {
-				tools := make([]openai.Tool, 0, len(r.dmToolDefinitions)+2)
+				tools = make([]openai.Tool, 0, len(r.dmToolDefinitions)+len(r.knowledgeToolDefs)+2)
 				for _, t := range r.dmToolDefinitions {
 					if t.Function != nil && t.Function.Name == "sandbox_request" {
 						continue
@@ -368,10 +436,16 @@ func (r *Registry) ToolDefinitionsForSession(session ChatSessionContext) []opena
 					tools = append(tools, t)
 				}
 				tools = append(tools, r.attachmentToolDefinitions()...)
-				return tools
 			}
 		}
-		return r.dmToolDefinitions
+		if tools == nil {
+			tools = make([]openai.Tool, 0, len(r.dmToolDefinitions)+len(r.knowledgeToolDefs))
+			tools = append(tools, r.dmToolDefinitions...)
+		}
+		if !session.IsScheduled {
+			tools = append(tools, r.knowledgeToolDefs...)
+		}
+		return tools
 	}
 	return r.toolDefinitions
 }
@@ -380,15 +454,15 @@ func (r *Registry) ToolDefinitionsForSession(session ChatSessionContext) []opena
 func (r *Registry) ToolDefinitionsForChat(ctx context.Context, chatID string, isDM bool) []openai.Tool {
 	session, ok := ChatSessionFromContext(ctx)
 	if !ok {
-		session = ChatSessionContext{
-			ChatID: chatID,
-			IsDM:   isDM,
-		}
+		session = NewChatSessionContext(chatID, "", isDM, r.knowledgeLimits)
 	} else {
 		if session.ChatID == "" {
 			session.ChatID = chatID
 		}
 		session.IsDM = isDM
+		if session.KnowledgeBudget == nil {
+			session.KnowledgeBudget = NewKnowledgeBudgetTracker(r.knowledgeLimits)
+		}
 	}
 	return r.ToolDefinitionsForSession(session)
 }
@@ -437,6 +511,18 @@ func (r *Registry) Execute(ctx context.Context, name string, argsJSON string) (s
 		return r.executeListSchedules(ctx, argsJSON)
 	case "cancel_schedule":
 		return r.executeCancelSchedule(ctx, argsJSON)
+	case "propose_memory":
+		return r.executeProposeMemory(ctx, argsJSON)
+	case "discover_memories":
+		return r.executeDiscoverMemories(ctx, argsJSON)
+	case "load_memory":
+		return r.executeLoadMemory(ctx, argsJSON)
+	case "propose_skill":
+		return r.executeProposeSkill(ctx, argsJSON)
+	case "discover_skills":
+		return r.executeDiscoverSkills(ctx, argsJSON)
+	case "load_skill":
+		return r.executeLoadSkill(ctx, argsJSON)
 	default:
 		return "", fmt.Errorf("unknown tool: %s", name)
 	}

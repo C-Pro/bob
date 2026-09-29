@@ -48,3 +48,8 @@
 
 - [x] **Track: Task Scheduler & Permission-Guarded Execution**
 *Link: [./tracks/task-scheduler_20260919/](./tracks/task-scheduler_20260919/)*
+
+---
+
+- [~] **Track: User-Validated Skills and Structured Memory**
+*Link: [./tracks/user-validated-skills_20260925/](./tracks/user-validated-skills_20260925/)*

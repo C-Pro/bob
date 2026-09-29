@@ -264,7 +264,14 @@ func (inv *ScheduleInvoker) ExecuteSchedule(ctx context.Context, sched *schedule
 	}
 
 	// 4. Prepare chat context and tool definitions
-	sessionCtx := tools.NewChatSessionContext(sched.ChatID, sched.UserID, isDM)
+	var budgetLimits tools.KnowledgeBudgetLimits
+	if inv.cfg.Tools != nil {
+		budgetLimits = inv.cfg.Tools.KnowledgeLimits()
+	} else {
+		budgetLimits = tools.DefaultKnowledgeBudgetLimits()
+	}
+	sessionCtx := tools.NewChatSessionContext(sched.ChatID, sched.UserID, isDM, budgetLimits)
+	sessionCtx.IsScheduled = true
 	if inv.cfg.Sender != nil {
 		sessionCtx.Notifier = inv.cfg.Sender.SendMessage
 	}

@@ -533,10 +533,16 @@ func TestSandboxToolDefinitionsScope(t *testing.T) {
 	assert.NotContains(t, thNames, "sandbox_request")
 	assert.NotContains(t, thNames, "sandbox_download_attachment")
 	assert.NotContains(t, thNames, "sandbox_upload_attachment")
+	assert.NotContains(t, thNames, "propose_memory")
+	assert.NotContains(t, thNames, "discover_memories")
+	assert.NotContains(t, thNames, "load_memory")
+	assert.NotContains(t, thNames, "propose_skill")
+	assert.NotContains(t, thNames, "discover_skills")
+	assert.NotContains(t, thNames, "load_skill")
 
-	// DM session has 9 tools (3 base + 3 scheduler + 3 sandbox) when no sandbox running
+	// DM session has 15 tools (3 base + 3 scheduler + 3 sandbox + 6 knowledge) when no sandbox running
 	dmTools := reg.ToolDefinitionsForSession(ChatSessionContext{IsDM: true})
-	assert.Len(t, dmTools, 9)
+	assert.Len(t, dmTools, 15)
 
 	names := make([]string, len(dmTools))
 	for i, tool := range dmTools {
@@ -548,6 +554,12 @@ func TestSandboxToolDefinitionsScope(t *testing.T) {
 	assert.Contains(t, names, "sandbox_request")
 	assert.Contains(t, names, "sandbox_exec")
 	assert.Contains(t, names, "sandbox_destroy")
+	assert.Contains(t, names, "propose_memory")
+	assert.Contains(t, names, "discover_memories")
+	assert.Contains(t, names, "load_memory")
+	assert.Contains(t, names, "propose_skill")
+	assert.Contains(t, names, "discover_skills")
+	assert.Contains(t, names, "load_skill")
 	assert.NotContains(t, names, "sandbox_download_attachment")
 	assert.NotContains(t, names, "sandbox_upload_attachment")
 

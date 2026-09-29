@@ -60,19 +60,23 @@ func (s *Store) CreateRun(ctx context.Context, run *FSMRun) error {
 		INSERT INTO fsm_runs (
 			id, chat_id, user_id, is_dm, fsm_type, status, current_state,
 			iteration, max_iterations, wait_cycles, context_json, result_json,
-			error_text, resume_at, version, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			error_text, resume_at, version, source_message_seq, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	var resumeAt sql.NullInt64
 	if run.ResumeAt != nil {
 		resumeAt = sql.NullInt64{Int64: *run.ResumeAt, Valid: true}
 	}
+	var sourceMsgSeq sql.NullInt64
+	if run.SourceMessageSeq != nil {
+		sourceMsgSeq = sql.NullInt64{Int64: *run.SourceMessageSeq, Valid: true}
+	}
 
 	_, err := s.db.ExecContext(ctx, query,
 		run.ID, run.ChatID, run.UserID, isDMInt, string(run.FSMType), string(run.Status), string(run.CurrentState),
 		run.Iteration, run.MaxIterations, run.WaitCycles, run.ContextJSON, run.ResultJSON,
-		run.ErrorText, resumeAt, run.Version, run.CreatedAt, run.UpdatedAt,
+		run.ErrorText, resumeAt, run.Version, sourceMsgSeq, run.CreatedAt, run.UpdatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to insert fsm_run %s: %w", run.ID, err)
@@ -82,32 +86,29 @@ func (s *Store) CreateRun(ctx context.Context, run *FSMRun) error {
 	return nil
 }
 
-// GetRun retrieves an FSM run by its unique ID.
-func (s *Store) GetRun(ctx context.Context, id string) (*FSMRun, error) {
-	query := `
-		SELECT id, chat_id, user_id, is_dm, fsm_type, status, current_state,
-		       iteration, max_iterations, wait_cycles, context_json, result_json,
-		       error_text, resume_at, version, created_at, updated_at
-		FROM fsm_runs
-		WHERE id = ?
-	`
+type rowScanner interface {
+	Scan(dest ...any) error
+}
 
+const runSelectColumns = `id, chat_id, user_id, is_dm, fsm_type, status, current_state,
+       iteration, max_iterations, wait_cycles, context_json, result_json,
+       error_text, resume_at, version, source_message_seq, created_at, updated_at`
+
+func scanRun(scanner rowScanner) (*FSMRun, error) {
 	var run FSMRun
 	var isDMInt int
 	var fsmType, status, currentState string
 	var resumeAt sql.NullInt64
+	var sourceMsgSeq sql.NullInt64
 	var resultJSON, errorText sql.NullString
 
-	err := s.db.QueryRowContext(ctx, query, id).Scan(
+	err := scanner.Scan(
 		&run.ID, &run.ChatID, &run.UserID, &isDMInt, &fsmType, &status, &currentState,
 		&run.Iteration, &run.MaxIterations, &run.WaitCycles, &run.ContextJSON, &resultJSON,
-		&errorText, &resumeAt, &run.Version, &run.CreatedAt, &run.UpdatedAt,
+		&errorText, &resumeAt, &run.Version, &sourceMsgSeq, &run.CreatedAt, &run.UpdatedAt,
 	)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrRunNotFound
-		}
-		return nil, fmt.Errorf("failed to query fsm_run %s: %w", id, err)
+		return nil, err
 	}
 
 	run.IsDM = isDMInt == 1
@@ -124,9 +125,32 @@ func (s *Store) GetRun(ctx context.Context, id string) (*FSMRun, error) {
 		val := resumeAt.Int64
 		run.ResumeAt = &val
 	}
+	if sourceMsgSeq.Valid {
+		val := sourceMsgSeq.Int64
+		run.SourceMessageSeq = &val
+	}
 	run.MarkContextSynced()
 
 	return &run, nil
+}
+
+// GetRun retrieves an FSM run by its unique ID.
+func (s *Store) GetRun(ctx context.Context, id string) (*FSMRun, error) {
+	query := `
+		SELECT ` + runSelectColumns + `
+		FROM fsm_runs
+		WHERE id = ?
+	`
+
+	run, err := scanRun(s.db.QueryRowContext(ctx, query, id))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrRunNotFound
+		}
+		return nil, fmt.Errorf("failed to query fsm_run %s: %w", id, err)
+	}
+
+	return run, nil
 }
 
 // UpdateRunState updates the dynamic execution state, status, context, and timestamps of a run using optimistic concurrency control.
@@ -206,9 +230,7 @@ func (s *Store) UpdateRun(ctx context.Context, run *FSMRun) error {
 // ListActiveRuns returns all runs currently in PENDING, RUNNING, or WAITING status.
 func (s *Store) ListActiveRuns(ctx context.Context) ([]FSMRun, error) {
 	query := `
-		SELECT id, chat_id, user_id, is_dm, fsm_type, status, current_state,
-		       iteration, max_iterations, wait_cycles, context_json, result_json,
-		       error_text, resume_at, version, created_at, updated_at
+		SELECT ` + runSelectColumns + `
 		FROM fsm_runs
 		WHERE status IN ('PENDING', 'RUNNING', 'WAITING')
 		ORDER BY created_at ASC
@@ -222,37 +244,11 @@ func (s *Store) ListActiveRuns(ctx context.Context) ([]FSMRun, error) {
 
 	var runs []FSMRun
 	for rows.Next() {
-		var run FSMRun
-		var isDMInt int
-		var fsmType, status, currentState string
-		var resumeAt sql.NullInt64
-		var resultJSON, errorText sql.NullString
-
-		if err := rows.Scan(
-			&run.ID, &run.ChatID, &run.UserID, &isDMInt, &fsmType, &status, &currentState,
-			&run.Iteration, &run.MaxIterations, &run.WaitCycles, &run.ContextJSON, &resultJSON,
-			&errorText, &resumeAt, &run.Version, &run.CreatedAt, &run.UpdatedAt,
-		); err != nil {
+		run, err := scanRun(rows)
+		if err != nil {
 			return nil, fmt.Errorf("failed to scan active fsm_run: %w", err)
 		}
-
-		run.IsDM = isDMInt == 1
-		run.FSMType = FSMType(fsmType)
-		run.Status = RunStatus(status)
-		run.CurrentState = RunState(currentState)
-		if resultJSON.Valid {
-			run.ResultJSON = resultJSON.String
-		}
-		if errorText.Valid {
-			run.ErrorText = errorText.String
-		}
-		if resumeAt.Valid {
-			val := resumeAt.Int64
-			run.ResumeAt = &val
-		}
-		run.MarkContextSynced()
-
-		runs = append(runs, run)
+		runs = append(runs, *run)
 	}
 
 	if err := rows.Err(); err != nil {
@@ -265,9 +261,7 @@ func (s *Store) ListActiveRuns(ctx context.Context) ([]FSMRun, error) {
 // ListDueWaitingRuns returns runs in WAITING status whose resume_at deadline has arrived.
 func (s *Store) ListDueWaitingRuns(ctx context.Context, nowUnix int64) ([]FSMRun, error) {
 	query := `
-		SELECT id, chat_id, user_id, is_dm, fsm_type, status, current_state,
-		       iteration, max_iterations, wait_cycles, context_json, result_json,
-		       error_text, resume_at, version, created_at, updated_at
+		SELECT ` + runSelectColumns + `
 		FROM fsm_runs
 		WHERE status = 'WAITING' AND resume_at IS NOT NULL AND resume_at <= ?
 		ORDER BY resume_at ASC
@@ -281,37 +275,11 @@ func (s *Store) ListDueWaitingRuns(ctx context.Context, nowUnix int64) ([]FSMRun
 
 	var runs []FSMRun
 	for rows.Next() {
-		var run FSMRun
-		var isDMInt int
-		var fsmType, status, currentState string
-		var resumeAt sql.NullInt64
-		var resultJSON, errorText sql.NullString
-
-		if err := rows.Scan(
-			&run.ID, &run.ChatID, &run.UserID, &isDMInt, &fsmType, &status, &currentState,
-			&run.Iteration, &run.MaxIterations, &run.WaitCycles, &run.ContextJSON, &resultJSON,
-			&errorText, &resumeAt, &run.Version, &run.CreatedAt, &run.UpdatedAt,
-		); err != nil {
+		run, err := scanRun(rows)
+		if err != nil {
 			return nil, fmt.Errorf("failed to scan due waiting fsm_run: %w", err)
 		}
-
-		run.IsDM = isDMInt == 1
-		run.FSMType = FSMType(fsmType)
-		run.Status = RunStatus(status)
-		run.CurrentState = RunState(currentState)
-		if resultJSON.Valid {
-			run.ResultJSON = resultJSON.String
-		}
-		if errorText.Valid {
-			run.ErrorText = errorText.String
-		}
-		if resumeAt.Valid {
-			val := resumeAt.Int64
-			run.ResumeAt = &val
-		}
-		run.MarkContextSynced()
-
-		runs = append(runs, run)
+		runs = append(runs, *run)
 	}
 
 	if err := rows.Err(); err != nil {

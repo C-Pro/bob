@@ -1,185 +1,436 @@
-This phased roadmap structures your continuous learning agentic harness according to your 11 steps. It addresses your Phase 2 context retrieval question and outlines the engineering specs for each phase.
+# Bob Roadmap
 
-### **Solution to Phase 2 Open Question: Attending Chat History Without Context Inflation**
+This roadmap starts from Bob's current implementation. Completed work such as the
+Besedka gateway, chat context, hybrid history retrieval, attachments, isolated
+sandboxes, durable tool execution, scheduling, backups, and local embeddings is
+intentionally omitted.
 
-To query long historical conversations without filling up the context window:
+The goal is a resource-conscious, continuously improving agent. Bob should first
+learn through user-approved memory, reusable skills, and evaluated prompt changes.
+Weight updates are a later consolidation mechanism, not the primary source of
+day-to-day learning.
 
-> 1. **Two-Tier Storage:**  
-   * **Active Working Context (In-Memory Ring Buffer):** Holds the last $N$ raw message turns.  
-   * **Persisted Canonical Log (Database):** Every incoming/outgoing raw message is recorded in SQLite or PostgreSQL with timestamps and metadata.  
-> 2. **Task Summarizer \+ Active Reflection:**  
-   * The Ring Buffer feeds a **Task Summarizer** prompt that compresses the ongoing dialogue into a structured TASK.md prompt ($\\Phi$).  
-   * If the user references past information not present in the current $N$ turns (e.g., *"Use the database credential I gave you last week"*), the Task Summarizer identifies missing information and generates a historical retrieval query.  
-> 3. **Hybrid Search Tool (search\_history):**  
-   * Do **not** inject all chat history into every request. Instead, treat chat history as an **external tool available to the Task Summarizer and Agent**:
+## Design Principles
 
-     * **Full-Text Search (FTS):** SQLite FTS5 or Postgres pg\_trgm for exact keyword matches (API keys, URLs, usernames, file names).  
-     * **Vector Embeddings (Dense Search):** Local embedding model (e.g., bge-small-en-v1.5) for semantic similarity searches over past turn chunks.  
-   * When needed, the agent executes search\_history(query="database credential", limit=3) to retrieve *only* the top-k relevant turns into its active context.
+- **Fast learning before weight updates:** Prefer memory, skills, prompt changes,
+  and retrieval improvements when they can solve the problem.
+- **User authority:** Initially, no proposed memory or skill becomes active until
+  the affected user explicitly approves it.
+- **Evidence before promotion:** Changes must improve a versioned evaluation suite
+  before they can be deployed.
+- **Separate knowledge types:** Raw chat history, durable facts, user preferences,
+  procedural skills, and model-training trajectories have different lifecycles and
+  must not be stored as interchangeable text chunks.
+- **Privacy by construction:** DM-derived information remains scoped to that user.
+  Private facts and preferences must never enter global skills or training data
+  without explicit authorization and redaction.
+- **Reversible evolution:** Prompts, skills, memories, datasets, and adapters are
+  versioned. Every promoted change can be inspected, disabled, or rolled back.
+- **Resource-aware experiments:** Optimize for a small number of informative
+  evaluations and short rented-GPU training runs rather than large-scale
+  pretraining or continuous online RL.
 
-## **Technical Roadmap**
+## Phase 1: Long-Horizon Context, User-Validated Skills, and Memory
 
-\+-----------------------------------------------------------------------------------+  
-|                               PHASED ARCHITECTURE                                 |  
-+-----------------------------------------------------------------------------------+  
-| [Phases 1-3] Core Bot, Besedka API, Task Buffer, Retrieval, Tool Engine          |  
-| [Phases 4-6] Docker Sandbox, Trajectory Exporter, Durable FSM Scheduler          |  
-| [Phases 7-10] Open-Weights Inference, PESO Python Pipeline, Validation, Reloading  |  
-| [Phase 11]  Autonomous "Dreaming", Game Sandboxes, RPE Curiosity Engine          |  
-| [Phases 12-16] Skills, Knowledge RAG, User Preferences, Ephemeral Progress,      |  
-|                Adaptive Agentic Planning & Supervised Execution Harness          |  
-+-----------------------------------------------------------------------------------+
+Build the first fast-learning and long-horizon context layer on top of Bob's
+existing chat history and hybrid retrieval.
 
-### **Phase 1: Simple Request/Response Agent & Besedka Gateway**
+### 1.1 Skill Registry
 
-* **Besedka Ingress (Go):** Implement a client in Go that connects to the Besedka Bot API endpoint (/api/v1/...). Listen for message events, filter incoming payloads, and react **only** when the message explicitly directly mentions the bot (@botusername).  
-* **OpenAI API Client Engine (Go):** Wrap standard HTTP requests targeting OpenAI-compatible REST endpoints. Initially configure base URL and API keys to route to Google Gemini's OpenAI-compatible API (\[https://generativelanguage.googleapis.com/v1beta/openai/\](https://generativelanguage.googleapis.com/v1beta/openai/)).  
-* **Basic Execution Pipeline:**  
-  1. Receive mention event from Besedka (websocket with rest API fallback).  
-  2. Strip bot handle and extract user input $x$.  
-  3. Send request to Gemini endpoint.  
-  4. Post final response back via Besedka API.
+A skill is reusable procedural guidance for performing a class of tasks. It is not
+a transcript or a user fact.
 
-### **Phase 2: Ring Buffer, Task Summarizer, & Hybrid History Retrieval**
+Each skill should contain:
 
-* **Ring Buffer (Go):** Maintain a thread-safe circular queue holding the last $N$ message turns per chat/user.  
-* **Task Summarizer Engine:**  
-  * Before generating a final answer, pass the Ring Buffer contents to a lightweight LLM summarization call with system prompt:*"Compress the conversation into a single canonical task description (TASK.md). Preserve explicit constraints, code snippets, and active goals. If crucial information is referenced but missing, output \<SEARCH\_REQUIRED: 'search query'\>."*  
-  * Subsequent user turns trigger an update pass to mutate or replace the active TASK.md.  
-* **Database Persister:** Write every turn to SQLite/PostgreSQL. Implement search\_history(query, method="hybrid") combining FTS5 lexical matching and local dense embedding retrieval.
+- Stable ID, name, description, and version.
+- Trigger conditions and task tags used for discovery.
+- Focused procedural instructions and optional examples.
+- Owner and scope: private user, chat, or explicitly approved global scope.
+- Provenance linking the skill to the conversation, correction, or authored source
+  that produced it.
+- Lifecycle state: `proposed`, `approved`, `rejected`, `disabled`, or `archived`.
+- Evaluation metadata recording where the skill helped, had no effect, or caused a
+  regression.
 
-### **Phase 3: Tool Execution Framework & Multimodal Attachments**
+Initial operations:
 
-* **Tool Calling Interface:** Implement Go JSON-Schema parser for OpenAI tool-calling primitives (tools and tool\_calls).  
-* **Multimodal Attachments:**  
-  * Parse incoming image/file attachments from Besedka message payloads.  
-  * Implement an image generation tool (e.g., calling Imagen / FLUX / DALL-E endpoints) returning generated media back to Besedka via multipart file uploads.  
-  * Implement file extraction tools (parsing .txt, .pdf, .json, .csv) and mounting them into working memory.
+- `propose_skill`: Create an inactive candidate from a conversation or explicit
+  user request.
+- `discover_skills`: Search skill metadata and contents for the current task.
+- `load_skill`: Load a selected approved skill into a bounded context budget.
+- `list_skills` and `show_skill`: Make active and proposed skills inspectable.
+- `approve_skill`, `reject_skill`, and `disable_skill`: Keep activation under user
+  control.
 
-### **Phase 4: Pluggable Environment Sandboxes (Docker Driver)**
+Discovery should use explicit triggers and lexical search first, with embedding
+retrieval as a secondary signal. Loading must be selective: inject the smallest
+set of relevant skills rather than the entire library.
 
-* **Environment Interface:** Create the Go Environment interface abstraction (Init, Exec, InjectFile, ReadFile, Close).  
-* **Docker Environment Driver:**  
-  * Implement using the official \[github.com/docker/docker/client\](https://github.com/docker/docker/client) Go SDK.  
-  * On task execution, spawn a temporary container (e.g., alpine:latest or ubuntu:22.04) with constrained limits (Memory=512MB, CPU=1.0, Network=Disabled or whitelist proxy, ReadOnlyRootfs=false with restricted tmpfs).  
-  * Expose tools to the agent: bash\_exec, read\_file, write\_file.  
-  * Ensure teardown and volume cleanup on session completion or timeout.
+### 1.2 Structured Memory
 
-### **Phase 5: Trajectory Logging & Fast-Slow Data Collection**
+Keep the existing raw conversational memory as an immutable source, while adding
+typed durable memories for information that should be recalled directly.
 
-* **Trajectory Logger:** Record full interaction sessions in Go as structured JSON objects:
+Initial memory types:
 
-  $$\\tau \= \\big(\\text{session\\\_id}, x, \\Phi\_{\\text{task}}, z, a, o, y, R\_{\\text{eval}}\\big)$$  
-* **Reward Engine:**  
-  * Calculate scalar scores $R\_{\\text{eval}}$ based on tool execution exit codes (0 vs non-zero), user explicit feedback (thumbs up/down or text corrections), and guardrail checks.
+- Explicit user preferences.
+- Durable facts supplied or confirmed by the user.
+- Project decisions and constraints.
+- Ongoing tasks and unresolved commitments.
 
-* **Storage Exporter:** Asynchronously push JSON trajectory blobs to object storage (S3/MinIO) to serve as training samples for the future Python pipeline.
+Each structured memory should include scope, provenance, status, timestamps,
+confidence, and an optional expiration time. Superseding or correcting a memory
+must preserve its history rather than silently overwriting it.
 
-### **Phase 6: Durable FSM & Task Scheduler**
+Initial operations:
 
-* **Durable State Machine:** Implement a persistent Finite State Machine (FSM) in Go (or integrate a lightweight workflow engine like Temporal / River / SQLite-backed queue).  
-* **Background & Scheduled Tasks:**  
-  * Allow the agent to register background jobs: schedule\_task(cron\_expr, instruction).  
-  * The scheduler executes tasks out-of-band inside Docker environments without blocking the main chat interface, posting completion notifications back to the user's Besedka chat.  
-* **State Recovery:** Ensure running agent tasks survive binary restarts by checkpointing active execution nodes to disk.
+- `propose_memory`: Create an inactive memory candidate with source attribution.
+- `discover_memories`: Search approved memory metadata and contents only within
+  the caller's permitted scopes.
+- `load_memory`: Load selected approved memories into the current task context.
+- `list_memories` and `show_memory`: Allow inspection of stored knowledge.
+- `approve_memory`, `reject_memory`, `update_memory`, and `forget_memory`: Give the
+  user direct control over persistence.
 
-### **Phase 7: Local Open-Weights Inference Backend**
+Bob may suggest memories, but initially only explicit approval activates them.
+Conflicting, sensitive, or inferred claims must never be auto-approved.
 
-* **Inference Engine Setup:** Deploy an open-weights inference server (such as vLLM or SGLang) hosting a foundation model (e.g., Qwen3.6-35B-A3B or gemma-4-26B-A4B).  
-* **OpenAI Proxy Compatibility:** Ensure the server exposes standard /v1/chat/completions endpoints with support for dynamic LoRA adapter mounting (/v1/load\_lora\_adapter).  
-* **Go Harness Switch:** Update the Go binary config to target the local inference backend instead of Gemini. Can still use external models for more demanding tasks to generate higher quality traces. Not sure if gemini will fit here as it does not expose full reasoning AFAIK. Maybe some top open weights models like Qwen-3.8, Kimi K3 accessed via API (openrouter) would be a better option.
+### 1.3 Context Assembly and Episodic Index
 
-### **Phase 8: Offline FSL & PESO Training Pipeline**
+Add a context builder that independently selects:
 
-* **Python Training Service:** Build a standalone Python service using PyTorch, Hugging Face peft, and the **PESO** algorithm repository.
+1. Recent conversation turns.
+2. Relevant raw historical passages.
+3. Approved structured memories.
+4. Approved procedural skills.
 
-* **Dataset Ingestion:** Filter trajectories from Phase 5 to extract high-reward execution steps and user correction patterns.
+The builder must enforce per-source token budgets, deduplicate overlapping
+content, preserve provenance, and expose which items were injected for debugging.
 
-* **PESO Optimization Loop:**  
-  * Train a single evolving LoRA adapter using the proximal regularizer loss:
+Segment older chat history into task or topic episodes so retrieval does not have
+to search only isolated message chunks. Each derived episode should contain a
+source message range, participants, time range, topic tags, task status, and a
+compact description of what happened. Episode summaries are navigation indexes,
+not approved memories: they remain linked to raw messages, are marked as
+model-derived, and cannot silently become trusted facts. Retrieval should use an
+episode to locate the relevant raw evidence before relying on important details.
 
-    $$\\mathcal{L}\_{\\text{PESO}}(\\theta) \= \\mathcal{L}\_{\\text{task}}(\\theta) \+ \\lambda \\mathcal{R}\_{\\text{prox}}(\\theta, \\theta\_{\\text{prev}})$$  
-  * The regularizer anchors parameters to $\\theta\_{\\text{prev}}$, preserving core model capabilities while updating task directions.
+Maintain an explicit task or thread ID where possible so separate goals discussed
+in the same chat do not contaminate one another. A task may span multiple chat
+turns, process restarts, or scheduled resumptions without requiring the entire chat
+history to be replayed.
 
-### **Phase 9: Automated LoRA Validation & Benchmarking**
+### 1.4 Active Task State and Adaptive Compaction
 
-* **Evaluation Pipeline:** Before any newly trained LoRA adapter is approved, the Python service runs an automated test suite:  
-  1. **Task Benchmark:** Evaluates execution success on a held-out set of command execution and tool-routing tasks.  
-  2. **Catastrophic Forgetting Check:** Measures performance on general reasoning and code generation to ensure no policy collapse occurred.  
-  3. **Safety Alignment Probe:** Runs prompt-injection and guardrail test suites to verify safety boundaries have not drifted.  
-* **Gatekeeper:** Output a binary PASS/FAIL report alongside quality metrics.
+The chat ring buffer provides recent conversational continuity, but a long-running
+tool workflow needs its own durable working state. Add adaptive task-context
+compaction based on the SelfCompact approach: periodically ask the model, using a
+small explicit rubric, whether the current trajectory has reached a safe semantic
+boundary for compaction.
 
-### **Phase 10: Dynamic LoRA Deployment & Hot-Reloading**
+Keep three distinct context horizons:
 
-* **Deployment Orchestrator:**  
-  * Upon a PASS validation score, upload the new LoRA weights to the inference server storage.  
-  * Send an API request to vLLM/SGLang to load/hot-reload the adapter.  
-* **Harness Model Router:** Update the Go harness active model configuration key dynamically, routing subsequent chat requests through the updated LoRA adapter without restarting the Go binary.
+1. **Recent chat context:** The existing ring buffer for conversational continuity.
+2. **Active task context:** Original task, compacted task state, a short raw tail,
+   and the tool interactions still needed by the current subtask.
+3. **Long-term context:** Approved memories and skills, plus searchable raw history.
 
-### **Phase 11: "Dream" Self-Training & Autonomous Curiosity**
+Compaction is a view over an immutable trajectory, not deletion. The full messages,
+tool calls, tool results, and earlier compacted states remain durably stored and can
+be retrieved for audit or recovery.
 
-* **Toy / Game Environment Drivers:**  
-  * Implement game drivers satisfying the Go Environment interface (e.g., Gym/PettingZoo wrappers, text adventure engines, or custom strategy gridworlds).  
-* **Autonomous Offline Rollouts ("Dreaming"):**  
-  * During idle hours, the harness spawns autonomous agent sessions inside game/toy sandboxes without user interaction.  
-* **Reward Prediction Error (RPE) Curiosity Engine:**  
-  * Implement an internal world-model critic that measures prediction error between expected tool outcomes and actual sandbox state changes.  
-  * High-RPE (unexpected/surprising) trajectories are flagged as valuable learning moments and prioritized for offline PESO training passes, encouraging holistic skill development.
+#### Compaction Trigger
 
-### **Phase 12: Skills support**
+At configurable tool-iteration or token intervals, append a rubric probe to a copy
+of the current trajectory. Compact when:
 
-Support loading skills based on the current task
+- A subtask has completed and its result has been verified.
+- A search or investigation has converged on durable findings.
+- An earlier plan or failed approach is no longer active.
+- Repeated tool output has been incorporated into a smaller working state.
 
-### **Phase 13: RAG for knowledge**
+Do not compact when:
 
-Accumulate facts/knowledge/skills and provide RAG search tool to the agent.
+- A tool call or dependent operation is still in flight.
+- The agent is midway through a derivation or unresolved subtask.
+- The most recent observation has not yet been interpreted.
+- The agent is stuck or repeating itself; that should trigger reflection or
+  replanning rather than conceal the failure in a summary.
 
-### **Phase 14: Generalized User Preferences Storage in CortexDB**
+Use a hard token-budget backstop to prevent overflow if the model repeatedly elects
+not to compact. Trigger values must be model-specific and selected through the
+evaluation harness rather than embedded as universal constants.
 
-Implement a persistent, structured preferences storage layer backed by CortexDB for per-user and per-chat configuration:
-* **Storage Schema:** Durable key-value and typed preference attributes indexed by user ID and chat ID.
-* **Progress Reporting Preferences:** User-level setting to opt out of or customize progress notifications (e.g. `quiet_mode`, `suppress_progress`), replacing ad-hoc text heuristics.
-* **Sandbox Retention Preferences:** Configurable policy for container lifecycles post-task (e.g. `auto_destroy_on_completion: true/false`, custom idle timeouts).
-* **Control Interface:** Explicit command interactions (e.g. `/set preference ...`) and agent tool invocation for querying and mutating preferences safely.
+#### Structured Task State
 
-### **Phase 15: Ephemeral Progress Notifications (Besedka Protocol Integration)**
+The compacted state should use a stable schema rather than an unconstrained prose
+summary:
 
-Support first-class transient / ephemeral notification messages in the chat protocol that bypass persistent message storage and memory:
-* **Besedka Protocol Support:** Introduce an ephemeral/transient message attribute (e.g. `transient: true` or `ephemeral: true`) in Besedka WebSocket frames and REST API.
-* **Storage Exclusion:** Besedka server displays progress and status frames in the active chat UI for real-time human feedback, but excludes them from persistent database storage tables.
-* **Memory Ingress Cleanliness:** Eliminates the need for client-side message prefixes (`⏳ `) and in-memory tracking caches (`recentProgress`) in Bob, ensuring historical backfill, warmup, and sequence catch-up operations never ingest transient progress messages into chat context or long-term CortexDB memory.
-* **Agent Integration:** Update Bob's `ProgressReporter` to transmit native ephemeral frames directly.
+- Original objective and immutable user constraints.
+- Completed and verified findings, with references to their source events.
+- Decisions made and approaches rejected.
+- Current subgoal and next intended actions.
+- Unresolved questions, risks, and blockers.
+- Produced artifacts, paths, identifiers, and relevant versions.
+- Loaded skill IDs and memory IDs that remain applicable.
+- A short raw tail containing recent unresolved interactions.
 
-### **Phase 16: Adaptive Agentic Planning, Execution & Supervised Reflection Harness**
+System instructions, the original user request, security constraints, and pending
+tool-call protocol messages are pinned and must not be summarized away. A
+`recall_task_history` operation should allow narrowly retrieving omitted raw events
+when the compacted state lacks a needed detail.
 
-Empower Bob to evaluate incoming task complexity and dynamically choose between the fast, standard tool loop and an isolated, deep agentic planning, execution, and validation workflow:
+Each compaction records its input event range, rubric verdict, generated state,
+model and prompt versions, token counts, and the compacted state's parent version.
+Compacted task state is a derived, replaceable execution view and therefore does
+not require user approval. It cannot become a durable user fact or procedural skill
+without going through the normal proposal and user-validation workflow.
 
-* **Dual-Path Execution Architecture (Adaptive Routing):**
-  * **Fast / Direct Path (Standard Tool Loop):** For simple, low-iteration requests that do not require multi-step planning or validation (e.g. direct Q&A, simple information lookup, or straightforward unambiguous instructions completable in $\le 5$ tool steps). The agent proceeds with the standard tool loop bounded by a configurable iteration cap $N_{\text{max}}$ (differentiated by channel context: e.g. lower iteration cap in public Townhall chats to prevent chat spam and context bloat, up to 20 in DMs).
-  * **Deep Agentic Path (DM-Exclusive Tool):** When the agent assesses a request as complex (e.g. multi-step refactoring, multi-file code modifications, research requiring verification, or complex problem-solving), it generates a focused task prompt and invokes a specialized agentic workflow tool (`run_agentic_workflow`). This tool is strictly restricted to 1-on-1 Direct Messages (DMs) and excluded from Townhall to safeguard shared channels.
+### Acceptance Criteria
 
-* **Isolated Read-Only Planning Cycle:**
-  * **Fresh Context Initialization:** The agentic workflow tool spins up a dedicated tool loop cycle in a completely fresh, isolated conversation context, eliminating prompt and context contamination from parent chat history.
-  * **Read-Only Tool Access:** The planning cycle is strictly constrained to non-mutating, read-only tools (e.g. web search, web fetch, reading files/directories, memory recall). Mutating tools (sandbox execution, file writing) are excluded.
-  * **Recursion Guard:** The agentic workflow tool itself is omitted from the planning cycle's tool definitions, completely preventing recursive planning loops.
-  * **Structured Plan Formulation:** Generates an actionable, step-by-step execution roadmap with explicit validation criteria and expected intermediate milestones.
+- A user can propose, review, approve, reject, disable, and delete memories and
+  skills.
+- Proposed items cannot influence responses before approval.
+- DM-scoped items cannot be discovered or loaded from another DM or Townhall.
+- Skill selection is observable and bounded by a configurable token budget.
+- Memory corrections and skill revisions retain an auditable version history.
+- Restart and backup/restore operations preserve lifecycle states and provenance.
+- Long workflows can compact and resume after restart without losing their original
+  objective, verified findings, active subgoal, or pending tool protocol state.
+- Raw task events remain recoverable after any number of compactions.
 
-* **Guided Execution, Validation & Reporting:**
-  * **Plan Execution:** Following plan generation, the agentic execution loop follows the planned steps sequentially, utilizing full mutating tool capabilities (e.g. sandbox commands, file writing) authorized for the DM session.
-  * **Plan Validation:** After executing the planned steps, the agent validates the results against the plan's acceptance criteria (e.g. running test suites, verifying file outputs, checking exit statuses).
-  * **Validation Outcomes & Remediation:**
-    * *On Validation Failure:* The agent analyzes the failure, generates structured fix recommendations, and diagnoses the root cause.
-    * *On Validation Success:* The agentic loop generates a comprehensive summary report detailing what was accomplished.
-  * **Return Value:** Returns the final report or remediation recommendations to the parent conversation context.
+## Phase 2: Evaluation Dataset and Harness
 
-* **Supervisor Reflection Agents (Anti-Loop Watchdogs):**
-  * **Periodic Progress Auditing:** An independent reflection agent runs periodically out-of-band (triggered by an iteration count threshold, e.g. every $K$ iterations, or a background time ticker) to audit the agentic loop's ongoing trajectory.
-  * **Pathology & Drift Detection:** Evaluates recent actions, tool arguments, and intermediate thought outputs to detect if the main agent has entered a recursive loop, repeated redundant actions, or strayed from the original plan/task.
-  * **Authoritative Termination:** The reflection agent is equipped with a dedicated control tool (`terminate_agentic_workflow`) that aborts runaway execution, marks the agentic workflow as unsuccessful, and logs diagnostic reasons for the termination.
+Build the measurement system before introducing automated prompt optimization or
+model training. The harness should evaluate the complete agent behavior, not only
+the model's final text.
 
-* **Tool Resilience (Timeouts & Retries):**
-  * **Granular Tool Timeouts:** Enforce explicit execution deadlines per tool call and per overall workflow using Go `context.WithTimeout`, ensuring slow, hung, or frozen tool invocations fail fast.
-  * **Automated Transient Retries:** Implement automated retry policies with exponential backoff and jitter for transient errors (e.g. temporary network drops, upstream rate limits / HTTP 429s, 503 service outages), while immediately surfacing non-retryable deterministic errors.
+### 2.1 Bob Evaluation Dataset
 
+Create a versioned repository of replayable tasks. Each case should define:
 
+- Input messages and channel context.
+- Initial memory, skill, and workspace fixtures.
+- Available tools and relevant configuration versions.
+- Expected outcomes, prohibited outcomes, and task-specific verifiers.
+- Tags for capability, difficulty, privacy scope, and expected execution cost.
+- Whether grading is deterministic, rubric-based, or requires user review.
 
+Initial capability groups:
+
+- Skill discovery, selection, loading, and conflicts between skills.
+- Memory proposal, approval, correction, retrieval, and forgetting.
+- Cross-user and Townhall/DM privacy isolation.
+- Tool selection and argument correctness.
+- Sandbox tasks with executable or file-state verification.
+- Long-running task recovery and scheduled execution.
+- Adaptive compaction timing, state fidelity, raw-history recovery, and resistance
+  to context rot across long tool trajectories.
+- Prompt injection, unsafe tool requests, and secret-handling behavior.
+- General response quality and the ability to avoid unnecessary tool calls.
+
+Prefer deterministic verification such as unit tests, JSON Schema validation,
+expected database state, file hashes, or explicit tool-call constraints. LLM judges
+may supplement these checks but should not be the sole gate for critical behavior.
+
+### 2.2 Harness
+
+The harness should:
+
+- Run the same cases against API and local OpenAI-compatible providers.
+- Create isolated, reproducible fixtures for memory, skills, and workspaces.
+- Record final results and turn-level actions, observations, errors, and retries.
+- Compare no compaction, fixed-threshold compaction, and rubric-gated adaptive
+  compaction under matched task and token budgets.
+- Measure pass rate, privacy violations, tool-call accuracy, token use, latency, and
+  estimated cost.
+- Compare a candidate against a named baseline and report paired regressions.
+- Support a fast smoke suite and a larger offline suite.
+- Emit machine-readable results suitable for future training-data selection.
+
+Maintain separate optimization, development, and held-out test partitions. Do not
+use held-out cases to evolve prompts, author skills, or select checkpoints.
+
+### Acceptance Criteria
+
+- The suite produces a reproducible baseline report for the current Gemini-backed
+  agent.
+- Memory and skill behavior is covered by both positive and isolation tests.
+- A candidate change can be rejected automatically for critical regressions.
+- Results identify the exact model, prompt, skill set, memory fixture, tool schema,
+  and code revision used by each run.
+
+## Phase 3: Versioned Trajectory and Feedback Collection
+
+Collect learning-quality interaction data without treating every successful tool
+exit or uncorrected response as a positive example.
+
+Each trajectory should record:
+
+- Model, base revision, adapter revision, decoding configuration, and provider.
+- System prompt, tool schema, loaded skills, and retrieved-memory versions.
+- State, action, complete next-state observation, and final result for every turn.
+- Compaction probes, verdicts, structured state versions, and retrievals from
+  compacted task history.
+- Deterministic verifier results and the source of any subjective judgment.
+- Explicit user feedback, corrections, approvals, and rejected proposals.
+- Token use, latency, cost, environment revision, and applicable random seeds.
+- Privacy classification, consent, and redaction status.
+
+Raw events remain immutable. Rewards, summaries, skills, and training examples are
+derived artifacts that can be regenerated as grading logic changes.
+
+### Acceptance Criteria
+
+- Evaluation and production interactions share a common trajectory schema.
+- User corrections can be converted into candidate demonstrations while retaining
+  the original failed attempt and next-state feedback.
+- Private or unapproved data is excluded from exports by default.
+- Dataset generation is reproducible from selected trajectory and artifact
+  versions.
+
+## Phase 4: Offline Prompt and Skill Optimization
+
+Use the approved skill library and evaluation harness to improve the fast path
+before changing model weights.
+
+### GEPA-Based Optimization
+
+Apply reflective optimization to bounded textual components such as:
+
+- System prompts.
+- Tool descriptions and tool-use policies.
+- Skill triggers and compact skill instructions.
+- Memory retrieval and context-routing rules.
+- Compaction rubrics and structured summarization prompts.
+- Fast-path versus deep-path routing criteria.
+
+Optimization runs must operate offline on the optimization partition. Proposed
+changes are versioned candidates and require held-out evaluation plus user review
+before promotion. Production feedback may propose a new optimization run but must
+not mutate the active prompt directly.
+
+### Acceptance Criteria
+
+- Every optimized artifact has a baseline comparison and readable change history.
+- Improvements survive the held-out suite without critical privacy or safety
+  regressions.
+- Prompt and skill changes can be canaried and rolled back independently of a model
+  deployment.
+
+## Phase 5: Local Open-Weights Inference
+
+Select a local model based on Bob's evaluation suite and measured performance on
+the target machine, rather than public benchmark scores alone.
+
+### Model Bake-Off
+
+Start with dense models in approximately the 4B and 8B-9B classes. Measure:
+
+- Bob evaluation pass rate, especially structured tool calling.
+- Prompt ingestion and generation speed on the Ryzen 7 PRO 8840U / Radeon 780M.
+- Memory use at realistic context sizes.
+- Reliability of the OpenAI-compatible server and chat template.
+- Quantization-induced regressions.
+
+Retain an API escalation path for tasks the local model cannot reliably complete.
+The first local model should be small enough to serve interactively and cheap enough
+to fine-tune during short rented-GPU sessions. Large dense and MoE models may be
+evaluated as teachers or optional backends, but are not the initial continual
+learning target.
+
+### Acceptance Criteria
+
+- The selected local model passes a defined minimum quality threshold on Bob's
+  held-out suite.
+- Local throughput and memory usage are acceptable at the configured context size.
+- Provider routing is transparent to the Go harness and records the selected route
+  in trajectories.
+- API fallback behavior is explicit, measurable, and privacy-aware.
+
+## Phase 6: Slow-Path LoRA Consolidation
+
+Use weight updates only for recurring, generalizable behavior that cannot be served
+adequately by memory, skills, or prompt optimization.
+
+### Initial Experiments
+
+Establish progressively more complex baselines:
+
+1. QLoRA supervised fine-tuning on user-approved, verifier-backed corrections.
+2. QLoRA with replay examples and output-KL regularization against a frozen
+   reference model.
+3. Self-distillation or hindsight-guided on-policy distillation where suitable.
+4. PESO as an experimental proximal regularizer for a single evolving adapter.
+
+PESO is not assumed to be superior for agent behavior. Compare it against simpler
+baselines using identical data, compute budgets, and evaluation gates.
+
+### Adapter Lifecycle
+
+- Keep the foundation model immutable.
+- Bind adapters to an exact base-model and tokenizer revision.
+- Store immutable candidate and stable adapter checkpoints.
+- Never overwrite the last known-good adapter.
+- Track the full training-data manifest, hyperparameters, code revision, and
+  evaluation report.
+- Promote through offline evaluation, shadow testing, and a limited canary.
+- Support immediate rollback.
+
+A previous-adapter proximal term alone does not prevent gradual long-term drift.
+Replay data, reference-policy checks, and regression evaluation remain mandatory.
+
+### Acceptance Criteria
+
+- A LoRA candidate improves its target capability beyond the best prompt/skill
+  baseline.
+- General reasoning, tool use, privacy, and safety regressions remain within
+  explicit thresholds.
+- Training fits the defined rental budget and can be reproduced from its manifest.
+- Deployment and rollback do not require mutating or replacing the base model.
+
+## Phase 7: Verifier-Backed Agentic RL and Self-Play
+
+Consider reinforcement learning only after the evaluation, trajectory, local
+inference, and adapter pipelines are reliable.
+
+Start with short-horizon tasks that have deterministic rewards, such as producing a
+file that passes tests or issuing a valid sequence of tool calls. Extend to
+multi-turn tasks only with turn-level credit assignment and explicit safeguards
+against reward hacking and excessive reasoning.
+
+Later, add proposer-solver task generation inside isolated environments:
+
+- Generate tasks grounded in available tools and fixtures.
+- Deduplicate and cross-verify generated tasks.
+- Keep tasks near the current solver's competence frontier.
+- Admit tasks to training only when their verifier is reliable.
+- Preserve an untouched external evaluation set.
+
+Generic reward-prediction-error curiosity and unconstrained autonomous "dreaming"
+are deferred. Surprising behavior is not necessarily useful behavior, and
+verifiable task generation provides a clearer learning signal.
+
+## Explicitly Deferred
+
+- Pretraining or full-model continual training.
+- Unreviewed automatic activation of generated skills or memories.
+- Training on private conversations without explicit consent and redaction.
+- Continuous live weight updates from individual interactions.
+- GraphRAG until measured retrieval failures justify its complexity.
+- Large-model or MoE adapter training as the first slow-path experiment.
+- Autonomous self-modification outside versioned artifacts and evaluation gates.
+
+## Immediate Work
+
+The next two tracks can proceed in sequence or overlap where practical:
+
+1. **User-validated skills, structured memory, and active task state:** schemas,
+   scoped storage, proposal/approval tools, discovery, selective loading, adaptive
+   compaction, raw-history recovery, and privacy tests.
+2. **Evaluation dataset and harness:** case format, deterministic verifiers,
+   isolated fixtures, compaction baselines, metrics, and the first Bob capability
+   suite.
+
+Automated skill generation, GEPA, local-model selection, and LoRA training should
+wait until these foundations produce trustworthy evidence.
