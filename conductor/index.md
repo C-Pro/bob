@@ -53,3 +53,9 @@
 
 - [~] **Track: User-Validated Skills and Structured Memory**
 *Link: [./tracks/user-validated-skills_20260925/](./tracks/user-validated-skills_20260925/)*
+
+---
+
+- [ ] **Track: Besedka progress report: support user timezone/language context injection and rich progress report cards**
+*Link: [./tracks/progress-report_20261001/](./tracks/progress-report_20261001/)*
+
