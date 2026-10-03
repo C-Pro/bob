@@ -209,11 +209,14 @@ func (e *StoreError) Unwrap() error {
 
 // updateStep persists the given step to the store if configured, returning any storage error.
 func (e *StepExecutor) updateStep(ctx context.Context, store StepStore, step *FSMStep) error {
-	if store == nil {
-		return nil
+	if store != nil {
+		if err := store.UpdateStep(ctx, step); err != nil {
+			return &StoreError{StepID: step.ID, Err: err}
+		}
 	}
-	if err := store.UpdateStep(ctx, step); err != nil {
-		return &StoreError{StepID: step.ID, Err: err}
+	if obs := GetProgressObserver(ctx); obs != nil && step != nil {
+		stepCopy := *step
+		obs.OnStepUpdate(ctx, &stepCopy)
 	}
 	return nil
 }

@@ -4,6 +4,7 @@ go 1.27.0
 
 require (
 	github.com/C-Pro/go-embed v0.2.0
+	github.com/c-pro/geche v1.7.2
 	github.com/fasthttp/websocket v1.5.12
 	github.com/go-shiori/go-readability v0.0.0-20251205110129-5db1dc9836f0
 	github.com/liliang-cn/cortexdb/v2 v2.82.2

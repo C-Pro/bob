@@ -305,12 +305,16 @@ func TestProcessMessage_SelfMessageHandling(t *testing.T) {
 	assert.Equal(t, "assistant", dmEntries[0].Role)
 	assert.Equal(t, "Hello from bot in DM", dmEntries[0].Content)
 
-	// 3. Progress messages from bot (both via ProgressPrefix and recorded progress) should NOT land in contextManager
+	// 3. Progress messages (both typed MessageTypeProgress and legacy prefix) should NOT land in contextManager
 	progressMsg := models.Message{
 		UserID:    "bot-123",
 		ChatID:    "dm_user_bot",
-		Content:   "⏳ Looking for files. Grep is running.",
+		Type:      models.MessageTypeProgress,
+		Content:   "Executing tools",
 		Timestamp: time.Now().Unix(),
+		Progress: &models.ProgressData{
+			Title: "Executing tools",
+		},
 	}
 	err = gw.ProcessMessage(context.Background(), progressMsg)
 	require.NoError(t, err)
@@ -319,15 +323,25 @@ func TestProcessMessage_SelfMessageHandling(t *testing.T) {
 	dmEntriesAfterProgress := gw.contextManager.GetOrCreate("dm_user_bot").Entries()
 	assert.Len(t, dmEntriesAfterProgress, 1)
 
-	// Recorded progress message without prefix should also be discarded
-	gw.recordProgressMessage("dm_user_bot", "Custom progress update")
-	customProgressMsg := models.Message{
+	// Legacy progress message with prefix should also be discarded
+	legacyProgressMsg := models.Message{
 		UserID:    "bot-123",
 		ChatID:    "dm_user_bot",
-		Content:   "Custom progress update",
+		Content:   "⏳ Looking for files. Grep is running.",
 		Timestamp: time.Now().Unix(),
 	}
-	err = gw.ProcessMessage(context.Background(), customProgressMsg)
+	err = gw.ProcessMessage(context.Background(), legacyProgressMsg)
+	require.NoError(t, err)
+	assert.Equal(t, 1, gw.contextManager.GetOrCreate("dm_user_bot").Len())
+
+	// Progress message from another user should also be discarded
+	otherProgressMsg := models.Message{
+		UserID:    "other-bot",
+		ChatID:    "dm_user_bot",
+		Type:      models.MessageTypeProgress,
+		Timestamp: time.Now().Unix(),
+	}
+	err = gw.ProcessMessage(context.Background(), otherProgressMsg)
 	require.NoError(t, err)
 	assert.Equal(t, 1, gw.contextManager.GetOrCreate("dm_user_bot").Len())
 }
@@ -376,6 +390,11 @@ func TestProcessMessage_TownhallContextAccumulation(t *testing.T) {
 	// Mock WebSocket for egress
 	upgrader := websocket.Upgrader{}
 	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !websocket.IsWebSocketUpgrade(r) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.User{})
+			return
+		}
 		conn, err := upgrader.Upgrade(w, r, nil)
 		require.NoError(t, err)
 		defer func() { _ = conn.Close() }()

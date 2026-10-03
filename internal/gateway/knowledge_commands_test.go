@@ -1026,6 +1026,38 @@ func TestGateway_VerifyDMOwner_EdgeCases(t *testing.T) {
 		UserIDs: []string{"bot-id-qa", "user_alice"},
 	})
 	assert.NoError(t, gw.VerifyDMOwner(ctx, "inferred_owner_dm", "user_alice"))
+
+	// 12. Valid owner caller where TargetUserID and UserIDs are empty, but chat ID is dm_<botID>_<userID> (standard Besedka)
+	gw.chatCache.Set(models.Chat{
+		ID:   "dm_bot-id-qa_user_alice",
+		Type: "dm",
+		IsDM: true,
+	})
+	assert.NoError(t, gw.VerifyDMOwner(ctx, "dm_bot-id-qa_user_alice", "user_alice"))
+	// Verify chatCache was updated with resolved TargetUserID and UserIDs
+	cached, ok := gw.chatCache.Get("dm_bot-id-qa_user_alice")
+	assert.True(t, ok)
+	assert.Equal(t, "user_alice", cached.TargetUserID)
+	assert.Equal(t, []string{"bot-id-qa", "user_alice"}, cached.UserIDs)
+
+	// 13. Valid owner caller with reverse sorted chat ID dm_<userID>_<botID>
+	gw.chatCache.Set(models.Chat{
+		ID:   "dm_user_alice_bot-id-qa",
+		Type: "dm",
+		IsDM: true,
+	})
+	assert.NoError(t, gw.VerifyDMOwner(ctx, "dm_user_alice_bot-id-qa", "user_alice"))
+
+	// 14. Unauthorized user for dm_<botID>_<userID>
+	assert.ErrorContains(t, gw.VerifyDMOwner(ctx, "dm_bot-id-qa_user_alice", "user_eve"), "only the owner of this DM can manage memories and skills")
+
+	// 15. DM chat between two other humans where bot is not a participant
+	gw.chatCache.Set(models.Chat{
+		ID:   "dm_user_eve_user_alice",
+		Type: "dm",
+		IsDM: true,
+	})
+	assert.ErrorContains(t, gw.VerifyDMOwner(ctx, "dm_user_eve_user_alice", "user_alice"), "unable to verify human owner of this DM")
 }
 
 func TestKnowledgeTools_GroupChatRejection_DefinitionsAndExecution(t *testing.T) {
