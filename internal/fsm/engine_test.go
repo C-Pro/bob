@@ -752,6 +752,11 @@ func TestEngine_Recover_StaleRun_MarksTerminated(t *testing.T) {
 	err = engine.Recover(ctx)
 	require.NoError(t, err)
 
+	require.Eventually(t, func() bool {
+		persisted, err := store.GetRun(ctx, "run_stale_test")
+		return err == nil && persisted.Status == RunStatusTerminated
+	}, 3*time.Second, 10*time.Millisecond)
+
 	engine.Stop()
 
 	assert.Equal(t, 0, execCount, "stale run should not be executed")
