@@ -29,7 +29,6 @@ type ChatSessionContext struct {
 	SourceMessageSeq      *int64
 	FSMRunID              string
 	Notifier              func(chatID, text string) error
-	Progress              *ProgressReporter
 	SandboxRequestCreated *bool
 	StagedAttachments     *StagedAttachmentCollector
 	KnowledgeBudget       *KnowledgeBudgetTracker
@@ -395,7 +394,7 @@ func (r *Registry) initToolDefinitions() {
 			Type: openai.ToolTypeFunction,
 			Function: &openai.FunctionDefinition{
 				Name:        "sandbox_destroy",
-				Description: "Explicitly terminate and tear down your active sandbox when you have finished your tasks, freeing system resources.",
+				Description: "Explicitly terminate and tear down your active sandbox when you have finished your tasks or before requesting a different sandbox environment, freeing system resources.",
 				Parameters:  sandboxDestroySchema,
 			},
 		},
@@ -978,20 +977,9 @@ func (r *Registry) executeSandboxExec(ctx context.Context, argsJSON string) (str
 		return "", errors.New("command cannot be empty")
 	}
 
-	if session.Progress != nil {
-		if desc := strings.TrimSpace(args.Description); desc != "" {
-			session.Progress.SetCurrent(desc)
-		} else {
-			session.Progress.SetCommand(cmdStr)
-		}
-	}
-
 	timeout := time.Duration(args.TimeoutSeconds) * time.Second
 
 	res, err := r.sandboxManager.Exec(ctx, session.UserID, []string{"sh", "-c", cmdStr}, timeout)
-	if session.Progress != nil {
-		session.Progress.SetCurrent("Analyzing output")
-	}
 	if err != nil {
 		return "", fmt.Errorf("execution failed: %w", err)
 	}

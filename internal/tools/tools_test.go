@@ -6,8 +6,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -351,23 +349,12 @@ func TestExecuteEmptyQuery(t *testing.T) {
 	assert.ErrorContains(t, err, "query cannot be empty")
 }
 
-func linkTestModels(t *testing.T, dataDir string) {
-	t.Helper()
-	absDataModels, err := filepath.Abs("../../data/models")
-	if err == nil {
-		if fi, err := os.Stat(absDataModels); err == nil && fi.IsDir() {
-			target := filepath.Join(dataDir, "models")
-			_ = os.Symlink(absDataModels, target)
-		}
-	}
-}
-
 func TestExecuteRecallMemory_Success(t *testing.T) {
 	tempDir := t.TempDir()
-	linkTestModels(t, tempDir)
 
 	cfg := &config.Config{
-		DataDir: tempDir,
+		DataDir:        tempDir,
+		EmbeddingModel: "none",
 	}
 	memMgr := memory.NewManager(cfg, nil)
 	defer func() { _ = memMgr.Close() }()
@@ -433,10 +420,10 @@ func TestExecuteRecallMemory_Success(t *testing.T) {
 
 func TestExecuteRecallMemory_EmptyResults(t *testing.T) {
 	tempDir := t.TempDir()
-	linkTestModels(t, tempDir)
 
 	cfg := &config.Config{
-		DataDir: tempDir,
+		DataDir:        tempDir,
+		EmbeddingModel: "none",
 	}
 	memMgr := memory.NewManager(cfg, nil)
 	defer func() { _ = memMgr.Close() }()
@@ -460,9 +447,8 @@ func TestExecuteRecallMemory_NoMemoryManager(t *testing.T) {
 
 func TestExecuteRecallMemory_InvalidArgs(t *testing.T) {
 	tempDir := t.TempDir()
-	linkTestModels(t, tempDir)
 
-	memMgr := memory.NewManager(&config.Config{DataDir: tempDir}, nil)
+	memMgr := memory.NewManager(&config.Config{DataDir: tempDir, EmbeddingModel: "none"}, nil)
 	defer func() { _ = memMgr.Close() }()
 
 	registry := NewRegistry(nil, memMgr)

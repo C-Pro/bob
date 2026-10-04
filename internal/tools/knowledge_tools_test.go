@@ -38,7 +38,7 @@ func (m *mockKnowledgeStoreProvider) GetKnowledgeStore(ctx context.Context, chat
 		return st, nil
 	}
 	dbPath := filepath.Join(m.dir, key+".db")
-	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=foreign_keys(ON)&_pragma=journal_mode(WAL)")
+	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=foreign_keys(ON)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)")
 	if err != nil {
 		return nil, err
 	}

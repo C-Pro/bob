@@ -3,6 +3,8 @@ package llm
 import (
 	"context"
 	"math"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/liliang-cn/cortexdb/v2/pkg/cortexdb"
@@ -88,4 +90,48 @@ func TestLocalEmbedderBasic(t *testing.T) {
 
 	// Close on nil engine
 	assert.NoError(t, emb.Close())
+}
+
+func TestResolveModelDir_Precedence(t *testing.T) {
+	t.Setenv("BOB_MODELS_DIR", "")
+	tempDir := t.TempDir()
+
+	// 1. Target directory wins over everything (including BOB_MODELS_DIR)
+	t.Run("target directory wins over environment directory", func(t *testing.T) {
+		targetDir := filepath.Join(tempDir, "t1_target")
+		require.NoError(t, os.MkdirAll(targetDir, 0755))
+		require.NoError(t, os.WriteFile(filepath.Join(targetDir, "model.safetensors"), []byte("target-weights"), 0644))
+
+		envDir := filepath.Join(tempDir, "t1_env")
+		envModelDir := filepath.Join(envDir, "my-model")
+		require.NoError(t, os.MkdirAll(envModelDir, 0755))
+		require.NoError(t, os.WriteFile(filepath.Join(envModelDir, "model.safetensors"), []byte("env-weights"), 0644))
+
+		t.Setenv("BOB_MODELS_DIR", envDir)
+		res := resolveModelDir(targetDir, "my-model")
+		assert.Equal(t, targetDir, res)
+	})
+
+	// 2. BOB_MODELS_DIR wins over relative candidates
+	t.Run("environment directory wins over relative candidates", func(t *testing.T) {
+		envDir := filepath.Join(tempDir, "t2_env")
+		envModelDir := filepath.Join(envDir, "my-model")
+		require.NoError(t, os.MkdirAll(envModelDir, 0755))
+		require.NoError(t, os.WriteFile(filepath.Join(envModelDir, "model.safetensors"), []byte("env-weights"), 0644))
+
+		t.Setenv("BOB_MODELS_DIR", envDir)
+		emptyTarget := filepath.Join(tempDir, "t2_empty")
+		res := resolveModelDir(emptyTarget, "my-model")
+		expectedAbs, err := filepath.Abs(envModelDir)
+		require.NoError(t, err)
+		assert.Equal(t, expectedAbs, res)
+	})
+
+	// 3. When targetDir is empty and no candidate matches, fallback to targetDir
+	t.Run("fallback to target directory when no candidates exist", func(t *testing.T) {
+		t.Setenv("BOB_MODELS_DIR", "")
+		emptyDir := filepath.Join(tempDir, "t3_empty")
+		res := resolveModelDir(emptyDir, "nonexistent-model")
+		assert.Equal(t, emptyDir, res)
+	})
 }

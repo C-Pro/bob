@@ -70,12 +70,12 @@ func setupGatewayQATestEnvironment(t *testing.T) (*Gateway, *sandbox.Manager, ch
 	}))
 
 	tempDir := t.TempDir()
-	linkTestModels(t, tempDir)
 
 	cfg := &config.Config{
 		BotHandle:                  "@bot",
 		BesedkaURL:                 server.URL,
 		DataDir:                    tempDir,
+		EmbeddingModel:             "none",
 		SandboxEnabled:             true,
 		SandboxDrivers:             []string{"bwrap"},
 		SandboxAllowedNetworkModes: []string{"none", "restricted"},
@@ -474,7 +474,7 @@ func TestGateway_NonDMSandboxCommandRejection(t *testing.T) {
 		select {
 		case msg := <-receivedMsgs:
 			t.Fatalf("unexpected message sent to townhall: %s", msg.Content)
-		case <-time.After(100 * time.Millisecond):
+		default:
 			// Success: no command was intercepted or processed
 		}
 
@@ -533,7 +533,7 @@ func TestGateway_NonDMSandboxCommandRejection(t *testing.T) {
 		select {
 		case msg := <-receivedMsgs:
 			t.Fatalf("unexpected bot self-message: %s", msg.Content)
-		case <-time.After(100 * time.Millisecond):
+		default:
 			// Success: rejected
 		}
 

@@ -172,8 +172,9 @@ func TestEnsureForwarderBinary_CacheInvalidation(t *testing.T) {
 	assert.Equal(t, []byte("version-1"), content1)
 
 	// Update custom binary with newer modtime and new content
-	time.Sleep(20 * time.Millisecond)
 	require.NoError(t, os.WriteFile(customPath, []byte("version-2-updated"), 0o755))
+	futureTime := time.Now().Add(time.Minute)
+	require.NoError(t, os.Chtimes(customPath, futureTime, futureTime))
 
 	res2, err := EnsureForwarderBinary(ForwarderConfig{
 		DataDir:      tempDataDir,

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -22,9 +23,11 @@ const (
 
 // ToolLoopRunner executes the simple tool loop finite state machine.
 type ToolLoopRunner struct {
-	llmClient    LLMClient
-	stepExecutor *StepExecutor
-	defaultModel string
+	mu              sync.RWMutex
+	llmClient       LLMClient
+	stepExecutor    *StepExecutor
+	defaultModel    string
+	toolDefProvider ToolDefinitionProvider
 }
 
 // NewToolLoopRunner creates a new ToolLoopRunner.
@@ -37,6 +40,26 @@ func NewToolLoopRunner(llmClient LLMClient, stepExecutor *StepExecutor, defaultM
 		stepExecutor: stepExecutor,
 		defaultModel: defaultModel,
 	}
+}
+
+// SetToolDefinitionProvider configures dynamic tool definition provider for the runner.
+func (r *ToolLoopRunner) SetToolDefinitionProvider(p ToolDefinitionProvider) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.toolDefProvider = p
+}
+
+func (r *ToolLoopRunner) getToolDefProvider() ToolDefinitionProvider {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.toolDefProvider
+}
+
+// HasToolDefinitionProvider returns true if a dynamic tool definition provider is set.
+func (r *ToolLoopRunner) HasToolDefinitionProvider() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.toolDefProvider != nil
 }
 
 // Execute drives the state machine for the given FSMRun until it reaches a terminal or suspended state.
@@ -78,7 +101,13 @@ func (r *ToolLoopRunner) Execute(ctx context.Context, run *FSMRun, store *Store,
 			}
 
 		case StateLLMRequest:
-			if err := r.handleLLMRequest(ctx, run, store, tools, model); err != nil {
+			currentTools := tools
+			if len(tools) == 0 {
+				if provider := r.getToolDefProvider(); provider != nil {
+					currentTools = provider.ToolDefinitions(ctx, run.ChatID, run.IsDM)
+				}
+			}
+			if err := r.handleLLMRequest(ctx, run, store, currentTools, model); err != nil {
 				return err
 			}
 
@@ -246,6 +275,9 @@ func (r *ToolLoopRunner) handlePrepareSteps(ctx context.Context, run *FSMRun, st
 	}
 	if len(existingSteps) > 0 {
 		run.CurrentState = StateExecuteSteps
+		if obs := GetProgressObserver(ctx); obs != nil {
+			obs.OnStepsPrepared(ctx, existingSteps)
+		}
 		return store.UpdateRun(ctx, run)
 	}
 
@@ -257,6 +289,10 @@ func (r *ToolLoopRunner) handlePrepareSteps(ctx context.Context, run *FSMRun, st
 
 	if err := store.CreateSteps(ctx, steps); err != nil {
 		return fmt.Errorf("failed to create fsm steps: %w", err)
+	}
+
+	if obs := GetProgressObserver(ctx); obs != nil {
+		obs.OnStepsPrepared(ctx, steps)
 	}
 
 	run.CurrentState = StateExecuteSteps

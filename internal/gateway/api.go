@@ -57,6 +57,9 @@ func (g *Gateway) FetchBotUser(ctx context.Context) (*models.User, error) {
 
 // FetchUsers fetches all users from Besedka /api/users and caches them.
 func (g *Gateway) FetchUsers(ctx context.Context) ([]models.User, error) {
+	if g == nil || g.httpClient == nil {
+		return nil, fmt.Errorf("gateway or http client not configured")
+	}
 	reqURL := fmt.Sprintf("%s/api/users", strings.TrimSuffix(g.cfg.BesedkaURL, "/"))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
@@ -137,6 +140,27 @@ func (g *Gateway) FetchChats(ctx context.Context) ([]models.Chat, error) {
 			chats = wrapper.Chats
 		} else {
 			return nil, fmt.Errorf("failed to parse chats JSON: %w", err)
+		}
+	}
+
+	g.mu.Lock()
+	botID := g.botUserID
+	g.mu.Unlock()
+
+	for i := range chats {
+		if (chats[i].IsDM || strings.HasPrefix(chats[i].ID, "dm_")) && len(chats[i].UserIDs) == 0 && botID != "" && strings.HasPrefix(chats[i].ID, "dm_") {
+			var otherID string
+			if strings.HasPrefix(chats[i].ID, "dm_"+botID+"_") {
+				otherID = strings.TrimPrefix(chats[i].ID, "dm_"+botID+"_")
+			} else if strings.HasSuffix(chats[i].ID, "_"+botID) {
+				otherID = strings.TrimSuffix(strings.TrimPrefix(chats[i].ID, "dm_"), "_"+botID)
+			}
+			if otherID != "" {
+				chats[i].UserIDs = []string{botID, otherID}
+				if chats[i].TargetUserID == "" {
+					chats[i].TargetUserID = otherID
+				}
+			}
 		}
 	}
 
@@ -449,3 +473,101 @@ func (g *Gateway) uploadPayload(ctx context.Context, endpoint string, data []byt
 
 	return id, nil
 }
+
+// sendProgressRequest represents the REST payload for sending progress cards.
+type sendProgressRequest struct {
+	Type     models.MessageType   `json:"type"`
+	Progress *models.ProgressData `json:"progress"`
+}
+
+// sendProgressResponse represents the REST response from POST /api/chats/{id}/messages.
+type sendProgressResponse struct {
+	Seq       int64 `json:"seq"`
+	Timestamp int64 `json:"timestamp"`
+}
+
+// SendProgressMessage sends a root progress card or child progress step update to Besedka.
+// Returns the sequence number assigned to the message.
+func (g *Gateway) SendProgressMessage(ctx context.Context, chatID string, progress *models.ProgressData) (int64, error) {
+	if strings.TrimSpace(chatID) == "" {
+		return 0, errors.New("chatID cannot be empty")
+	}
+	if progress == nil {
+		return 0, errors.New("progress data cannot be nil")
+	}
+	if progress.ParentSeq < 0 {
+		return 0, errors.New("parentSeq cannot be negative")
+	}
+
+	if progress.ParentSeq == 0 {
+		if strings.TrimSpace(progress.Title) == "" {
+			return 0, errors.New("root progress message must have a title")
+		}
+		if progress.CardStatus == "" {
+			progress.CardStatus = models.ProgressStatusRunning
+		}
+	} else {
+		if progress.Step == nil && progress.CardStatus == "" {
+			return 0, errors.New("child progress update must have a step or cardStatus")
+		}
+	}
+
+	if progress.Step != nil {
+		if strings.TrimSpace(progress.Step.ID) == "" {
+			return 0, errors.New("step ID cannot be empty")
+		}
+		if strings.TrimSpace(progress.Step.Title) == "" {
+			return 0, errors.New("step title cannot be empty")
+		}
+		if progress.Step.Status != models.ProgressStatusRunning &&
+			progress.Step.Status != models.ProgressStatusCompleted &&
+			progress.Step.Status != models.ProgressStatusFailed {
+			return 0, errors.New("invalid step status")
+		}
+	}
+
+	reqBody := sendProgressRequest{
+		Type:     models.MessageTypeProgress,
+		Progress: progress,
+	}
+
+	data, err := json.Marshal(reqBody)
+	if err != nil {
+		return 0, fmt.Errorf("failed to marshal progress request: %w", err)
+	}
+
+	reqURL := fmt.Sprintf("%s/api/chats/%s/messages", strings.TrimSuffix(g.cfg.BesedkaURL, "/"), url.PathEscape(chatID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(data))
+	if err != nil {
+		return 0, fmt.Errorf("failed to create progress message request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	if g.cfg.BesedkaAPIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+g.cfg.BesedkaAPIKey)
+	}
+
+	resp, err := g.httpClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("failed to send progress message: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		errReader := io.LimitReader(resp.Body, 512)
+		body, _ := io.ReadAll(errReader)
+		return 0, fmt.Errorf("send progress message returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var res sendProgressResponse
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return 0, fmt.Errorf("failed to decode send progress response: %w", err)
+	}
+
+	if res.Seq <= 0 {
+		return 0, errors.New("server returned non-positive sequence number for progress message")
+	}
+
+	return res.Seq, nil
+}
+

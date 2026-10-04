@@ -370,3 +370,32 @@ func TestManager_GetDB_AutoVacuumIncremental(t *testing.T) {
 	assert.Equal(t, 2, autoVac, "new chat database must be created with auto_vacuum = INCREMENTAL (2)")
 }
 
+func TestNewManager_EmbedderResolution(t *testing.T) {
+	t.Setenv("BOB_MODELS_DIR", "")
+	mockEmb := &mockEmbedder{dim: 4, model: "custom-mock"}
+
+	t.Run("explicitly injected embedder preserved", func(t *testing.T) {
+		cfg := &config.Config{DataDir: t.TempDir(), EmbeddingModel: "none"}
+		mgr := NewManager(cfg, mockEmb)
+		defer func() { _ = mgr.Close() }()
+		assert.Equal(t, mockEmb, mgr.Embedder())
+	})
+
+	t.Run("disabling aliases result in nil embedder", func(t *testing.T) {
+		aliases := []string{"none", "NONE", "  None ", "disabled", "DISABLED", "off", "  OFF  "}
+		for _, alias := range aliases {
+			cfg := &config.Config{DataDir: t.TempDir(), EmbeddingModel: alias}
+			mgr := NewManager(cfg, nil)
+			defer func() { _ = mgr.Close() }()
+			assert.Nil(t, mgr.Embedder(), "expected nil embedder for alias %q", alias)
+		}
+	})
+
+	t.Run("empty model under unit test with no local model defaults to nil embedder without error", func(t *testing.T) {
+		cfg := &config.Config{DataDir: t.TempDir(), EmbeddingModel: ""}
+		mgr := NewManager(cfg, nil)
+		defer func() { _ = mgr.Close() }()
+		assert.Nil(t, mgr.Embedder())
+	})
+}
+

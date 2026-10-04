@@ -478,8 +478,8 @@ func TestAgentIntegration_StartupLocationReporting(t *testing.T) {
 
 	gw := gateway.NewGateway(cfg, nil)
 	gw.SetLocation(loc)
-	gw.SetInitialLocationDelay(20 * time.Millisecond)
-	gw.SetLocationInterval(50 * time.Millisecond)
+	gw.SetInitialLocationDelay(2 * time.Millisecond)
+	gw.SetLocationInterval(10 * time.Millisecond)
 
 	go func() {
 		_ = gw.Start(ctx)

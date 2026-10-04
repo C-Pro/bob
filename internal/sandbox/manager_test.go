@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -453,13 +454,12 @@ func TestManager_ApproveAndStatus_Race(t *testing.T) {
 		defer wg.Done()
 		for i := 0; i < 50; i++ {
 			_, _ = mgr.GetStatus("user_race")
-			time.Sleep(1 * time.Millisecond)
+			runtime.Gosched()
 		}
 	}()
 
 	go func() {
 		defer wg.Done()
-		time.Sleep(5 * time.Millisecond)
 		_, _ = mgr.ApproveSandbox(ctx, "user_race")
 	}()
 

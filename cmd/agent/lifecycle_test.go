@@ -1,6 +1,7 @@
 package main_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"database/sql"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -25,37 +27,100 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+var (
+	testBinPath string
+	testBinErr  error
+	testBinOnce sync.Once
+)
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if testBinPath != "" {
+		_ = os.RemoveAll(filepath.Dir(testBinPath))
+	}
+	os.Exit(code)
+}
+
+func getTestBinary(t *testing.T) string {
+	t.Helper()
+	testBinOnce.Do(func() {
+		binDir, err := os.MkdirTemp("", "bob_agent_bin_*")
+		if err != nil {
+			testBinErr = err
+			return
+		}
+		binPath := filepath.Join(binDir, "agent_test_bin")
+		buildCmd := exec.Command("go", "build", "-o", binPath, ".")
+		buildCmd.Dir = "."
+		buildOut, err := buildCmd.CombinedOutput()
+		if err != nil {
+			_ = os.RemoveAll(binDir)
+			testBinErr = fmt.Errorf("failed to build agent binary: %w: %s", err, string(buildOut))
+			return
+		}
+		testBinPath = binPath
+	})
+	require.NoError(t, testBinErr)
+	return testBinPath
+}
+
+func runAgentUntilOutput(t *testing.T, binPath string, args []string, env []string, target string, timeout time.Duration) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, binPath, args...)
+	cmd.Env = env
+
+	pr, pw := io.Pipe()
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+
+	var outBuf bytes.Buffer
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		scanner := bufio.NewScanner(pr)
+		for scanner.Scan() {
+			line := scanner.Text()
+			outBuf.WriteString(line)
+			outBuf.WriteByte('\n')
+			if strings.Contains(line, target) {
+				if cmd.Process != nil {
+					_ = cmd.Process.Signal(syscall.SIGTERM)
+				}
+				cancel()
+			}
+		}
+	}()
+
+	_ = cmd.Run()
+	_ = pw.Close()
+	<-done
+	return outBuf.String()
+}
+
 // TestServiceDatabaseLifecycle verifies the complete service lifecycle with SQLite database:
 // 1. Fresh start with no DB (creates DB at current version).
 // 2. Start with DB at previous version (v-1) (auto-migrates to current version).
 // 3. Start with DB at v-2 (fails startup with version mismatch error).
 func TestServiceDatabaseLifecycle(t *testing.T) {
-	// Build binary for testing
-	binDir := t.TempDir()
-	binPath := filepath.Join(binDir, "agent_test_bin")
-	buildCmd := exec.Command("go", "build", "-o", binPath, ".")
-	buildCmd.Dir = "."
-	buildOut, err := buildCmd.CombinedOutput()
-	require.NoError(t, err, "failed to build agent binary: %s", string(buildOut))
+	binPath := getTestBinary(t)
 
 	t.Run("Fresh start with no db creates db at current version", func(t *testing.T) {
 		dataDir := filepath.Join(t.TempDir(), "data")
 		dbFile := filepath.Join(dataDir, "bob.db")
 		assert.NoFileExists(t, dbFile)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-
-		cmd := exec.CommandContext(ctx, binPath)
-		cmd.Env = append(os.Environ(),
+		env := append(os.Environ(),
 			"DATA_DIR="+dataDir,
 			"BESEDKA_URL=http://127.0.0.1:59999", // Unused port, won't connect
 			"OPENAI_API_KEY=test-key",
 			"OPENAI_MODEL=test-model",
 			"EMBEDDING_MODEL=test-model",
 		)
-		out, _ := cmd.CombinedOutput()
-		outputStr := string(out)
+		outputStr := runAgentUntilOutput(t, binPath, nil, env, "database storage initialized", 5*time.Second)
 
 		// Verify startup logged database initialization
 		assert.Contains(t, outputStr, "database storage initialized")
@@ -325,11 +390,7 @@ insert into schema_version(version, description, is_current) values(-1, 'ancient
 		require.NoError(t, backup.PutManifest(context.Background(), osClient, "bob_agent/", manifest))
 
 		// Start agent in dataDir (where no DB exists)
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-
-		cmd := exec.CommandContext(ctx, binPath, "-data-dir="+dataDir)
-		cmd.Env = append(os.Environ(),
+		env := append(os.Environ(),
 			"BESEDKA_URL=http://127.0.0.1:59999",
 			"SECRET="+secret,
 			"OPENAI_API_KEY=test-key",
@@ -341,8 +402,7 @@ insert into schema_version(version, description, is_current) values(-1, 'ancient
 			"S3_SECRET_KEY=secret",
 			"S3_BACKUP_PREFIX=bob_agent/",
 		)
-		out, _ := cmd.CombinedOutput()
-		outputStr := string(out)
+		outputStr := runAgentUntilOutput(t, binPath, []string{"-data-dir=" + dataDir}, env, "database recovery from object storage completed", 5*time.Second)
 
 		assert.Contains(t, outputStr, "database recovery from object storage completed")
 
@@ -364,11 +424,7 @@ insert into schema_version(version, description, is_current) values(-1, 'ancient
 		tempDir := t.TempDir()
 		dataDir := filepath.Join(tempDir, "data")
 
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-
-		cmd := exec.CommandContext(ctx, binPath, "-init-db", "-data-dir="+dataDir)
-		cmd.Env = append(os.Environ(),
+		env := append(os.Environ(),
 			"BESEDKA_URL=http://127.0.0.1:59999",
 			"SECRET=secret",
 			"OPENAI_API_KEY=test-key",
@@ -379,8 +435,7 @@ insert into schema_version(version, description, is_current) values(-1, 'ancient
 			"S3_ACCESS_KEY=key",
 			"S3_SECRET_KEY=secret",
 		)
-		out, _ := cmd.CombinedOutput()
-		outputStr := string(out)
+		outputStr := runAgentUntilOutput(t, binPath, []string{"-init-db", "-data-dir=" + dataDir}, env, "skipping S3 recovery", 5*time.Second)
 
 		assert.Contains(t, outputStr, "skipping S3 recovery")
 	})
