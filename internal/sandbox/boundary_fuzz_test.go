@@ -422,9 +422,13 @@ func TestApproveSandbox_StateRaceCondition(t *testing.T) {
 }
 
 type blockingMockDriver struct {
-	driverType DriverType
-	available  bool
-	onCreate   func()
+	mu             sync.Mutex
+	createdCount   int
+	destroyedCount int
+	driverType     DriverType
+	available      bool
+	onCreate       func()
+	onCreateCtx    func(ctx context.Context) error
 }
 
 func (m *blockingMockDriver) Type() DriverType {
@@ -436,6 +440,12 @@ func (m *blockingMockDriver) Available(ctx context.Context) bool {
 }
 
 func (m *blockingMockDriver) Create(ctx context.Context, sbx *UserSandbox, workspace string) error {
+	m.mu.Lock()
+	m.createdCount++
+	m.mu.Unlock()
+	if m.onCreateCtx != nil {
+		return m.onCreateCtx(ctx)
+	}
 	if m.onCreate != nil {
 		m.onCreate()
 	}
@@ -447,5 +457,8 @@ func (m *blockingMockDriver) Exec(ctx context.Context, sbx *UserSandbox, cmd []s
 }
 
 func (m *blockingMockDriver) Destroy(ctx context.Context, sbx *UserSandbox) error {
+	m.mu.Lock()
+	m.destroyedCount++
+	m.mu.Unlock()
 	return nil
 }

@@ -24,15 +24,25 @@ type RequestParams struct {
 	Reason          string
 }
 
+type creationOp struct {
+	done   chan struct{}
+	cancel context.CancelFunc
+	sbx    *UserSandbox
+	err    error
+}
+
 // Manager orchestrates user sandboxes, enforces the 1-sandbox-per-user limit,
 // handles user approval transitions, and cleans up expired sessions.
 type Manager struct {
-	cfg       Config
-	drivers   map[DriverType]Driver
-	sandboxes map[string]*UserSandbox // Keyed strictly by UserID
-	mu        sync.Mutex
-	stopCh    chan struct{}
-	wg        sync.WaitGroup
+	cfg         Config
+	drivers     map[DriverType]Driver
+	sandboxes   map[string]*UserSandbox // Keyed strictly by UserID
+	creations   map[string]*creationOp  // In-flight creations keyed by UserID
+	mu          sync.Mutex
+	closeCtx    context.Context
+	closeCancel context.CancelFunc
+	stopCh      chan struct{}
+	wg          sync.WaitGroup
 }
 
 // NewManager creates a new Sandbox Manager and registers configured drivers.
@@ -42,11 +52,16 @@ func NewManager(cfg Config, drivers []Driver) *Manager {
 		driverMap[d.Type()] = d
 	}
 
+	closeCtx, closeCancel := context.WithCancel(context.Background())
+
 	m := &Manager{
-		cfg:       cfg,
-		drivers:   driverMap,
-		sandboxes: make(map[string]*UserSandbox),
-		stopCh:    make(chan struct{}),
+		cfg:         cfg,
+		drivers:     driverMap,
+		sandboxes:   make(map[string]*UserSandbox),
+		creations:   make(map[string]*creationOp),
+		closeCtx:    closeCtx,
+		closeCancel: closeCancel,
+		stopCh:      make(chan struct{}),
 	}
 
 	m.wg.Add(1)
@@ -64,6 +79,11 @@ func (m *Manager) Close() error {
 		return nil
 	default:
 		close(m.stopCh)
+	}
+
+	m.closeCancel()
+	for _, op := range m.creations {
+		op.cancel()
 	}
 
 	var toDestroy []*UserSandbox
@@ -260,60 +280,170 @@ func (m *Manager) RequestSandbox(ctx context.Context, userID, chatID string, par
 }
 
 // ApproveSandbox transitions a pending sandbox request to running and invokes driver creation.
+// If the sandbox is already creating, it waits for the in-flight creation to complete.
+// If the sandbox is already running, it returns the active instance idempotently.
 func (m *Manager) ApproveSandbox(ctx context.Context, userID string) (*UserSandbox, error) {
 	m.mu.Lock()
 	sbx, ok := m.sandboxes[userID]
-	if !ok || sbx.GetStatus() != StatusPendingApproval {
+	if !ok {
 		m.mu.Unlock()
 		return nil, errors.New("no pending sandbox request found to approve")
 	}
 
-	driver, ok := m.drivers[sbx.Driver]
-	if !ok {
+	switch sbx.GetStatus() {
+	case StatusRunning:
+		if time.Now().After(sbx.ExpiresAt) {
+			m.mu.Unlock()
+			return nil, errors.New("sandbox lifetime has expired; please request a new sandbox")
+		}
 		m.mu.Unlock()
-		return nil, fmt.Errorf("driver %s not found", sbx.Driver)
+		return sbx, nil
+
+	case StatusCreating:
+		op, hasOp := m.creations[userID]
+		if !hasOp {
+			m.mu.Unlock()
+			return nil, errors.New("sandbox is in an invalid creation state")
+		}
+		m.mu.Unlock()
+
+		select {
+		case <-op.done:
+			if op.err != nil {
+				return nil, op.err
+			}
+			return op.sbx, nil
+		default:
+		}
+
+		select {
+		case <-op.done:
+			if op.err != nil {
+				return nil, op.err
+			}
+			return op.sbx, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+
+	case StatusPendingApproval:
+		driver, ok := m.drivers[sbx.Driver]
+		if !ok {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("driver %s not found", sbx.Driver)
+		}
+
+		sbx.SetStatus(StatusCreating)
+		createCtx, cancel := context.WithTimeout(m.closeCtx, 10*time.Minute)
+		op := &creationOp{
+			done:   make(chan struct{}),
+			cancel: cancel,
+			sbx:    sbx,
+		}
+		m.creations[userID] = op
+		m.wg.Add(1)
+		go m.runCreation(createCtx, op, sbx, userID, driver)
+		m.mu.Unlock()
+
+		select {
+		case <-op.done:
+			if op.err != nil {
+				return nil, op.err
+			}
+			return op.sbx, nil
+		default:
+		}
+
+		select {
+		case <-op.done:
+			if op.err != nil {
+				return nil, op.err
+			}
+			return op.sbx, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+
+	default:
+		m.mu.Unlock()
+		return nil, errors.New("no pending sandbox request found to approve")
 	}
-	sbx.SetStatus(StatusCreating)
-	m.mu.Unlock()
+}
+
+func (m *Manager) runCreation(ctx context.Context, op *creationOp, sbx *UserSandbox, userID string, driver Driver) {
+	defer m.wg.Done()
+	defer op.cancel()
+	defer close(op.done)
 
 	userWorkspace, err := m.UserWorkspaceDir(userID)
 	if err != nil {
 		m.mu.Lock()
 		delete(m.sandboxes, userID)
+		delete(m.creations, userID)
 		m.mu.Unlock()
-		return nil, fmt.Errorf("invalid user workspace: %w", err)
+		op.err = fmt.Errorf("invalid user workspace: %w", err)
+		return
 	}
+
 	if err := os.MkdirAll(userWorkspace, 0o755); err != nil {
 		m.mu.Lock()
 		delete(m.sandboxes, userID)
+		delete(m.creations, userID)
 		m.mu.Unlock()
-		return nil, fmt.Errorf("failed to create user workspace: %w", err)
+		op.err = fmt.Errorf("failed to create user workspace: %w", err)
+		return
 	}
 
 	sbx.SetWorkspaceDir(userWorkspace)
+
 	if err := driver.Create(ctx, sbx, userWorkspace); err != nil {
-		if dErr := driver.Destroy(ctx, sbx); dErr != nil {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if dErr := driver.Destroy(cleanupCtx, sbx); dErr != nil {
 			slog.Warn("failed to destroy sandbox during create rollback", "user", userID, "error", dErr)
 		}
+		cleanupCancel()
+
 		m.mu.Lock()
 		delete(m.sandboxes, userID)
+		delete(m.creations, userID)
 		m.mu.Unlock()
-		return nil, fmt.Errorf("failed to initialize sandbox: %w", err)
+		if errors.Is(ctx.Err(), context.Canceled) {
+			op.err = errors.New("sandbox creation was cancelled")
+		} else {
+			op.err = fmt.Errorf("failed to initialize sandbox: %w", err)
+		}
+		return
 	}
 
 	m.mu.Lock()
-	current, stillExists := m.sandboxes[userID]
-	if !stillExists || current != sbx {
-		m.mu.Unlock()
-		if err := driver.Destroy(ctx, sbx); err != nil {
+	defer m.mu.Unlock()
+	delete(m.creations, userID)
+
+	select {
+	case <-ctx.Done():
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := driver.Destroy(cleanupCtx, sbx); err != nil {
 			slog.Warn("failed to destroy cancelled sandbox", "user", userID, "error", err)
 		}
-		return nil, errors.New("sandbox creation was cancelled")
+		cleanupCancel()
+		delete(m.sandboxes, userID)
+		op.err = errors.New("sandbox creation was cancelled")
+		return
+	default:
 	}
-	sbx.SetStatus(StatusRunning)
-	m.mu.Unlock()
 
-	return sbx, nil
+	current, stillExists := m.sandboxes[userID]
+	if !stillExists || current != sbx {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := driver.Destroy(cleanupCtx, sbx); err != nil {
+			slog.Warn("failed to destroy cancelled sandbox", "user", userID, "error", err)
+		}
+		cleanupCancel()
+		op.err = errors.New("sandbox creation was cancelled")
+		return
+	}
+
+	sbx.SetStatus(StatusRunning)
 }
 
 // DenySandbox rejects and cancels a user's pending sandbox request.
@@ -322,8 +452,8 @@ func (m *Manager) DenySandbox(userID string) error {
 	defer m.mu.Unlock()
 
 	sbx, ok := m.sandboxes[userID]
-	if !ok || sbx.Status != StatusPendingApproval {
-		if ok && sbx.Status == StatusCreating {
+	if !ok || sbx.GetStatus() != StatusPendingApproval {
+		if ok && sbx.GetStatus() == StatusCreating {
 			return errors.New("sandbox is currently being created and cannot be denied")
 		}
 		return errors.New("no pending sandbox request found to deny")
@@ -337,7 +467,7 @@ func (m *Manager) DenySandbox(userID string) error {
 func (m *Manager) Exec(ctx context.Context, userID string, cmd []string, requestedTimeout time.Duration) (*ExecResult, error) {
 	m.mu.Lock()
 	sbx, ok := m.sandboxes[userID]
-	if !ok || sbx.Status != StatusRunning {
+	if !ok || sbx.GetStatus() != StatusRunning {
 		m.mu.Unlock()
 		return nil, errors.New("no active sandbox found for this user; request one first with sandbox_request and approve it")
 	}
@@ -345,7 +475,7 @@ func (m *Manager) Exec(ctx context.Context, userID string, cmd []string, request
 	// Check expiration
 	if time.Now().After(sbx.ExpiresAt) {
 		driver := m.drivers[sbx.Driver]
-		sbx.Status = StatusExpired
+		sbx.SetStatus(StatusExpired)
 		m.mu.Unlock()
 		if driver != nil {
 			if err := driver.Destroy(ctx, sbx); err != nil {
@@ -397,10 +527,31 @@ func (m *Manager) Destroy(ctx context.Context, userID string) error {
 		m.mu.Unlock()
 		return nil // Already destroyed
 	}
+
+	status := sbx.GetStatus()
+	op := m.creations[userID]
+
+	if status == StatusCreating && op != nil {
+		op.cancel()
+		m.mu.Unlock()
+		select {
+		case <-op.done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	if status == StatusPendingApproval {
+		delete(m.sandboxes, userID)
+		m.mu.Unlock()
+		return nil
+	}
+
 	driver := m.drivers[sbx.Driver]
 	m.mu.Unlock()
 
-	if driver != nil && (sbx.GetStatus() == StatusRunning || sbx.GetStatus() == StatusExpired) {
+	if driver != nil && (status == StatusRunning || status == StatusExpired) {
 		if err := driver.Destroy(ctx, sbx); err != nil {
 			return err
 		}

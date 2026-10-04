@@ -332,3 +332,45 @@ func TestGatewayProgressObserver_ContextCancellationStillEmitsTerminal(t *testin
 	require.Len(t, msgs, 2)
 	assert.Equal(t, models.ProgressStatusFailed, msgs[1].CardStatus)
 }
+
+func TestGatewayProgressObserver_WithExistingRoot(t *testing.T) {
+	sender := &mockProgressSender{nextSeq: 50}
+	obs := NewGatewayProgressObserverWithRoot(sender, "chat_root", true, 50)
+	assert.Equal(t, int64(50), obs.RootSeq())
+
+	ctx := context.Background()
+	step := fsm.FSMStep{
+		ID:        "s1",
+		Iteration: 1,
+		StepIndex: 0,
+		ToolName:  "sandbox_exec",
+		ArgsJSON:  `{"command":["ls"]}`,
+		Status:    fsm.StepStatusRunning,
+	}
+
+	// OnStepsPrepared should NOT emit a new root card because rootSeq is already 50
+	obs.OnStepsPrepared(ctx, []fsm.FSMStep{step})
+	assert.Empty(t, sender.getMessages(), "No new root card should be emitted when rootSeq is already set")
+
+	// OnStepUpdate emits a child step update under ParentSeq = 50
+	obs.OnStepUpdate(ctx, &step)
+	msgs := sender.getMessages()
+	require.Len(t, msgs, 1)
+	assert.Equal(t, int64(50), msgs[0].ParentSeq)
+	assert.Equal(t, models.ProgressStatusRunning, msgs[0].Step.Status)
+
+	// Step completes
+	step.Status = fsm.StepStatusCompleted
+	obs.OnStepUpdate(ctx, &step)
+	msgs = sender.getMessages()
+	require.Len(t, msgs, 2)
+	assert.Equal(t, int64(50), msgs[1].ParentSeq)
+	assert.Equal(t, models.ProgressStatusCompleted, msgs[1].Step.Status)
+
+	// Run finished marks the root card completed
+	obs.OnRunFinished(ctx, fsm.RunStatusCompleted, nil)
+	msgs = sender.getMessages()
+	require.Len(t, msgs, 3)
+	assert.Equal(t, int64(50), msgs[2].ParentSeq)
+	assert.Equal(t, models.ProgressStatusCompleted, msgs[2].CardStatus)
+}

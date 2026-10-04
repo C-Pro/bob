@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -81,7 +82,14 @@ type UserSandbox struct {
 	ExpiresAt    time.Time
 	Status       SandboxStatus
 	InternalID   string // Driver-specific handle (e.g. docker container ID)
-	WorkspaceDir string // Absolute path to user sandbox workspace on host
+	WorkspaceDir        string // Absolute path to user sandbox workspace on host
+	continuationClaimed atomic.Bool
+}
+
+// ClaimContinuation atomically claims the right to trigger the post-approval
+// conversation continuation. Exactly one caller receives true.
+func (s *UserSandbox) ClaimContinuation() bool {
+	return s.continuationClaimed.CompareAndSwap(false, true)
 }
 
 // GetInternalID returns the internal driver handle safely under read lock.

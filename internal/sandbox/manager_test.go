@@ -289,7 +289,7 @@ func TestManager_ApproveSandbox_TOCTOURace(t *testing.T) {
 			successes++
 		}
 	}
-	assert.Equal(t, 1, successes, "Exactly one ApproveSandbox call must succeed")
+	assert.Equal(t, 2, successes, "Both concurrent ApproveSandbox calls must succeed")
 
 	driver.mu.Lock()
 	assert.Equal(t, 1, driver.createdCount, "Driver.Create must only be called once")
@@ -561,4 +561,193 @@ func TestManagerExec_ContainerNotRunning_MarksExpiredAndCleansUp(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, StatusPendingApproval, newSbx.Status)
+}
+
+func TestManager_ApproveSandbox_ConcurrentApprovalWhileCreating(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := Config{
+		DataDir:            tempDir,
+		Enabled:            true,
+		Drivers:            []string{"docker"},
+		AllowedImages:      []string{"golang:alpine"},
+		MaxLifetime:        30 * time.Minute,
+		DefaultExecTimeout: 1 * time.Minute,
+		MaxExecTimeout:     10 * time.Minute,
+	}
+
+	createStarted := make(chan struct{})
+	createBlock := make(chan struct{})
+
+	blockingDriver := &blockingMockDriver{
+		driverType: DriverDocker,
+		available:  true,
+		onCreate: func() {
+			close(createStarted)
+			<-createBlock
+		},
+	}
+
+	mgr := NewManager(cfg, []Driver{blockingDriver})
+	defer func() { _ = mgr.Close() }()
+
+	ctx := context.Background()
+	_, err := mgr.RequestSandbox(ctx, "user1", "chat1", RequestParams{
+		Driver:      DriverDocker,
+		DockerImage: "golang:alpine",
+		NetworkMode: NetworkNone,
+		Reason:      "Slow image pull reproduction",
+	})
+	require.NoError(t, err)
+
+	// Goroutine 1 starts approval, which triggers driver.Create (simulating slow image pull)
+	var sbx1 *UserSandbox
+	var err1 error
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		sbx1, err1 = mgr.ApproveSandbox(ctx, "user1")
+	}()
+
+	// Wait until driver.Create is running
+	<-createStarted
+
+	// Goroutine 2 calls ApproveSandbox concurrently while status is StatusCreating
+	var sbx2 *UserSandbox
+	var err2 error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		sbx2, err2 = mgr.ApproveSandbox(ctx, "user1")
+	}()
+
+	// Allow a tiny moment to ensure goroutine 2 reaches ApproveSandbox
+	time.Sleep(50 * time.Millisecond)
+
+	// Unblock driver.Create (image pull finishes)
+	close(createBlock)
+	wg.Wait()
+
+	require.NoError(t, err1, "First approval must succeed")
+	require.NoError(t, err2, "Concurrent approval during creation must also succeed")
+	assert.Same(t, sbx1, sbx2, "Both callers must receive the exact same UserSandbox instance")
+	assert.Equal(t, StatusRunning, sbx1.GetStatus())
+
+	// Only one caller may claim the continuation
+	c1 := sbx1.ClaimContinuation()
+	c2 := sbx2.ClaimContinuation()
+	assert.True(t, (c1 && !c2) || (!c1 && c2), "Exactly one caller must successfully claim continuation")
+
+	// Verify driver.Create was only invoked once
+	blockingDriver.mu.Lock()
+	assert.Equal(t, 1, blockingDriver.createdCount, "Driver.Create must be invoked exactly once")
+	blockingDriver.mu.Unlock()
+}
+
+func TestManager_ApproveSandbox_AlreadyRunning(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := Config{
+		DataDir:            tempDir,
+		Enabled:            true,
+		Drivers:            []string{"docker"},
+		AllowedImages:      []string{"golang:alpine"},
+		MaxLifetime:        30 * time.Minute,
+		DefaultExecTimeout: 1 * time.Minute,
+		MaxExecTimeout:     10 * time.Minute,
+	}
+
+	mockDocker := &mockDriver{
+		driverType: DriverDocker,
+		available:  true,
+	}
+	mgr := NewManager(cfg, []Driver{mockDocker})
+	defer func() { _ = mgr.Close() }()
+
+	ctx := context.Background()
+	_, err := mgr.RequestSandbox(ctx, "user1", "chat1", RequestParams{
+		Driver:      DriverDocker,
+		DockerImage: "golang:alpine",
+		NetworkMode: NetworkNone,
+		Reason:      "Already running test",
+	})
+	require.NoError(t, err)
+
+	// First approval succeeds
+	sbx1, err := mgr.ApproveSandbox(ctx, "user1")
+	require.NoError(t, err)
+	assert.Equal(t, StatusRunning, sbx1.GetStatus())
+	assert.True(t, sbx1.ClaimContinuation(), "First approval claims continuation")
+
+	// Second approval on already running sandbox succeeds idempotently
+	sbx2, err := mgr.ApproveSandbox(ctx, "user1")
+	require.NoError(t, err)
+	assert.Same(t, sbx1, sbx2)
+	assert.False(t, sbx2.ClaimContinuation(), "Subsequent approval does not reclaim continuation")
+}
+
+func TestManager_Destroy_WhileCreating(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := Config{
+		DataDir:            tempDir,
+		Enabled:            true,
+		Drivers:            []string{"docker"},
+		AllowedImages:      []string{"golang:alpine"},
+		MaxLifetime:        30 * time.Minute,
+		DefaultExecTimeout: 1 * time.Minute,
+		MaxExecTimeout:     10 * time.Minute,
+	}
+
+	createStarted := make(chan struct{})
+
+	blockingDriver := &blockingMockDriver{
+		driverType: DriverDocker,
+		available:  true,
+		onCreateCtx: func(ctx context.Context) error {
+			close(createStarted)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	mgr := NewManager(cfg, []Driver{blockingDriver})
+	defer func() { _ = mgr.Close() }()
+
+	ctx := context.Background()
+	_, err := mgr.RequestSandbox(ctx, "user1", "chat1", RequestParams{
+		Driver:      DriverDocker,
+		DockerImage: "golang:alpine",
+		NetworkMode: NetworkNone,
+		Reason:      "Destroy while creating test",
+	})
+	require.NoError(t, err)
+
+	// Goroutine starts approval
+	var sbx *UserSandbox
+	var approveErr error
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		sbx, approveErr = mgr.ApproveSandbox(ctx, "user1")
+	}()
+
+	<-createStarted
+
+	// Call Destroy while creation is in-flight
+	destroyErr := mgr.Destroy(ctx, "user1")
+	require.NoError(t, destroyErr)
+
+	wg.Wait()
+	require.Error(t, approveErr)
+	assert.Nil(t, sbx)
+	assert.Contains(t, approveErr.Error(), "sandbox creation was cancelled")
+
+	// Verify sandbox is gone from manager
+	_, exists := mgr.GetStatus("user1")
+	assert.False(t, exists)
+
+	// Verify driver Destroy was invoked for rollback cleanup
+	blockingDriver.mu.Lock()
+	assert.Equal(t, 1, blockingDriver.destroyedCount)
+	blockingDriver.mu.Unlock()
 }
