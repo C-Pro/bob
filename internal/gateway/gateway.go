@@ -32,6 +32,7 @@ import (
 	"bob/internal/tools"
 	"bob/internal/tools/tavily"
 
+	"github.com/c-pro/geche"
 	"github.com/fasthttp/websocket"
 	"github.com/liliang-cn/cortexdb/v2/pkg/cortexdb"
 	openai "github.com/sashabaranov/go-openai"
@@ -59,7 +60,7 @@ type Gateway struct {
 	locationInterval     time.Duration
 	initialLocationDelay time.Duration
 	indexingWg           sync.WaitGroup
-	recentProgress       sync.Map
+	userContextInjected  *geche.MapCache[string, bool]
 	schedulerEngine      *scheduler.Engine
 	schedulerInvoker     *ScheduleInvoker
 	knowledgeWorker      *KnowledgeWorker
@@ -74,7 +75,8 @@ func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 	httpClient := &http.Client{Timeout: 10 * time.Second}
 
 	var embedder cortexdb.Embedder
-	if cfg.EmbeddingModel != "" && llmClient != nil {
+	modelSetting := strings.ToLower(strings.TrimSpace(cfg.EmbeddingModel))
+	if modelSetting != "" && modelSetting != "none" && modelSetting != "disabled" && modelSetting != "off" && llmClient != nil {
 		embedder = llm.NewEmbedder(llmClient, cfg.EmbeddingModel)
 	}
 	memoryManager := memory.NewManager(cfg, embedder)
@@ -143,6 +145,7 @@ func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 		startTime:            time.Now(),
 		locationInterval:     9 * time.Minute,
 		initialLocationDelay: 1 * time.Second,
+		userContextInjected:  geche.NewMapCache[string, bool](),
 		chatLocker:           chatLocker,
 		chatCache:            NewChatCache(),
 	}
@@ -769,23 +772,111 @@ func (g *Gateway) SendMessageWithAttachments(chatID, content string, attachments
 	return conn.WriteJSON(clientMsg)
 }
 
-func (g *Gateway) recordProgressMessage(chatID, content string) {
-	key := chatID + "\x00" + content
-	g.recentProgress.Store(key, time.Now())
+func isLegacyProgressMessage(content string) bool {
+	clean := strings.TrimSpace(content)
+	return strings.HasPrefix(clean, "⏳ ") && !strings.Contains(clean, "Sandbox Request")
 }
 
-func (g *Gateway) isRecentProgress(chatID, content string) bool {
-	key := chatID + "\x00" + content
-	val, ok := g.recentProgress.Load(key)
+// FormatUserContext formats the user's timezone and preferred language into a system context note.
+// FormatUserContextFor formats the user's timezone and preferred language into a system context message,
+// optionally attributing it to a specific user tag (e.g. "@alice") in group/townhall chats.
+// Returns an empty string if neither field is set.
+func FormatUserContextFor(userTag, timeZone, preferredLanguage string) string {
+	tz := strings.TrimSpace(timeZone)
+	lang := strings.TrimSpace(preferredLanguage)
+	if tz == "" && lang == "" {
+		return ""
+	}
+	userTag = strings.TrimSpace(userTag)
+	prefix := "[User context"
+	if userTag != "" {
+		if !strings.HasPrefix(userTag, "@") {
+			userTag = "@" + userTag
+		}
+		prefix = fmt.Sprintf("[User context for %s", userTag)
+	}
+
+	if tz != "" && lang != "" {
+		return fmt.Sprintf("%s: timezone=%s, language=%s]", prefix, tz, lang)
+	}
+	if tz != "" {
+		return fmt.Sprintf("%s: timezone=%s]", prefix, tz)
+	}
+	return fmt.Sprintf("%s: language=%s]", prefix, lang)
+}
+
+// FormatUserContext formats the user's timezone and preferred language into a system context message.
+// Returns an empty string if neither field is set.
+func FormatUserContext(timeZone, preferredLanguage string) string {
+	return FormatUserContextFor("", timeZone, preferredLanguage)
+}
+
+func (g *Gateway) getUserContextInjected() *geche.MapCache[string, bool] {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.userContextInjected == nil {
+		g.userContextInjected = geche.NewMapCache[string, bool]()
+	}
+	return g.userContextInjected
+}
+
+func (g *Gateway) injectUserContextOnce(ctx context.Context, chatID, userID string, rb *chatcontext.RingBuffer, isDM bool) {
+	if chatID == "" || userID == "" || rb == nil || g.userCache == nil {
+		return
+	}
+	injectedKey := chatID
+	if !isDM {
+		injectedKey = chatID + ":" + userID
+	}
+	injectedMap := g.getUserContextInjected()
+	if _, err := injectedMap.Get(injectedKey); err == nil {
+		return
+	}
+
+	user, ok := g.userCache.Get(userID)
+	if !ok || (user.TimeZone == "" && user.PreferredLanguage == "") {
+		if users, err := g.FetchUsers(ctx); err == nil && len(users) > 0 {
+			user, ok = g.userCache.Get(userID)
+		}
+	}
 	if !ok {
-		return false
+		return
 	}
-	t, ok := val.(time.Time)
-	if !ok || time.Since(t) > 5*time.Minute {
-		g.recentProgress.Delete(key)
-		return false
+
+	var userTag string
+	if !isDM {
+		userTag = user.GetUserName()
+		if userTag == "" {
+			userTag = user.GetDisplayName()
+		}
 	}
-	return true
+
+	contextText := FormatUserContextFor(userTag, user.TimeZone, user.PreferredLanguage)
+	if contextText == "" {
+		_, _ = injectedMap.SetIfAbsent(injectedKey, true)
+		return
+	}
+
+	if _, stored := injectedMap.SetIfAbsent(injectedKey, true); !stored {
+		return
+	}
+
+	rb.Push(chatcontext.Entry{
+		Role:      "system",
+		Content:   contextText,
+		Timestamp: time.Now().Unix(),
+	})
+}
+
+// ResetUserContextSession resets the session injection state for a chat.
+func (g *Gateway) ResetUserContextSession(chatID string) {
+	injectedMap := g.getUserContextInjected()
+	_ = injectedMap.Del(chatID)
+	for k := range injectedMap.Snapshot() {
+		if strings.HasPrefix(k, chatID+":") {
+			_ = injectedMap.Del(k)
+		}
+	}
 }
 
 // SetLocation sets the server location for periodic location reporting.
@@ -870,6 +961,9 @@ func (g *Gateway) handleEvictedBatch(chatID string, evicted []chatcontext.Entry)
 	isDM := chatID != "townhall"
 	msgs := make([]memory.MessageToStore, 0, len(evicted))
 	for _, e := range evicted {
+		if e.Role == "system" || e.Seq <= 0 {
+			continue
+		}
 		msgs = append(msgs, memory.MessageToStore{
 			Seq:        e.Seq,
 			Timestamp:  e.Timestamp,
@@ -935,10 +1029,13 @@ func (g *Gateway) CatchupChatMemory(ctx context.Context, chatID string, isDM boo
 
 		toStore := make([]memory.MessageToStore, 0, len(fetchedMsgs))
 		for _, m := range fetchedMsgs {
+			if m.Type == models.MessageTypeProgress {
+				continue
+			}
 			cleanContent := ExtractMessageText(m)
 			extraText, _ := g.processAttachments(ctx, m.Attachments)
 			fullContent := strings.TrimSpace(cleanContent + extraText)
-			if fullContent == "" || (botID != "" && m.UserID == botID && tools.IsProgressMessage(fullContent)) {
+			if fullContent == "" || (botID != "" && m.UserID == botID && isLegacyProgressMessage(fullContent)) {
 				continue
 			}
 
@@ -964,6 +1061,12 @@ func (g *Gateway) CatchupChatMemory(ctx context.Context, chatID string, isDM boo
 			if err := memMgr.IndexMessages(ctx, chatID, isDM, toStore); err != nil {
 				slog.Warn("failed to index historical batch during memory catchup", "chatID", chatID, "error", err)
 				break
+			}
+			lastReturnedSeq := fetchedMsgs[len(fetchedMsgs)-1].Seq
+			if lastReturnedSeq > toStore[len(toStore)-1].Seq {
+				if err := memMgr.SetWatermark(ctx, chatID, isDM, lastReturnedSeq); err != nil {
+					slog.Warn("failed to advance watermark for skipped messages during memory catchup", "chatID", chatID, "error", err)
+				}
 			}
 		} else if len(fetchedMsgs) > 0 {
 			lastReturnedSeq := fetchedMsgs[len(fetchedMsgs)-1].Seq
@@ -1016,12 +1119,16 @@ func (g *Gateway) WarmupChat(ctx context.Context, chatID string, lastSeq int64) 
 
 	rb := g.contextManager.GetOrCreate(chatID)
 	rb.Clear()
+	g.ResetUserContextSession(chatID)
 
 	for _, m := range msgs {
+		if m.Type == models.MessageTypeProgress {
+			continue
+		}
 		cleanContent := ExtractMessageText(m)
 		extraText, images := g.processAttachments(ctx, m.Attachments)
 		fullContent := strings.TrimSpace(cleanContent + extraText)
-		if (fullContent == "" && len(images) == 0) || (botID != "" && m.UserID == botID && tools.IsProgressMessage(fullContent)) {
+		if (fullContent == "" && len(images) == 0) || (botID != "" && m.UserID == botID && isLegacyProgressMessage(fullContent)) {
 			continue
 		}
 
@@ -1109,6 +1216,10 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 		msg.ChatID = "townhall"
 	}
 
+	if msg.Type == models.MessageTypeProgress {
+		return nil
+	}
+
 	cleanContent := ExtractMessageText(msg)
 	if cleanContent == "" && len(msg.Attachments) == 0 {
 		return nil
@@ -1138,8 +1249,7 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 
 	// 1. Handle self-messages from the bot itself (Townhall and DM)
 	if botID != "" && msg.UserID == botID {
-		// Transient progress notifications must never be stored in ring buffer or memory
-		if tools.IsProgressMessage(fullContent) || g.isRecentProgress(msg.ChatID, fullContent) {
+		if isLegacyProgressMessage(fullContent) {
 			return nil
 		}
 		entries := g.contextManager.GetOrCreate(msg.ChatID).Entries()
@@ -1183,8 +1293,12 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 	// On lookup or verification failure, fail closed and treat as public/group chat behavior.
 	isChatDM := false
 	if msg.ChatID != "townhall" && strings.TrimSpace(msg.ChatID) != "" {
-		chat, ok := g.chatCache.Get(msg.ChatID)
-		if !ok {
+		var chat models.Chat
+		var ok bool
+		if g.chatCache != nil {
+			chat, ok = g.chatCache.Get(msg.ChatID)
+		}
+		if !ok && g.httpClient != nil {
 			var err error
 			chat, err = g.GetChat(ctx, msg.ChatID)
 			if err != nil {
@@ -1196,11 +1310,16 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 		}
 	}
 
-	shouldProcess, promptText := IsMentionedOrDM(g.cfg.BotHandle, isChatDM, msg.Content)
+	botHandle := "@bot"
+	if g.cfg != nil && g.cfg.BotHandle != "" {
+		botHandle = g.cfg.BotHandle
+	}
+
+	shouldProcess, promptText := IsMentionedOrDM(botHandle, isChatDM, msg.Content)
 	if !shouldProcess && msg.ChatID == "townhall" {
-		if strings.EqualFold(g.cfg.BotHandle, "@bob") {
+		if strings.EqualFold(botHandle, "@bob") {
 			shouldProcess, promptText = IsMentionedOrDM("@bot", isChatDM, msg.Content)
-		} else if strings.EqualFold(g.cfg.BotHandle, "@bot") {
+		} else if strings.EqualFold(botHandle, "@bot") {
 			shouldProcess, promptText = IsMentionedOrDM("@bob", isChatDM, msg.Content)
 		}
 	}
@@ -1237,6 +1356,10 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 	rb := g.contextManager.GetOrCreate(msg.ChatID)
 	if rb.Len() == 0 && msg.Seq > 1 {
 		g.WarmupChat(ctx, msg.ChatID, msg.Seq-1)
+	}
+
+	if shouldProcess {
+		g.injectUserContextOnce(ctx, msg.ChatID, msg.UserID, rb, isChatDM)
 	}
 
 	rb.Push(chatcontext.Entry{
@@ -1317,30 +1440,13 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 	// A session is granted DM privileges only if it is an authoritative 1-on-1 DM owned by msg.UserID.
 	isAuthorizedDMOwner := isDM && g.VerifyDMOwner(ctx, msg.ChatID, msg.UserID) == nil
 
-	var sandboxActive bool
-	var sandboxTTL string
-	if sm != nil && isAuthorizedDMOwner {
-		if sbx, ok := sm.GetStatus(msg.UserID); ok && sbx != nil && sbx.Status == sandbox.StatusRunning {
-			sandboxActive = true
-			rem := time.Until(sbx.ExpiresAt).Round(time.Minute)
-			if rem < 0 {
-				rem = 0
-			}
-			sandboxTTL = rem.String()
-		}
-	}
-
 	var systemPrompt string
 	if isDM {
 		targetUser, ok := g.userCache.Get(msg.UserID)
 		if !ok || targetUser.GetDisplayName() == "" {
 			targetUser = models.User{ID: msg.UserID, DisplayName: senderName, UserName: senderName}
 		}
-		if sandboxActive {
-			systemPrompt = prompt.RenderDMPromptWithSandbox(botUser, g.cfg.BotHandle, targetUser, g.cfg.DMMaxParagraphs, true, sandboxTTL)
-		} else {
-			systemPrompt = prompt.RenderDMPrompt(botUser, g.cfg.BotHandle, targetUser, g.cfg.DMMaxParagraphs)
-		}
+		systemPrompt = prompt.RenderDMPrompt(botUser, g.cfg.BotHandle, targetUser, g.cfg.DMMaxParagraphs)
 	} else {
 		systemPrompt = prompt.RenderTownhallPrompt(botUser, g.cfg.BotHandle, g.cfg.TownhallMaxParagraphs)
 	}
@@ -1367,18 +1473,6 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 		})
 	}
 
-	taskDesc := currentTask
-	if taskDesc == "" {
-		taskDesc = msg.Content
-	}
-	noProgress := !isDM
-	progress := tools.NewProgressReporter(msg.ChatID, taskDesc, func(chatID, text string) error {
-		g.recordProgressMessage(chatID, text)
-		return g.SendMessage(chatID, text)
-	}, 30*time.Second, noProgress)
-	progress.Start()
-	defer progress.Stop()
-
 	var sandboxRequestCreated bool
 	var budgetLimits tools.KnowledgeBudgetLimits
 	if toolsRegistry != nil {
@@ -1397,7 +1491,6 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 	sessionCtx.Notifier = func(chatID, text string) error {
 		return g.SendMessage(chatID, text)
 	}
-	sessionCtx.Progress = progress
 	sessionCtx.SandboxRequestCreated = &sandboxRequestCreated
 
 	var toolDefs []openai.Tool
@@ -1425,27 +1518,16 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 				s := msg.Seq
 				seq = &s
 			}
+			progressObs := NewGatewayProgressObserver(g, msg.ChatID, isDM)
 			fsmReq := fsm.ToolLoopRequest{
 				ChatID:           msg.ChatID,
 				UserID:           msg.UserID,
 				IsDM:             isDM,
 				Model:            g.cfg.OpenAIModel,
 				Messages:         llmMsgs,
-				Tools:            toolDefs,
 				MaxIterations:    maxIterations,
 				SourceMessageSeq: seq,
-				OnTransition: func(state fsm.RunState, run *fsm.FSMRun) {
-					switch state {
-					case fsm.StateLLMRequest:
-						progress.SetCurrent("Thinking")
-					case fsm.StatePrepareSteps, fsm.StateExecuteSteps:
-						progress.SetCurrent("Executing tools")
-					case fsm.StateWaiting:
-						progress.SetCurrent("Waiting")
-					case fsm.StateSynthesis:
-						progress.SetCurrent("Synthesizing response")
-					}
-				},
+				ProgressObserver: progressObs,
 			}
 			fsmRes, err = fsmEng.RunToolLoop(toolCtx, fsmReq)
 			if err != nil {
@@ -1505,8 +1587,6 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 	}
 
 	formattedReply := FormatResponse(reply, isDM, g.cfg.TownhallMaxParagraphs, g.cfg.DMMaxParagraphs)
-
-	progress.Stop()
 
 	var outgoingAttachments []models.Attachment
 	if sessionCtx.StagedAttachments != nil {
@@ -2098,6 +2178,12 @@ func (g *Gateway) VerifyDMOwner(ctx context.Context, chatID, userID string) erro
 		if humanCount != 1 {
 			return fmt.Errorf("unauthorized: memory/skill management requires a 1-on-1 DM with exactly one human participant")
 		}
+	} else if botID != "" && strings.HasPrefix(chat.ID, "dm_") {
+		if strings.HasPrefix(chat.ID, "dm_"+botID+"_") {
+			humanOwnerFromUsers = strings.TrimPrefix(chat.ID, "dm_"+botID+"_")
+		} else if strings.HasSuffix(chat.ID, "_"+botID) {
+			humanOwnerFromUsers = strings.TrimSuffix(strings.TrimPrefix(chat.ID, "dm_"), "_"+botID)
+		}
 	}
 
 	ownerID := chat.TargetUserID
@@ -2113,6 +2199,14 @@ func (g *Gateway) VerifyDMOwner(ctx context.Context, chatID, userID string) erro
 
 	if userID != ownerID {
 		return fmt.Errorf("unauthorized: only the owner of this DM can manage memories and skills")
+	}
+
+	if chat.TargetUserID == "" && humanOwnerFromUsers != "" {
+		chat.TargetUserID = humanOwnerFromUsers
+		if len(chat.UserIDs) == 0 && botID != "" {
+			chat.UserIDs = []string{botID, humanOwnerFromUsers}
+		}
+		g.chatCache.Set(chat)
 	}
 
 	return nil

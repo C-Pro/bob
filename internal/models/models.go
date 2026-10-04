@@ -1,14 +1,50 @@
 package models
 
+// MessageType defines the content type of a message.
+type MessageType string
+
+const (
+	MessageTypeText     MessageType = "text"
+	MessageTypeProgress MessageType = "progress"
+)
+
+// ProgressStatus represents the execution status of a progress card or individual step.
+type ProgressStatus string
+
+const (
+	ProgressStatusRunning   ProgressStatus = "running"
+	ProgressStatusCompleted ProgressStatus = "completed"
+	ProgressStatusFailed    ProgressStatus = "failed"
+)
+
+// ProgressStep represents a single step within a progress card.
+type ProgressStep struct {
+	ID          string         `json:"id"`
+	Title       string         `json:"title"`
+	Description string         `json:"description,omitempty"`
+	Status      ProgressStatus `json:"status"`
+}
+
+// ProgressData represents progress tracking details for root cards and child step updates.
+type ProgressData struct {
+	ParentSeq  int64          `json:"parentSeq,omitempty"`
+	CardStatus ProgressStatus `json:"cardStatus,omitempty"`
+	Title      string         `json:"title,omitempty"`
+	Step       *ProgressStep  `json:"step,omitempty"`
+	Steps      []ProgressStep `json:"steps,omitempty"`
+}
+
 // Message represents a chat message.
 type Message struct {
-	Seq         int64        `json:"seq"`
-	Timestamp   int64        `json:"timestamp"` // Unix timestamp (seconds)
-	ChatID      string       `json:"chatId"`
-	UserID      string       `json:"userId"`
-	Content     string       `json:"content"`
-	RawContent  string       `json:"rawContent,omitempty"`
-	Attachments []Attachment `json:"attachments,omitempty"`
+	Seq         int64         `json:"seq"`
+	Timestamp   int64         `json:"timestamp"` // Unix timestamp (seconds)
+	ChatID      string        `json:"chatId"`
+	UserID      string        `json:"userId"`
+	Content     string        `json:"content"`
+	RawContent  string        `json:"rawContent,omitempty"`
+	Attachments []Attachment  `json:"attachments,omitempty"`
+	Type        MessageType   `json:"type,omitempty"`
+	Progress    *ProgressData `json:"progress,omitempty"`
 }
 
 // Location represents geographical coordinates.
@@ -24,6 +60,8 @@ type ClientMessage struct {
 	Content     string            `json:"content,omitempty"`
 	Attachments []Attachment      `json:"attachments,omitempty"`
 	Location    *Location         `json:"location,omitempty"`
+	MessageType MessageType       `json:"messageType,omitempty"`
+	Progress    *ProgressData     `json:"progress,omitempty"`
 }
 
 // ServerMessage represents an incoming event frame from the Besedka server.
@@ -40,7 +78,9 @@ type User struct {
 	UserName    string `json:"userName,omitempty"`
 	Name        string `json:"name,omitempty"`
 	DisplayName string `json:"displayName,omitempty"`
-	AvatarURL   string `json:"avatarUrl,omitempty"`
+	AvatarURL         string `json:"avatarUrl,omitempty"`
+	TimeZone          string `json:"timeZone,omitempty"`
+	PreferredLanguage string `json:"preferredLanguage,omitempty"`
 }
 
 // GetDisplayName returns the user's DisplayName or Name, falling back to UserName if empty.

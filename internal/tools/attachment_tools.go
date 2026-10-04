@@ -259,10 +259,6 @@ func (r *Registry) executeSandboxDownloadAttachment(ctx context.Context, argsJSO
 		return "", fmt.Errorf("failed to inspect destination path %q: %w", args.DestinationPath, err)
 	}
 
-	if session.Progress != nil {
-		session.Progress.SetCurrent(fmt.Sprintf("Downloading attachment %s", fileID))
-	}
-
 	data, mimeType, err := r.attachmentClient.DownloadAttachment(ctx, fileID)
 	if err != nil {
 		return "", fmt.Errorf("failed to download attachment %s: %w", fileID, err)
@@ -403,10 +399,6 @@ func (r *Registry) executeSandboxUploadAttachment(ctx context.Context, argsJSON 
 
 	var fileID string
 	var attType models.AttachmentType
-
-	if session.Progress != nil {
-		session.Progress.SetCurrent(fmt.Sprintf("Uploading attachment %s", name))
-	}
 
 	if isImage && int64(len(data)) <= maxImageUploadSize {
 		id, uploadErr := r.attachmentClient.UploadImage(ctx, data, name, mimeType)

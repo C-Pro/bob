@@ -171,3 +171,16 @@ func NewStepFromToolCall(runID string, iteration, stepIndex int, tc openai.ToolC
 		TimeoutSeconds: 30,
 	}
 }
+
+// ToToolCall reconstructs an OpenAI ToolCall from the FSMStep.
+func (s FSMStep) ToToolCall() openai.ToolCall {
+	return openai.ToolCall{
+		ID:   s.ToolCallID,
+		Type: openai.ToolTypeFunction,
+		Function: openai.FunctionCall{
+			Name:      s.ToolName,
+			Arguments: s.ArgsJSON,
+		},
+	}
+}
+

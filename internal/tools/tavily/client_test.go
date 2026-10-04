@@ -161,18 +161,13 @@ func TestSearchFailureAfterRetries(t *testing.T) {
 }
 
 func TestSearchContextCancellation(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(200 * time.Millisecond)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer ts.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
 
-	client := NewClient("test-api-key", ts.URL, ts.Client())
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-
+	client := NewClient("test-api-key", "http://127.0.0.1:9", http.DefaultClient)
 	_, err := client.Search(ctx, SearchRequest{Query: "timeout query"})
 	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
 }
 
 func TestExtractSuccess(t *testing.T) {

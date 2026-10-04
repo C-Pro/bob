@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 	"unicode/utf8"
 
@@ -499,35 +500,34 @@ func TestSearcher_SearchVectorJoinedErrors(t *testing.T) {
 }
 
 func TestSearcher_CleanupStaleIndicesSharedTimeout(t *testing.T) {
-	kStore, rawDB := setupTestStore(t)
-	defer func() { _ = rawDB.Close() }()
+	synctest.Test(t, func(t *testing.T) {
+		session := SessionIdentity{
+			ChatID: "c1",
+			UserID: "u1",
+		}
 
-	session := SessionIdentity{
-		ChatID: "c1",
-		UserID: "u1",
-	}
+		var callCount atomic.Int32
+		mockV := &mockVectorDB{
+			deleteFn: func(ctx context.Context, req cortexdb.MemoryDeleteRequest) (*cortexdb.MemoryDeleteResponse, error) {
+				callCount.Add(1)
+				select {
+				case <-time.After(600 * time.Millisecond):
+					return &cortexdb.MemoryDeleteResponse{Deleted: true}, nil
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			},
+		}
 
-	var callCount atomic.Int32
-	mockV := &mockVectorDB{
-		deleteFn: func(ctx context.Context, req cortexdb.MemoryDeleteRequest) (*cortexdb.MemoryDeleteResponse, error) {
-			callCount.Add(1)
-			select {
-			case <-time.After(600 * time.Millisecond):
-				return &cortexdb.MemoryDeleteResponse{Deleted: true}, nil
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		},
-	}
+		searcher, err := NewSearcher(&Store{}, mockV, session, 5)
+		require.NoError(t, err)
 
-	searcher, err := NewSearcher(kStore, mockV, session, 5)
-	require.NoError(t, err)
+		start := time.Now()
+		// Pass 10 IDs. With 600ms per delete, 10 deletes would take 6s without shared 2s timeout.
+		searcher.cleanupStaleIndices(context.Background(), []string{"m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8", "m9", "m10"})
+		elapsed := time.Since(start)
 
-	start := time.Now()
-	// Pass 10 IDs. With 600ms per delete, 10 deletes would take 6s without shared 2s timeout.
-	searcher.cleanupStaleIndices(context.Background(), []string{"m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8", "m9", "m10"})
-	elapsed := time.Since(start)
-
-	assert.Less(t, elapsed, 2500*time.Millisecond, "cleanup must be bounded to ~2 seconds")
-	assert.Less(t, callCount.Load(), int32(6), "should have aborted before processing all items")
+		assert.GreaterOrEqual(t, elapsed, 2*time.Second, "simulated time should advance past 2 seconds")
+		assert.Less(t, callCount.Load(), int32(6), "should have aborted before processing all items")
+	})
 }

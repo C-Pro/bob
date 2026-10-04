@@ -76,7 +76,31 @@ func TestRenderDMPromptWithSandbox(t *testing.T) {
 	prompt := RenderDMPromptWithSandbox(bot, "@bot", user, 5, true, "25 minutes")
 	assert.Contains(t, prompt, "Bob AI")
 	assert.Contains(t, prompt, "Alice")
-	assert.Contains(t, prompt, "active sandbox")
-	assert.Contains(t, prompt, "unconditional destruction in 25 minutes")
-	assert.Contains(t, prompt, "/sandbox destroy")
+	assert.Contains(t, prompt, "sandbox_request")
+	assert.Contains(t, prompt, "sandbox_exec")
+	assert.Contains(t, prompt, "sandbox_destroy")
+	assert.Contains(t, prompt, "/workspace")
+	assert.NotContains(t, prompt, "active sandbox")
+	assert.NotContains(t, prompt, "unconditional destruction")
+
+	// Verify static rendering matches RenderDMPrompt (preserving KV cache)
+	staticPrompt := RenderDMPrompt(bot, "@bot", user, 5)
+	assert.Equal(t, prompt, staticPrompt)
 }
+
+func TestPromptMarkdownAndMathGuidelines(t *testing.T) {
+	bot := models.User{ID: "bot-1", DisplayName: "Bob AI"}
+	user := models.User{ID: "user-1", DisplayName: "Alice"}
+
+	townhallPrompt := RenderTownhallPrompt(bot, "@bot", 2)
+	dmPrompt := RenderDMPrompt(bot, "@bot", user, 5)
+
+	for _, p := range []string{townhallPrompt, dmPrompt} {
+		assert.Contains(t, p, "Besedka formatting guidelines:")
+		assert.Contains(t, p, "safe subset of Markdown")
+		assert.Contains(t, p, "GitHub Flavored Markdown tables")
+		assert.Contains(t, p, "Raw HTML tags and markdown images")
+		assert.Contains(t, p, "Do NOT use MathML or LaTeX math syntax")
+	}
+}
+

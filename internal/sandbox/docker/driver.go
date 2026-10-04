@@ -463,7 +463,9 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 	}
 
 	for attempt := 0; attempt < maxPollAttempts; attempt++ {
-		time.Sleep(pollInterval)
+		if attempt > 0 {
+			time.Sleep(pollInterval)
+		}
 
 		inspectCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		inspectURL := fmt.Sprintf("http://localhost/containers/%s/json", sbx.GetInternalID())

@@ -1,0 +1,8 @@
+{
+  "track_id": "progress-report_20261001",
+  "type": "feature",
+  "status": "new",
+  "created_at": "2026-10-01T22:08:00Z",
+  "updated_at": "2026-10-01T22:08:00Z",
+  "description": "Besedka progress report: support user timezone/language context injection and rich progress report cards"
+}

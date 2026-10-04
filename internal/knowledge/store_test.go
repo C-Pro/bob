@@ -14,7 +14,7 @@ import (
 func setupTestStore(t *testing.T) (*Store, *sql.DB) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "knowledge_test.db")
-	db, err := sql.Open("sqlite", "file:"+dbPath+"?_auto_vacuum=INCREMENTAL&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)")
+	db, err := sql.Open("sqlite", "file:"+dbPath+"?_auto_vacuum=INCREMENTAL&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)")
 	require.NoError(t, err)
 
 	err = EnsureKnowledgeSchema(context.Background(), db)

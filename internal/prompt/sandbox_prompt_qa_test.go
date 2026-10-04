@@ -1,7 +1,6 @@
 package prompt
 
 import (
-	"strings"
 	"testing"
 
 	"bob/internal/models"
@@ -24,36 +23,35 @@ func TestRenderDMPromptWithSandbox_EdgeCases(t *testing.T) {
 		DisplayName: "Alice Wonder",
 	}
 
-	t.Run("sandbox inactive hides sandbox instructions regardless of TTL", func(t *testing.T) {
-		prompt := RenderDMPromptWithSandbox(bot, "@bob_bot", user, 5, false, "30 minutes")
-		assert.Contains(t, prompt, "Bob AI")
-		assert.Contains(t, prompt, "Alice Wonder")
-		assert.NotContains(t, prompt, "active sandbox")
-		assert.NotContains(t, prompt, "unconditional destruction")
-		assert.NotContains(t, prompt, "/sandbox destroy")
-	})
+	t.Run("sandbox instructions are static across any sandbox parameter to preserve KV cache", func(t *testing.T) {
+		basePrompt := RenderDMPrompt(bot, "@bob_bot", user, 5)
+		assert.Contains(t, basePrompt, "Bob AI")
+		assert.Contains(t, basePrompt, "Alice Wonder")
+		assert.Contains(t, basePrompt, "sandbox_request")
+		assert.Contains(t, basePrompt, "sandbox_exec")
+		assert.Contains(t, basePrompt, "sandbox_destroy")
+		assert.Contains(t, basePrompt, "/workspace")
+		assert.NotContains(t, basePrompt, "active sandbox")
+		assert.NotContains(t, basePrompt, "unconditional destruction")
 
-	t.Run("sandbox active with various TTL formats", func(t *testing.T) {
 		ttlCases := []struct {
-			name        string
-			ttl         string
-			expectedTTL string
+			name   string
+			active bool
+			ttl    string
 		}{
-			{"standard minutes", "25 minutes", "25 minutes"},
-			{"empty TTL", "", ""},
-			{"expired TTL", "expired", "expired"},
-			{"zero seconds", "0s", "0s"},
-			{"negative TTL", "-5m", "-5m"},
-			{"complex duration", "1h 45m 30s", "1h 45m 30s"},
+			{"inactive with minutes", false, "30 minutes"},
+			{"active standard minutes", true, "25 minutes"},
+			{"empty TTL", true, ""},
+			{"expired TTL", true, "expired"},
+			{"zero seconds", true, "0s"},
+			{"negative TTL", true, "-5m"},
+			{"complex duration", true, "1h 45m 30s"},
 		}
 
 		for _, tc := range ttlCases {
 			t.Run(tc.name, func(t *testing.T) {
-				p := RenderDMPromptWithSandbox(bot, "@bob_bot", user, 5, true, tc.ttl)
-				assert.Contains(t, p, "You have an active sandbox")
-				assert.Contains(t, p, "unconditional destruction in "+tc.expectedTTL)
-				assert.Contains(t, p, "/sandbox destroy")
-				assert.Contains(t, p, "keep it")
+				p := RenderDMPromptWithSandbox(bot, "@bob_bot", user, 5, tc.active, tc.ttl)
+				assert.Equal(t, basePrompt, p, "prompt must be static regardless of sandbox state to preserve LLM KV cache")
 			})
 		}
 	})
@@ -95,17 +93,17 @@ func TestRenderDMPromptWithSandbox_EdgeCases(t *testing.T) {
 		p := RenderDMPromptWithSandbox(intlBot, "@bot_cjk", intlUser, 5, true, "15m")
 		assert.Contains(t, p, "ボット AI 🤖")
 		assert.Contains(t, p, "Алиса 👩‍💻 (مرحبا)")
-		assert.Contains(t, p, "unconditional destruction in 15m")
+		assert.Contains(t, p, "sandbox_request")
 	})
 
-	t.Run("newlines and tabs in names and TTL", func(t *testing.T) {
+	t.Run("newlines and tabs in names", func(t *testing.T) {
 		spacedUser := models.User{
 			ID:          "user-space",
 			DisplayName: "Line1\nLine2\tTabbed",
 		}
 		p := RenderDMPromptWithSandbox(bot, "@bot", spacedUser, 5, true, "10m\nremaining")
 		assert.Contains(t, p, "Line1\nLine2\tTabbed")
-		assert.Contains(t, p, "10m\nremaining")
+		assert.Contains(t, p, "sandbox_request")
 	})
 
 	t.Run("fallback resolution hierarchy", func(t *testing.T) {
@@ -147,12 +145,5 @@ func TestRenderDMPromptWithSandbox_EdgeCases(t *testing.T) {
 
 		pHundred := RenderDMPromptWithSandbox(bot, "@bot", user, 100, false, "")
 		assert.Contains(t, pHundred, "maximum 100 paragraphs")
-	})
-
-	t.Run("long reason string or special characters in sandbox state", func(t *testing.T) {
-		longTTL := strings.Repeat("99 hours ", 20)
-		p := RenderDMPromptWithSandbox(bot, "@bot", user, 5, true, longTTL)
-		assert.Contains(t, p, longTTL)
-		assert.Contains(t, p, "/sandbox destroy")
 	})
 }

@@ -72,6 +72,7 @@ type ToolLoopRequest struct {
 	MaxIterations    int
 	SourceMessageSeq *int64
 	OnTransition     func(state RunState, run *FSMRun)
+	ProgressObserver ProgressObserver
 }
 
 // ToolLoopResult contains the outcome of a completed tool loop run.
@@ -220,7 +221,11 @@ func NewEngine(storeProvider StoreProvider, llmClient LLMClient, invoker ToolInv
 	}
 
 	// Register default ToolLoopRunner
-	e.RegisterRunner(FSMTypeToolLoop, NewToolLoopRunner(llmClient, e.stepExecutor, e.defaultModel))
+	runner := NewToolLoopRunner(llmClient, e.stepExecutor, e.defaultModel)
+	if e.toolDefProvider != nil {
+		runner.SetToolDefinitionProvider(e.toolDefProvider)
+	}
+	e.RegisterRunner(FSMTypeToolLoop, runner)
 
 	return e
 }
@@ -234,7 +239,19 @@ func (e *Engine) RegisterRunner(fsmType FSMType, runner Runner) {
 
 // SetToolDefinitionProvider configures or updates the tool definition provider for the engine.
 func (e *Engine) SetToolDefinitionProvider(p ToolDefinitionProvider) {
+	e.runnersMu.Lock()
 	e.toolDefProvider = p
+	runner := e.runners[FSMTypeToolLoop]
+	e.runnersMu.Unlock()
+	if tr, ok := runner.(*ToolLoopRunner); ok {
+		tr.SetToolDefinitionProvider(p)
+	}
+}
+
+func (e *Engine) getToolDefProvider() ToolDefinitionProvider {
+	e.runnersMu.RLock()
+	defer e.runnersMu.RUnlock()
+	return e.toolDefProvider
 }
 
 // ToolDefinitionProviderFunc adapts a function to ToolDefinitionProvider.
@@ -696,8 +713,10 @@ func (e *Engine) Recover(ctx context.Context) error {
 				}
 
 				var tools []openai.Tool
-				if e.toolDefProvider != nil {
-					tools = e.toolDefProvider.ToolDefinitions(runCtx, runToRecover.ChatID, runToRecover.IsDM)
+				if provider := e.getToolDefProvider(); provider != nil {
+					if tr, ok := runner.(*ToolLoopRunner); !ok || !tr.HasToolDefinitionProvider() {
+						tools = provider.ToolDefinitions(runCtx, runToRecover.ChatID, runToRecover.IsDM)
+					}
 				}
 
 				if err := runner.Execute(runCtx, &runToRecover, s, tools, e.defaultModel); err != nil {
@@ -843,8 +862,10 @@ func (e *Engine) PollDueWaitingRuns(ctx context.Context) error {
 				}
 
 				var tools []openai.Tool
-				if e.toolDefProvider != nil {
-					tools = e.toolDefProvider.ToolDefinitions(runCtx, runToResume.ChatID, runToResume.IsDM)
+				if provider := e.getToolDefProvider(); provider != nil {
+					if tr, ok := runner.(*ToolLoopRunner); !ok || !tr.HasToolDefinitionProvider() {
+						tools = provider.ToolDefinitions(runCtx, runToResume.ChatID, runToResume.IsDM)
+					}
 				}
 
 				if err := runner.Execute(runCtx, &runToResume, s, tools, e.defaultModel); err != nil {
@@ -888,9 +909,12 @@ func generateRunID() string {
 }
 
 // RunToolLoop executes a tool loop workflow run synchronously until completion or suspension.
-func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (*ToolLoopResult, error) {
+func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (result *ToolLoopResult, retErr error) {
 	if req.OnTransition != nil {
 		ctx = WithTransitionCallback(ctx, req.OnTransition)
+	}
+	if req.ProgressObserver != nil {
+		ctx = WithProgressObserver(ctx, req.ProgressObserver)
 	}
 	if req.ChatID == "" {
 		return nil, errors.New("chat_id is required")
@@ -959,6 +983,23 @@ func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (*ToolLoo
 			run.ErrorText = "request context cancelled"
 			_ = store.UpdateRun(bg, run)
 		}
+		if obs := GetProgressObserver(ctx); obs != nil {
+			var terminalStatus RunStatus
+			var runErr error
+			if run.Status == RunStatusCompleted && retErr == nil {
+				terminalStatus = RunStatusCompleted
+			} else if run.Status.IsTerminal() || retErr != nil {
+				terminalStatus = RunStatusFailed
+				if retErr != nil {
+					runErr = retErr
+				} else if run.ErrorText != "" {
+					runErr = errors.New(run.ErrorText)
+				}
+			}
+			if terminalStatus != "" {
+				obs.OnRunFinished(ctx, terminalStatus, runErr)
+			}
+		}
 	}()
 
 	sess, ok := tools.ChatSessionFromContext(ctx)
@@ -997,14 +1038,18 @@ func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (*ToolLoo
 	}
 	defer e.releaseRun(run.ID)
 
-	toolDefs := req.Tools
-	if len(toolDefs) == 0 && e.toolDefProvider != nil {
-		toolDefs = e.toolDefProvider.ToolDefinitions(ctx, req.ChatID, req.IsDM)
-	}
-
 	runner, err := e.getRunner(FSMTypeToolLoop)
 	if err != nil {
 		return nil, err
+	}
+
+	toolDefs := req.Tools
+	if len(toolDefs) == 0 {
+		if provider := e.getToolDefProvider(); provider != nil {
+			if tr, ok := runner.(*ToolLoopRunner); !ok || !tr.HasToolDefinitionProvider() {
+				toolDefs = provider.ToolDefinitions(ctx, req.ChatID, req.IsDM)
+			}
+		}
 	}
 
 	execErr := runner.Execute(runCtx, run, store, toolDefs, model)

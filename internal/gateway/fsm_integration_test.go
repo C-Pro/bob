@@ -1180,3 +1180,241 @@ func TestGateway_InteractiveSession_ConfiguredKnowledgeBudgetLimits(t *testing.T
 	assert.Equal(t, int32(3), atomic.LoadInt32(&llmCallCount))
 	assert.Equal(t, int32(1), atomic.LoadInt32(&secondLoadErrorSeen), "second load_memory must fail with budget exceeded in interactive session")
 }
+
+func TestGateway_FSMToolLoop_SandboxDestroyAndRequestNew(t *testing.T) {
+	tempDir := t.TempDir()
+	sentMsgs := make(chan models.ClientMessage, 20)
+	var llmCallCount int32
+	var turn1SawDestroy bool
+	var turn1SawRequest bool
+	var turn2SawDestroy bool
+	var turn2SawRequest bool
+
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := atomic.AddInt32(&llmCallCount, 1)
+
+		var req openai.ChatCompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		if count == 1 {
+			// Turn 1: user had running sandbox, so sandbox_request should be absent and sandbox_destroy should be present
+			for _, tool := range req.Tools {
+				if tool.Function.Name == "sandbox_destroy" {
+					turn1SawDestroy = true
+				}
+				if tool.Function.Name == "sandbox_request" {
+					turn1SawRequest = true
+				}
+			}
+			resp := openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role: openai.ChatMessageRoleAssistant,
+							ToolCalls: []openai.ToolCall{
+								{
+									ID:   "call_destroy_old",
+									Type: openai.ToolTypeFunction,
+									Function: openai.FunctionCall{
+										Name:      "sandbox_destroy",
+										Arguments: "{}",
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		if count == 2 {
+			// Turn 2: old sandbox was destroyed in turn 1, so tool definitions should be dynamically refreshed:
+			// sandbox_request should now be available!
+			for _, tool := range req.Tools {
+				if tool.Function.Name == "sandbox_destroy" {
+					turn2SawDestroy = true
+				}
+				if tool.Function.Name == "sandbox_request" {
+					turn2SawRequest = true
+				}
+			}
+			resp := openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role: openai.ChatMessageRoleAssistant,
+							ToolCalls: []openai.ToolCall{
+								{
+									ID:   "call_request_new",
+									Type: openai.ToolTypeFunction,
+									Function: openai.FunctionCall{
+										Name:      "sandbox_request",
+										Arguments: `{"driver":"bwrap","network":"none","reason":"Go calculation"}`,
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		// Turn 3: LLM receives result of sandbox_request and finishes
+		resp := openai.ChatCompletionResponse{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Message: openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "Sandbox request submitted.",
+					},
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer llmServer.Close()
+
+	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/me":
+			_ = json.NewEncoder(w).Encode(models.User{ID: "bot-id", DisplayName: "Bob", UserName: "bot"})
+		case "/api/users":
+			_ = json.NewEncoder(w).Encode([]models.User{{ID: "u1", DisplayName: "Alice"}})
+		case "/api/chats":
+			_ = json.NewEncoder(w).Encode([]models.Chat{{ID: "townhall"}, {ID: "dm_bot-id_u1", IsDM: true}})
+		case "/api/chat":
+			upgrader := websocket.Upgrader{}
+			c, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer func() { _ = c.Close() }()
+			for {
+				var cm models.ClientMessage
+				if err := c.ReadJSON(&cm); err != nil {
+					return
+				}
+				sentMsgs <- cm
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer besedkaServer.Close()
+
+	cfg := &config.Config{
+		BesedkaURL:                besedkaServer.URL,
+		BesedkaAPIKey:             "test-key",
+		OpenAIAPIKey:              "test-key",
+		OpenAIBaseURL:             llmServer.URL,
+		OpenAIModel:               "test-model",
+		BotHandle:                 "@bot",
+		DataDir:                   tempDir,
+		TownhallToolMaxIterations: 10,
+		DMToolMaxIterations:       20,
+		TownhallMaxParagraphs:     5,
+		DMMaxParagraphs:           10,
+		MsgRingBufferSize:         10,
+		SandboxEnabled:            true,
+		SandboxDrivers:            []string{"bwrap"},
+		SandboxMaxLifetime:        30 * time.Minute,
+		SandboxDefaultExecTimeout: 1 * time.Minute,
+		SandboxMaxExecTimeout:     10 * time.Minute,
+	}
+
+	llmClient := llm.NewClient(cfg, llmServer.Client())
+	gw := NewGateway(cfg, llmClient)
+	defer gw.Stop()
+	gw.httpClient = besedkaServer.Client()
+
+	storeProv := NewMemoryStoreProvider(gw.MemoryManager(), cfg.DataDir)
+	fsmEngine := fsm.NewEngine(storeProv, llmClient, gw.ToolsRegistry(), fsm.WithDefaultModel(cfg.OpenAIModel))
+	gw.SetFSMEngine(fsmEngine)
+
+	mockDriver := &mockGatewaySandboxDriver{}
+	sbxMgr := sandbox.NewManager(cfg.SandboxConfig(), []sandbox.Driver{mockDriver})
+	defer func() { _ = sbxMgr.Close() }()
+	gw.SetSandboxManager(sbxMgr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	require.NoError(t, gw.DialWebSocket(ctx))
+	_, err := gw.FetchBotUser(ctx)
+	require.NoError(t, err)
+
+	// User "u1" already has a running sandbox
+	_, err = sbxMgr.RequestSandbox(ctx, "u1", "dm_bot-id_u1", sandbox.RequestParams{
+		Driver:      sandbox.DriverBwrap,
+		NetworkMode: sandbox.NetworkNone,
+		Reason:      "initial python sandbox",
+	})
+	require.NoError(t, err)
+	_, err = sbxMgr.ApproveSandbox(ctx, "u1")
+	require.NoError(t, err)
+
+	sbxStatus, ok := sbxMgr.GetStatus("u1")
+	require.True(t, ok)
+	require.Equal(t, sandbox.StatusRunning, sbxStatus.Status)
+
+	// User sends message asking to destroy and request a new go sandbox
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_bot-id_u1",
+		UserID:    "u1",
+		Content:   "destroy current sandbox and create a go sandbox",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+
+	// The bot should have sent the approval card via websocket
+	select {
+	case cardMsg := <-sentMsgs:
+		assert.Contains(t, cardMsg.Content, "Sandbox Approval Requested")
+		assert.Contains(t, cardMsg.Content, "/sandbox approve")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for sandbox approval card")
+	}
+
+	// Verify tool definitions exposed in turn 1 vs turn 2
+	assert.True(t, turn1SawDestroy, "turn 1 should expose sandbox_destroy")
+	assert.False(t, turn1SawRequest, "turn 1 should NOT expose sandbox_request while sandbox is running")
+	assert.True(t, turn2SawDestroy, "turn 2 should expose sandbox_destroy")
+	assert.True(t, turn2SawRequest, "turn 2 should expose sandbox_request after old sandbox was destroyed")
+
+	// Verify pending sandbox request was created in sandbox manager
+	pending, ok := sbxMgr.GetStatus("u1")
+	require.True(t, ok, "pending sandbox request must exist in sandbox manager")
+	assert.Equal(t, sandbox.StatusPendingApproval, pending.Status)
+	assert.Equal(t, "Go calculation", pending.Reason)
+
+	// Now user sends /sandbox approve
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_bot-id_u1",
+		UserID:    "u1",
+		Content:   "/sandbox approve",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+
+	// Bot should confirm sandbox approval
+	select {
+	case approveReply := <-sentMsgs:
+		assert.Contains(t, approveReply.Content, "Sandbox created successfully")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for approval confirmation message")
+	}
+
+	// Verify user now has the new approved running sandbox
+	newStatus, ok := sbxMgr.GetStatus("u1")
+	require.True(t, ok)
+	assert.Equal(t, sandbox.StatusRunning, newStatus.Status)
+	assert.Equal(t, "Go calculation", newStatus.Reason)
+}
+

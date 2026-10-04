@@ -126,21 +126,28 @@ func TestFetchChats(t *testing.T) {
 		_ = json.NewEncoder(w).Encode([]models.Chat{
 			{ID: "townhall", Name: "Townhall", Type: "townhall", LastSeq: 15},
 			{ID: "dm_user1", Name: "DM with User 1", Type: "dm", LastSeq: 5},
+			{ID: "dm_bot-id_user2", Name: "User 2", IsDM: true, LastSeq: 8},
 		})
 	}))
 	defer server.Close()
 
 	cfg := &config.Config{BesedkaURL: server.URL, MsgRingBufferSize: 50}
 	gw := NewGateway(cfg, nil)
+	gw.botUserID = "bot-id"
 	gw.httpClient = server.Client()
 
 	chats, err := gw.FetchChats(context.Background())
 	require.NoError(t, err)
-	assert.Len(t, chats, 2)
+	assert.Len(t, chats, 3)
 	assert.Equal(t, "townhall", chats[0].ID)
 	assert.Equal(t, 15, chats[0].LastSeq)
 	assert.Equal(t, "dm_user1", chats[1].ID)
 	assert.Equal(t, 5, chats[1].LastSeq)
+	assert.Equal(t, "dm_bot-id_user2", chats[2].ID)
+	assert.Equal(t, 8, chats[2].LastSeq)
+	assert.True(t, chats[2].IsDM)
+	assert.Equal(t, []string{"bot-id", "user2"}, chats[2].UserIDs)
+	assert.Equal(t, "user2", chats[2].TargetUserID)
 }
 
 func TestFetchChatMessages(t *testing.T) {
@@ -458,3 +465,155 @@ func TestUploadImage(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "img-67890", id)
 }
+
+func TestSendProgressMessage(t *testing.T) {
+	var receivedPath string
+	var receivedAuth string
+	var receivedBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		receivedAuth = r.Header.Get("Authorization")
+		_ = json.NewDecoder(r.Body).Decode(&receivedBody)
+
+		if r.URL.Path == "/api/chats/error_chat/messages" {
+			http.Error(w, "bot has no write permission", http.StatusForbidden)
+			return
+		}
+		if r.URL.Path == "/api/chats/invalid_seq/messages" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"seq": 0})
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"seq": 105, "timestamp": 1700000000})
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		BesedkaURL:    server.URL,
+		BesedkaAPIKey: "secret-token",
+	}
+	gw := NewGateway(cfg, nil)
+	gw.httpClient = server.Client()
+
+	t.Run("root progress card success", func(t *testing.T) {
+		root := &models.ProgressData{
+			Title:      "Running task",
+			CardStatus: models.ProgressStatusRunning,
+			Steps: []models.ProgressStep{
+				{ID: "s1", Title: "Initialize", Status: models.ProgressStatusRunning},
+			},
+		}
+
+		seq, err := gw.SendProgressMessage(context.Background(), "townhall", root)
+		require.NoError(t, err)
+		assert.Equal(t, int64(105), seq)
+		assert.Equal(t, "/api/chats/townhall/messages", receivedPath)
+		assert.Equal(t, "Bearer secret-token", receivedAuth)
+		assert.Equal(t, "progress", receivedBody["type"])
+		prog := receivedBody["progress"].(map[string]any)
+		assert.Equal(t, "Running task", prog["title"])
+		assert.Equal(t, "running", prog["cardStatus"])
+	})
+
+	t.Run("child step update success", func(t *testing.T) {
+		child := &models.ProgressData{
+			ParentSeq: 105,
+			Step: &models.ProgressStep{
+				ID:          "s1",
+				Title:       "Initialize",
+				Description: "Setting up sandbox",
+				Status:      models.ProgressStatusCompleted,
+			},
+		}
+
+		seq, err := gw.SendProgressMessage(context.Background(), "dm_user_bot", child)
+		require.NoError(t, err)
+		assert.Equal(t, int64(105), seq)
+		assert.Equal(t, "/api/chats/dm_user_bot/messages", receivedPath)
+		prog := receivedBody["progress"].(map[string]any)
+		assert.Equal(t, float64(105), prog["parentSeq"])
+		step := prog["step"].(map[string]any)
+		assert.Equal(t, "s1", step["id"])
+		assert.Equal(t, "completed", step["status"])
+	})
+
+	t.Run("status-only child update", func(t *testing.T) {
+		child := &models.ProgressData{
+			ParentSeq:  105,
+			CardStatus: models.ProgressStatusCompleted,
+		}
+
+		seq, err := gw.SendProgressMessage(context.Background(), "dm_user_bot", child)
+		require.NoError(t, err)
+		assert.Equal(t, int64(105), seq)
+		prog := receivedBody["progress"].(map[string]any)
+		assert.Equal(t, "completed", prog["cardStatus"])
+		assert.Nil(t, prog["step"])
+	})
+
+	t.Run("validation errors", func(t *testing.T) {
+		// Empty chatID
+		_, err := gw.SendProgressMessage(context.Background(), "", &models.ProgressData{Title: "A"})
+		require.Error(t, err)
+
+		// Nil progress
+		_, err = gw.SendProgressMessage(context.Background(), "c1", nil)
+		require.Error(t, err)
+
+		// Negative parentSeq
+		_, err = gw.SendProgressMessage(context.Background(), "c1", &models.ProgressData{ParentSeq: -1, Title: "A"})
+		require.Error(t, err)
+
+		// Root with empty title
+		_, err = gw.SendProgressMessage(context.Background(), "c1", &models.ProgressData{Title: "   "})
+		require.Error(t, err)
+
+		// Child with neither step nor cardStatus
+		_, err = gw.SendProgressMessage(context.Background(), "c1", &models.ProgressData{ParentSeq: 100})
+		require.Error(t, err)
+
+		// Child with invalid step ID
+		_, err = gw.SendProgressMessage(context.Background(), "c1", &models.ProgressData{
+			ParentSeq: 100,
+			Step:      &models.ProgressStep{ID: "", Title: "T", Status: models.ProgressStatusRunning},
+		})
+		require.Error(t, err)
+
+		// Child with invalid step title
+		_, err = gw.SendProgressMessage(context.Background(), "c1", &models.ProgressData{
+			ParentSeq: 100,
+			Step:      &models.ProgressStep{ID: "s1", Title: "", Status: models.ProgressStatusRunning},
+		})
+		require.Error(t, err)
+
+		// Child with invalid step status
+		_, err = gw.SendProgressMessage(context.Background(), "c1", &models.ProgressData{
+			ParentSeq: 100,
+			Step:      &models.ProgressStep{ID: "s1", Title: "T", Status: "unknown"},
+		})
+		require.Error(t, err)
+	})
+
+	t.Run("server error", func(t *testing.T) {
+		_, err := gw.SendProgressMessage(context.Background(), "error_chat", &models.ProgressData{Title: "T"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "status 403")
+	})
+
+	t.Run("invalid sequence returned", func(t *testing.T) {
+		_, err := gw.SendProgressMessage(context.Background(), "invalid_seq", &models.ProgressData{Title: "T"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "non-positive sequence number")
+	})
+
+	t.Run("context cancelled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err := gw.SendProgressMessage(ctx, "c1", &models.ProgressData{Title: "T"})
+		require.Error(t, err)
+	})
+}
+

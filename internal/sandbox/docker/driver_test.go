@@ -393,6 +393,7 @@ func TestDockerDriver_Create_ForwarderBinaryMissing(t *testing.T) {
 		SocketPath:    sockPath,
 		AllowedImages: []string{"alpine:latest"},
 		DataDir:       filepath.Join(tempDir, "data"),
+		HostDataDir:   filepath.Join(tempDir, "data"),
 		ProxyFwdPath:  filepath.Join(tempDir, "nonexistent", "bob-proxy-fwd"),
 	})
 

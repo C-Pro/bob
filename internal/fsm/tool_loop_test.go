@@ -1216,6 +1216,148 @@ func TestToolLoop_ToolOutputNotDuplicatedInContext(t *testing.T) {
 	assert.Equal(t, secretOutput, toolMsg.Content)
 }
 
+func TestToolLoop_DynamicToolDefinitionsRefresh(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	var activeSandbox int32 = 1
+	var requestedSandbox int32
+
+	destroyTool := openai.Tool{
+		Type: openai.ToolTypeFunction,
+		Function: &openai.FunctionDefinition{
+			Name: "sandbox_destroy",
+		},
+	}
+	requestTool := openai.Tool{
+		Type: openai.ToolTypeFunction,
+		Function: &openai.FunctionDefinition{
+			Name: "sandbox_request",
+		},
+	}
+
+	provider := ToolDefinitionProviderFunc(func(_ context.Context, _ string, _ bool) []openai.Tool {
+		if atomic.LoadInt32(&activeSandbox) == 1 {
+			return []openai.Tool{destroyTool}
+		}
+		return []openai.Tool{requestTool}
+	})
+
+	invoker := ToolInvokerFunc(func(_ context.Context, name string, _ string) (string, error) {
+		if name == "sandbox_destroy" {
+			atomic.StoreInt32(&activeSandbox, 0)
+			return "sandbox destroyed", nil
+		}
+		if name == "sandbox_request" {
+			atomic.StoreInt32(&requestedSandbox, 1)
+			return "sandbox requested", nil
+		}
+		return "", fmt.Errorf("unexpected tool: %s", name)
+	})
+
+	var turn int32
+	llm := &mockLLMClient{
+		handler: func(_ context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			curTurn := atomic.AddInt32(&turn, 1)
+			switch curTurn {
+			case 1:
+				// Turn 1: should see sandbox_destroy tool
+				require.Len(t, req.Tools, 1)
+				assert.Equal(t, "sandbox_destroy", req.Tools[0].Function.Name)
+				return &openai.ChatCompletionResponse{
+					Choices: []openai.ChatCompletionChoice{
+						{
+							Message: openai.ChatCompletionMessage{
+								Role: openai.ChatMessageRoleAssistant,
+								ToolCalls: []openai.ToolCall{
+									{
+										ID:   "call_destroy_1",
+										Type: openai.ToolTypeFunction,
+										Function: openai.FunctionCall{
+											Name:      "sandbox_destroy",
+											Arguments: "{}",
+										},
+									},
+								},
+							},
+						},
+					},
+				}, nil
+			case 2:
+				// Turn 2: sandbox was destroyed in turn 1; tools should be refreshed dynamically and contain sandbox_request!
+				require.Len(t, req.Tools, 1)
+				assert.Equal(t, "sandbox_request", req.Tools[0].Function.Name)
+				return &openai.ChatCompletionResponse{
+					Choices: []openai.ChatCompletionChoice{
+						{
+							Message: openai.ChatCompletionMessage{
+								Role: openai.ChatMessageRoleAssistant,
+								ToolCalls: []openai.ToolCall{
+									{
+										ID:   "call_req_1",
+										Type: openai.ToolTypeFunction,
+										Function: openai.FunctionCall{
+											Name:      "sandbox_request",
+											Arguments: `{"driver":"docker","image":"golang:1.22-alpine"}`,
+										},
+									},
+								},
+							},
+						},
+					},
+				}, nil
+			case 3:
+				// Turn 3: final text response
+				return &openai.ChatCompletionResponse{
+					Choices: []openai.ChatCompletionChoice{
+						{
+							Message: openai.ChatCompletionMessage{
+								Role:    openai.ChatMessageRoleAssistant,
+								Content: "Sandbox requested and awaiting approval.",
+							},
+						},
+					},
+				}, nil
+			default:
+				return nil, errors.New("too many turns")
+			}
+		},
+	}
+
+	executor := NewStepExecutor(invoker)
+	runner := NewToolLoopRunner(llm, executor, "test-model")
+	runner.SetToolDefinitionProvider(provider)
+
+	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "destroy sandbox and create go sandbox"},
+	})
+	require.NoError(t, err)
+
+	run := &FSMRun{
+		ID:            "run_dynamic_tools",
+		ChatID:        "chat_dm_1",
+		UserID:        "user_1",
+		IsDM:          true,
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusPending,
+		CurrentState:  StateInit,
+		Iteration:     0,
+		MaxIterations: 10,
+		ContextJSON:   contextJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	// Pass nil tools so runner uses dynamic provider
+	err = runner.Execute(ctx, run, store, nil, "test-model")
+	require.NoError(t, err)
+
+	assert.Equal(t, RunStatusCompleted, run.Status)
+	assert.Equal(t, StateCompleted, run.CurrentState)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&requestedSandbox))
+	assert.Equal(t, int32(3), atomic.LoadInt32(&turn))
+}
+
 
 
 
