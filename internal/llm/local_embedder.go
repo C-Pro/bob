@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"math"
 	"os"
@@ -237,11 +238,22 @@ func resolveModelDir(targetDir, modelName string) string {
 	candidates := []string{
 		filepath.Join(os.Getenv("BOB_MODELS_DIR"), modelName),
 		filepath.Join("models", modelName),
-		filepath.Join("..", "models", modelName),
-		filepath.Join("..", "..", "models", modelName),
-		filepath.Join("data", "models", modelName),
-		filepath.Join("..", "data", "models", modelName),
-		filepath.Join("..", "..", "data", "models", modelName),
+	}
+
+	// In test environments, avoid auto-discovering large neural models from parent directories
+	// unless BOB_MODELS_DIR is explicitly configured.
+	if flag.Lookup("test.v") == nil || os.Getenv("BOB_MODELS_DIR") != "" {
+		candidates = append(candidates,
+			filepath.Join("..", "models", modelName),
+			filepath.Join("..", "..", "models", modelName),
+		)
+	}
+	candidates = append(candidates, filepath.Join("data", "models", modelName))
+	if flag.Lookup("test.v") == nil || os.Getenv("BOB_MODELS_DIR") != "" {
+		candidates = append(candidates,
+			filepath.Join("..", "data", "models", modelName),
+			filepath.Join("..", "..", "data", "models", modelName),
+		)
 	}
 
 	for _, c := range candidates {

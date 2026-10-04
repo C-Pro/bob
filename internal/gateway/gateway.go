@@ -75,7 +75,8 @@ func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 	httpClient := &http.Client{Timeout: 10 * time.Second}
 
 	var embedder cortexdb.Embedder
-	if cfg.EmbeddingModel != "" && llmClient != nil {
+	modelSetting := strings.ToLower(strings.TrimSpace(cfg.EmbeddingModel))
+	if modelSetting != "" && modelSetting != "none" && modelSetting != "disabled" && modelSetting != "off" && llmClient != nil {
 		embedder = llm.NewEmbedder(llmClient, cfg.EmbeddingModel)
 	}
 	memoryManager := memory.NewManager(cfg, embedder)
@@ -1439,30 +1440,13 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 	// A session is granted DM privileges only if it is an authoritative 1-on-1 DM owned by msg.UserID.
 	isAuthorizedDMOwner := isDM && g.VerifyDMOwner(ctx, msg.ChatID, msg.UserID) == nil
 
-	var sandboxActive bool
-	var sandboxTTL string
-	if sm != nil && isAuthorizedDMOwner {
-		if sbx, ok := sm.GetStatus(msg.UserID); ok && sbx != nil && sbx.Status == sandbox.StatusRunning {
-			sandboxActive = true
-			rem := time.Until(sbx.ExpiresAt).Round(time.Minute)
-			if rem < 0 {
-				rem = 0
-			}
-			sandboxTTL = rem.String()
-		}
-	}
-
 	var systemPrompt string
 	if isDM {
 		targetUser, ok := g.userCache.Get(msg.UserID)
 		if !ok || targetUser.GetDisplayName() == "" {
 			targetUser = models.User{ID: msg.UserID, DisplayName: senderName, UserName: senderName}
 		}
-		if sandboxActive {
-			systemPrompt = prompt.RenderDMPromptWithSandbox(botUser, g.cfg.BotHandle, targetUser, g.cfg.DMMaxParagraphs, true, sandboxTTL)
-		} else {
-			systemPrompt = prompt.RenderDMPrompt(botUser, g.cfg.BotHandle, targetUser, g.cfg.DMMaxParagraphs)
-		}
+		systemPrompt = prompt.RenderDMPrompt(botUser, g.cfg.BotHandle, targetUser, g.cfg.DMMaxParagraphs)
 	} else {
 		systemPrompt = prompt.RenderTownhallPrompt(botUser, g.cfg.BotHandle, g.cfg.TownhallMaxParagraphs)
 	}

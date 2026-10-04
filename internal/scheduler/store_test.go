@@ -15,7 +15,7 @@ import (
 func setupTestStore(t *testing.T) (*Store, *sql.DB) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "scheduler_test.db")
-	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=foreign_keys(ON)&_pragma=journal_mode(WAL)")
+	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=foreign_keys(ON)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)")
 	require.NoError(t, err)
 	require.NoError(t, EnsureScheduleSchema(context.Background(), db))
 

@@ -76,9 +76,16 @@ func TestRenderDMPromptWithSandbox(t *testing.T) {
 	prompt := RenderDMPromptWithSandbox(bot, "@bot", user, 5, true, "25 minutes")
 	assert.Contains(t, prompt, "Bob AI")
 	assert.Contains(t, prompt, "Alice")
-	assert.Contains(t, prompt, "active sandbox")
-	assert.Contains(t, prompt, "unconditional destruction in 25 minutes")
-	assert.Contains(t, prompt, "/sandbox destroy")
+	assert.Contains(t, prompt, "sandbox_request")
+	assert.Contains(t, prompt, "sandbox_exec")
+	assert.Contains(t, prompt, "sandbox_destroy")
+	assert.Contains(t, prompt, "/workspace")
+	assert.NotContains(t, prompt, "active sandbox")
+	assert.NotContains(t, prompt, "unconditional destruction")
+
+	// Verify static rendering matches RenderDMPrompt (preserving KV cache)
+	staticPrompt := RenderDMPrompt(bot, "@bot", user, 5)
+	assert.Equal(t, prompt, staticPrompt)
 }
 
 func TestPromptMarkdownAndMathGuidelines(t *testing.T) {

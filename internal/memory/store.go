@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"database/sql"
+	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -81,7 +82,14 @@ func NewManager(cfg *config.Config, embedder cortexdb.Embedder) *Manager {
 	}
 	if embedder == nil && cfg != nil {
 		modelSetting := strings.ToLower(strings.TrimSpace(cfg.EmbeddingModel))
-		if modelSetting != "none" && modelSetting != "disabled" && modelSetting != "off" && modelSetting == "" {
+		if modelSetting == "" {
+			if flag.Lookup("test.v") != nil && os.Getenv("BOB_MODELS_DIR") == "" && !hasLocalModelInDir(cfg.DataDir) {
+				return &Manager{
+					cfg:      cfg,
+					embedder: nil,
+					dbs:      make(map[string]*cortexdb.DB),
+				}
+			}
 			localEmb, err := llm.NewLocalEmbedder(cfg)
 			if err != nil {
 				slog.Warn("could not initialize local embedding engine, falling back to FTS5 lexical search", "error", err)
@@ -95,6 +103,20 @@ func NewManager(cfg *config.Config, embedder cortexdb.Embedder) *Manager {
 		embedder: embedder,
 		dbs:      make(map[string]*cortexdb.DB),
 	}
+}
+
+func hasLocalModelInDir(dataDir string) bool {
+	if dataDir == "" {
+		return false
+	}
+	targetSafetensors := filepath.Join(dataDir, "models", llm.DefaultLocalModel, "model.safetensors")
+	fi, err := os.Stat(targetSafetensors)
+	return err == nil && fi.Size() > 0
+}
+
+// Embedder returns the active Embedder instance, or nil if running in lexical-only FTS5 mode.
+func (m *Manager) Embedder() cortexdb.Embedder {
+	return m.embedder
 }
 
 func (m *Manager) dbKey(chatID string, isDM bool) (string, string) {

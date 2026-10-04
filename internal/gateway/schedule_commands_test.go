@@ -70,12 +70,12 @@ func setupScheduleTestGateway(t *testing.T) (*Gateway, *scheduler.Store, chan mo
 	}))
 
 	tempDir := t.TempDir()
-	linkTestModels(t, tempDir)
 
 	cfg := &config.Config{
 		BotHandle:          "@bot",
 		BesedkaURL:         server.URL,
 		DataDir:            tempDir,
+		EmbeddingModel:     "none",
 		MsgRingBufferSize:  50,
 		SchedulerMinRunTimeout: 1 * time.Minute,
 		SchedulerMaxRunTimeout: 1 * time.Hour,

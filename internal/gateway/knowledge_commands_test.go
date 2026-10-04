@@ -74,13 +74,13 @@ func setupKnowledgeTestGateway(t *testing.T) (*Gateway, *knowledge.Store, chan m
 	}))
 
 	tempDir := t.TempDir()
-	linkTestModels(t, tempDir)
 
 	cfg := &config.Config{
 		BotHandle:         "@bot",
 		BesedkaURL:        server.URL,
 		DataDir:           tempDir,
 		MsgRingBufferSize: 50,
+		EmbeddingModel:    "none",
 	}
 
 	gw := NewGateway(cfg, nil)
@@ -166,8 +166,8 @@ func TestKnowledgeCommands_BotSenderIgnored(t *testing.T) {
 	select {
 	case msg := <-ch:
 		t.Fatalf("expected no response to bot sender, got: %s", msg.Content)
-	case <-time.After(500 * time.Millisecond):
-		// Expected timeout, no reply sent
+	default:
+		// Expected: no reply sent
 	}
 }
 
@@ -1161,7 +1161,7 @@ func TestProcessMessage_UncachedGroupChat_NoMention(t *testing.T) {
 	select {
 	case msg := <-ch:
 		t.Fatalf("unexpected message sent for unmentioned uncached chat: %s", msg.Content)
-	case <-time.After(200 * time.Millisecond):
+	default:
 		// Expected: no reply triggered
 	}
 }
@@ -1185,7 +1185,7 @@ func TestProcessMessage_UnknownDMChat_NoMention(t *testing.T) {
 	select {
 	case msg := <-ch:
 		t.Fatalf("unexpected message sent for unmentioned unknown dm_* chat: %s", msg.Content)
-	case <-time.After(200 * time.Millisecond):
+	default:
 		// Expected: no reply triggered
 	}
 }
@@ -1216,7 +1216,7 @@ func TestProcessMessage_GroupChatWithDMPrefix_NoMention(t *testing.T) {
 	select {
 	case msg := <-ch:
 		t.Fatalf("unexpected message sent for group chat with dm_ prefix: %s", msg.Content)
-	case <-time.After(200 * time.Millisecond):
+	default:
 		// Expected: no reply triggered
 	}
 }

@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -832,8 +830,8 @@ func TestGateway_LocationFrameReporting_InitialAndPeriodic(t *testing.T) {
 	assert.Equal(t, loc, gw.Location())
 
 	// Set short delay and interval for rapid testing
-	gw.SetInitialLocationDelay(20 * time.Millisecond)
-	gw.SetLocationInterval(60 * time.Millisecond)
+	gw.SetInitialLocationDelay(2 * time.Millisecond)
+	gw.SetLocationInterval(8 * time.Millisecond)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -915,10 +913,10 @@ func TestGateway_LocationFrameReporting_NilLocation(t *testing.T) {
 	gw := NewGateway(cfg, nil)
 	gw.httpClient = besedkaServer.Client()
 	gw.SetLocation(nil)
-	gw.SetInitialLocationDelay(20 * time.Millisecond)
-	gw.SetLocationInterval(50 * time.Millisecond)
+	gw.SetInitialLocationDelay(5 * time.Millisecond)
+	gw.SetLocationInterval(10 * time.Millisecond)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
 	go func() {
@@ -928,7 +926,7 @@ func TestGateway_LocationFrameReporting_NilLocation(t *testing.T) {
 	select {
 	case frame := <-receivedFrames:
 		t.Fatalf("unexpected frame received when location is nil: %+v", frame)
-	case <-time.After(150 * time.Millisecond):
+	case <-time.After(30 * time.Millisecond):
 		// Expected: no frames sent
 	}
 
@@ -1583,23 +1581,12 @@ func TestWarmupChat_WithAttachments(t *testing.T) {
 	assert.Contains(t, entries[1].Content, "[Attachment: app.log (id: f-warmup, type: text/plain)]:\n```\nhistorical log line\n```")
 }
 
-func linkTestModels(t *testing.T, dataDir string) {
-	t.Helper()
-	absDataModels, err := filepath.Abs("../../data/models")
-	if err == nil {
-		if fi, err := os.Stat(absDataModels); err == nil && fi.IsDir() {
-			target := filepath.Join(dataDir, "models")
-			_ = os.Symlink(absDataModels, target)
-		}
-	}
-}
-
 func TestGateway_EvictionToMemoryIndexing(t *testing.T) {
 	tempDir := t.TempDir()
-	linkTestModels(t, tempDir)
 
 	cfg := &config.Config{
 		DataDir:           tempDir,
+		EmbeddingModel:    "none",
 		MsgRingBufferSize: 3,
 	}
 
@@ -1661,7 +1648,6 @@ func TestGateway_EvictionToMemoryIndexing(t *testing.T) {
 
 func TestGateway_AttachmentRAGDiscoverability(t *testing.T) {
 	tempDir := t.TempDir()
-	linkTestModels(t, tempDir)
 
 	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -1680,6 +1666,7 @@ func TestGateway_AttachmentRAGDiscoverability(t *testing.T) {
 	cfg := &config.Config{
 		BesedkaURL:        besedkaServer.URL,
 		DataDir:           tempDir,
+		EmbeddingModel:    "none",
 		MsgRingBufferSize: 2,
 	}
 
@@ -1753,7 +1740,6 @@ func TestGateway_AttachmentRAGDiscoverability(t *testing.T) {
 
 func TestGateway_StartupSequenceCatchup(t *testing.T) {
 	tempDir := t.TempDir()
-	linkTestModels(t, tempDir)
 
 	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/me" {
@@ -1808,6 +1794,7 @@ func TestGateway_StartupSequenceCatchup(t *testing.T) {
 	cfg := &config.Config{
 		BesedkaURL:        besedkaServer.URL,
 		DataDir:           tempDir,
+		EmbeddingModel:    "none",
 		MsgRingBufferSize: 10,
 	}
 
@@ -1846,7 +1833,6 @@ func TestGateway_StartupSequenceCatchup(t *testing.T) {
 
 func TestProcessMessageWithRecallMemoryTool(t *testing.T) {
 	tempDir := t.TempDir()
-	linkTestModels(t, tempDir)
 
 	upgrader := websocket.Upgrader{}
 	sentMessages := make(chan models.ClientMessage, 10)
@@ -1967,6 +1953,7 @@ func TestProcessMessageWithRecallMemoryTool(t *testing.T) {
 		OpenAIAPIKey:      "test-key",
 		OpenAIModel:       "test-model",
 		DataDir:           tempDir,
+		EmbeddingModel:    "none",
 		MsgRingBufferSize: 10,
 	}
 
@@ -2204,12 +2191,12 @@ func TestGateway_SandboxSlashCommands(t *testing.T) {
 	defer server.Close()
 
 	tempDir := t.TempDir()
-	linkTestModels(t, tempDir)
 
 	cfg := &config.Config{
 		BotHandle:                 "@bot",
 		BesedkaURL:                server.URL,
 		DataDir:                   tempDir,
+		EmbeddingModel:            "none",
 		SandboxEnabled:            true,
 		SandboxDrivers:            []string{"bwrap"},
 		SandboxMaxLifetime:        30 * time.Minute,
@@ -2320,7 +2307,6 @@ func TestGateway_SandboxSlashCommands(t *testing.T) {
 
 func TestGateway_BotCannotApproveSandbox(t *testing.T) {
 	tempDir := t.TempDir()
-	linkTestModels(t, tempDir)
 
 	upgrader := websocket.Upgrader{}
 	receivedMsgs := make(chan models.ClientMessage, 10)
@@ -2372,6 +2358,7 @@ func TestGateway_BotCannotApproveSandbox(t *testing.T) {
 	cfg := &config.Config{
 		BesedkaURL:                server.URL,
 		DataDir:                   tempDir,
+		EmbeddingModel:            "none",
 		SandboxEnabled:            true,
 		SandboxDrivers:            []string{"bwrap"},
 		SandboxMaxLifetime:        30 * time.Minute,
@@ -2500,7 +2487,6 @@ func TestGateway_SandboxApproveAutoResumesTask(t *testing.T) {
 	defer llmServer.Close()
 
 	tempDir := t.TempDir()
-	linkTestModels(t, tempDir)
 
 	cfg := &config.Config{
 		BotHandle:                 "@bot",
@@ -2510,6 +2496,7 @@ func TestGateway_SandboxApproveAutoResumesTask(t *testing.T) {
 		OpenAIModel:               "gemini-3.7-flash",
 		OpenAIBaseURL:             llmServer.URL,
 		DataDir:                   tempDir,
+		EmbeddingModel:            "none",
 		SandboxEnabled:            true,
 		SandboxDrivers:            []string{"bwrap"},
 		SandboxMaxLifetime:        30 * time.Minute,
@@ -2660,7 +2647,6 @@ func TestGateway_SandboxApproveGeminiResumption_NoTrailingAssistant(t *testing.T
 	defer llmServer.Close()
 
 	tempDir := t.TempDir()
-	linkTestModels(t, tempDir)
 
 	cfg := &config.Config{
 		BotHandle:                 "@bot",
@@ -2670,6 +2656,7 @@ func TestGateway_SandboxApproveGeminiResumption_NoTrailingAssistant(t *testing.T
 		OpenAIModel:               "gemini-3.7-flash",
 		OpenAIBaseURL:             llmServer.URL,
 		DataDir:                   tempDir,
+		EmbeddingModel:            "none",
 		SandboxEnabled:            true,
 		SandboxDrivers:            []string{"bwrap"},
 		SandboxMaxLifetime:        30 * time.Minute,
@@ -2830,7 +2817,6 @@ func TestGateway_SandboxRequestSuppressesRedundantReply(t *testing.T) {
 	defer llmServer.Close()
 
 	tempDir := t.TempDir()
-	linkTestModels(t, tempDir)
 
 	cfg := &config.Config{
 		BotHandle:                 "@bot",
@@ -2840,6 +2826,7 @@ func TestGateway_SandboxRequestSuppressesRedundantReply(t *testing.T) {
 		OpenAIModel:               "gemini-3.7-flash",
 		OpenAIBaseURL:             llmServer.URL,
 		DataDir:                   tempDir,
+		EmbeddingModel:            "none",
 		SandboxEnabled:            true,
 		SandboxDrivers:            []string{"bwrap"},
 		SandboxMaxLifetime:        30 * time.Minute,
@@ -3121,4 +3108,58 @@ func TestGateway_Deliver_WithAttachments(t *testing.T) {
 	lastEntry := entries[len(entries)-1]
 	assert.Contains(t, lastEntry.Content, "Here is your report.")
 	assert.Contains(t, lastEntry.Content, "[Attachment: report.pdf (id: file_pdf_77, type: application/pdf)]")
+}
+
+func TestNewGateway_EmbedderConfiguration(t *testing.T) {
+	t.Setenv("BOB_MODELS_DIR", "")
+
+	fakeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer fakeServer.Close()
+
+	llmCfg := &config.Config{
+		OpenAIBaseURL: fakeServer.URL,
+		OpenAIAPIKey:  "fake-key",
+	}
+	llmClient := llm.NewClient(llmCfg, fakeServer.Client())
+
+	cases := []struct {
+		name          string
+		model         string
+		client        *llm.Client
+		expectEmbed   bool
+		expectedModel string
+	}{
+		{name: "empty model", model: "", client: llmClient, expectEmbed: false},
+		{name: "none alias", model: "none", client: llmClient, expectEmbed: false},
+		{name: "none mixed case whitespace", model: "  None  ", client: llmClient, expectEmbed: false},
+		{name: "disabled alias", model: "disabled", client: llmClient, expectEmbed: false},
+		{name: "disabled uppercase", model: "DISABLED", client: llmClient, expectEmbed: false},
+		{name: "off alias", model: "off", client: llmClient, expectEmbed: false},
+		{name: "off mixed whitespace", model: "  OFF ", client: llmClient, expectEmbed: false},
+		{name: "valid remote model with client", model: "text-embedding-3-small", client: llmClient, expectEmbed: true, expectedModel: "text-embedding-3-small"},
+		{name: "valid remote model with nil client", model: "text-embedding-3-small", client: nil, expectEmbed: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{
+				DataDir:        t.TempDir(),
+				EmbeddingModel: tc.model,
+			}
+			gw := NewGateway(cfg, tc.client)
+			defer gw.Stop()
+
+			emb := gw.MemoryManager().Embedder()
+			if tc.expectEmbed {
+				require.NotNil(t, emb)
+				llmEmb, ok := emb.(*llm.Embedder)
+				require.True(t, ok, "expected *llm.Embedder instance")
+				assert.Equal(t, tc.expectedModel, llmEmb.Model())
+			} else {
+				assert.Nil(t, emb)
+			}
+		})
+	}
 }

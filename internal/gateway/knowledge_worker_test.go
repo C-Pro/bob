@@ -22,8 +22,7 @@ import (
 
 func TestMemoryStoreProvider_FineGrainedLocking_NoCrossChatBlocking(t *testing.T) {
 	tempDir := t.TempDir()
-	linkTestModels(t, tempDir)
-	cfg := &config.Config{DataDir: tempDir}
+	cfg := &config.Config{DataDir: tempDir, EmbeddingModel: "none"}
 	memMgr := memory.NewManager(cfg, nil)
 	defer func() { _ = memMgr.Close() }()
 
@@ -59,8 +58,7 @@ func TestMemoryStoreProvider_FineGrainedLocking_NoCrossChatBlocking(t *testing.T
 
 func TestMemoryStoreProvider_ConcurrentInit_SingleInstance(t *testing.T) {
 	tempDir := t.TempDir()
-	linkTestModels(t, tempDir)
-	cfg := &config.Config{DataDir: tempDir}
+	cfg := &config.Config{DataDir: tempDir, EmbeddingModel: "none"}
 	memMgr := memory.NewManager(cfg, nil)
 	defer func() { _ = memMgr.Close() }()
 
@@ -100,8 +98,7 @@ func TestMemoryStoreProvider_ConcurrentInit_SingleInstance(t *testing.T) {
 
 func TestKnowledgeWorker_SerializesWithForegroundReconcile(t *testing.T) {
 	tempDir := t.TempDir()
-	linkTestModels(t, tempDir)
-	cfg := &config.Config{DataDir: tempDir}
+	cfg := &config.Config{DataDir: tempDir, EmbeddingModel: "none"}
 	memMgr := memory.NewManager(cfg, nil)
 	defer func() { _ = memMgr.Close() }()
 
@@ -146,8 +143,7 @@ func TestKnowledgeWorker_SerializesWithForegroundReconcile(t *testing.T) {
 
 func TestMemoryStoreProvider_ReconcileChat_ContextCancellation(t *testing.T) {
 	tempDir := t.TempDir()
-	linkTestModels(t, tempDir)
-	cfg := &config.Config{DataDir: tempDir}
+	cfg := &config.Config{DataDir: tempDir, EmbeddingModel: "none"}
 	memMgr := memory.NewManager(cfg, nil)
 	defer func() { _ = memMgr.Close() }()
 
@@ -277,8 +273,7 @@ func TestKnowledgeWorker_CancellationDuringConcurrencySaturation(t *testing.T) {
 
 func TestKnowledgeWorker_DiscoversAndReconcilesUnopenedDMDatabases(t *testing.T) {
 	tempDir := t.TempDir()
-	linkTestModels(t, tempDir)
-	cfg := &config.Config{DataDir: tempDir}
+	cfg := &config.Config{DataDir: tempDir, EmbeddingModel: "none"}
 	ctx := context.Background()
 
 	// Phase 1: Create a DM database with pending index deletion work and pending unindexed skill
@@ -410,8 +405,7 @@ func TestHasPendingKnowledgeWork_ExcludesExpiredMemories(t *testing.T) {
 
 func TestKnowledgeWorker_LifecycleAndGracefulStop(t *testing.T) {
 	tempDir := t.TempDir()
-	linkTestModels(t, tempDir)
-	cfg := &config.Config{DataDir: tempDir}
+	cfg := &config.Config{DataDir: tempDir, EmbeddingModel: "none"}
 	memMgr := memory.NewManager(cfg, nil)
 	defer func() { _ = memMgr.Close() }()
 
@@ -432,9 +426,6 @@ func TestKnowledgeWorker_LifecycleAndGracefulStop(t *testing.T) {
 	worker.Start(ctx)
 	assert.True(t, worker.Running())
 
-	// Let it run a cycle
-	time.Sleep(50 * time.Millisecond)
-
 	// Stop cleanly
 	worker.Stop()
 	assert.False(t, worker.Running())
@@ -447,6 +438,7 @@ func TestKnowledgeWorker_LifecycleAndGracefulStop(t *testing.T) {
 func TestKnowledgeWorker_StopVersusStart_GenerationSafe(t *testing.T) {
 	blockReconcile := make(chan struct{})
 	reconcileStarted := make(chan struct{})
+	stopTriggered := make(chan struct{})
 
 	mockProv := &mockKnowledgeTargetProvider{
 		targets: []string{"chat_gen"},
@@ -455,6 +447,13 @@ func TestKnowledgeWorker_StopVersusStart_GenerationSafe(t *testing.T) {
 			case reconcileStarted <- struct{}{}:
 			default:
 			}
+			go func() {
+				<-ctx.Done()
+				select {
+				case stopTriggered <- struct{}{}:
+				default:
+				}
+			}()
 			<-blockReconcile
 			return 0, nil
 		},
@@ -482,7 +481,7 @@ func TestKnowledgeWorker_StopVersusStart_GenerationSafe(t *testing.T) {
 
 	// While Stop is waiting for generation 1 to drain, attempt Start.
 	// Must be ignored because generation 1 is still draining.
-	time.Sleep(20 * time.Millisecond)
+	<-stopTriggered
 	worker.Start(ctx)
 
 	// Unblock generation 1
@@ -522,6 +521,7 @@ func TestGateway_KnowledgeWorker_ReplacementVersusStop(t *testing.T) {
 
 	oldRelease := make(chan struct{})
 	oldStarted := make(chan struct{})
+	oldStopTriggered := make(chan struct{})
 	oldProv := &mockKnowledgeTargetProvider{
 		targets: []string{"c1"},
 		reconcileFn: func(ctx context.Context, chatID string, isDM bool, limit int) (int, error) {
@@ -529,6 +529,13 @@ func TestGateway_KnowledgeWorker_ReplacementVersusStop(t *testing.T) {
 			case oldStarted <- struct{}{}:
 			default:
 			}
+			go func() {
+				<-ctx.Done()
+				select {
+				case oldStopTriggered <- struct{}{}:
+				default:
+				}
+			}()
 			<-oldRelease
 			return 0, nil
 		},
@@ -553,7 +560,7 @@ func TestGateway_KnowledgeWorker_ReplacementVersusStop(t *testing.T) {
 	}()
 
 	// While SetKnowledgeWorker is deterministically blocked stopping oldWorker, trigger Gateway.Stop()
-	time.Sleep(20 * time.Millisecond)
+	<-oldStopTriggered
 	gw.Stop()
 
 	// Unblock oldWorker so setter can finish

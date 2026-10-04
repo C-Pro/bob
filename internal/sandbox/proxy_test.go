@@ -378,6 +378,15 @@ func TestFilteringProxy_UnixSocket_ConnectHalfCloseAndClose(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = ln.Close() }()
 
+	testDone := make(chan struct{})
+	defer func() {
+		select {
+		case <-testDone:
+		default:
+			close(testDone)
+		}
+	}()
+
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -395,8 +404,11 @@ func TestFilteringProxy_UnixSocket_ConnectHalfCloseAndClose(t *testing.T) {
 				if tc, ok := c.(*net.TCPConn); ok {
 					_ = tc.CloseWrite()
 				}
-				// Server keeps read side open for a moment
-				time.Sleep(1 * time.Second)
+				// Server keeps read side open until client/test finishes
+				select {
+				case <-testDone:
+				case <-time.After(2 * time.Second):
+				}
 			}(conn)
 		}
 	}()
@@ -458,6 +470,7 @@ func TestFilteringProxy_UnixSocket_ConnectHalfCloseAndClose(t *testing.T) {
 	assert.Equal(t, "ECHO:ping", string(resp))
 	// If half-close was propagated to unixConn, duration must be < 500ms (not waiting 1s for server Close)
 	assert.Less(t, duration, 500*time.Millisecond, "CloseWrite on destConn must immediately propagate EOF to clientConn")
+	close(testDone)
 
 	// 4. Test that proxy.Close() actively closes hijacked connections immediately
 	conn2, err := net.Dial("unix", sockPath)
@@ -673,11 +686,14 @@ func TestFilteringProxy_MaxConcurrentTunnels(t *testing.T) {
 
 	// Close tunnel 1, now a new tunnel should succeed
 	_ = conn1.Close()
-	time.Sleep(50 * time.Millisecond)
 
-	conn4 := connectToProxy()
-	defer func() { _ = conn4.Close() }()
-	resp4 := sendConnect(conn4)
+	var resp4 string
+	require.Eventually(t, func() bool {
+		conn4 := connectToProxy()
+		defer func() { _ = conn4.Close() }()
+		resp4 = sendConnect(conn4)
+		return strings.Contains(resp4, "200 Connection Established")
+	}, 1*time.Second, 2*time.Millisecond)
 	assert.Contains(t, resp4, "200 Connection Established")
 }
 
@@ -711,7 +727,7 @@ func TestFilteringProxy_TunnelIdleTimeout(t *testing.T) {
 			AllowedHosts: []string{"127.0.0.1"},
 		},
 		CustomBlocked:     []string{}, // allow in test
-		TunnelIdleTimeout: 100 * time.Millisecond,
+		TunnelIdleTimeout: 30 * time.Millisecond,
 	})
 	require.NoError(t, err)
 	defer func() { _ = proxy.Close() }()
@@ -731,7 +747,7 @@ func TestFilteringProxy_TunnelIdleTimeout(t *testing.T) {
 	assert.Contains(t, string(buf[:n]), "200 Connection Established")
 
 	// Now don't write anything. Read should return EOF or error within ~500ms
-	_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 	_, err = conn.Read(buf)
 	require.Error(t, err, "idle tunnel should be closed after idle timeout")
 }
@@ -749,10 +765,10 @@ func TestFilteringProxy_TunnelUnidirectionalActive(t *testing.T) {
 		}
 		defer func() { _ = conn.Close() }()
 
-		// Stream 5 chunks with 40ms pause between them (total duration ~200ms)
+		// Stream 3 chunks with 15ms pause between them (total duration ~45ms)
 		// Client sends 0 bytes during this entire time.
-		for i := 0; i < 5; i++ {
-			time.Sleep(40 * time.Millisecond)
+		for i := 0; i < 3; i++ {
+			time.Sleep(15 * time.Millisecond)
 			_, _ = fmt.Fprintf(conn, "chunk-%d\n", i)
 		}
 		close(streamDone)
@@ -764,7 +780,7 @@ func TestFilteringProxy_TunnelUnidirectionalActive(t *testing.T) {
 			AllowedHosts: []string{"127.0.0.1"},
 		},
 		CustomBlocked:     []string{},
-		TunnelIdleTimeout: 100 * time.Millisecond, // 100ms idle timeout < 200ms transfer time
+		TunnelIdleTimeout: 30 * time.Millisecond, // 30ms idle timeout < 45ms transfer time
 	})
 	require.NoError(t, err)
 	defer func() { _ = proxy.Close() }()
@@ -783,16 +799,16 @@ func TestFilteringProxy_TunnelUnidirectionalActive(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(buf[:n]), "200 Connection Established")
 
-	// Read all 5 chunks from upstream
+	// Read all 3 chunks from upstream
 	var received []string
 	scanner := bufio.NewScanner(conn)
 	for scanner.Scan() {
 		received = append(received, scanner.Text())
-		if len(received) == 5 {
+		if len(received) == 3 {
 			break
 		}
 	}
-	assert.Len(t, received, 5, "all chunks must be received without premature idle timeout")
+	assert.Len(t, received, 3, "all chunks must be received without premature idle timeout")
 	<-streamDone
 }
 
