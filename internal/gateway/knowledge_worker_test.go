@@ -439,20 +439,19 @@ func TestKnowledgeWorker_StopVersusStart_GenerationSafe(t *testing.T) {
 	blockReconcile := make(chan struct{})
 	reconcileStarted := make(chan struct{})
 	stopTriggered := make(chan struct{})
+	var startOnce, stopOnce sync.Once
 
 	mockProv := &mockKnowledgeTargetProvider{
 		targets: []string{"chat_gen"},
 		reconcileFn: func(ctx context.Context, chatID string, isDM bool, limit int) (int, error) {
-			select {
-			case reconcileStarted <- struct{}{}:
-			default:
-			}
+			startOnce.Do(func() {
+				close(reconcileStarted)
+			})
 			go func() {
 				<-ctx.Done()
-				select {
-				case stopTriggered <- struct{}{}:
-				default:
-				}
+				stopOnce.Do(func() {
+					close(stopTriggered)
+				})
 			}()
 			<-blockReconcile
 			return 0, nil
@@ -470,7 +469,11 @@ func TestKnowledgeWorker_StopVersusStart_GenerationSafe(t *testing.T) {
 	require.True(t, worker.Running())
 
 	// Wait until generation 1 job starts and blocks
-	<-reconcileStarted
+	select {
+	case <-reconcileStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for reconcileStarted")
+	}
 
 	// Launch Stop in a goroutine
 	stopDone := make(chan struct{})
@@ -481,7 +484,11 @@ func TestKnowledgeWorker_StopVersusStart_GenerationSafe(t *testing.T) {
 
 	// While Stop is waiting for generation 1 to drain, attempt Start.
 	// Must be ignored because generation 1 is still draining.
-	<-stopTriggered
+	select {
+	case <-stopTriggered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for stopTriggered")
+	}
 	worker.Start(ctx)
 
 	// Unblock generation 1
@@ -490,7 +497,7 @@ func TestKnowledgeWorker_StopVersusStart_GenerationSafe(t *testing.T) {
 	// Stop completes
 	select {
 	case <-stopDone:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("worker.Stop did not return after unblocking job")
 	}
 
@@ -522,19 +529,19 @@ func TestGateway_KnowledgeWorker_ReplacementVersusStop(t *testing.T) {
 	oldRelease := make(chan struct{})
 	oldStarted := make(chan struct{})
 	oldStopTriggered := make(chan struct{})
+	var oldStartOnce, oldStopOnce sync.Once
+
 	oldProv := &mockKnowledgeTargetProvider{
 		targets: []string{"c1"},
 		reconcileFn: func(ctx context.Context, chatID string, isDM bool, limit int) (int, error) {
-			select {
-			case oldStarted <- struct{}{}:
-			default:
-			}
+			oldStartOnce.Do(func() {
+				close(oldStarted)
+			})
 			go func() {
 				<-ctx.Done()
-				select {
-				case oldStopTriggered <- struct{}{}:
-				default:
-				}
+				oldStopOnce.Do(func() {
+					close(oldStopTriggered)
+				})
 			}()
 			<-oldRelease
 			return 0, nil
@@ -545,7 +552,11 @@ func TestGateway_KnowledgeWorker_ReplacementVersusStop(t *testing.T) {
 		Concurrency: 1,
 	})
 	oldWorker.Start(lifecycleCtx)
-	<-oldStarted
+	select {
+	case <-oldStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for oldWorker to start")
+	}
 	gw.SetKnowledgeWorker(oldWorker)
 
 	newWorker := NewKnowledgeWorker(&mockKnowledgeTargetProvider{}, KnowledgeWorkerConfig{
@@ -560,7 +571,11 @@ func TestGateway_KnowledgeWorker_ReplacementVersusStop(t *testing.T) {
 	}()
 
 	// While SetKnowledgeWorker is deterministically blocked stopping oldWorker, trigger Gateway.Stop()
-	<-oldStopTriggered
+	select {
+	case <-oldStopTriggered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for oldStopTriggered")
+	}
 	gw.Stop()
 
 	// Unblock oldWorker so setter can finish
@@ -568,7 +583,7 @@ func TestGateway_KnowledgeWorker_ReplacementVersusStop(t *testing.T) {
 
 	select {
 	case <-setDone:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("SetKnowledgeWorker timed out")
 	}
 
