@@ -59,3 +59,8 @@
 - [x] **Track: Besedka progress report: support user timezone/language context injection and rich progress report cards**
 *Link: [./tracks/progress-report_20261001/](./tracks/progress-report_20261001/)*
 
+---
+
+- [ ] **Track: Core Agent Engine Decoupling**
+*Link: [./tracks/core-engine-decoupling_20261006/](./tracks/core-engine-decoupling_20261006/)*
+
