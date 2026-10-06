@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -542,4 +543,381 @@ func TestGateway_NonDMSandboxCommandRejection(t *testing.T) {
 		require.True(t, exists)
 		assert.Equal(t, sandbox.StatusRunning, sbx.Status)
 	})
+}
+
+// TestGateway_RepeatedApprove_AlreadyRunning verifies that sending /sandbox approve
+// when a sandbox is already running acknowledges that the sandbox is approved and running
+// without re-triggering continuation turns.
+func TestGateway_RepeatedApprove_AlreadyRunning(t *testing.T) {
+	gw, sm, receivedMsgs, cleanup := setupGatewayQATestEnvironment(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	recv := func() models.ClientMessage {
+		select {
+		case msg := <-receivedMsgs:
+			return msg
+		case <-time.After(1 * time.Second):
+			t.Fatal("timed out waiting for message")
+			return models.ClientMessage{}
+		}
+	}
+
+	_, err := sm.RequestSandbox(ctx, "user1", "dm_user1", sandbox.RequestParams{
+		Driver:      sandbox.DriverBwrap,
+		NetworkMode: sandbox.NetworkNone,
+		Reason:      "Run tests",
+	})
+	require.NoError(t, err)
+
+	approved, err := sm.ApproveSandbox(ctx, "user1")
+	require.NoError(t, err)
+	assert.Equal(t, sandbox.StatusRunning, approved.Status)
+	assert.True(t, approved.ClaimContinuation(), "First claim succeeds")
+
+	// Send repeated /sandbox approve
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_user1",
+		UserID:    "user1",
+		Content:   "/sandbox approve",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+
+	reply := recv()
+	assert.Contains(t, reply.Content, "Sandbox is already approved and running.")
+}
+
+type blockingGatewaySandboxDriver struct {
+	createdCount int
+	onCreate     func()
+	mu           sync.Mutex
+}
+
+func (m *blockingGatewaySandboxDriver) Type() sandbox.DriverType {
+	return sandbox.DriverBwrap
+}
+
+func (m *blockingGatewaySandboxDriver) Available(ctx context.Context) bool {
+	return true
+}
+
+func (m *blockingGatewaySandboxDriver) Create(ctx context.Context, sbx *sandbox.UserSandbox, workspace string) error {
+	m.mu.Lock()
+	m.createdCount++
+	m.mu.Unlock()
+	if m.onCreate != nil {
+		m.onCreate()
+	}
+	return nil
+}
+
+func (m *blockingGatewaySandboxDriver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []string, timeout time.Duration) (*sandbox.ExecResult, error) {
+	return &sandbox.ExecResult{ExitCode: 0}, nil
+}
+
+func (m *blockingGatewaySandboxDriver) Destroy(ctx context.Context, sbx *sandbox.UserSandbox) error {
+	return nil
+}
+
+// TestGateway_ConcurrentApprove_CreationInFlight tests that if a user sends a second /sandbox approve
+// while driver creation is still in-flight (e.g. image downloading), both messages succeed, exactly
+// one conversation continuation is triggered, and the second message receives an acknowledgment.
+func TestGateway_ConcurrentApprove_CreationInFlight(t *testing.T) {
+	gw, _, receivedMsgs, cleanup := setupGatewayQATestEnvironment(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	recv := func() models.ClientMessage {
+		select {
+		case msg := <-receivedMsgs:
+			return msg
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for message")
+			return models.ClientMessage{}
+		}
+	}
+
+	createStarted := make(chan struct{})
+	createBlock := make(chan struct{})
+
+	blockingDriver := &blockingGatewaySandboxDriver{
+		onCreate: func() {
+			close(createStarted)
+			<-createBlock
+		},
+	}
+	sm := sandbox.NewManager(gw.cfg.SandboxConfig(), []sandbox.Driver{blockingDriver})
+	defer func() { _ = sm.Close() }()
+	gw.SetSandboxManager(sm)
+
+	_, err := sm.RequestSandbox(ctx, "user1", "dm_user1", sandbox.RequestParams{
+		Driver:      sandbox.DriverBwrap,
+		NetworkMode: sandbox.NetworkNone,
+		Reason:      "Inspect airbag repo",
+	})
+	require.NoError(t, err)
+
+	// User sends first /sandbox approve
+	var wg sync.WaitGroup
+	var err1, err2 error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err1 = gw.ProcessMessage(ctx, models.Message{
+			ChatID:    "dm_user1",
+			UserID:    "user1",
+			Content:   "/sandbox approve",
+			Timestamp: time.Now().Unix(),
+		})
+	}()
+
+	// Wait until driver.Create is executing
+	<-createStarted
+
+	// User sends second /sandbox approve concurrently while status is StatusCreating
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err2 = gw.ProcessMessage(ctx, models.Message{
+			ChatID:    "dm_user1",
+			UserID:    "user1",
+			Content:   "/sandbox approve",
+			Timestamp: time.Now().Unix(),
+		})
+	}()
+
+	// Allow goroutine 2 to enter ProcessMessage and block in ApproveSandbox
+	time.Sleep(50 * time.Millisecond)
+
+	// Unblock driver.Create
+	close(createBlock)
+	wg.Wait()
+
+	require.NoError(t, err1)
+	require.NoError(t, err2)
+
+	// Collect messages sent by gateway
+	var replies []string
+	for i := 0; i < 2; i++ {
+		msg := recv()
+		replies = append(replies, msg.Content)
+	}
+
+	hasProceeding := false
+	hasAlreadyApproved := false
+	for _, r := range replies {
+		if strings.Contains(r, "Sandbox created successfully, proceeding with Inspect airbag repo...") {
+			hasProceeding = true
+		}
+		if strings.Contains(r, "Sandbox is already approved and running.") {
+			hasAlreadyApproved = true
+		}
+	}
+
+	assert.True(t, hasProceeding, "Expected one proceeding message")
+	assert.True(t, hasAlreadyApproved, "Expected one already approved message")
+
+	// Ensure driver.Create was only called once
+	blockingDriver.mu.Lock()
+	assert.Equal(t, 1, blockingDriver.createdCount)
+	blockingDriver.mu.Unlock()
+}
+
+// TestGateway_SandboxApprove_EmitsProgressCardNotTextMessage verifies that when the server
+// supports progress cards, /sandbox approve emits a progress card containing the sandbox
+// creation confirmation step rather than sending a redundant plain text chat message.
+func TestGateway_SandboxApprove_EmitsProgressCardNotTextMessage(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	receivedMsgs := make(chan models.ClientMessage, 50)
+
+	var mu sync.Mutex
+	var progressRequests []sendProgressRequest
+	seqCounter := int64(100)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/me" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(models.User{ID: "bot-id-qa", UserName: "bot", DisplayName: "Bob QA Bot"})
+			return
+		}
+		if r.URL.Path == "/api/users" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.User{
+				{ID: "bot-id-qa", UserName: "bot", DisplayName: "Bob QA Bot"},
+				{ID: "user1", UserName: "alice", DisplayName: "Alice QA"},
+			})
+			return
+		}
+		if r.URL.Path == "/api/chats" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.Chat{
+				{ID: "townhall", Type: "townhall"},
+				{ID: "dm_user1", Type: "dm", IsDM: true},
+			})
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/chats/") && strings.HasSuffix(r.URL.Path, "/messages") {
+			if r.Method == http.MethodPost {
+				var req sendProgressRequest
+				if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
+					mu.Lock()
+					seqCounter++
+					assignedSeq := seqCounter
+					progressRequests = append(progressRequests, req)
+					mu.Unlock()
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(sendProgressResponse{Seq: assignedSeq, Timestamp: time.Now().Unix()})
+					return
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]models.Message{})
+			return
+		}
+
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		go func() {
+			defer func() { _ = conn.Close() }()
+			for {
+				var clientMsg models.ClientMessage
+				if err := conn.ReadJSON(&clientMsg); err != nil {
+					break
+				}
+				receivedMsgs <- clientMsg
+			}
+		}()
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		BotHandle:                  "@bot",
+		BesedkaURL:                 server.URL,
+		DataDir:                    t.TempDir(),
+		EmbeddingModel:             "none",
+		SandboxEnabled:             true,
+		SandboxDrivers:             []string{"bwrap"},
+		SandboxAllowedNetworkModes: []string{"none", "restricted"},
+		SandboxMaxLifetime:         30 * time.Minute,
+		SandboxDefaultExecTimeout:  1 * time.Minute,
+		SandboxMaxExecTimeout:      10 * time.Minute,
+	}
+
+	gw := NewGateway(cfg, nil)
+	gw.httpClient = server.Client()
+
+	mockDriver := &mockGatewaySandboxDriver{}
+	sm := sandbox.NewManager(cfg.SandboxConfig(), []sandbox.Driver{mockDriver})
+	defer func() { _ = sm.Close() }()
+	gw.SetSandboxManager(sm)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	require.NoError(t, gw.DialWebSocket(ctx))
+	defer gw.Stop()
+
+	// 1. Request sandbox
+	_, err := sm.RequestSandbox(ctx, "user1", "dm_user1", sandbox.RequestParams{
+		Driver:      sandbox.DriverBwrap,
+		NetworkMode: sandbox.NetworkNone,
+		Reason:      "Inspect airbag repo",
+	})
+	require.NoError(t, err)
+
+	// 2. User approves sandbox
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_user1",
+		UserID:    "user1",
+		Content:   "/sandbox approve",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+
+	// 3. Verify progress card was emitted
+	mu.Lock()
+	defer mu.Unlock()
+	require.NotEmpty(t, progressRequests, "Must have emitted progress message")
+
+	// First progress request is the root card
+	rootReq := progressRequests[0]
+	assert.Equal(t, models.MessageTypeProgress, rootReq.Type)
+	require.NotNil(t, rootReq.Progress)
+	assert.Equal(t, int64(0), rootReq.Progress.ParentSeq)
+	assert.Equal(t, "Working on your request...", rootReq.Progress.Title)
+	assert.Equal(t, models.ProgressStatusRunning, rootReq.Progress.CardStatus)
+	require.Len(t, rootReq.Progress.Steps, 1)
+
+	step := rootReq.Progress.Steps[0]
+	assert.Equal(t, "sandbox_create", step.ID)
+	assert.Equal(t, "Sandbox created", step.Title)
+	assert.Equal(t, models.ProgressStatusCompleted, step.Status)
+	assert.Equal(t, "Proceeding with: Inspect airbag repo", step.Description)
+
+	// Second progress request completes the card (since llmClient is nil)
+	require.Len(t, progressRequests, 2)
+	finalReq := progressRequests[1]
+	assert.Equal(t, int64(101), finalReq.Progress.ParentSeq)
+	assert.Equal(t, models.ProgressStatusCompleted, finalReq.Progress.CardStatus)
+
+	// 4. Verify that NO plain text message was sent over WebSocket
+	select {
+	case msg := <-receivedMsgs:
+		t.Fatalf("unexpected chat message received via websocket: %+v", msg)
+	case <-time.After(100 * time.Millisecond):
+		// Expected: no redundant text message sent
+	}
+
+	// 5. Verify chat context does not contain redundant confirmation text
+	entries := gw.contextManager.GetOrCreate("dm_user1").Entries()
+	for _, entry := range entries {
+		assert.NotContains(t, entry.Content, "Sandbox created successfully")
+	}
+}
+
+// TestGateway_SandboxApprove_FallbackToTextMessageWhenProgressFails verifies that
+// if emitting the progress card fails (e.g. older server version), Bob falls back to
+// sending the plain text confirmation message.
+func TestGateway_SandboxApprove_FallbackToTextMessageWhenProgressFails(t *testing.T) {
+	gw, sm, receivedMsgs, cleanup := setupGatewayQATestEnvironment(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	recv := func() models.ClientMessage {
+		select {
+		case msg := <-receivedMsgs:
+			return msg
+		case <-time.After(1 * time.Second):
+			t.Fatal("timed out waiting for message")
+			return models.ClientMessage{}
+		}
+	}
+
+	_, err := sm.RequestSandbox(ctx, "user1", "dm_user1", sandbox.RequestParams{
+		Driver:      sandbox.DriverBwrap,
+		NetworkMode: sandbox.NetworkNone,
+		Reason:      "Inspect airbag repo",
+	})
+	require.NoError(t, err)
+
+	// User approves sandbox in an environment where POST /messages returns empty array (fail seq)
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_user1",
+		UserID:    "user1",
+		Content:   "/sandbox approve",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+
+	reply := recv()
+	assert.Contains(t, reply.Content, "Sandbox created successfully, proceeding with Inspect airbag repo...")
 }

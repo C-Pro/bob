@@ -1407,10 +1407,10 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 		return g.handleSkillCommand(ctx, msg, skillCmdText, senderName, isChatDM)
 	}
 
-	return g.generateAndSendAgentReply(ctx, msg, isChatDM, senderName, "")
+	return g.generateAndSendAgentReply(ctx, msg, isChatDM, senderName, "", 0)
 }
 
-func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Message, isDM bool, senderName, currentTask string) error {
+func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Message, isDM bool, senderName, currentTask string, initialProgressSeq int64) error {
 	g.mu.Lock()
 	botID := g.botUserID
 	botUser := g.botUser
@@ -1424,6 +1424,12 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 	g.mu.Unlock()
 
 	if g.llmClient == nil {
+		if initialProgressSeq > 0 {
+			_, _ = g.SendProgressMessage(ctx, msg.ChatID, &models.ProgressData{
+				ParentSeq:  initialProgressSeq,
+				CardStatus: models.ProgressStatusCompleted,
+			})
+		}
 		return nil
 	}
 
@@ -1518,7 +1524,12 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 				s := msg.Seq
 				seq = &s
 			}
-			progressObs := NewGatewayProgressObserver(g, msg.ChatID, isDM)
+			var progressObs fsm.ProgressObserver
+			if initialProgressSeq > 0 {
+				progressObs = NewGatewayProgressObserverWithRoot(g, msg.ChatID, isDM, initialProgressSeq)
+			} else {
+				progressObs = NewGatewayProgressObserver(g, msg.ChatID, isDM)
+			}
 			fsmReq := fsm.ToolLoopRequest{
 				ChatID:           msg.ChatID,
 				UserID:           msg.UserID,
@@ -1554,9 +1565,29 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 				toolsRegistry,
 				maxIterations,
 			)
+			if initialProgressSeq > 0 {
+				cardStatus := models.ProgressStatusCompleted
+				if err != nil {
+					cardStatus = models.ProgressStatusFailed
+				}
+				_, _ = g.SendProgressMessage(ctx, msg.ChatID, &models.ProgressData{
+					ParentSeq:  initialProgressSeq,
+					CardStatus: cardStatus,
+				})
+			}
 		}
 	} else {
 		reply, err = g.llmClient.GenerateChatResponse(ctx, llmMsgs)
+		if initialProgressSeq > 0 {
+			cardStatus := models.ProgressStatusCompleted
+			if err != nil {
+				cardStatus = models.ProgressStatusFailed
+			}
+			_, _ = g.SendProgressMessage(ctx, msg.ChatID, &models.ProgressData{
+				ParentSeq:  initialProgressSeq,
+				CardStatus: cardStatus,
+			})
+		}
 	}
 	if err != nil {
 		slog.Error("failed to generate LLM response", "error", err)
@@ -1991,17 +2022,9 @@ func (g *Gateway) handleSandboxCommand(ctx context.Context, msg models.Message, 
 		if err != nil {
 			return g.SendMessage(msg.ChatID, fmt.Sprintf("⚠️ Failed to approve sandbox: %v", err))
 		}
-		ackMsg := fmt.Sprintf("Sandbox created successfully, proceeding with %s...", sbx.Reason)
-		if err := g.SendMessage(msg.ChatID, ackMsg); err != nil {
-			return fmt.Errorf("failed to send approval message: %w", err)
+		if !sbx.ClaimContinuation() {
+			return g.SendMessage(msg.ChatID, "Sandbox is already approved and running.")
 		}
-		g.contextManager.Push(msg.ChatID, chatcontext.Entry{
-			Role:       "assistant",
-			SenderID:   botID,
-			SenderName: botUser.GetDisplayName(),
-			Content:    ackMsg,
-			Timestamp:  time.Now().Unix(),
-		})
 
 		userContinuation := "Sandbox is approved. Please proceed with: " + sbx.Reason
 		g.contextManager.Push(msg.ChatID, chatcontext.Entry{
@@ -2012,7 +2035,39 @@ func (g *Gateway) handleSandboxCommand(ctx context.Context, msg models.Message, 
 			Timestamp:  time.Now().Unix(),
 		})
 
-		return g.generateAndSendAgentReply(ctx, msg, true, senderName, sbx.Reason)
+		progress := &models.ProgressData{
+			CardStatus: models.ProgressStatusRunning,
+			Title:      "Working on your request...",
+			Steps: []models.ProgressStep{
+				{
+					ID:          "sandbox_create",
+					Title:       "Sandbox created",
+					Description: fmt.Sprintf("Proceeding with: %s", sbx.Reason),
+					Status:      models.ProgressStatusCompleted,
+				},
+			},
+		}
+
+		var initialProgressSeq int64
+		seq, pErr := g.SendProgressMessage(ctx, msg.ChatID, progress)
+		if pErr == nil && seq > 0 {
+			initialProgressSeq = seq
+		} else {
+			slog.Warn("could not emit initial progress card for sandbox approval, falling back to chat message", "chat_id", msg.ChatID, "error", pErr)
+			ackMsg := fmt.Sprintf("Sandbox created successfully, proceeding with %s...", sbx.Reason)
+			if err := g.SendMessage(msg.ChatID, ackMsg); err != nil {
+				return fmt.Errorf("failed to send approval message: %w", err)
+			}
+			g.contextManager.Push(msg.ChatID, chatcontext.Entry{
+				Role:       "assistant",
+				SenderID:   botID,
+				SenderName: botUser.GetDisplayName(),
+				Content:    ackMsg,
+				Timestamp:  time.Now().Unix(),
+			})
+		}
+
+		return g.generateAndSendAgentReply(ctx, msg, true, senderName, sbx.Reason, initialProgressSeq)
 
 	case "deny":
 		err := sm.DenySandbox(msg.UserID)

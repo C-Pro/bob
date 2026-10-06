@@ -39,6 +39,17 @@ func NewGatewayProgressObserver(sender progressSender, chatID string, isDM bool)
 	}
 }
 
+// NewGatewayProgressObserverWithRoot creates a new GatewayProgressObserver with an existing root card seq.
+func NewGatewayProgressObserverWithRoot(sender progressSender, chatID string, isDM bool, rootSeq int64) *GatewayProgressObserver {
+	return &GatewayProgressObserver{
+		sender:      sender,
+		chatID:      chatID,
+		isDM:        isDM,
+		rootSeq:     rootSeq,
+		lastEmitted: make(map[string]models.ProgressStatus),
+	}
+}
+
 // RootSeq returns the sequence number of the root progress card (0 if not created).
 func (o *GatewayProgressObserver) RootSeq() int64 {
 	o.mu.Lock()
