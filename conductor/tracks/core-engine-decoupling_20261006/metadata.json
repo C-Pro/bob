@@ -1,0 +1,8 @@
+{
+  "track_id": "core-engine-decoupling_20261006",
+  "type": "refactor",
+  "status": "completed",
+  "created_at": "2026-10-06T21:00:00Z",
+  "updated_at": "2026-10-06T21:00:00Z",
+  "description": "Decouple core agent engine and execution contracts from Besedka chat transport with full frontend authority over prompts, tools, and progress"
+}

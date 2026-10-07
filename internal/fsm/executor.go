@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"bob/internal/agentapi"
+
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -223,23 +225,54 @@ func (e *StepExecutor) updateStep(ctx context.Context, store StepStore, step *FS
 
 // Execute executes a slice of FSM steps according to their execution mode (parallel or sequential).
 // Status and execution metrics are updated in-place and persisted to the store if configured.
-func (e *StepExecutor) Execute(ctx context.Context, store StepStore, steps []*FSMStep) error {
+func (e *StepExecutor) Execute(ctx context.Context, store StepStore, steps []*FSMStep, binding ...*ToolBinding) error {
 	if len(steps) == 0 {
 		return nil
 	}
-	if e.invoker == nil {
+
+	var b *ToolBinding
+	if len(binding) > 0 && binding[0] != nil {
+		b = binding[0]
+	} else if e.invoker != nil {
+		// Build fallback legacy binding from e.invoker for callers that do not provide an explicit binding
+		defs := make([]agentapi.ToolDefinition, 0, len(steps))
+		seen := make(map[string]bool)
+		for _, s := range steps {
+			if !seen[s.ToolName] {
+				seen[s.ToolName] = true
+				defs = append(defs, agentapi.ToolDefinition{
+					Schema: openai.Tool{
+						Type: openai.ToolTypeFunction,
+						Function: &openai.FunctionDefinition{
+							Name: s.ToolName,
+						},
+					},
+					ReadOnly: IsReadOnlyTool(s.ToolName),
+				})
+			}
+		}
+		toolsList := make([]openai.Tool, len(defs))
+		for i, d := range defs {
+			toolsList[i] = d.Schema
+		}
+		var err error
+		b, err = NewToolBinding(ctx, NewLegacyToolset(toolsList, e.invoker))
+		if err != nil {
+			return err
+		}
+	} else {
 		return fmt.Errorf("tool invoker is not configured")
 	}
 
-	mode := ClassifyStepExecutionMode(steps)
+	mode := b.ClassifyStepExecutionMode(steps)
 	if mode == ExecutionModeParallel {
-		return e.executeParallel(ctx, store, steps)
+		return e.executeParallel(ctx, store, steps, b)
 	}
-	return e.executeSequential(ctx, store, steps)
+	return e.executeSequential(ctx, store, steps, b)
 }
 
 // ExecuteBatch is a convenience wrapper that accepts and returns a slice of value FSMSteps.
-func (e *StepExecutor) ExecuteBatch(ctx context.Context, store StepStore, steps []FSMStep) ([]FSMStep, error) {
+func (e *StepExecutor) ExecuteBatch(ctx context.Context, store StepStore, steps []FSMStep, binding ...*ToolBinding) ([]FSMStep, error) {
 	if len(steps) == 0 {
 		return nil, nil
 	}
@@ -247,7 +280,7 @@ func (e *StepExecutor) ExecuteBatch(ctx context.Context, store StepStore, steps 
 	for i := range steps {
 		ptrs[i] = &steps[i]
 	}
-	if err := e.Execute(ctx, store, ptrs); err != nil {
+	if err := e.Execute(ctx, store, ptrs, binding...); err != nil {
 		return nil, err
 	}
 	result := make([]FSMStep, len(ptrs))
@@ -257,7 +290,7 @@ func (e *StepExecutor) ExecuteBatch(ctx context.Context, store StepStore, steps 
 	return result, nil
 }
 
-func (e *StepExecutor) executeParallel(ctx context.Context, store StepStore, steps []*FSMStep) error {
+func (e *StepExecutor) executeParallel(ctx context.Context, store StepStore, steps []*FSMStep, binding *ToolBinding) error {
 	workers := e.maxWorkers
 	if workers <= 0 {
 		workers = 4
@@ -287,7 +320,7 @@ func (e *StepExecutor) executeParallel(ctx context.Context, store StepStore, ste
 			select {
 			case sem <- struct{}{}:
 				defer func() { <-sem }()
-				if err := e.executeSingleStep(ctx, store, s); err != nil {
+				if err := e.executeSingleStep(ctx, store, s, binding); err != nil {
 					recordErr(err)
 				}
 			case <-ctx.Done():
@@ -310,7 +343,7 @@ func (e *StepExecutor) executeParallel(ctx context.Context, store StepStore, ste
 	return ctx.Err()
 }
 
-func (e *StepExecutor) executeSequential(ctx context.Context, store StepStore, steps []*FSMStep) error {
+func (e *StepExecutor) executeSequential(ctx context.Context, store StepStore, steps []*FSMStep, binding *ToolBinding) error {
 	for i, step := range steps {
 		step.ExecutionMode = ExecutionModeSequential
 
@@ -325,7 +358,7 @@ func (e *StepExecutor) executeSequential(ctx context.Context, store StepStore, s
 			return ctx.Err()
 		}
 
-		err := e.executeSingleStep(ctx, store, step)
+		err := e.executeSingleStep(ctx, store, step, binding)
 		// If a sequential step failed or timed out, abort remaining dependent steps
 		if step.Status == StepStatusFailed || step.Status == StepStatusTimedOut {
 			skipErr := e.skipRemainingSteps(ctx, store, steps[i+1:], step.ID)
@@ -359,12 +392,21 @@ func (e *StepExecutor) skipRemainingSteps(ctx context.Context, store StepStore, 
 	return errs
 }
 
-func (e *StepExecutor) executeSingleStep(ctx context.Context, store StepStore, step *FSMStep) error {
+func (e *StepExecutor) executeSingleStep(ctx context.Context, store StepStore, step *FSMStep, binding *ToolBinding) error {
 	if step.Status.IsTerminal() {
 		return nil
 	}
 
-	if step.Status == StepStatusRunning && !IsReadOnlyTool(step.ToolName) {
+	if binding == nil || !binding.HasTool(step.ToolName) {
+		step.Status = StepStatusFailed
+		step.ErrorText = fmt.Sprintf("unauthorized tool: %q is not in the allowed toolset", step.ToolName)
+		now := time.Now().Unix()
+		step.CompletedAt = &now
+		return e.updateStep(ctx, store, step)
+	}
+
+	def, _ := binding.Definition(step.ToolName)
+	if step.Status == StepStatusRunning && !def.ReadOnly {
 		step.Status = StepStatusFailed
 		step.ErrorText = "interrupted mid-execution; not retried (non-idempotent tool)"
 		now := time.Now().Unix()
@@ -397,16 +439,25 @@ func (e *StepExecutor) executeSingleStep(ctx context.Context, store StepStore, s
 	for {
 		step.Attempt++
 		stepCtx, cancel := context.WithTimeout(ctx, timeout)
-		res, err := e.invoker.Execute(stepCtx, step.ToolName, step.ArgsJSON)
+		call := agentapi.ToolCall{
+			ID:        step.ToolCallID,
+			Name:      step.ToolName,
+			Arguments: step.ArgsJSON,
+		}
+		res, err := binding.Execute(stepCtx, call)
 		cancel()
 
 		completedTime := time.Now().Unix()
 		if err == nil {
 			step.Status = StepStatusCompleted
-			if len(res) > MaxStepResultBytes {
-				res = res[:MaxStepResultBytes] + StepTruncationNotice
+			encoded, encErr := EncodeStoredToolResult(res)
+			if encErr != nil {
+				step.Status = StepStatusFailed
+				step.ErrorText = fmt.Sprintf("failed to encode step result: %v", encErr)
+				step.CompletedAt = &completedTime
+				return e.updateStep(ctx, store, step)
 			}
-			step.ResultJSON = res
+			step.ResultJSON = encoded
 			step.ErrorText = ""
 			step.CompletedAt = &completedTime
 			if updateErr := e.updateStep(ctx, store, step); updateErr != nil {

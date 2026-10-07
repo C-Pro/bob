@@ -92,13 +92,19 @@ func TestScheduleInvoker_NilSchedule(t *testing.T) {
 	assert.Contains(t, err.Error(), "schedule cannot be nil")
 }
 
+type messageSenderFunc func(chatID, content string) error
+
+func (f messageSenderFunc) SendMessage(chatID, content string) error {
+	return f(chatID, content)
+}
+
 func TestScheduleInvoker_Execute_NoGrant(t *testing.T) {
 	ctx := context.Background()
 	ctxMgr := chatcontext.NewManager(10)
 
 	var sentMsg string
 	var sentChatID string
-	sender := MessageSenderFunc(func(chatID, content string) error {
+	sender := messageSenderFunc(func(chatID, content string) error {
 		sentChatID = chatID
 		sentMsg = content
 		return nil
@@ -149,8 +155,13 @@ func TestScheduleInvoker_Execute_NoGrant(t *testing.T) {
 	assert.Contains(t, capturedReq.Messages[0].Content, "Check current weather and report.")
 
 	// Verify no sandbox tools were exposed since no sandbox grant exists
-	for _, tool := range capturedReq.Tools {
-		assert.False(t, strings.HasPrefix(tool.Function.Name, "sandbox_"), "tool %s should not be exposed without sandbox grant", tool.Function.Name)
+	require.NotNil(t, capturedReq.Toolset)
+	toolsetDefs, err := capturedReq.Toolset.Definitions(ctx)
+	require.NoError(t, err)
+	for _, tool := range toolsetDefs {
+		name := tool.Schema.Function.Name
+		assert.False(t, strings.HasPrefix(name, "sandbox_"), "tool %s should not be exposed without sandbox grant", name)
+		assert.False(t, name == "schedule_task" || name == "cancel_schedule" || name == "list_schedules", "scheduler tool %s should not be exposed to scheduled run", name)
 	}
 
 	assert.Equal(t, "dm_user1", sentChatID)
@@ -220,7 +231,14 @@ func TestScheduleInvoker_Execute_WithPreApprovedSandbox(t *testing.T) {
 	var toolsExposed []openai.Tool
 	mockFSM := FSMRunnerFunc(func(ctx context.Context, req fsm.ToolLoopRequest) (*fsm.ToolLoopResult, error) {
 		fsmExecuted = true
-		toolsExposed = req.Tools
+		if req.Toolset != nil {
+			defs, _ := req.Toolset.Definitions(ctx)
+			for _, d := range defs {
+				toolsExposed = append(toolsExposed, d.Schema)
+			}
+		} else {
+			toolsExposed = req.Tools
+		}
 		// Check that sandbox is active during FSM execution
 		if sbx, ok := sandboxMgr.GetStatus("user1"); ok && sbx.Status == sandbox.StatusRunning {
 			activeSandboxDuringFSM = true

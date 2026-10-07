@@ -11,6 +11,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	_ "modernc.org/sqlite"
+
+	"bob/internal/agentapi"
 )
 
 func setupTestDB(t *testing.T) *sql.DB {
@@ -41,13 +43,17 @@ func TestStore_RunCRUD(t *testing.T) {
 	seq := int64(777)
 
 	run := &FSMRun{
-		ID:            "run_test_1",
-		ChatID:        "chat_123",
-		UserID:        "user_456",
-		FSMType:       FSMTypeToolLoop,
-		Status:        RunStatusRunning,
-		CurrentState:  StateLLMRequest,
-		Iteration:     1,
+		ID:               "run_test_1",
+		ChatID:           "chat_123",
+		UserID:           "user_456",
+		FrontendID:       "frontend_test",
+		ScopeID:          "scope_test",
+		Model:            "model_test",
+		ExecutionKind:    agentapi.Interactive,
+		FSMType:          FSMTypeToolLoop,
+		Status:           RunStatusRunning,
+		CurrentState:     StateLLMRequest,
+		Iteration:        1,
 		MaxIterations:    20,
 		ContextJSON:      `[{"role":"user","content":"hello"}]`,
 		ResultJSON:       "",
@@ -68,6 +74,10 @@ func TestStore_RunCRUD(t *testing.T) {
 	assert.Equal(t, run.ID, fetched.ID)
 	assert.Equal(t, run.ChatID, fetched.ChatID)
 	assert.Equal(t, run.UserID, fetched.UserID)
+	assert.Equal(t, "frontend_test", fetched.FrontendID)
+	assert.Equal(t, "scope_test", fetched.ScopeID)
+	assert.Equal(t, "model_test", fetched.Model)
+	assert.Equal(t, agentapi.Interactive, fetched.ExecutionKind)
 	assert.Equal(t, run.FSMType, fetched.FSMType)
 	assert.Equal(t, run.Status, fetched.Status)
 	assert.Equal(t, run.CurrentState, fetched.CurrentState)

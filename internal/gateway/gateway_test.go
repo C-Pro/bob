@@ -7,10 +7,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"bob/internal/agentapi"
 	"bob/internal/chatcontext"
 	"bob/internal/config"
 	"bob/internal/fsm"
@@ -2922,7 +2924,7 @@ func TestGateway_DeliverFSMResult(t *testing.T) {
 		ResultJSON: "Recovered message answer",
 	}
 
-	err := gw.Deliver(ctx, run)
+	err := gw.DeliverLegacyFSMRun(ctx, run)
 	require.NoError(t, err)
 
 	select {
@@ -2945,7 +2947,7 @@ func TestGateway_DeliverFSMResult(t *testing.T) {
 		Status:    fsm.RunStatusFailed,
 		ErrorText: "some LLM failure",
 	}
-	err = gw.Deliver(ctx, failedRun)
+	err = gw.DeliverLegacyFSMRun(ctx, failedRun)
 	require.NoError(t, err)
 
 	select {
@@ -3089,7 +3091,7 @@ func TestGateway_Deliver_WithAttachments(t *testing.T) {
 		ResultJSON: "Here is your report.",
 	}
 
-	err := gw.Deliver(deliverCtx, run)
+	err := gw.DeliverLegacyFSMRun(deliverCtx, run)
 	require.NoError(t, err)
 
 	select {
@@ -3162,4 +3164,99 @@ func TestNewGateway_EmbedderConfiguration(t *testing.T) {
 			}
 		})
 	}
+}
+
+type mockTurnRunner struct {
+	mu        sync.Mutex
+	turnCalls []agentapi.Turn
+	result    agentapi.Result
+	err       error
+}
+
+func (m *mockTurnRunner) Run(ctx context.Context, turn agentapi.Turn) (agentapi.Result, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.turnCalls = append(m.turnCalls, turn)
+	return m.result, m.err
+}
+
+func TestGateway_Frontend_BindAndDeliver(t *testing.T) {
+	ctx := context.Background()
+	cfg := &config.Config{
+		BotHandle:             "@bot",
+		TownhallMaxParagraphs: 2,
+		DMMaxParagraphs:       5,
+		MsgRingBufferSize:     10,
+		DataDir:               t.TempDir(),
+	}
+	gw := NewGateway(cfg, nil)
+	defer gw.Stop()
+
+	// 1. Test Bind
+	desc := agentapi.RunDescriptor{
+		RunID: "run-bind-1",
+		Session: agentapi.SessionRef{
+			FrontendID: "besedka",
+			SessionID:  "chat-1",
+		},
+		Actor: agentapi.Actor{
+			ID: "user-1",
+		},
+		Metadata: map[string]string{
+			"initial_progress_seq": "42",
+		},
+	}
+
+	bindings, err := gw.Bind(ctx, desc)
+	require.NoError(t, err)
+	assert.NotNil(t, bindings.Tools)
+	assert.NotNil(t, bindings.Attachments)
+	assert.NotNil(t, bindings.Progress)
+	assert.NotNil(t, bindings.Notifications)
+
+	// Verify progress observer has rootSeq 42
+	progObs, ok := bindings.Progress.(*GatewayProgressObserver)
+	require.True(t, ok)
+	assert.Equal(t, int64(42), progObs.RootSeq())
+
+	// 2. Test Deliver with suppress_reply
+	compSuppressed := agentapi.Completion{
+		Run: desc,
+		Result: agentapi.Result{
+			RunID: "run-bind-1",
+			Actions: []agentapi.Action{
+				{Type: agentapi.ActionSuppressReply},
+			},
+		},
+		Status: agentapi.RunCompleted,
+	}
+	require.NoError(t, gw.Deliver(ctx, compSuppressed))
+	entries := gw.contextManager.GetOrCreate("chat-1").Entries()
+	require.NotEmpty(t, entries)
+	assert.Equal(t, "Sandbox approval requested.", entries[len(entries)-1].Content)
+
+	// 3. Test generateAndSendAgentReply delegates to runner
+	runner := &mockTurnRunner{
+		result: agentapi.Result{
+			RunID:   "run-mock",
+			Content: "Agent reply from runner",
+		},
+	}
+	gw.SetRunner(runner)
+	assert.Equal(t, runner, gw.Runner())
+
+	msg := models.Message{
+		ChatID:    "chat-1",
+		UserID:    "user-1",
+		Content:   "Hello bot",
+		Timestamp: time.Now().Unix(),
+	}
+	err = gw.generateAndSendAgentReply(ctx, msg, false, "Alice", "", 0)
+	require.NoError(t, err)
+
+	runner.mu.Lock()
+	require.Len(t, runner.turnCalls, 1)
+	assert.True(t, runner.turnCalls[0].Deliver)
+	assert.Equal(t, "chat-1", runner.turnCalls[0].Run.Session.SessionID)
+	runner.mu.Unlock()
 }

@@ -2,15 +2,20 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 
+	"bob/internal/agentapi"
 	"bob/internal/fsm"
 	"bob/internal/models"
 	"bob/internal/tools"
 )
+
+var _ agentapi.ProgressObserver = (*GatewayProgressObserver)(nil)
+var _ fsm.ProgressObserver = (*GatewayProgressObserver)(nil)
 
 type progressSender interface {
 	SendProgressMessage(ctx context.Context, chatID string, progress *models.ProgressData) (int64, error)
@@ -191,5 +196,44 @@ func (o *GatewayProgressObserver) OnRunFinished(ctx context.Context, status fsm.
 			"card_status", cardStatus,
 			"error", err,
 		)
+	}
+}
+
+// Observe implements agentapi.ProgressObserver to forward generic events to GatewayProgressObserver.
+func (o *GatewayProgressObserver) Observe(ctx context.Context, ev agentapi.ProgressEvent) {
+	switch ev.Type {
+	case agentapi.ProgressStepsPrepared:
+		fsmSteps := make([]fsm.FSMStep, 0, len(ev.Steps))
+		for _, s := range ev.Steps {
+			fsmSteps = append(fsmSteps, fsm.FSMStep{
+				ID:        s.ID,
+				Iteration: s.Iteration,
+				StepIndex: s.StepIndex,
+				ToolName:  s.Call.Name,
+				ArgsJSON:  s.Call.Arguments,
+				Status:    fsm.StepStatus(s.Status),
+			})
+		}
+		o.OnStepsPrepared(ctx, fsmSteps)
+	case agentapi.ProgressStepUpdated:
+		if ev.Step != nil {
+			s := ev.Step
+			fsmStep := fsm.FSMStep{
+				ID:        s.ID,
+				Iteration: s.Iteration,
+				StepIndex: s.StepIndex,
+				ToolName:  s.Call.Name,
+				ArgsJSON:  s.Call.Arguments,
+				Status:    fsm.StepStatus(s.Status),
+				ErrorText: s.Error,
+			}
+			o.OnStepUpdate(ctx, &fsmStep)
+		}
+	case agentapi.ProgressRunFinished:
+		var runErr error
+		if ev.Error != "" {
+			runErr = errors.New(ev.Error)
+		}
+		o.OnRunFinished(ctx, fsm.RunStatus(ev.Status), runErr)
 	}
 }

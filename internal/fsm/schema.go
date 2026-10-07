@@ -8,9 +8,9 @@ import (
 
 const (
 	// SchemaVersion is the current schema version for FSM tables.
-	SchemaVersion = 2
+	SchemaVersion = 3
 	// SchemaDescription describes the current FSM schema.
-	SchemaDescription = "add source_message_seq to fsm_runs"
+	SchemaDescription = "add frontend_id, scope_id, model, execution_kind to fsm_runs"
 )
 
 // EnsureDBSchema ensures that the namespaced FSM tables and version markers
@@ -50,6 +50,10 @@ func EnsureDBSchema(ctx context.Context, db *sql.DB) error {
 			chat_id TEXT NOT NULL,
 			user_id TEXT NOT NULL,
 			is_dm INTEGER NOT NULL DEFAULT 0,
+			frontend_id TEXT NOT NULL DEFAULT '',
+			scope_id TEXT NOT NULL DEFAULT '',
+			model TEXT NOT NULL DEFAULT '',
+			execution_kind TEXT NOT NULL DEFAULT '',
 			fsm_type TEXT NOT NULL,
 			status TEXT NOT NULL,
 			current_state TEXT NOT NULL,
@@ -148,6 +152,10 @@ func ensureFSMColumns(ctx context.Context, db *sql.DB) error {
 	hasWaitCycles := false
 	hasVersion := false
 	hasSourceMessageSeq := false
+	hasFrontendID := false
+	hasScopeID := false
+	hasModel := false
+	hasExecutionKind := false
 	for rows.Next() {
 		var cid int
 		var name, colType string
@@ -165,6 +173,18 @@ func ensureFSMColumns(ctx context.Context, db *sql.DB) error {
 			}
 			if name == "source_message_seq" {
 				hasSourceMessageSeq = true
+			}
+			if name == "frontend_id" {
+				hasFrontendID = true
+			}
+			if name == "scope_id" {
+				hasScopeID = true
+			}
+			if name == "model" {
+				hasModel = true
+			}
+			if name == "execution_kind" {
+				hasExecutionKind = true
 			}
 		}
 	}
@@ -189,6 +209,26 @@ func ensureFSMColumns(ctx context.Context, db *sql.DB) error {
 	if !hasSourceMessageSeq {
 		if _, err := db.ExecContext(ctx, "ALTER TABLE fsm_runs ADD COLUMN source_message_seq INTEGER"); err != nil {
 			return fmt.Errorf("failed to add source_message_seq column to fsm_runs: %w", err)
+		}
+	}
+	if !hasFrontendID {
+		if _, err := db.ExecContext(ctx, "ALTER TABLE fsm_runs ADD COLUMN frontend_id TEXT NOT NULL DEFAULT ''"); err != nil {
+			return fmt.Errorf("failed to add frontend_id column to fsm_runs: %w", err)
+		}
+	}
+	if !hasScopeID {
+		if _, err := db.ExecContext(ctx, "ALTER TABLE fsm_runs ADD COLUMN scope_id TEXT NOT NULL DEFAULT ''"); err != nil {
+			return fmt.Errorf("failed to add scope_id column to fsm_runs: %w", err)
+		}
+	}
+	if !hasModel {
+		if _, err := db.ExecContext(ctx, "ALTER TABLE fsm_runs ADD COLUMN model TEXT NOT NULL DEFAULT ''"); err != nil {
+			return fmt.Errorf("failed to add model column to fsm_runs: %w", err)
+		}
+	}
+	if !hasExecutionKind {
+		if _, err := db.ExecContext(ctx, "ALTER TABLE fsm_runs ADD COLUMN execution_kind TEXT NOT NULL DEFAULT ''"); err != nil {
+			return fmt.Errorf("failed to add execution_kind column to fsm_runs: %w", err)
 		}
 	}
 	return nil

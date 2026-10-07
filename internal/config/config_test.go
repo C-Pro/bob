@@ -222,7 +222,14 @@ func TestConfigValidation(t *testing.T) {
 
 	cfg.BesedkaURL = ""
 	err = cfg.Validate(false)
+	assert.NoError(t, err)
+
+	err = cfg.ValidateBesedka(false)
 	assert.ErrorContains(t, err, "BESEDKA_URL cannot be empty")
+
+	cfg.BesedkaURL = "ftp://invalid-scheme"
+	err = cfg.Validate(false)
+	assert.ErrorContains(t, err, "invalid URL scheme")
 
 	cfg.BesedkaURL = "http://localhost:8080"
 	cfg.MsgRingBufferSize = 0
@@ -717,3 +724,58 @@ func TestValidateKnowledgeBoundaries(t *testing.T) {
 		assert.ErrorContains(t, cfg.Validate(false), "KNOWLEDGE_MAX_DISCOVERY_LIMIT (5) cannot be less than KNOWLEDGE_DEFAULT_DISCOVERY_LIMIT (10)")
 	})
 }
+
+func TestValidateBesedka(t *testing.T) {
+	validCfg := func() *Config {
+		return &Config{
+			BotHandle:             "@bot",
+			BesedkaURL:            "http://127.0.0.1:8080",
+			OpenAIAPIKey:          "sk-test",
+			OpenAIModel:           "gpt-4",
+			TownhallMaxParagraphs: 2,
+			DMMaxParagraphs:       10,
+			MsgRingBufferSize:     100,
+		}
+	}
+
+	t.Run("valid configuration passes both Validate and ValidateBesedka", func(t *testing.T) {
+		cfg := validCfg()
+		require.NoError(t, cfg.Validate(true))
+		require.NoError(t, cfg.ValidateBesedka())
+		require.NoError(t, cfg.ValidateBesedka(true))
+		require.NoError(t, cfg.ValidateBesedka(false))
+	})
+
+	t.Run("empty BesedkaURL valid for core, rejected by ValidateBesedka", func(t *testing.T) {
+		cfg := validCfg()
+		cfg.BesedkaURL = ""
+		require.NoError(t, cfg.Validate(true))
+		err := cfg.ValidateBesedka()
+		assert.ErrorContains(t, err, "BESEDKA_URL cannot be empty")
+	})
+
+	t.Run("malformed BesedkaURL rejected by both", func(t *testing.T) {
+		cfg := validCfg()
+		cfg.BesedkaURL = "not-a-valid-url"
+		assert.ErrorContains(t, cfg.Validate(false), "invalid BESEDKA_URL")
+		assert.ErrorContains(t, cfg.ValidateBesedka(), "invalid BESEDKA_URL")
+
+		cfg.BesedkaURL = "ftp://example.com/chat"
+		assert.ErrorContains(t, cfg.Validate(false), "invalid URL scheme")
+		assert.ErrorContains(t, cfg.ValidateBesedka(), "invalid URL scheme")
+	})
+
+	t.Run("missing required credentials rejected by ValidateBesedka with requireAPIKey", func(t *testing.T) {
+		cfg := validCfg()
+		cfg.OpenAIAPIKey = ""
+		assert.ErrorContains(t, cfg.ValidateBesedka(), "OPENAI_API_KEY (or GEMINI_API_KEY) is required")
+		assert.NoError(t, cfg.ValidateBesedka(false))
+	})
+
+	t.Run("general invalid config rejected by ValidateBesedka", func(t *testing.T) {
+		cfg := validCfg()
+		cfg.TownhallMaxParagraphs = 0
+		assert.ErrorContains(t, cfg.ValidateBesedka(), "invalid TOWNHALL_MAX_PARAGRAPHS: 0")
+	})
+}
+

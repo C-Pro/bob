@@ -90,6 +90,7 @@ func TestEnsureDBSchema(t *testing.T) {
 		defer func() { _ = rows.Close() }()
 
 		hasIsDM, hasWaitCycles, hasVersion, hasSourceMessageSeq := false, false, false, false
+		hasFrontendID, hasScopeID, hasModel, hasExecutionKind := false, false, false, false
 		for rows.Next() {
 			var cid int
 			var name, colType string
@@ -108,10 +109,26 @@ func TestEnsureDBSchema(t *testing.T) {
 			if name == "source_message_seq" {
 				hasSourceMessageSeq = true
 			}
+			if name == "frontend_id" {
+				hasFrontendID = true
+			}
+			if name == "scope_id" {
+				hasScopeID = true
+			}
+			if name == "model" {
+				hasModel = true
+			}
+			if name == "execution_kind" {
+				hasExecutionKind = true
+			}
 		}
 		assert.True(t, hasIsDM)
 		assert.True(t, hasWaitCycles)
 		assert.True(t, hasVersion)
 		assert.True(t, hasSourceMessageSeq)
+		assert.True(t, hasFrontendID)
+		assert.True(t, hasScopeID)
+		assert.True(t, hasModel)
+		assert.True(t, hasExecutionKind)
 	})
 }

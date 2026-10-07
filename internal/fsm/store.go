@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"bob/internal/agentapi"
 )
 
 var (
@@ -58,10 +60,11 @@ func (s *Store) CreateRun(ctx context.Context, run *FSMRun) error {
 
 	query := `
 		INSERT INTO fsm_runs (
-			id, chat_id, user_id, is_dm, fsm_type, status, current_state,
+			id, chat_id, user_id, is_dm, frontend_id, scope_id, model, execution_kind,
+			fsm_type, status, current_state,
 			iteration, max_iterations, wait_cycles, context_json, result_json,
 			error_text, resume_at, version, source_message_seq, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	var resumeAt sql.NullInt64
@@ -74,7 +77,8 @@ func (s *Store) CreateRun(ctx context.Context, run *FSMRun) error {
 	}
 
 	_, err := s.db.ExecContext(ctx, query,
-		run.ID, run.ChatID, run.UserID, isDMInt, string(run.FSMType), string(run.Status), string(run.CurrentState),
+		run.ID, run.ChatID, run.UserID, isDMInt, run.FrontendID, run.ScopeID, run.Model, string(run.ExecutionKind),
+		string(run.FSMType), string(run.Status), string(run.CurrentState),
 		run.Iteration, run.MaxIterations, run.WaitCycles, run.ContextJSON, run.ResultJSON,
 		run.ErrorText, resumeAt, run.Version, sourceMsgSeq, run.CreatedAt, run.UpdatedAt,
 	)
@@ -90,20 +94,24 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
-const runSelectColumns = `id, chat_id, user_id, is_dm, fsm_type, status, current_state,
+const runSelectColumns = `id, chat_id, user_id, is_dm, frontend_id, scope_id, model, execution_kind,
+       fsm_type, status, current_state,
        iteration, max_iterations, wait_cycles, context_json, result_json,
        error_text, resume_at, version, source_message_seq, created_at, updated_at`
 
 func scanRun(scanner rowScanner) (*FSMRun, error) {
 	var run FSMRun
 	var isDMInt int
+	var executionKind string
 	var fsmType, status, currentState string
 	var resumeAt sql.NullInt64
 	var sourceMsgSeq sql.NullInt64
 	var resultJSON, errorText sql.NullString
 
 	err := scanner.Scan(
-		&run.ID, &run.ChatID, &run.UserID, &isDMInt, &fsmType, &status, &currentState,
+		&run.ID, &run.ChatID, &run.UserID, &isDMInt,
+		&run.FrontendID, &run.ScopeID, &run.Model, &executionKind,
+		&fsmType, &status, &currentState,
 		&run.Iteration, &run.MaxIterations, &run.WaitCycles, &run.ContextJSON, &resultJSON,
 		&errorText, &resumeAt, &run.Version, &sourceMsgSeq, &run.CreatedAt, &run.UpdatedAt,
 	)
@@ -112,6 +120,7 @@ func scanRun(scanner rowScanner) (*FSMRun, error) {
 	}
 
 	run.IsDM = isDMInt == 1
+	run.ExecutionKind = agentapi.ExecutionKind(executionKind)
 	run.FSMType = FSMType(fsmType)
 	run.Status = RunStatus(status)
 	run.CurrentState = RunState(currentState)

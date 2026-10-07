@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -301,8 +302,10 @@ func (c *Config) Validate(requireAPIKey bool) error {
 			return errors.New("OPENAI_MODEL (or GEMINI_MODEL) cannot be empty")
 		}
 	}
-	if strings.TrimSpace(c.BesedkaURL) == "" {
-		return errors.New("BESEDKA_URL cannot be empty")
+	if strings.TrimSpace(c.BesedkaURL) != "" {
+		if err := validateURL(c.BesedkaURL); err != nil {
+			return fmt.Errorf("invalid BESEDKA_URL: %w", err)
+		}
 	}
 	if c.TownhallMaxParagraphs <= 0 {
 		return fmt.Errorf("invalid TOWNHALL_MAX_PARAGRAPHS: %d", c.TownhallMaxParagraphs)
@@ -387,6 +390,35 @@ func (c *Config) Validate(requireAPIKey bool) error {
 	sbxCfg := c.SandboxConfig()
 	if err := sbxCfg.Validate(); err != nil {
 		return err
+	}
+	return nil
+}
+
+// ValidateBesedka checks both general runtime configuration and daemon-specific Besedka requirements.
+func (c *Config) ValidateBesedka(requireAPIKey ...bool) error {
+	reqKey := true
+	if len(requireAPIKey) > 0 {
+		reqKey = requireAPIKey[0]
+	}
+	if err := c.Validate(reqKey); err != nil {
+		return err
+	}
+	if strings.TrimSpace(c.BesedkaURL) == "" {
+		return errors.New("BESEDKA_URL cannot be empty")
+	}
+	return nil
+}
+
+func validateURL(rawURL string) error {
+	u, err := url.ParseRequestURI(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("invalid URL scheme %q, must be http or https", u.Scheme)
+	}
+	if u.Host == "" {
+		return errors.New("URL must specify a host")
 	}
 	return nil
 }

@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"bob/internal/agentapi"
 	"bob/internal/knowledge"
 	"bob/internal/models"
 	"bob/internal/tools"
@@ -57,7 +58,7 @@ type ToolDefinitionProvider interface {
 
 // Runner defines the interface for executing an FSM workflow.
 type Runner interface {
-	Execute(ctx context.Context, run *FSMRun, store *Store, tools []openai.Tool, model string) error
+	Execute(ctx context.Context, run *FSMRun, store *Store, toolset agentapi.Toolset, model string) error
 }
 
 // ToolLoopRequest encapsulates all parameters needed to execute a tool loop.
@@ -66,9 +67,13 @@ type ToolLoopRequest struct {
 	ChatID           string
 	UserID           string
 	IsDM             bool
+	FrontendID       string
+	ScopeID          string
+	ExecutionKind    agentapi.ExecutionKind
 	Model            string
 	Messages         []openai.ChatCompletionMessage
-	Tools            []openai.Tool
+	Tools            []openai.Tool    // Legacy tool definitions
+	Toolset          agentapi.Toolset // Execution-scoped toolset
 	MaxIterations    int
 	SourceMessageSeq *int64
 	OnTransition     func(state RunState, run *FSMRun)
@@ -77,10 +82,12 @@ type ToolLoopRequest struct {
 
 // ToolLoopResult contains the outcome of a completed tool loop run.
 type ToolLoopResult struct {
-	RunID           string
-	Content         string
-	TotalIterations int
-	Attachments     []models.Attachment
+	RunID            string
+	Content          string
+	TotalIterations  int
+	Attachments      []models.Attachment
+	AgentAttachments []agentapi.Attachment
+	Actions          []agentapi.Action
 }
 
 // EngineOption configures an Engine instance.
@@ -130,6 +137,13 @@ func WithResultSink(sink ResultSink) EngineOption {
 	}
 }
 
+// WithFrontend configures a registered frontend for execution binding and recovery delivery.
+func WithFrontend(id string, f agentapi.Frontend) EngineOption {
+	return func(e *Engine) {
+		e.RegisterFrontend(id, f)
+	}
+}
+
 // WithRecoveryStalenessCutoff sets the maximum staleness duration for interrupted runs on recovery.
 func WithRecoveryStalenessCutoff(d time.Duration) EngineOption {
 	return func(e *Engine) {
@@ -169,6 +183,9 @@ type Engine struct {
 	maxRecoveryConcurrency  int
 	knowledgeLimits         tools.KnowledgeBudgetLimits
 
+	frontendsMu sync.RWMutex
+	frontends   map[string]agentapi.Frontend
+
 	runnersMu sync.RWMutex
 	runners   map[FSMType]Runner
 
@@ -195,6 +212,7 @@ func NewEngine(storeProvider StoreProvider, llmClient LLMClient, invoker ToolInv
 		recoveryStalenessCutoff: 15 * time.Minute,
 		maxRecoveryConcurrency:  4,
 		knowledgeLimits:         tools.DefaultKnowledgeBudgetLimits(),
+		frontends:               make(map[string]agentapi.Frontend),
 		runners:                 make(map[FSMType]Runner),
 		running:                 make(map[string]context.CancelFunc),
 		timers:                  make(map[string]*time.Timer),
@@ -265,6 +283,123 @@ func (f ToolDefinitionProviderFunc) ToolDefinitions(ctx context.Context, chatID 
 // SetResultSink configures or updates the result delivery sink for the engine.
 func (e *Engine) SetResultSink(sink ResultSink) {
 	e.resultSink = sink
+}
+
+// LegacyFrontendID defines the default frontend ID for pre-existing or unspecified runs.
+const LegacyFrontendID = "besedka"
+
+// RegisterFrontend registers a frontend by ID.
+func (e *Engine) RegisterFrontend(id string, f agentapi.Frontend) {
+	e.frontendsMu.Lock()
+	defer e.frontendsMu.Unlock()
+	if e.frontends == nil {
+		e.frontends = make(map[string]agentapi.Frontend)
+	}
+	e.frontends[id] = f
+}
+
+func (e *Engine) getFrontend(id string) (agentapi.Frontend, bool) {
+	e.frontendsMu.RLock()
+	defer e.frontendsMu.RUnlock()
+	if e.frontends == nil {
+		return nil, false
+	}
+	f, ok := e.frontends[id]
+	return f, ok
+}
+
+func (e *Engine) resolveRunDescriptor(run *FSMRun) agentapi.RunDescriptor {
+	frontendID := run.FrontendID
+	if frontendID == "" {
+		frontendID = LegacyFrontendID
+	}
+	scopeID := run.ScopeID
+	if scopeID == "" {
+		scopeID = run.ChatID
+	}
+	kind := run.ExecutionKind
+	if kind == "" {
+		if strings.HasPrefix(run.ID, "sched_") {
+			kind = agentapi.Scheduled
+		} else {
+			kind = agentapi.Interactive
+		}
+	}
+	model := run.Model
+	if model == "" {
+		model = e.defaultModel
+	}
+
+	return agentapi.RunDescriptor{
+		RunID: run.ID,
+		Session: agentapi.SessionRef{
+			FrontendID: frontendID,
+			SessionID:  run.ChatID,
+			ScopeID:    scopeID,
+		},
+		Actor: agentapi.Actor{
+			ID: run.UserID,
+		},
+		Kind:          kind,
+		Model:         model,
+		MaxIterations: run.MaxIterations,
+	}
+}
+
+func (e *Engine) deliverCompletion(ctx context.Context, run *FSMRun, desc agentapi.RunDescriptor, fe agentapi.Frontend, store *Store) {
+	if !run.Status.IsTerminal() {
+		return
+	}
+
+	deliverCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var attachments []agentapi.Attachment
+	var actions []agentapi.Action
+	if store != nil && run.ID != "" {
+		steps, err := store.ListStepsByRun(deliverCtx, run.ID)
+		if err == nil {
+			var seenAttIDs = make(map[string]bool)
+			for _, s := range steps {
+				if s.Status == StepStatusCompleted {
+					res, _ := DecodeStoredToolResult(s.ResultJSON)
+					for _, att := range res.Attachments {
+						if !seenAttIDs[att.ID] {
+							seenAttIDs[att.ID] = true
+							attachments = append(attachments, att)
+						}
+					}
+					actions = append(actions, res.Actions...)
+				}
+			}
+		}
+	}
+
+	completion := agentapi.Completion{
+		Run: desc,
+		Result: agentapi.Result{
+			RunID:       run.ID,
+			Content:     run.ResultJSON,
+			Iterations:  run.Iteration,
+			Attachments: attachments,
+			Actions:     actions,
+		},
+		Status: agentapi.RunStatus(run.Status),
+		Error:  run.ErrorText,
+	}
+
+	if fe != nil {
+		if err := fe.Deliver(deliverCtx, completion); err != nil {
+			slog.Error("failed to deliver completion to frontend", "run_id", run.ID, "frontend_id", desc.Session.FrontendID, "error", err)
+		}
+		return
+	}
+
+	if desc.Session.FrontendID == LegacyFrontendID && e.resultSink != nil {
+		if err := e.resultSink.Deliver(deliverCtx, run); err != nil {
+			slog.Error("failed to deliver recovered run result via legacy sink", "run_id", run.ID, "error", err)
+		}
+	}
 }
 
 func (e *Engine) getRunner(fsmType FSMType) (Runner, error) {
@@ -445,27 +580,50 @@ func restoreChatSessionContext(ctx context.Context, store *Store, run *FSMRun, l
 		if step.Status != StepStatusCompleted {
 			continue
 		}
+		decodedRes, _ := DecodeStoredToolResult(step.ResultJSON)
+		stepContent := decodedRes.Content
+
 		switch step.ToolName {
 		case "sandbox_upload_attachment":
-			var payload struct {
-				FileID   string `json:"file_id"`
-				Name     string `json:"name"`
-				MimeType string `json:"mime_type"`
-				Type     string `json:"type"`
-			}
-			if err := json.Unmarshal([]byte(step.ResultJSON), &payload); err != nil {
-				return sess, fmt.Errorf("failed to parse sandbox_upload_attachment result for step %s: %w", step.ID, err)
-			}
-			if payload.FileID == "" {
-				return sess, fmt.Errorf("invalid sandbox_upload_attachment result for step %s: missing file_id", step.ID)
-			}
-			if err := sess.StageAttachment(models.Attachment{
-				FileID:   payload.FileID,
-				Name:     payload.Name,
-				MimeType: payload.MimeType,
-				Type:     models.AttachmentType(payload.Type),
-			}); err != nil {
-				return sess, fmt.Errorf("failed to stage attachment for step %s: %w", step.ID, err)
+			if len(decodedRes.Attachments) > 0 {
+				for _, att := range decodedRes.Attachments {
+					var attType models.AttachmentType
+					switch att.Type {
+					case agentapi.AttachmentImage:
+						attType = models.AttachmentTypeImage
+					default:
+						attType = models.AttachmentTypeFile
+					}
+					if err := sess.StageAttachment(models.Attachment{
+						FileID:   att.ID,
+						Name:     att.Name,
+						MimeType: att.MIMEType,
+						Type:     attType,
+					}); err != nil {
+						return sess, fmt.Errorf("failed to stage attachment for step %s: %w", step.ID, err)
+					}
+				}
+			} else {
+				var payload struct {
+					FileID   string `json:"file_id"`
+					Name     string `json:"name"`
+					MimeType string `json:"mime_type"`
+					Type     string `json:"type"`
+				}
+				if err := json.Unmarshal([]byte(stepContent), &payload); err != nil {
+					return sess, fmt.Errorf("failed to parse sandbox_upload_attachment result for step %s: %w", step.ID, err)
+				}
+				if payload.FileID == "" {
+					return sess, fmt.Errorf("invalid sandbox_upload_attachment result for step %s: missing file_id", step.ID)
+				}
+				if err := sess.StageAttachment(models.Attachment{
+					FileID:   payload.FileID,
+					Name:     payload.Name,
+					MimeType: payload.MimeType,
+					Type:     models.AttachmentType(payload.Type),
+				}); err != nil {
+					return sess, fmt.Errorf("failed to stage attachment for step %s: %w", step.ID, err)
+				}
 			}
 		case "load_memory":
 			var payload struct {
@@ -475,7 +633,7 @@ func restoreChatSessionContext(ctx context.Context, store *Store, run *FSMRun, l
 				ContentBytes int    `json:"content_bytes"`
 				ExpiresAt    *int64 `json:"expires_at,omitempty"`
 			}
-			if err := json.Unmarshal([]byte(step.ResultJSON), &payload); err != nil {
+			if err := json.Unmarshal([]byte(stepContent), &payload); err != nil {
 				return sess, fmt.Errorf("failed to parse load_memory result for step %s: %w", step.ID, err)
 			}
 			if payload.ItemID == "" || !strings.HasPrefix(payload.ItemID, "mem_") {
@@ -499,7 +657,7 @@ func restoreChatSessionContext(ctx context.Context, store *Store, run *FSMRun, l
 				// Expired before recovery; skip restoring into budget tracker so stale item is not cached.
 				continue
 			}
-			if err := sess.KnowledgeBudget.RestoreItem("memory", payload.ItemID, payload.VersionID, payload.Content, payload.ContentBytes, step.ResultJSON); err != nil {
+			if err := sess.KnowledgeBudget.RestoreItem("memory", payload.ItemID, payload.VersionID, payload.Content, payload.ContentBytes, stepContent); err != nil {
 				return sess, fmt.Errorf("failed to restore memory item for step %s: %w", step.ID, err)
 			}
 		case "load_skill":
@@ -511,7 +669,7 @@ func restoreChatSessionContext(ctx context.Context, store *Store, run *FSMRun, l
 				InstructionsMarkdown string `json:"instructions_markdown"`
 				ContentBytes         int    `json:"content_bytes"`
 			}
-			if err := json.Unmarshal([]byte(step.ResultJSON), &payload); err != nil {
+			if err := json.Unmarshal([]byte(stepContent), &payload); err != nil {
 				return sess, fmt.Errorf("failed to parse load_skill result for step %s: %w", step.ID, err)
 			}
 			if payload.ItemID == "" || !strings.HasPrefix(payload.ItemID, "skill_") {
@@ -531,7 +689,7 @@ func restoreChatSessionContext(ctx context.Context, store *Store, run *FSMRun, l
 			if payload.ContentBytes != actualBytes {
 				return sess, fmt.Errorf("invalid load_skill result for step %s: content_bytes mismatch (recorded %d, actual %d)", step.ID, payload.ContentBytes, actualBytes)
 			}
-			if err := sess.KnowledgeBudget.RestoreItem("skill", payload.ItemID, payload.VersionID, payload.InstructionsMarkdown, payload.ContentBytes, step.ResultJSON); err != nil {
+			if err := sess.KnowledgeBudget.RestoreItem("skill", payload.ItemID, payload.VersionID, payload.InstructionsMarkdown, payload.ContentBytes, stepContent); err != nil {
 				return sess, fmt.Errorf("failed to restore skill item for step %s: %w", step.ID, err)
 			}
 		}
@@ -671,13 +829,41 @@ func (e *Engine) Recover(ctx context.Context) error {
 
 				runToRecover.Status = RunStatusRunning
 				runToRecover.ResumeAt = nil
-				if strings.HasPrefix(runToRecover.ID, "sched_") {
+
+				desc := e.resolveRunDescriptor(&runToRecover)
+				fe, feFound := e.getFrontend(desc.Session.FrontendID)
+				if !feFound && desc.Session.FrontendID != LegacyFrontendID {
+					slog.Error("unregistered frontend on recovery", "run_id", runToRecover.ID, "frontend_id", desc.Session.FrontendID)
+					runToRecover.Status = RunStatusFailed
+					runToRecover.CurrentState = StateFailed
+					runToRecover.ErrorText = fmt.Sprintf("unregistered frontend %q on recovery", desc.Session.FrontendID)
+					_ = s.UpdateRun(runCtx, &runToRecover)
+					return
+				}
+
+				var bindings agentapi.Bindings
+				if feFound {
+					var bindErr error
+					bindings, bindErr = fe.Bind(runCtx, desc)
+					if bindErr != nil {
+						slog.Error("failed to bind frontend on recovery", "run_id", runToRecover.ID, "frontend_id", desc.Session.FrontendID, "error", bindErr)
+						runToRecover.Status = RunStatusFailed
+						runToRecover.CurrentState = StateFailed
+						runToRecover.ErrorText = fmt.Sprintf("failed to bind frontend %q: %v", desc.Session.FrontendID, bindErr)
+						_ = s.UpdateRun(runCtx, &runToRecover)
+						e.deliverCompletion(runCtx, &runToRecover, desc, fe, s)
+						return
+					}
+				}
+
+				if desc.Kind == agentapi.Scheduled || strings.HasPrefix(runToRecover.ID, "sched_") {
 					runToRecover.Status = RunStatusFailed
 					runToRecover.CurrentState = StateFailed
 					runToRecover.ErrorText = "scheduled run interrupted by service restart; ephemeral environment terminated"
 					if updateErr := s.UpdateRun(runCtx, &runToRecover); updateErr != nil {
 						slog.Error("failed to mark recovered scheduled run as failed", "run_id", runToRecover.ID, "error", updateErr)
 					}
+					e.deliverCompletion(runCtx, &runToRecover, desc, fe, s)
 					return
 				}
 				if runToRecover.CurrentState == StateWaiting {
@@ -693,6 +879,7 @@ func (e *Engine) Recover(ctx context.Context) error {
 							}
 							slog.Error("failed to persist wait cycles failure for recovered run", "run_id", runToRecover.ID, "error", updateErr)
 						}
+						e.deliverCompletion(runCtx, &runToRecover, desc, fe, s)
 						return
 					}
 					runToRecover.CurrentState = StateExecuteSteps
@@ -712,20 +899,22 @@ func (e *Engine) Recover(ctx context.Context) error {
 					return
 				}
 
-				var tools []openai.Tool
-				if provider := e.getToolDefProvider(); provider != nil {
-					if tr, ok := runner.(*ToolLoopRunner); !ok || !tr.HasToolDefinitionProvider() {
-						tools = provider.ToolDefinitions(runCtx, runToRecover.ChatID, runToRecover.IsDM)
+				var toolset agentapi.Toolset
+				if bindings.Tools != nil {
+					toolset = bindings.Tools
+				} else if provider := e.getToolDefProvider(); provider != nil {
+					var inv ToolInvoker
+					if e.stepExecutor != nil {
+						inv = e.stepExecutor.invoker
 					}
+					toolset = NewProviderToolset(provider, inv, runToRecover.ChatID, runToRecover.IsDM)
 				}
 
-				if err := runner.Execute(runCtx, &runToRecover, s, tools, e.defaultModel); err != nil {
+				if err := runner.Execute(runCtx, &runToRecover, s, toolset, desc.Model); err != nil {
 					slog.Error("error executing recovered run", "run_id", runToRecover.ID, "error", err)
 				}
-				if e.resultSink != nil && (runToRecover.Status == RunStatusCompleted || runToRecover.Status == RunStatusFailed) {
-					if err := e.resultSink.Deliver(runCtx, &runToRecover); err != nil {
-						slog.Error("failed to deliver recovered run result", "run_id", runToRecover.ID, "error", err)
-					}
+				if runToRecover.Status.IsTerminal() {
+					e.deliverCompletion(runCtx, &runToRecover, desc, fe, s)
 				}
 			})
 		}
@@ -820,13 +1009,41 @@ func (e *Engine) PollDueWaitingRuns(ctx context.Context) error {
 
 				runToResume.Status = RunStatusRunning
 				runToResume.ResumeAt = nil
-				if strings.HasPrefix(runToResume.ID, "sched_") {
+
+				desc := e.resolveRunDescriptor(&runToResume)
+				fe, feFound := e.getFrontend(desc.Session.FrontendID)
+				if !feFound && desc.Session.FrontendID != LegacyFrontendID {
+					slog.Error("unregistered frontend on resume", "run_id", runToResume.ID, "frontend_id", desc.Session.FrontendID)
+					runToResume.Status = RunStatusFailed
+					runToResume.CurrentState = StateFailed
+					runToResume.ErrorText = fmt.Sprintf("unregistered frontend %q on resume", desc.Session.FrontendID)
+					_ = s.UpdateRun(runCtx, &runToResume)
+					return
+				}
+
+				var bindings agentapi.Bindings
+				if feFound {
+					var bindErr error
+					bindings, bindErr = fe.Bind(runCtx, desc)
+					if bindErr != nil {
+						slog.Error("failed to bind frontend on resume", "run_id", runToResume.ID, "frontend_id", desc.Session.FrontendID, "error", bindErr)
+						runToResume.Status = RunStatusFailed
+						runToResume.CurrentState = StateFailed
+						runToResume.ErrorText = fmt.Sprintf("failed to bind frontend %q: %v", desc.Session.FrontendID, bindErr)
+						_ = s.UpdateRun(runCtx, &runToResume)
+						e.deliverCompletion(runCtx, &runToResume, desc, fe, s)
+						return
+					}
+				}
+
+				if desc.Kind == agentapi.Scheduled || strings.HasPrefix(runToResume.ID, "sched_") {
 					runToResume.Status = RunStatusFailed
 					runToResume.CurrentState = StateFailed
 					runToResume.ErrorText = "scheduled run interrupted; ephemeral environment terminated"
 					if updateErr := s.UpdateRun(runCtx, &runToResume); updateErr != nil {
 						slog.Error("failed to mark resumed scheduled run as failed", "run_id", runToResume.ID, "error", updateErr)
 					}
+					e.deliverCompletion(runCtx, &runToResume, desc, fe, s)
 					return
 				}
 				if runToResume.CurrentState == StateWaiting {
@@ -842,6 +1059,7 @@ func (e *Engine) PollDueWaitingRuns(ctx context.Context) error {
 							}
 							slog.Error("failed to persist wait cycles failure for waiting run", "run_id", runToResume.ID, "error", updateErr)
 						}
+						e.deliverCompletion(runCtx, &runToResume, desc, fe, s)
 						return
 					}
 					runToResume.CurrentState = StateExecuteSteps
@@ -861,20 +1079,22 @@ func (e *Engine) PollDueWaitingRuns(ctx context.Context) error {
 					return
 				}
 
-				var tools []openai.Tool
-				if provider := e.getToolDefProvider(); provider != nil {
-					if tr, ok := runner.(*ToolLoopRunner); !ok || !tr.HasToolDefinitionProvider() {
-						tools = provider.ToolDefinitions(runCtx, runToResume.ChatID, runToResume.IsDM)
+				var toolset agentapi.Toolset
+				if bindings.Tools != nil {
+					toolset = bindings.Tools
+				} else if provider := e.getToolDefProvider(); provider != nil {
+					var inv ToolInvoker
+					if e.stepExecutor != nil {
+						inv = e.stepExecutor.invoker
 					}
+					toolset = NewProviderToolset(provider, inv, runToResume.ChatID, runToResume.IsDM)
 				}
 
-				if err := runner.Execute(runCtx, &runToResume, s, tools, e.defaultModel); err != nil {
+				if err := runner.Execute(runCtx, &runToResume, s, toolset, desc.Model); err != nil {
 					slog.Error("error executing resumed run", "run_id", runToResume.ID, "error", err)
 				}
-				if e.resultSink != nil && (runToResume.Status == RunStatusCompleted || runToResume.Status == RunStatusFailed) {
-					if err := e.resultSink.Deliver(runCtx, &runToResume); err != nil {
-						slog.Error("failed to deliver resumed run result", "run_id", runToResume.ID, "error", err)
-					}
+				if runToResume.Status.IsTerminal() {
+					e.deliverCompletion(runCtx, &runToResume, desc, fe, s)
 				}
 			})
 		}
@@ -953,11 +1173,32 @@ func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (result *
 		return nil, fmt.Errorf("initial context size (%d bytes) exceeds maximum allowable limit (%d bytes)", len(contextJSON), MaxContextJSONBytes)
 	}
 
+	frontendID := req.FrontendID
+	if frontendID == "" {
+		frontendID = LegacyFrontendID
+	}
+	scopeID := req.ScopeID
+	if scopeID == "" {
+		scopeID = req.ChatID
+	}
+	execKind := req.ExecutionKind
+	if execKind == "" {
+		if strings.HasPrefix(req.RunID, "sched_") {
+			execKind = agentapi.Scheduled
+		} else {
+			execKind = agentapi.Interactive
+		}
+	}
+
 	run := &FSMRun{
 		ID:               req.RunID,
 		ChatID:           req.ChatID,
 		UserID:           req.UserID,
 		IsDM:             req.IsDM,
+		FrontendID:       frontendID,
+		ScopeID:          scopeID,
+		Model:            model,
+		ExecutionKind:    execKind,
 		FSMType:          FSMTypeToolLoop,
 		Status:           RunStatusRunning,
 		CurrentState:     StateInit,
@@ -1043,16 +1284,17 @@ func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (result *
 		return nil, err
 	}
 
-	toolDefs := req.Tools
-	if len(toolDefs) == 0 {
-		if provider := e.getToolDefProvider(); provider != nil {
-			if tr, ok := runner.(*ToolLoopRunner); !ok || !tr.HasToolDefinitionProvider() {
-				toolDefs = provider.ToolDefinitions(ctx, req.ChatID, req.IsDM)
-			}
+	toolset := req.Toolset
+	if toolset == nil && len(req.Tools) > 0 {
+		var inv ToolInvoker
+		if e.stepExecutor != nil {
+			inv = e.stepExecutor.invoker
 		}
+		toolset = NewLegacyToolset(req.Tools, inv)
 	}
+	// Note: If toolset is nil, strictly 0 tools are provided. No fallback to toolDefProvider.
 
-	execErr := runner.Execute(runCtx, run, store, toolDefs, model)
+	execErr := runner.Execute(runCtx, run, store, toolset, model)
 	if execErr != nil && runCtx.Err() != nil {
 		return nil, runCtx.Err()
 	}
@@ -1116,7 +1358,7 @@ func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (result *
 				if updateErr := store.UpdateRun(runCtx, run); updateErr != nil {
 					return nil, updateErr
 				}
-				execErr = runner.Execute(runCtx, run, store, toolDefs, model)
+				execErr = runner.Execute(runCtx, run, store, toolset, model)
 				if execErr != nil {
 					return nil, execErr
 				}
@@ -1128,15 +1370,54 @@ func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (result *
 		return nil, fmt.Errorf("run %s failed: %s", run.ID, run.ErrorText)
 	}
 
+	var completedAttachments []agentapi.Attachment
+	var completedActions []agentapi.Action
+	var seenAttIDs = make(map[string]bool)
+
+	allSteps, err := store.ListStepsByRun(ctx, run.ID)
+	if err == nil {
+		for _, s := range allSteps {
+			if s.Status == StepStatusCompleted {
+				res, _ := DecodeStoredToolResult(s.ResultJSON)
+				for _, att := range res.Attachments {
+					if !seenAttIDs[att.ID] {
+						seenAttIDs[att.ID] = true
+						completedAttachments = append(completedAttachments, att)
+					}
+				}
+				completedActions = append(completedActions, res.Actions...)
+			}
+		}
+	}
+
 	var attachments []models.Attachment
-	if sess, ok := tools.ChatSessionFromContext(runCtx); ok {
-		attachments = sess.GetStagedAttachments()
+	for _, a := range completedAttachments {
+		var attType models.AttachmentType
+		switch a.Type {
+		case agentapi.AttachmentImage:
+			attType = models.AttachmentTypeImage
+		default:
+			attType = models.AttachmentTypeFile
+		}
+		attachments = append(attachments, models.Attachment{
+			Type:     attType,
+			Name:     a.Name,
+			MimeType: a.MIMEType,
+			FileID:   a.ID,
+		})
+	}
+	if len(attachments) == 0 {
+		if sess, ok := tools.ChatSessionFromContext(runCtx); ok {
+			attachments = sess.GetStagedAttachments()
+		}
 	}
 
 	return &ToolLoopResult{
-		RunID:           run.ID,
-		Content:         run.ResultJSON,
-		TotalIterations: run.Iteration,
-		Attachments:     attachments,
+		RunID:            run.ID,
+		Content:          run.ResultJSON,
+		TotalIterations:  run.Iteration,
+		Attachments:      attachments,
+		AgentAttachments: completedAttachments,
+		Actions:          completedActions,
 	}, nil
 }
