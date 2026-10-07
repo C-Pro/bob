@@ -61,6 +61,6 @@
 
 ---
 
-- [ ] **Track: Core Agent Engine Decoupling**
+- [x] **Track: Core Agent Engine Decoupling**
 *Link: [./tracks/core-engine-decoupling_20261006/](./tracks/core-engine-decoupling_20261006/)*
 

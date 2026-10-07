@@ -130,7 +130,7 @@ func TestInjectUserContextOnce(t *testing.T) {
 	gw.injectUserContextOnce(ctx, "chat_1", "u1", rb1, true)
 	entries := rb1.Entries()
 	require.Len(t, entries, 1)
-	assert.Equal(t, "system", entries[0].Role)
+	assert.Equal(t, "user", entries[0].Role)
 	assert.Equal(t, "[User context: timezone=America/New_York, language=en-US]", entries[0].Content)
 
 	// Second call for same chat_1: should NOT inject again
@@ -150,7 +150,7 @@ func TestInjectUserContextOnce(t *testing.T) {
 	// After reset, should inject once more
 	gw.injectUserContextOnce(ctx, "chat_1", "u1", rb1, true)
 	require.Len(t, rb1.Entries(), 1)
-	assert.Equal(t, "system", rb1.Entries()[0].Role)
+	assert.Equal(t, "user", rb1.Entries()[0].Role)
 }
 
 func TestInjectUserContextOnce_TownhallMultipleUsers(t *testing.T) {
@@ -182,7 +182,7 @@ func TestInjectUserContextOnce_TownhallMultipleUsers(t *testing.T) {
 	gw.injectUserContextOnce(ctx, "townhall", "u1", rbTownhall, false)
 	entries := rbTownhall.Entries()
 	require.Len(t, entries, 1)
-	assert.Equal(t, "system", entries[0].Role)
+	assert.Equal(t, "user", entries[0].Role)
 	assert.Equal(t, "[User context for @alice: timezone=America/New_York, language=en-US]", entries[0].Content)
 
 	// Alice messages again: should NOT inject duplicate
@@ -193,7 +193,7 @@ func TestInjectUserContextOnce_TownhallMultipleUsers(t *testing.T) {
 	gw.injectUserContextOnce(ctx, "townhall", "u2", rbTownhall, false)
 	entries = rbTownhall.Entries()
 	require.Len(t, entries, 2)
-	assert.Equal(t, "system", entries[1].Role)
+	assert.Equal(t, "user", entries[1].Role)
 	assert.Equal(t, "[User context for @charlie: timezone=Europe/Paris, language=fr-FR]", entries[1].Content)
 
 	// ResetTownhall session clears all user session markers in townhall
@@ -235,6 +235,6 @@ func TestInjectUserContextOnce_Concurrent(t *testing.T) {
 
 	// Must be injected exactly once
 	assert.Equal(t, 1, rb.Len())
-	assert.Equal(t, "system", rb.Entries()[0].Role)
+	assert.Equal(t, "user", rb.Entries()[0].Role)
 	assert.Equal(t, "[User context: timezone=UTC, language=en]", rb.Entries()[0].Content)
 }

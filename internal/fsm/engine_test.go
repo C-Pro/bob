@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"bob/internal/agentapi"
 	"bob/internal/models"
 	"bob/internal/tools"
 
@@ -69,6 +70,9 @@ func TestEngine_RunToolLoopSuccess(t *testing.T) {
 		ChatID: "townhall",
 		UserID: "user_42",
 		IsDM:   false,
+		Tools: []openai.Tool{
+			{Type: openai.ToolTypeFunction, Function: &openai.FunctionDefinition{Name: "web_search"}},
+		},
 		Messages: []openai.ChatCompletionMessage{
 			{Role: openai.ChatMessageRoleUser, Content: "Tell me about Go"},
 		},
@@ -139,7 +143,7 @@ func TestEngine_DelayedTransitionPoller(t *testing.T) {
 
 	// Custom runner to simulate a workflow that enters WAITING and resumes
 	runner := &mockRunner{
-		execFunc: func(ctx context.Context, run *FSMRun, s *Store, tools []openai.Tool, model string) error {
+		execFunc: func(ctx context.Context, run *FSMRun, s *Store, _ agentapi.Toolset, model string) error {
 			if run.Iteration == 0 {
 				run.Iteration = 1
 				run.Status = RunStatusWaiting
@@ -263,7 +267,7 @@ func TestEngine_RecoverySessionContext(t *testing.T) {
 
 	var capturedSession tools.ChatSessionContext
 	runner := &mockRunner{
-		execFunc: func(ctx context.Context, run *FSMRun, s *Store, toolsList []openai.Tool, model string) error {
+		execFunc: func(ctx context.Context, run *FSMRun, s *Store, _ agentapi.Toolset, model string) error {
 			if sess, ok := tools.ChatSessionFromContext(ctx); ok {
 				capturedSession = sess
 			}
@@ -310,8 +314,13 @@ func TestEngine_RecoveryToolDefinitionProvider(t *testing.T) {
 
 	var capturedTools []openai.Tool
 	runner := &mockRunner{
-		execFunc: func(ctx context.Context, run *FSMRun, s *Store, toolsList []openai.Tool, model string) error {
-			capturedTools = toolsList
+		execFunc: func(ctx context.Context, run *FSMRun, s *Store, toolset agentapi.Toolset, model string) error {
+			if toolset != nil {
+				defs, _ := toolset.Definitions(ctx)
+				for _, d := range defs {
+					capturedTools = append(capturedTools, d.Schema)
+				}
+			}
 			run.Status = RunStatusCompleted
 			return s.UpdateRun(ctx, run)
 		},
@@ -397,12 +406,12 @@ func TestEngine_LifecycleStartStop(t *testing.T) {
 }
 
 type mockRunner struct {
-	execFunc func(ctx context.Context, run *FSMRun, store *Store, tools []openai.Tool, model string) error
+	execFunc func(ctx context.Context, run *FSMRun, store *Store, toolset agentapi.Toolset, model string) error
 }
 
-func (m *mockRunner) Execute(ctx context.Context, run *FSMRun, store *Store, tools []openai.Tool, model string) error {
+func (m *mockRunner) Execute(ctx context.Context, run *FSMRun, store *Store, toolset agentapi.Toolset, model string) error {
 	if m.execFunc != nil {
-		return m.execFunc(ctx, run, store, tools, model)
+		return m.execFunc(ctx, run, store, toolset, model)
 	}
 	return nil
 }
@@ -427,7 +436,7 @@ func TestEngine_RecoveryResultSinkDelivery(t *testing.T) {
 
 	sink := &mockResultSink{}
 	runner := &mockRunner{
-		execFunc: func(ctx context.Context, run *FSMRun, s *Store, toolsList []openai.Tool, model string) error {
+		execFunc: func(ctx context.Context, run *FSMRun, s *Store, _ agentapi.Toolset, model string) error {
 			run.Status = RunStatusCompleted
 			run.ResultJSON = "Here is your recovered answer."
 			return s.UpdateRun(ctx, run)
@@ -474,7 +483,7 @@ func TestEngine_RunToolLoop_MaxWaitCyclesExceeded(t *testing.T) {
 	ctx := context.Background()
 
 	runner := &mockRunner{
-		execFunc: func(ctx context.Context, run *FSMRun, s *Store, toolsList []openai.Tool, model string) error {
+		execFunc: func(ctx context.Context, run *FSMRun, s *Store, _ agentapi.Toolset, model string) error {
 			now := time.Now().Unix() - 10
 			run.Status = RunStatusWaiting
 			run.ResumeAt = &now
@@ -517,7 +526,7 @@ func TestEngine_RecoverySkipsTerminalFreshRun(t *testing.T) {
 
 	var execCount atomic.Int32
 	runner := &mockRunner{
-		execFunc: func(ctx context.Context, run *FSMRun, s *Store, toolsList []openai.Tool, model string) error {
+		execFunc: func(ctx context.Context, run *FSMRun, s *Store, _ agentapi.Toolset, model string) error {
 			run.Status = RunStatusCompleted
 			run.CurrentState = StateCompleted
 			run.ResultJSON = "completed"
@@ -578,7 +587,7 @@ func TestEngine_PollDueWaitingRuns_SkipsTerminalFreshRun(t *testing.T) {
 
 	var execCount atomic.Int32
 	runner := &mockRunner{
-		execFunc: func(ctx context.Context, run *FSMRun, s *Store, toolsList []openai.Tool, model string) error {
+		execFunc: func(ctx context.Context, run *FSMRun, s *Store, _ agentapi.Toolset, model string) error {
 			run.Status = RunStatusCompleted
 			run.CurrentState = StateCompleted
 			run.ResultJSON = "completed from poll"
@@ -679,7 +688,7 @@ func TestEngine_RunToolLoop_CancelledContext_MarksTerminated(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	runner := &mockRunner{
-		execFunc: func(execCtx context.Context, run *FSMRun, s *Store, toolsList []openai.Tool, model string) error {
+		execFunc: func(execCtx context.Context, run *FSMRun, s *Store, _ agentapi.Toolset, model string) error {
 			cancel() // cancel parent context during execution
 			<-execCtx.Done()
 			return execCtx.Err()
@@ -719,7 +728,7 @@ func TestEngine_Recover_StaleRun_MarksTerminated(t *testing.T) {
 
 	execCount := 0
 	runner := &mockRunner{
-		execFunc: func(execCtx context.Context, run *FSMRun, s *Store, toolsList []openai.Tool, model string) error {
+		execFunc: func(execCtx context.Context, run *FSMRun, s *Store, _ agentapi.Toolset, model string) error {
 			execCount++
 			return nil
 		},
@@ -778,7 +787,7 @@ func TestEngine_Recover_BoundedConcurrency(t *testing.T) {
 	var completedCount atomic.Int32
 
 	runner := &mockRunner{
-		execFunc: func(execCtx context.Context, run *FSMRun, s *Store, toolsList []openai.Tool, model string) error {
+		execFunc: func(execCtx context.Context, run *FSMRun, s *Store, _ agentapi.Toolset, model string) error {
 			cur := currentConcurrent.Add(1)
 			for {
 				oldMax := maxObserved.Load()

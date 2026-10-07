@@ -13,12 +13,16 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
+	"bob/internal/agent"
+	"bob/internal/agentapi"
 	"bob/internal/chatcontext"
+	"bob/internal/commands"
 	"bob/internal/config"
 	"bob/internal/fsm"
 	"bob/internal/llm"
@@ -37,6 +41,8 @@ import (
 	"github.com/liliang-cn/cortexdb/v2/pkg/cortexdb"
 	openai "github.com/sashabaranov/go-openai"
 )
+
+var _ agentapi.Frontend = (*Gateway)(nil)
 
 // Gateway handles Besedka ingress (listening for mentions/messages) and egress (posting AI responses).
 type Gateway struct {
@@ -68,6 +74,7 @@ type Gateway struct {
 	lifecycleID          uint64
 	chatLocker           *ChatLocker
 	chatCache            *ChatCache
+	runner               agentapi.TurnRunner
 }
 
 // NewGateway creates a new Besedka Gateway instance.
@@ -325,13 +332,28 @@ func (g *Gateway) FSMEngine() *fsm.Engine {
 	return g.fsmEngine
 }
 
+// SetRunner sets the TurnRunner for the gateway.
+func (g *Gateway) SetRunner(r agentapi.TurnRunner) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.runner = r
+}
+
+// Runner returns the TurnRunner for the gateway.
+func (g *Gateway) Runner() agentapi.TurnRunner {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.runner
+}
+
 // SetFSMEngine sets the durable FSM Engine for the gateway and configures it with the gateway ResultSink and ToolDefinitionProvider.
 func (g *Gateway) SetFSMEngine(e *fsm.Engine) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.fsmEngine = e
 	if e != nil {
-		e.SetResultSink(g)
+		e.RegisterFrontend("besedka", g)
+		e.SetResultSink(&fsmResultSink{gateway: g})
 		e.SetToolDefinitionProvider(g)
 	}
 	if g.schedulerInvoker != nil {
@@ -375,21 +397,125 @@ func (g *Gateway) ToolDefinitions(ctx context.Context, chatID string, isDM bool)
 	return r.ToolDefinitionsForSession(session)
 }
 
-// Deliver implements fsm.ResultSink to deliver completed or failed workflow results out-of-band.
-func (g *Gateway) Deliver(ctx context.Context, run *fsm.FSMRun) error {
-	if run == nil || run.ChatID == "" {
+func (g *Gateway) isChatDM(ctx context.Context, chatID string) bool {
+	if chatID == "townhall" {
+		return false
+	}
+	if g.chatCache != nil {
+		if chat, ok := g.chatCache.Get(chatID); ok {
+			return (chat.IsDM || chat.Type == "dm") && chat.Type != "group"
+		}
+	}
+	if g.httpClient != nil {
+		chat, err := g.GetChat(ctx, chatID)
+		if err == nil {
+			return (chat.IsDM || chat.Type == "dm") && chat.Type != "group"
+		}
+	}
+	return strings.HasPrefix(chatID, "dm_")
+}
+
+// Bind implements agentapi.Frontend to prepare execution-scoped dependencies for a run.
+func (g *Gateway) Bind(ctx context.Context, run agentapi.RunDescriptor) (agentapi.Bindings, error) {
+	chatID := run.Session.SessionID
+	userID := run.Actor.ID
+	isDM := g.isChatDM(ctx, chatID)
+	isAuthorizedDMOwner := isDM && g.VerifyDMOwner(ctx, chatID, userID) == nil
+
+	var budgetLimits tools.KnowledgeBudgetLimits
+	g.mu.Lock()
+	tr := g.toolsRegistry
+	g.mu.Unlock()
+	if tr != nil {
+		budgetLimits = tr.KnowledgeLimits()
+	} else if g.cfg != nil {
+		budgetLimits = tools.KnowledgeBudgetLimits{
+			MaxLoadedMemories:    g.cfg.KnowledgeMaxLoadedMemories,
+			MaxLoadedMemoryBytes: g.cfg.KnowledgeMaxLoadedMemoryBytes,
+			MaxLoadedSkills:      g.cfg.KnowledgeMaxLoadedSkills,
+			MaxLoadedSkillBytes:  g.cfg.KnowledgeMaxLoadedSkillBytes,
+		}
+	} else {
+		budgetLimits = tools.DefaultKnowledgeBudgetLimits()
+	}
+
+	sessionCtx := tools.NewChatSessionContext(chatID, userID, isAuthorizedDMOwner, budgetLimits)
+	sessionCtx.Notifier = func(targetChatID, text string) error {
+		return g.SendMessage(targetChatID, text)
+	}
+
+	var toolset agentapi.Toolset
+	if tr != nil {
+		toolset = tr.SessionToolset(sessionCtx)
+	}
+
+	var initialProgressSeq int64
+	if run.Metadata != nil {
+		if s, ok := run.Metadata["initial_progress_seq"]; ok && s != "" {
+			if parsed, err := strconv.ParseInt(s, 10, 64); err == nil && parsed > 0 {
+				initialProgressSeq = parsed
+			}
+		}
+	}
+
+	var progressObs agentapi.ProgressObserver
+	if initialProgressSeq > 0 {
+		progressObs = NewGatewayProgressObserverWithRoot(g, chatID, isDM, initialProgressSeq)
+	} else {
+		progressObs = NewGatewayProgressObserver(g, chatID, isDM)
+	}
+
+	attHandler := NewGatewayAttachmentAdapter(g, chatID)
+	sink := &gatewayNotificationSink{gateway: g, chatID: chatID}
+
+	return agentapi.Bindings{
+		Tools:         toolset,
+		Attachments:   attHandler,
+		Progress:      progressObs,
+		Notifications: sink,
+	}, nil
+}
+
+// Deliver implements agentapi.Frontend to deliver completed or failed workflow results to Besedka.
+func (g *Gateway) Deliver(ctx context.Context, comp agentapi.Completion) error {
+	chatID := comp.Run.Session.SessionID
+	if chatID == "" {
 		return nil
 	}
-	if strings.HasPrefix(run.ID, "sched_") {
+	if strings.HasPrefix(comp.Run.RunID, "sched_") {
 		// Scheduled task runs handle their own notifications inside schedule_invoker;
 		// suppress generic failure apologies to the chat on crash recovery.
 		return nil
 	}
+
+	g.mu.Lock()
+	botID := g.botUserID
+	botName := g.botUser.GetDisplayName()
+	sm := g.sandboxManager
+	g.mu.Unlock()
+	if botName == "" {
+		botName = "Bob"
+	}
+
+	// Check for suppress_reply action (e.g. sandbox approval requests)
+	for _, act := range comp.Result.Actions {
+		if act.Type == agentapi.ActionSuppressReply {
+			g.contextManager.Push(chatID, chatcontext.Entry{
+				Role:       "assistant",
+				SenderID:   botID,
+				SenderName: botName,
+				Content:    "Sandbox approval requested.",
+				Timestamp:  time.Now().Unix(),
+			})
+			return nil
+		}
+	}
+
 	var reply string
-	switch run.Status {
-	case fsm.RunStatusCompleted:
-		reply = run.ResultJSON
-	case fsm.RunStatusFailed, fsm.RunStatusTerminated:
+	switch comp.Status {
+	case agentapi.RunCompleted:
+		reply = comp.Result.Content
+	case agentapi.RunFailed, agentapi.RunTerminated:
 		reply = "Sorry, I encountered an issue processing your request. Please try again later."
 	default:
 		return nil
@@ -399,38 +525,35 @@ func (g *Gateway) Deliver(ctx context.Context, run *fsm.FSMRun) error {
 		return nil
 	}
 
-	formattedReply := FormatResponse(reply, run.IsDM, g.cfg.TownhallMaxParagraphs, g.cfg.DMMaxParagraphs)
-
-	var attachments []models.Attachment
-	if session, ok := tools.ChatSessionFromContext(ctx); ok {
-		attachments = session.GetStagedAttachments()
-	}
-	fsmEng := g.FSMEngine()
-	if len(attachments) == 0 && fsmEng != nil && run != nil {
-		restored, err := fsmEng.RestoreChatSessionContext(ctx, run)
-		if err == nil {
-			attachments = restored.GetStagedAttachments()
+	isDM := g.isChatDM(ctx, chatID)
+	if comp.Status == agentapi.RunCompleted && isDM && sm != nil {
+		if sbx, ok := sm.GetStatus(comp.Run.Actor.ID); ok && sbx != nil && sbx.Status == sandbox.StatusRunning {
+			if !strings.Contains(reply, "/sandbox destroy") {
+				rem := time.Until(sbx.ExpiresAt).Round(time.Minute)
+				if rem < 0 {
+					rem = 0
+				}
+				reply += fmt.Sprintf("\n\n💡 Would you like to destroy the sandbox (`/sandbox destroy`) or keep it? It will automatically be destroyed in %s.", rem)
+			}
 		}
 	}
 
-	if err := g.SendMessageWithAttachments(run.ChatID, formattedReply, attachments); err != nil {
-		return fmt.Errorf("failed to deliver recovered reply to chat %s: %w", run.ChatID, err)
-	}
+	formattedReply := FormatResponse(reply, isDM, g.cfg.TownhallMaxParagraphs, g.cfg.DMMaxParagraphs)
 
-	botID := g.botUserID
-	botName := g.botUser.GetDisplayName()
-	if botName == "" {
-		botName = "Bob"
+	outgoingAttachments := ToBesedkaAttachments(comp.Result.Attachments)
+
+	if err := g.SendMessageWithAttachments(chatID, formattedReply, outgoingAttachments); err != nil {
+		return fmt.Errorf("failed to deliver reply to chat %s: %w", chatID, err)
 	}
 
 	pushContent, pushImages := formattedReply, []chatcontext.ImageAttachment(nil)
-	if len(attachments) > 0 {
-		extraText, images := g.processAttachments(ctx, attachments)
+	if len(outgoingAttachments) > 0 {
+		extraText, images := g.processAttachments(ctx, outgoingAttachments)
 		pushContent = strings.TrimSpace(formattedReply + extraText)
 		pushImages = images
 	}
 
-	g.contextManager.Push(run.ChatID, chatcontext.Entry{
+	g.contextManager.Push(chatID, chatcontext.Entry{
 		Role:       "assistant",
 		SenderID:   botID,
 		SenderName: botName,
@@ -440,6 +563,85 @@ func (g *Gateway) Deliver(ctx context.Context, run *fsm.FSMRun) error {
 	})
 
 	return nil
+}
+
+// DeliverLegacyFSMRun converts an FSMRun to agentapi.Completion and delivers it to Besedka.
+func (g *Gateway) DeliverLegacyFSMRun(ctx context.Context, run *fsm.FSMRun) error {
+	if run == nil || run.ChatID == "" {
+		return nil
+	}
+	if strings.HasPrefix(run.ID, "sched_") {
+		return nil
+	}
+
+	var status agentapi.RunStatus
+	switch run.Status {
+	case fsm.RunStatusCompleted:
+		status = agentapi.RunCompleted
+	case fsm.RunStatusFailed:
+		status = agentapi.RunFailed
+	case fsm.RunStatusTerminated:
+		status = agentapi.RunTerminated
+	default:
+		return nil
+	}
+
+	var attachments []agentapi.Attachment
+	if session, ok := tools.ChatSessionFromContext(ctx); ok {
+		attachments = FromBesedkaAttachments(session.GetStagedAttachments())
+	}
+	fsmEng := g.FSMEngine()
+	if len(attachments) == 0 && fsmEng != nil {
+		restored, err := fsmEng.RestoreChatSessionContext(ctx, run)
+		if err == nil {
+			attachments = FromBesedkaAttachments(restored.GetStagedAttachments())
+		}
+	}
+
+	comp := agentapi.Completion{
+		Run: agentapi.RunDescriptor{
+			RunID: run.ID,
+			Session: agentapi.SessionRef{
+				FrontendID: "besedka",
+				SessionID:  run.ChatID,
+				ScopeID:    run.ScopeID,
+			},
+			Actor: agentapi.Actor{
+				ID: run.UserID,
+			},
+			Model:         run.Model,
+			MaxIterations: run.MaxIterations,
+		},
+		Result: agentapi.Result{
+			RunID:       run.ID,
+			Content:     run.ResultJSON,
+			Iterations:  run.Iteration,
+			Attachments: attachments,
+		},
+		Status: status,
+		Error:  run.ErrorText,
+	}
+
+	return g.Deliver(ctx, comp)
+}
+
+type fsmResultSink struct {
+	gateway *Gateway
+}
+
+var _ fsm.ResultSink = (*fsmResultSink)(nil)
+
+func (s *fsmResultSink) Deliver(ctx context.Context, run *fsm.FSMRun) error {
+	return s.gateway.DeliverLegacyFSMRun(ctx, run)
+}
+
+type gatewayNotificationSink struct {
+	gateway *Gateway
+	chatID  string
+}
+
+func (s *gatewayNotificationSink) Notify(ctx context.Context, notif agentapi.Notification) error {
+	return s.gateway.SendMessage(s.chatID, notif.Content)
 }
 
 // SandboxManager returns the Gateway's sandbox Manager.
@@ -862,7 +1064,7 @@ func (g *Gateway) injectUserContextOnce(ctx context.Context, chatID, userID stri
 	}
 
 	rb.Push(chatcontext.Entry{
-		Role:      "system",
+		Role:      "user",
 		Content:   contextText,
 		Timestamp: time.Now().Unix(),
 	})
@@ -1412,6 +1614,7 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 
 func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Message, isDM bool, senderName, currentTask string, initialProgressSeq int64) error {
 	g.mu.Lock()
+	runner := g.runner
 	botID := g.botUserID
 	botUser := g.botUser
 	if botUser.ID == "" && botID != "" {
@@ -1423,7 +1626,7 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 	sm := g.sandboxManager
 	g.mu.Unlock()
 
-	if g.llmClient == nil {
+	if runner == nil && g.llmClient == nil {
 		if initialProgressSeq > 0 {
 			_, _ = g.SendProgressMessage(ctx, msg.ChatID, &models.ProgressData{
 				ParentSeq:  initialProgressSeq,
@@ -1433,7 +1636,7 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 		return nil
 	}
 
-	if g.chatLocker != nil {
+	if runner == nil && g.chatLocker != nil {
 		release, err := g.chatLocker.TryAcquire(ctx, msg.ChatID, 30*time.Second)
 		if err != nil {
 			slog.Warn("chat execution lock busy for incoming message", "chat_id", msg.ChatID, "error", err)
@@ -1441,10 +1644,6 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 		}
 		defer release()
 	}
-
-	// Authoritative verification for knowledge and sandbox capabilities:
-	// A session is granted DM privileges only if it is an authoritative 1-on-1 DM owned by msg.UserID.
-	isAuthorizedDMOwner := isDM && g.VerifyDMOwner(ctx, msg.ChatID, msg.UserID) == nil
 
 	var systemPrompt string
 	if isDM {
@@ -1460,24 +1659,76 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 	slog.Info("processing bot message request", "chatID", msg.ChatID, "sender", senderName)
 
 	bufferedMsgs := g.contextManager.GetLLMMessages(msg.ChatID)
-	llmMsgs := make([]openai.ChatCompletionMessage, 0, len(bufferedMsgs)+2)
-	llmMsgs = append(llmMsgs, openai.ChatCompletionMessage{
-		Role:    openai.ChatMessageRoleSystem,
-		Content: systemPrompt,
-	})
-	llmMsgs = append(llmMsgs, bufferedMsgs...)
+	convMsgs := make([]openai.ChatCompletionMessage, 0, len(bufferedMsgs)+1)
+	convMsgs = append(convMsgs, bufferedMsgs...)
 
 	// Defense-in-depth: Ensure message list never ends with an assistant message (e.g. Gemini 400 constraint)
-	if len(llmMsgs) > 0 && llmMsgs[len(llmMsgs)-1].Role == openai.ChatMessageRoleAssistant {
+	if len(convMsgs) > 0 && convMsgs[len(convMsgs)-1].Role == openai.ChatMessageRoleAssistant {
 		continuation := "Please continue."
 		if currentTask != "" {
 			continuation = "Please proceed with: " + currentTask
 		}
-		llmMsgs = append(llmMsgs, openai.ChatCompletionMessage{
+		convMsgs = append(convMsgs, openai.ChatCompletionMessage{
 			Role:    openai.ChatMessageRoleUser,
 			Content: continuation,
 		})
 	}
+
+	if runner != nil {
+		maxIterations := g.cfg.TownhallToolMaxIterations
+		if isDM {
+			maxIterations = g.cfg.DMToolMaxIterations
+		}
+		metadata := make(map[string]string)
+		if initialProgressSeq > 0 {
+			metadata["initial_progress_seq"] = strconv.FormatInt(initialProgressSeq, 10)
+		}
+		if msg.Seq > 0 {
+			metadata["source_message_seq"] = strconv.FormatInt(msg.Seq, 10)
+		}
+
+		turn := agentapi.Turn{
+			Run: agentapi.RunDescriptor{
+				RunID: fmt.Sprintf("run_%s_%d", msg.ChatID, time.Now().UnixNano()),
+				Session: agentapi.SessionRef{
+					FrontendID: "besedka",
+					SessionID:  msg.ChatID,
+					ScopeID:    msg.ChatID,
+				},
+				Actor: agentapi.Actor{
+					ID: msg.UserID,
+				},
+				Kind:          agentapi.Interactive,
+				Model:         g.cfg.OpenAIModel,
+				MaxIterations: maxIterations,
+				Metadata:      metadata,
+			},
+			SystemPrompt: systemPrompt,
+			Messages:     convMsgs,
+			Deliver:      true,
+		}
+
+		_, err := runner.Run(ctx, turn)
+		if err != nil {
+			var delivErr *agent.DeliveryError
+			if errors.As(err, &delivErr) {
+				slog.Error("failed delivering agent reply", "chat_id", msg.ChatID, "error", delivErr.Err)
+				return delivErr.Err
+			}
+			slog.Error("turn runner execution failed", "chat_id", msg.ChatID, "error", err)
+			apology := "Sorry, I encountered an issue processing your request. Please try again later."
+			_ = g.SendMessage(msg.ChatID, apology)
+			return err
+		}
+		return nil
+	}
+
+	llmMsgs := make([]openai.ChatCompletionMessage, 0, len(convMsgs)+1)
+	llmMsgs = append(llmMsgs, openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleSystem,
+		Content: systemPrompt,
+	})
+	llmMsgs = append(llmMsgs, convMsgs...)
 
 	var sandboxRequestCreated bool
 	var budgetLimits tools.KnowledgeBudgetLimits
@@ -1493,6 +1744,10 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 	} else {
 		budgetLimits = tools.DefaultKnowledgeBudgetLimits()
 	}
+	// Authoritative verification for knowledge and sandbox capabilities:
+	// A session is granted DM privileges only if it is an authoritative 1-on-1 DM owned by msg.UserID.
+	isAuthorizedDMOwner := isDM && g.VerifyDMOwner(ctx, msg.ChatID, msg.UserID) == nil
+
 	sessionCtx := tools.NewChatSessionContext(msg.ChatID, msg.UserID, isAuthorizedDMOwner, budgetLimits)
 	sessionCtx.Notifier = func(chatID, text string) error {
 		return g.SendMessage(chatID, text)
@@ -1536,6 +1791,7 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 				IsDM:             isDM,
 				Model:            g.cfg.OpenAIModel,
 				Messages:         llmMsgs,
+				Toolset:          toolsRegistry.SessionToolset(sessionCtx),
 				MaxIterations:    maxIterations,
 				SourceMessageSeq: seq,
 				ProgressObserver: progressObs,
@@ -1556,6 +1812,11 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 				}
 			} else if fsmRes != nil {
 				reply = fsmRes.Content
+				for _, act := range fsmRes.Actions {
+					if act.Type == agentapi.ActionSuppressReply {
+						sandboxRequestCreated = true
+					}
+				}
 			}
 		} else {
 			reply, err = g.llmClient.GenerateChatResponseWithToolLoop(
@@ -2006,27 +2267,39 @@ func (g *Gateway) handleSandboxCommand(ctx context.Context, msg models.Message, 
 	sm := g.sandboxManager
 	g.mu.Unlock()
 
-	if sm == nil {
-		return g.SendMessage(msg.ChatID, "Sandbox execution is disabled on this server.")
-	}
-
 	parts := strings.Fields(strings.TrimSpace(text))
 	subcmd := ""
+	var args []string
 	if len(parts) > 1 {
-		subcmd = strings.ToLower(parts[1])
+		subcmd = parts[1]
+		args = parts[2:]
 	}
 
-	switch subcmd {
-	case "approve":
-		sbx, err := sm.ApproveSandbox(ctx, msg.UserID)
-		if err != nil {
-			return g.SendMessage(msg.ChatID, fmt.Sprintf("⚠️ Failed to approve sandbox: %v", err))
-		}
-		if !sbx.ClaimContinuation() {
-			return g.SendMessage(msg.ChatID, "Sandbox is already approved and running.")
-		}
+	req := commands.Request{
+		Session: agentapi.SessionRef{
+			FrontendID: "besedka",
+			SessionID:  msg.ChatID,
+			ScopeID:    msg.ChatID,
+		},
+		Actor: agentapi.Actor{
+			ID: msg.UserID,
+		},
+		ActorName:  senderName,
+		IsDirect:   true,
+		Command:    "sandbox",
+		Subcommand: subcmd,
+		Args:       args,
+		RawText:    text,
+	}
 
-		userContinuation := "Sandbox is approved. Please proceed with: " + sbx.Reason
+	handler := commands.NewSandboxHandler(sm)
+	res, err := handler.Handle(ctx, req)
+	if err != nil {
+		return err
+	}
+
+	if res.Continuation != nil {
+		userContinuation := "Sandbox is approved. Please proceed with: " + res.Continuation.Reason
 		g.contextManager.Push(msg.ChatID, chatcontext.Entry{
 			Role:       "user",
 			SenderID:   msg.UserID,
@@ -2042,7 +2315,7 @@ func (g *Gateway) handleSandboxCommand(ctx context.Context, msg models.Message, 
 				{
 					ID:          "sandbox_create",
 					Title:       "Sandbox created",
-					Description: fmt.Sprintf("Proceeding with: %s", sbx.Reason),
+					Description: fmt.Sprintf("Proceeding with: %s", res.Continuation.Reason),
 					Status:      models.ProgressStatusCompleted,
 				},
 			},
@@ -2054,7 +2327,7 @@ func (g *Gateway) handleSandboxCommand(ctx context.Context, msg models.Message, 
 			initialProgressSeq = seq
 		} else {
 			slog.Warn("could not emit initial progress card for sandbox approval, falling back to chat message", "chat_id", msg.ChatID, "error", pErr)
-			ackMsg := fmt.Sprintf("Sandbox created successfully, proceeding with %s...", sbx.Reason)
+			ackMsg := fmt.Sprintf("Sandbox created successfully, proceeding with %s...", res.Continuation.Reason)
 			if err := g.SendMessage(msg.ChatID, ackMsg); err != nil {
 				return fmt.Errorf("failed to send approval message: %w", err)
 			}
@@ -2067,107 +2340,24 @@ func (g *Gateway) handleSandboxCommand(ctx context.Context, msg models.Message, 
 			})
 		}
 
-		return g.generateAndSendAgentReply(ctx, msg, true, senderName, sbx.Reason, initialProgressSeq)
-
-	case "deny":
-		err := sm.DenySandbox(msg.UserID)
-		if err != nil {
-			return g.SendMessage(msg.ChatID, fmt.Sprintf("⚠️ Failed to deny sandbox: %v", err))
-		}
-		reply := "❌ **Sandbox request denied.**"
-		g.contextManager.Push(msg.ChatID, chatcontext.Entry{
-			Role:       "assistant",
-			SenderID:   botID,
-			SenderName: botUser.GetDisplayName(),
-			Content:    reply,
-			Timestamp:  time.Now().Unix(),
-		})
-		return g.SendMessage(msg.ChatID, reply)
-
-	case "destroy":
-		err := sm.Destroy(ctx, msg.UserID)
-		if err != nil {
-			return g.SendMessage(msg.ChatID, fmt.Sprintf("⚠️ Failed to destroy sandbox: %v", err))
-		}
-		reply := "🧹 **Sandbox terminated and resources released.**"
-		g.contextManager.Push(msg.ChatID, chatcontext.Entry{
-			Role:       "assistant",
-			SenderID:   botID,
-			SenderName: botUser.GetDisplayName(),
-			Content:    reply,
-			Timestamp:  time.Now().Unix(),
-		})
-		return g.SendMessage(msg.ChatID, reply)
-
-	case "status":
-		sbx, _ := sm.GetStatus(msg.UserID)
-		return g.SendMessage(msg.ChatID, g.formatSandboxStatus(sbx))
-
-	default:
-		helpText := "🔒 **Sandbox Commands:**\n" +
-			"• `/sandbox approve` — Approve pending sandbox request\n" +
-			"• `/sandbox deny` — Deny pending sandbox request\n" +
-			"• `/sandbox destroy` — Terminate your active sandbox\n" +
-			"• `/sandbox status` — View status of your sandbox"
-		return g.SendMessage(msg.ChatID, helpText)
+		return g.generateAndSendAgentReply(ctx, msg, true, senderName, res.Continuation.Reason, initialProgressSeq)
 	}
+
+	if res.RecordAssistantEntry {
+		g.contextManager.Push(msg.ChatID, chatcontext.Entry{
+			Role:       "assistant",
+			SenderID:   botID,
+			SenderName: botUser.GetDisplayName(),
+			Content:    res.Reply,
+			Timestamp:  time.Now().Unix(),
+		})
+	}
+
+	return g.SendMessage(msg.ChatID, res.Reply)
 }
 
 func (g *Gateway) formatSandboxStatus(sbx *sandbox.UserSandbox) string {
-	if sbx == nil || sbx.Status == sandbox.StatusNone {
-		return "ℹ️ You do not have an active or pending sandbox."
-	}
-
-	switch sbx.Status {
-	case sandbox.StatusPendingApproval:
-		var b strings.Builder
-		b.WriteString("⏳ **Sandbox Request Awaiting Your Approval**\n")
-		g.appendSandboxDetails(&b, sbx)
-		b.WriteString("\nReply `/sandbox approve` to approve or `/sandbox deny` to reject.")
-		return b.String()
-
-	case sandbox.StatusRunning:
-		var b strings.Builder
-		b.WriteString("🟢 **Active Sandbox Status**\n")
-		g.appendSandboxDetails(&b, sbx)
-		return b.String()
-
-	case sandbox.StatusExpired:
-		return "⌛ **Your previous sandbox has expired.** The agent can request a new sandbox when needed."
-
-	default:
-		return fmt.Sprintf("ℹ️ Sandbox status: %s", sbx.Status)
-	}
-}
-
-func (g *Gateway) appendSandboxDetails(b *strings.Builder, sbx *sandbox.UserSandbox) {
-	fmt.Fprintf(b, "- **Driver:** %s\n", sbx.Driver)
-	if sbx.Driver == sandbox.DriverDocker && sbx.DockerImage != "" {
-		fmt.Fprintf(b, "- **Docker Image:** %s\n", sbx.DockerImage)
-	}
-	fmt.Fprintf(b, "- **Network:** %s\n", sbx.Network.Mode)
-	if len(sbx.Network.AllowedHosts) > 0 {
-		fmt.Fprintf(b, "- **Allowed Domains:** %s\n", strings.Join(sbx.Network.AllowedHosts, ", "))
-	}
-	if len(sbx.Mounts) > 0 {
-		b.WriteString("- **Mounts (in workspace):**\n")
-		for _, m := range sbx.Mounts {
-			ro := "read-write"
-			if m.ReadOnly {
-				ro = "read-only"
-			}
-			pathStr := m.RelativePath
-			if pathStr == "." || pathStr == "" {
-				pathStr = "(whole workspace)"
-			}
-			fmt.Fprintf(b, "  • %s (%s)\n", pathStr, ro)
-		}
-	}
-	remaining := time.Until(sbx.ExpiresAt).Round(time.Minute)
-	if remaining < 0 {
-		remaining = 0
-	}
-	fmt.Fprintf(b, "- **Time Remaining:** %s\n", remaining)
+	return commands.FormatSandboxStatus(sbx)
 }
 
 // GetChat retrieves a chat from the cache, fetching chats from the API if missing.

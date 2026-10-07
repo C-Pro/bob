@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	"bob/internal/agent"
+	"bob/internal/agentapi"
 	"bob/internal/backup"
 	"bob/internal/config"
 	"bob/internal/fsm"
@@ -126,7 +128,7 @@ func main() {
 
 	slog.Info("starting Besedka AI Agent service")
 
-	if err := cfg.Validate(true); err != nil {
+	if err := cfg.ValidateBesedka(true); err != nil {
 		slog.Error("configuration validation failed", "error", err)
 		os.Exit(1)
 	}
@@ -203,7 +205,7 @@ func main() {
 		llmClient,
 		gw.ToolsRegistry(),
 		fsm.WithDefaultModel(cfg.OpenAIModel),
-		fsm.WithResultSink(gw),
+		fsm.WithFrontend("besedka", gw),
 		fsm.WithToolDefinitionProvider(gw),
 		fsm.WithPollInterval(2*time.Second),
 		fsm.WithKnowledgeBudgetLimits(tools.KnowledgeBudgetLimits{
@@ -214,6 +216,28 @@ func main() {
 		}),
 	)
 	gw.SetFSMEngine(fsmEngine)
+
+	// Initialize core Agent Engine
+	agentEngine, err := agent.NewEngine(agent.Dependencies{
+		Config: agent.Config{
+			DefaultModel:  cfg.OpenAIModel,
+			MaxIterations: cfg.TownhallToolMaxIterations,
+			LockTimeout:   30 * time.Second,
+		},
+		LLMClient:     llmClient,
+		FSMEngine:     fsmEngine,
+		SessionLocker: gw.ChatLocker(),
+		Frontends: map[string]agentapi.Frontend{
+			"besedka": gw,
+		},
+	})
+	if err != nil {
+		slog.Error("failed to initialize agent engine", "error", err)
+		os.Exit(1)
+	}
+	defer func() { _ = agentEngine.Close() }()
+
+	gw.SetRunner(agentEngine)
 
 	// Start periodic backup scheduler if S3 is enabled
 	var scheduler *backup.Scheduler

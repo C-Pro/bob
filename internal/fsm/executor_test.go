@@ -175,7 +175,9 @@ func TestStepExecutor_ParallelExecutionAndConcurrencyLimit(t *testing.T) {
 	for _, s := range steps {
 		assert.Equal(t, StepStatusCompleted, s.Status)
 		assert.Equal(t, ExecutionModeParallel, s.ExecutionMode)
-		assert.Equal(t, `{"ok": true}`, s.ResultJSON)
+		res, err := DecodeStoredToolResult(s.ResultJSON)
+		require.NoError(t, err)
+		assert.Equal(t, `{"ok": true}`, res.Content)
 		assert.NotNil(t, s.StartedAt)
 		assert.NotNil(t, s.CompletedAt)
 	}
@@ -317,7 +319,9 @@ func TestStepExecutor_TransientErrorRetries(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, StepStatusCompleted, step.Status)
 	assert.Equal(t, 3, step.Attempt)
-	assert.Equal(t, `{"recovered": true}`, step.ResultJSON)
+	res, err := DecodeStoredToolResult(step.ResultJSON)
+	require.NoError(t, err)
+	assert.Equal(t, `{"recovered": true}`, res.Content)
 }
 
 func TestStepExecutor_TransientErrorExhaustion(t *testing.T) {
@@ -369,7 +373,9 @@ func TestStepExecutor_StepTimeoutRetries(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, StepStatusCompleted, step.Status)
 	assert.Equal(t, 3, step.Attempt)
-	assert.Equal(t, `{"recovered": true}`, step.ResultJSON)
+	res, err := DecodeStoredToolResult(step.ResultJSON)
+	require.NoError(t, err)
+	assert.Equal(t, `{"recovered": true}`, res.Content)
 }
 
 func TestStepExecutor_StepTimeoutExhaustion(t *testing.T) {
@@ -436,9 +442,13 @@ func TestStepExecutor_ExecuteBatchWrapper(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, results, 2)
 	assert.Equal(t, StepStatusCompleted, results[0].Status)
-	assert.Equal(t, "result for web_search", results[0].ResultJSON)
+	res0, err := DecodeStoredToolResult(results[0].ResultJSON)
+	require.NoError(t, err)
+	assert.Equal(t, "result for web_search", res0.Content)
 	assert.Equal(t, StepStatusCompleted, results[1].Status)
-	assert.Equal(t, "result for web_fetch", results[1].ResultJSON)
+	res1, err := DecodeStoredToolResult(results[1].ResultJSON)
+	require.NoError(t, err)
+	assert.Equal(t, "result for web_fetch", res1.Content)
 }
 
 func TestStepExecutor_WithStorePersistence(t *testing.T) {
@@ -491,14 +501,16 @@ func TestStepExecutor_WithStorePersistence(t *testing.T) {
 	s1, err := store.GetStep(ctx, "step_persisted_1")
 	require.NoError(t, err)
 	assert.Equal(t, StepStatusCompleted, s1.Status)
-	assert.Equal(t, "ok-web_search", s1.ResultJSON)
+	res1, _ := DecodeStoredToolResult(s1.ResultJSON)
+	assert.Equal(t, "ok-web_search", res1.Content)
 	assert.NotNil(t, s1.StartedAt)
 	assert.NotNil(t, s1.CompletedAt)
 
 	s2, err := store.GetStep(ctx, "step_persisted_2")
 	require.NoError(t, err)
 	assert.Equal(t, StepStatusCompleted, s2.Status)
-	assert.Equal(t, "ok-web_fetch", s2.ResultJSON)
+	res2, _ := DecodeStoredToolResult(s2.ResultJSON)
+	assert.Equal(t, "ok-web_fetch", res2.Content)
 }
 
 type mockFailingStore struct{}
@@ -597,7 +609,8 @@ func TestStepExecutor_RecoveryInterruptedReadOnlyStepReexecutes(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, invokerCalls, "read-only tool left running must be re-executed")
 	assert.Equal(t, StepStatusCompleted, step.Status)
-	assert.Equal(t, `{"result":"found"}`, step.ResultJSON)
+	res, _ := DecodeStoredToolResult(step.ResultJSON)
+	assert.Equal(t, `{"result":"found"}`, res.Content)
 	assert.Empty(t, step.ErrorText)
 	assert.NotNil(t, step.CompletedAt)
 }
@@ -623,8 +636,9 @@ func TestStepExecutor_StepResultTruncation(t *testing.T) {
 	err := executor.Execute(context.Background(), nil, []*FSMStep{step})
 	require.NoError(t, err)
 	assert.Equal(t, StepStatusCompleted, step.Status)
-	assert.True(t, len(step.ResultJSON) <= MaxStepResultBytes+len(StepTruncationNotice))
-	assert.True(t, strings.HasSuffix(step.ResultJSON, StepTruncationNotice))
+	decoded, _ := DecodeStoredToolResult(step.ResultJSON)
+	assert.True(t, len(decoded.Content) <= MaxStepResultBytes+len(StepTruncationNotice))
+	assert.True(t, strings.HasSuffix(decoded.Content, StepTruncationNotice))
 }
 
 

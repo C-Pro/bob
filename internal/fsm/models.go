@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"bob/internal/agentapi"
+
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -74,12 +76,16 @@ const (
 
 // FSMRun represents a persistent workflow execution instance.
 type FSMRun struct {
-	ID            string    `json:"id"`
-	ChatID        string    `json:"chat_id"`
-	UserID        string    `json:"user_id"`
-	IsDM          bool      `json:"is_dm"`
-	FSMType       FSMType   `json:"fsm_type"`
-	Status        RunStatus `json:"status"`
+	ID               string                 `json:"id"`
+	ChatID           string                 `json:"chat_id"`
+	UserID           string                 `json:"user_id"`
+	IsDM             bool                   `json:"is_dm"`
+	FrontendID       string                 `json:"frontend_id,omitempty"`
+	ScopeID          string                 `json:"scope_id,omitempty"`
+	Model            string                 `json:"model,omitempty"`
+	ExecutionKind    agentapi.ExecutionKind `json:"execution_kind,omitempty"`
+	FSMType          FSMType                `json:"fsm_type"`
+	Status           RunStatus              `json:"status"`
 	CurrentState  RunState  `json:"current_state"`
 	Iteration     int       `json:"iteration"`
 	MaxIterations int       `json:"max_iterations"`

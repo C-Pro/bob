@@ -175,7 +175,7 @@ func TestToolLoop_SingleToolCallExecution(t *testing.T) {
 		},
 	}
 
-	err = runner.Execute(ctx, run, store, tools, "test-model")
+	err = runner.Execute(ctx, run, store, NewLegacyToolset(tools, invoker), "test-model")
 	require.NoError(t, err)
 
 	assert.Equal(t, RunStatusCompleted, run.Status)
@@ -189,8 +189,8 @@ func TestToolLoop_SingleToolCallExecution(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, steps, 1)
 	assert.Equal(t, StepStatusCompleted, steps[0].Status)
-	assert.Equal(t, "web_search", steps[0].ToolName)
-	assert.Equal(t, `{"result": "Go 1.26 released"}`, steps[0].ResultJSON)
+	stepRes, _ := DecodeStoredToolResult(steps[0].ResultJSON)
+	assert.Equal(t, `{"result": "Go 1.26 released"}`, stepRes.Content)
 }
 
 func TestToolLoop_ParallelToolCallsExecution(t *testing.T) {
@@ -274,8 +274,11 @@ func TestToolLoop_ParallelToolCallsExecution(t *testing.T) {
 		ContextJSON:   contextJSON,
 	}
 	require.NoError(t, store.CreateRun(ctx, run))
-
-	err = runner.Execute(ctx, run, store, nil, "test-model")
+	tools := []openai.Tool{
+		{Type: openai.ToolTypeFunction, Function: &openai.FunctionDefinition{Name: "web_search"}},
+		{Type: openai.ToolTypeFunction, Function: &openai.FunctionDefinition{Name: "web_fetch"}},
+	}
+	err = runner.Execute(ctx, run, store, NewLegacyToolset(tools, invoker), "test-model")
 	require.NoError(t, err)
 
 	assert.Equal(t, RunStatusCompleted, run.Status)
@@ -371,7 +374,7 @@ func TestToolLoop_MaxIterationsSynthesis(t *testing.T) {
 		{Type: openai.ToolTypeFunction, Function: &openai.FunctionDefinition{Name: "web_search"}},
 	}
 
-	err = runner.Execute(ctx, run, store, tools, "test-model")
+	err = runner.Execute(ctx, run, store, NewLegacyToolset(tools, invoker), "test-model")
 	require.NoError(t, err)
 
 	assert.Equal(t, RunStatusCompleted, run.Status)
@@ -451,7 +454,8 @@ func TestToolLoop_ToolExecutionFailureRecordedAndFedBack(t *testing.T) {
 	}
 	require.NoError(t, store.CreateRun(ctx, run))
 
-	err = runner.Execute(ctx, run, store, nil, "test-model")
+	tools := []openai.Tool{{Type: openai.ToolTypeFunction, Function: &openai.FunctionDefinition{Name: "web_search"}}}
+	err = runner.Execute(ctx, run, store, NewLegacyToolset(tools, invoker), "test-model")
 	require.NoError(t, err)
 
 	assert.Equal(t, RunStatusCompleted, run.Status)
@@ -589,7 +593,8 @@ func TestToolLoop_SequentialFailureDoesNotCauseWaitingLoop(t *testing.T) {
 	}
 	require.NoError(t, store.CreateRun(ctx, run))
 
-	err = runner.Execute(ctx, run, store, nil, "test-model")
+	tools := []openai.Tool{{Type: openai.ToolTypeFunction, Function: &openai.FunctionDefinition{Name: "sandbox_exec"}}}
+	err = runner.Execute(ctx, run, store, NewLegacyToolset(tools, invoker), "test-model")
 	require.NoError(t, err)
 
 	assert.Equal(t, RunStatusCompleted, run.Status)
@@ -664,7 +669,8 @@ func TestToolLoop_PersistenceErrorDuringStepExecution_FailsRun(t *testing.T) {
 	END;`)
 	require.NoError(t, err)
 
-	err = runner.Execute(ctx, run, store, nil, "test-model")
+	tools := []openai.Tool{{Type: openai.ToolTypeFunction, Function: &openai.FunctionDefinition{Name: "web_search"}}}
+	err = runner.Execute(ctx, run, store, NewLegacyToolset(tools, invoker), "test-model")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "step persistence failed")
 
@@ -743,7 +749,8 @@ func TestToolLoop_PrepareSteps_CrashRecoveryIdempotent(t *testing.T) {
 	require.NoError(t, store.CreateSteps(ctx, []FSMStep{existingStep}))
 
 	// Execute should cleanly resume from StatePrepareSteps without UNIQUE constraint violation
-	err = runner.Execute(ctx, run, store, nil, "test-model")
+	tools := []openai.Tool{{Type: openai.ToolTypeFunction, Function: &openai.FunctionDefinition{Name: "web_search"}}}
+	err = runner.Execute(ctx, run, store, NewLegacyToolset(tools, invoker), "test-model")
 	require.NoError(t, err)
 
 	assert.Equal(t, RunStatusCompleted, run.Status)
@@ -827,7 +834,10 @@ func TestToolLoop_ToolResultTruncationAndContextCeiling(t *testing.T) {
 	}
 	require.NoError(t, store.CreateRun(ctx, run))
 
-	err = runner.Execute(ctx, run, store, nil, "test-model")
+	tools := []openai.Tool{
+		{Type: openai.ToolTypeFunction, Function: &openai.FunctionDefinition{Name: "web_fetch"}},
+	}
+	err = runner.Execute(ctx, run, store, NewLegacyToolset(tools, invoker), "test-model")
 	require.NoError(t, err)
 	assert.Equal(t, RunStatusCompleted, run.Status)
 
@@ -835,7 +845,9 @@ func TestToolLoop_ToolResultTruncationAndContextCeiling(t *testing.T) {
 	steps, err := store.ListStepsByIteration(ctx, run.ID, 1)
 	require.NoError(t, err)
 	require.Len(t, steps, 1)
-	assert.Equal(t, len(largeStr), len(steps[0].ResultJSON))
+	res, err := DecodeStoredToolResult(steps[0].ResultJSON)
+	require.NoError(t, err)
+	assert.Equal(t, len(largeStr), len(res.Content))
 
 	// Tool message in context passed to LLM must be truncated to MaxToolResultSizeInContext
 	require.Len(t, lastReqMessages, 3) // user, assistant with tool_call, tool result
@@ -1015,11 +1027,99 @@ func TestToolLoop_NilStepExecutor_WithToolCall_NoPanic(t *testing.T) {
 	}
 	require.NoError(t, store.CreateRun(ctx, run))
 
-	// Execute should not panic; it should fail gracefully because invoker is not configured
-	err = runner.Execute(ctx, run, store, nil, "test-model")
+	// Execute should not panic; it should fail gracefully because stepExecutor is nil
+	var invokerCalls int32
+	stubInvoker := ToolInvokerFunc(func(ctx context.Context, name string, argsJSON string) (string, error) {
+		atomic.AddInt32(&invokerCalls, 1)
+		return `{"result":"ok"}`, nil
+	})
+	tools := []openai.Tool{
+		{Type: openai.ToolTypeFunction, Function: &openai.FunctionDefinition{Name: "web_search"}},
+	}
+	err = runner.Execute(ctx, run, store, NewLegacyToolset(tools, stubInvoker), "test-model")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "step")
+	assert.Contains(t, err.Error(), "step executor is not configured")
 	assert.Equal(t, RunStatusFailed, run.Status)
+	assert.Equal(t, StateFailed, run.CurrentState)
+
+	persisted, err := store.GetRun(ctx, run.ID)
+	require.NoError(t, err)
+	assert.Equal(t, RunStatusFailed, persisted.Status)
+	assert.Equal(t, StateFailed, persisted.CurrentState)
+	assert.Equal(t, int32(0), atomic.LoadInt32(&invokerCalls))
+}
+
+func TestToolLoop_DefaultStepExecutor_ExecutesAuthorizedToolset(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	llm := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			if len(req.Messages) == 1 {
+				return &openai.ChatCompletionResponse{
+					Choices: []openai.ChatCompletionChoice{
+						{
+							Message: openai.ChatCompletionMessage{
+								Role: openai.ChatMessageRoleAssistant,
+								ToolCalls: []openai.ToolCall{
+									{
+										ID:   "call_default_exec_1",
+										Type: openai.ToolTypeFunction,
+										Function: openai.FunctionCall{
+											Name:      "web_search",
+											Arguments: `{"q":"test"}`,
+										},
+									},
+								},
+							},
+						},
+					},
+				}, nil
+			}
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    openai.ChatMessageRoleAssistant,
+							Content: "Found result",
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	runner := NewToolLoopRunner(llm, nil, "test-model")
+	contextJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "Search something"},
+	})
+	require.NoError(t, err)
+
+	run := &FSMRun{
+		ID:           "run_default_exec",
+		ChatID:       "chat_1",
+		FSMType:      FSMTypeToolLoop,
+		Status:       RunStatusRunning,
+		CurrentState: StateInit,
+		ContextJSON:  contextJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	var invokerCalls int32
+	invoker := ToolInvokerFunc(func(ctx context.Context, name string, argsJSON string) (string, error) {
+		atomic.AddInt32(&invokerCalls, 1)
+		return `{"found": true}`, nil
+	})
+	tools := []openai.Tool{
+		{Type: openai.ToolTypeFunction, Function: &openai.FunctionDefinition{Name: "web_search"}},
+	}
+
+	err = runner.Execute(ctx, run, store, NewLegacyToolset(tools, invoker), "test-model")
+	require.NoError(t, err)
+	assert.Equal(t, RunStatusCompleted, run.Status)
+	assert.Equal(t, "Found result", run.ResultJSON)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&invokerCalls))
 }
 
 func TestToolLoop_EmptyToolResultFormatted(t *testing.T) {
@@ -1093,7 +1193,10 @@ func TestToolLoop_EmptyToolResultFormatted(t *testing.T) {
 	}
 	require.NoError(t, store.CreateRun(ctx, run))
 
-	err = runner.Execute(ctx, run, store, nil, "test-model")
+	tools := []openai.Tool{
+		{Type: openai.ToolTypeFunction, Function: &openai.FunctionDefinition{Name: "recall_memory"}},
+	}
+	err = runner.Execute(ctx, run, store, NewLegacyToolset(tools, invoker), "test-model")
 	require.NoError(t, err)
 	assert.Equal(t, RunStatusCompleted, run.Status)
 
@@ -1193,7 +1296,10 @@ func TestToolLoop_ToolOutputNotDuplicatedInContext(t *testing.T) {
 	}
 	require.NoError(t, store.CreateRun(ctx, run))
 
-	err = runner.Execute(ctx, run, store, nil, "test-model")
+	tools := []openai.Tool{
+		{Type: openai.ToolTypeFunction, Function: &openai.FunctionDefinition{Name: "web_fetch"}},
+	}
+	err = runner.Execute(ctx, run, store, NewLegacyToolset(tools, invoker), "test-model")
 	require.NoError(t, err)
 	assert.Equal(t, RunStatusCompleted, run.Status)
 
@@ -1201,7 +1307,9 @@ func TestToolLoop_ToolOutputNotDuplicatedInContext(t *testing.T) {
 	steps, err := store.ListStepsByRun(ctx, run.ID)
 	require.NoError(t, err)
 	require.Len(t, steps, 1)
-	assert.Equal(t, secretOutput, steps[0].ResultJSON)
+	res, err := DecodeStoredToolResult(steps[0].ResultJSON)
+	require.NoError(t, err)
+	assert.Equal(t, secretOutput, res.Content)
 
 	// 2. run.ContextJSON must NOT contain secretOutput (no duplication)
 	persistedRun, err := store.GetRun(ctx, run.ID)
@@ -1348,8 +1456,9 @@ func TestToolLoop_DynamicToolDefinitionsRefresh(t *testing.T) {
 	}
 	require.NoError(t, store.CreateRun(ctx, run))
 
-	// Pass nil tools so runner uses dynamic provider
-	err = runner.Execute(ctx, run, store, nil, "test-model")
+	// Pass provider-backed toolset so definitions refresh dynamically
+	dynamicToolset := NewProviderToolset(provider, invoker, run.ChatID, run.IsDM)
+	err = runner.Execute(ctx, run, store, dynamicToolset, "test-model")
 	require.NoError(t, err)
 
 	assert.Equal(t, RunStatusCompleted, run.Status)

@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"bob/internal/agentapi"
+
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -49,12 +51,6 @@ func (r *ToolLoopRunner) SetToolDefinitionProvider(p ToolDefinitionProvider) {
 	r.toolDefProvider = p
 }
 
-func (r *ToolLoopRunner) getToolDefProvider() ToolDefinitionProvider {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.toolDefProvider
-}
-
 // HasToolDefinitionProvider returns true if a dynamic tool definition provider is set.
 func (r *ToolLoopRunner) HasToolDefinitionProvider() bool {
 	r.mu.RLock()
@@ -62,16 +58,20 @@ func (r *ToolLoopRunner) HasToolDefinitionProvider() bool {
 	return r.toolDefProvider != nil
 }
 
+func (r *ToolLoopRunner) resolveBinding(ctx context.Context, run *FSMRun, toolset agentapi.Toolset) (*ToolBinding, error) {
+	if toolset != nil {
+		return NewToolBinding(ctx, toolset)
+	}
+	return NewToolBinding(ctx, nil)
+}
+
 // Execute drives the state machine for the given FSMRun until it reaches a terminal or suspended state.
-func (r *ToolLoopRunner) Execute(ctx context.Context, run *FSMRun, store *Store, tools []openai.Tool, model string) error {
+func (r *ToolLoopRunner) Execute(ctx context.Context, run *FSMRun, store *Store, toolset agentapi.Toolset, model string) error {
 	if run == nil {
 		return errors.New("run cannot be nil")
 	}
 	if store == nil {
 		return errors.New("store cannot be nil")
-	}
-	if r.stepExecutor == nil {
-		r.stepExecutor = NewStepExecutor(nil)
 	}
 	if model == "" {
 		model = r.defaultModel
@@ -101,23 +101,17 @@ func (r *ToolLoopRunner) Execute(ctx context.Context, run *FSMRun, store *Store,
 			}
 
 		case StateLLMRequest:
-			currentTools := tools
-			if len(tools) == 0 {
-				if provider := r.getToolDefProvider(); provider != nil {
-					currentTools = provider.ToolDefinitions(ctx, run.ChatID, run.IsDM)
-				}
-			}
-			if err := r.handleLLMRequest(ctx, run, store, currentTools, model); err != nil {
+			if err := r.handleLLMRequest(ctx, run, store, toolset, model); err != nil {
 				return err
 			}
 
 		case StatePrepareSteps:
-			if err := r.handlePrepareSteps(ctx, run, store); err != nil {
+			if err := r.handlePrepareSteps(ctx, run, store, toolset); err != nil {
 				return err
 			}
 
 		case StateExecuteSteps:
-			waiting, err := r.handleExecuteSteps(ctx, run, store)
+			waiting, err := r.handleExecuteSteps(ctx, run, store, toolset)
 			if err != nil {
 				return err
 			}
@@ -177,13 +171,27 @@ func (r *ToolLoopRunner) handleInit(ctx context.Context, run *FSMRun, store *Sto
 	return store.UpdateRun(ctx, run)
 }
 
-func (r *ToolLoopRunner) handleLLMRequest(ctx context.Context, run *FSMRun, store *Store, tools []openai.Tool, model string) error {
+func (r *ToolLoopRunner) handleLLMRequest(ctx context.Context, run *FSMRun, store *Store, toolset agentapi.Toolset, model string) error {
+	binding, err := r.resolveBinding(ctx, run, toolset)
+	if err != nil {
+		run.Status = RunStatusFailed
+		run.CurrentState = StateFailed
+		run.ErrorText = fmt.Sprintf("failed to get tool definitions: %v", err)
+		_ = store.UpdateRun(ctx, run)
+		return err
+	}
+
 	messages, err := r.buildChatMessages(ctx, run, store)
 	if err != nil {
 		run.Status = RunStatusFailed
 		run.ErrorText = fmt.Sprintf("failed to decode messages: %v", err)
 		_ = store.UpdateRun(ctx, run)
 		return err
+	}
+
+	var tools []openai.Tool
+	if binding != nil && len(binding.Schemas()) > 0 {
+		tools = binding.Schemas()
 	}
 
 	req := openai.ChatCompletionRequest{
@@ -198,6 +206,7 @@ func (r *ToolLoopRunner) handleLLMRequest(ctx context.Context, run *FSMRun, stor
 			return ctx.Err()
 		}
 		run.Status = RunStatusFailed
+		run.CurrentState = StateFailed
 		run.ErrorText = fmt.Sprintf("llm request failed: %v", err)
 		if updateErr := store.UpdateRun(ctx, run); updateErr != nil {
 			return errors.Join(err, updateErr)
@@ -215,6 +224,30 @@ func (r *ToolLoopRunner) handleLLMRequest(ctx context.Context, run *FSMRun, stor
 	}
 
 	assistantMsg := resp.Choices[0].Message
+
+	// If model requested tool calls, enforce strict tool authority
+	if len(assistantMsg.ToolCalls) > 0 {
+		if binding == nil || len(binding.Schemas()) == 0 {
+			run.Status = RunStatusFailed
+			run.CurrentState = StateFailed
+			run.ErrorText = fmt.Sprintf("unauthorized tool call: model called %q when no tools were authorized", assistantMsg.ToolCalls[0].Function.Name)
+			if updateErr := store.UpdateRun(ctx, run); updateErr != nil {
+				return errors.Join(errors.New(run.ErrorText), updateErr)
+			}
+			return errors.New(run.ErrorText)
+		}
+		for _, tc := range assistantMsg.ToolCalls {
+			if !binding.HasTool(tc.Function.Name) {
+				run.Status = RunStatusFailed
+				run.CurrentState = StateFailed
+				run.ErrorText = fmt.Sprintf("unauthorized tool call: %q is not in the allowed toolset", tc.Function.Name)
+				if updateErr := store.UpdateRun(ctx, run); updateErr != nil {
+					return errors.Join(errors.New(run.ErrorText), updateErr)
+				}
+				return errors.New(run.ErrorText)
+			}
+		}
+	}
 
 	baseMessages, err := DecodeMessages(run.ContextJSON)
 	if err != nil {
@@ -252,7 +285,16 @@ func (r *ToolLoopRunner) handleLLMRequest(ctx context.Context, run *FSMRun, stor
 	return store.UpdateRun(ctx, run)
 }
 
-func (r *ToolLoopRunner) handlePrepareSteps(ctx context.Context, run *FSMRun, store *Store) error {
+func (r *ToolLoopRunner) handlePrepareSteps(ctx context.Context, run *FSMRun, store *Store, toolset agentapi.Toolset) error {
+	binding, err := r.resolveBinding(ctx, run, toolset)
+	if err != nil {
+		run.Status = RunStatusFailed
+		run.CurrentState = StateFailed
+		run.ErrorText = fmt.Sprintf("failed to get tool definitions: %v", err)
+		_ = store.UpdateRun(ctx, run)
+		return err
+	}
+
 	messages, err := DecodeMessages(run.ContextJSON)
 	if err != nil {
 		return err
@@ -281,10 +323,29 @@ func (r *ToolLoopRunner) handlePrepareSteps(ctx context.Context, run *FSMRun, st
 		return store.UpdateRun(ctx, run)
 	}
 
-	mode := ClassifyExecutionMode(lastMsg.ToolCalls)
+	for _, tc := range lastMsg.ToolCalls {
+		if binding == nil || !binding.HasTool(tc.Function.Name) {
+			run.Status = RunStatusFailed
+			run.CurrentState = StateFailed
+			run.ErrorText = fmt.Sprintf("unauthorized tool call: %q", tc.Function.Name)
+			_ = store.UpdateRun(ctx, run)
+			return errors.New(run.ErrorText)
+		}
+	}
+
 	steps := make([]FSMStep, len(lastMsg.ToolCalls))
+	stepPtrs := make([]*FSMStep, len(lastMsg.ToolCalls))
 	for i, tc := range lastMsg.ToolCalls {
-		steps[i] = NewStepFromToolCall(run.ID, run.Iteration, i, tc, mode)
+		steps[i] = NewStepFromToolCall(run.ID, run.Iteration, i, tc, ExecutionModeSequential)
+		stepPtrs[i] = &steps[i]
+	}
+
+	mode := ExecutionModeSequential
+	if binding != nil {
+		mode = binding.ClassifyStepExecutionMode(stepPtrs)
+	}
+	for i := range steps {
+		steps[i].ExecutionMode = mode
 	}
 
 	if err := store.CreateSteps(ctx, steps); err != nil {
@@ -299,7 +360,7 @@ func (r *ToolLoopRunner) handlePrepareSteps(ctx context.Context, run *FSMRun, st
 	return store.UpdateRun(ctx, run)
 }
 
-func (r *ToolLoopRunner) handleExecuteSteps(ctx context.Context, run *FSMRun, store *Store) (bool, error) {
+func (r *ToolLoopRunner) handleExecuteSteps(ctx context.Context, run *FSMRun, store *Store, toolset agentapi.Toolset) (bool, error) {
 	steps, err := store.ListStepsByIteration(ctx, run.ID, run.Iteration)
 	if err != nil {
 		return false, err
@@ -310,18 +371,43 @@ func (r *ToolLoopRunner) handleExecuteSteps(ctx context.Context, run *FSMRun, st
 		return false, store.UpdateRun(ctx, run)
 	}
 
+	binding, err := r.resolveBinding(ctx, run, toolset)
+	if err != nil {
+		run.Status = RunStatusFailed
+		run.CurrentState = StateFailed
+		run.ErrorText = fmt.Sprintf("failed to get tool definitions: %v", err)
+		_ = store.UpdateRun(ctx, run)
+		return false, err
+	}
+
 	stepPtrs := make([]*FSMStep, len(steps))
 	for i := range steps {
 		stepPtrs[i] = &steps[i]
 	}
 
-	// Use shared executor directly, passing per-chat store to Execute
-	executor := r.stepExecutor
-	if executor == nil {
-		executor = NewStepExecutor(nil)
+	for _, s := range stepPtrs {
+		if !s.Status.IsTerminal() && (binding == nil || !binding.HasTool(s.ToolName)) {
+			run.Status = RunStatusFailed
+			run.CurrentState = StateFailed
+			run.ErrorText = fmt.Sprintf("step %s uses unauthorized tool %q", s.ID, s.ToolName)
+			_ = store.UpdateRun(ctx, run)
+			return false, errors.New(run.ErrorText)
+		}
 	}
 
-	execErr := executor.Execute(ctx, store, stepPtrs)
+	executor := r.stepExecutor
+	if executor == nil {
+		err := errors.New("step executor is not configured")
+		run.Status = RunStatusFailed
+		run.CurrentState = StateFailed
+		run.ErrorText = err.Error()
+		if updateErr := store.UpdateRun(ctx, run); updateErr != nil {
+			return false, errors.Join(err, updateErr)
+		}
+		return false, err
+	}
+
+	execErr := executor.Execute(ctx, store, stepPtrs, binding)
 	if ctx.Err() != nil {
 		return false, ctx.Err()
 	}
@@ -446,7 +532,8 @@ func (r *ToolLoopRunner) handleSynthesis(ctx context.Context, run *FSMRun, store
 }
 
 func formatToolStepResult(s FSMStep) string {
-	content := s.ResultJSON
+	decoded, _ := DecodeStoredToolResult(s.ResultJSON)
+	content := decoded.Content
 	switch {
 	case content != "":
 		// use as-is

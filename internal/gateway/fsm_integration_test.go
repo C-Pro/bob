@@ -659,7 +659,7 @@ func TestGateway_FSMToolLoop_SandboxUploadAttachment_Integration(t *testing.T) {
 		case "/api/users":
 			_ = json.NewEncoder(w).Encode([]models.User{{ID: "u1", DisplayName: "Alice"}})
 		case "/api/chats":
-			_ = json.NewEncoder(w).Encode([]models.Chat{{ID: "townhall"}, {ID: "dm1", IsDM: true}})
+			_ = json.NewEncoder(w).Encode([]models.Chat{{ID: "townhall"}, {ID: "dm1", IsDM: true, TargetUserID: "u1"}})
 		case "/api/upload/file":
 			atomic.AddInt32(&uploadFileCalled, 1)
 			_ = json.NewEncoder(w).Encode(map[string]string{"id": "file_upl_123", "fileId": "file_upl_123"})
@@ -843,7 +843,7 @@ func TestGateway_FSMToolLoop_SandboxDownloadAttachment_Integration(t *testing.T)
 		case "/api/users":
 			_ = json.NewEncoder(w).Encode([]models.User{{ID: "u1", DisplayName: "Alice"}})
 		case "/api/chats":
-			_ = json.NewEncoder(w).Encode([]models.Chat{{ID: "townhall"}, {ID: "dm1", IsDM: true}})
+			_ = json.NewEncoder(w).Encode([]models.Chat{{ID: "townhall"}, {ID: "dm1", IsDM: true, TargetUserID: "u1"}})
 		case "/api/files/file_dl_42":
 			atomic.AddInt32(&downloadFileCalled, 1)
 			w.Header().Set("Content-Type", "text/csv")
@@ -1417,4 +1417,149 @@ func TestGateway_FSMToolLoop_SandboxDestroyAndRequestNew(t *testing.T) {
 	assert.Equal(t, sandbox.StatusRunning, newStatus.Status)
 	assert.Equal(t, "Go calculation", newStatus.Reason)
 }
+
+func TestGateway_FSMToolLoop_KnowledgeProposalProvenance_Integration(t *testing.T) {
+	tempDir := t.TempDir()
+	var llmCallCount int32
+
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := atomic.AddInt32(&llmCallCount, 1)
+
+		var req openai.ChatCompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		if count == 1 {
+			// Model calls propose_memory
+			resp := openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role: openai.ChatMessageRoleAssistant,
+							ToolCalls: []openai.ToolCall{
+								{
+									ID:   "call_prop_1",
+									Type: openai.ToolTypeFunction,
+									Function: openai.FunctionCall{
+										Name:      "propose_memory",
+										Arguments: `{"type":"preference","content":"User prefers Go over Python"}`,
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		// Second turn: final response
+		resp := openai.ChatCompletionResponse{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Message: openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "I have proposed saving your preference.",
+					},
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer llmServer.Close()
+
+	sentMsgs := make(chan models.ClientMessage, 10)
+	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/me":
+			_ = json.NewEncoder(w).Encode(models.User{ID: "bot_1", DisplayName: "Bob", UserName: "bot"})
+		case "/api/users":
+			_ = json.NewEncoder(w).Encode([]models.User{{ID: "u1", DisplayName: "Alice"}})
+		case "/api/chats":
+			_ = json.NewEncoder(w).Encode([]models.Chat{{ID: "townhall"}, {ID: "dm_bot_1_u1", IsDM: true, TargetUserID: "u1"}})
+		case "/api/chat":
+			upgrader := websocket.Upgrader{}
+			c, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer func() { _ = c.Close() }()
+			for {
+				var cm models.ClientMessage
+				if err := c.ReadJSON(&cm); err != nil {
+					return
+				}
+				sentMsgs <- cm
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer besedkaServer.Close()
+
+	cfg := &config.Config{
+		BesedkaURL:                besedkaServer.URL,
+		BesedkaAPIKey:             "test-key",
+		OpenAIAPIKey:              "test-key",
+		OpenAIBaseURL:             llmServer.URL,
+		OpenAIModel:               "test-model",
+		BotHandle:                 "@bot",
+		DataDir:                   tempDir,
+		TownhallToolMaxIterations: 10,
+		DMToolMaxIterations:       20,
+		TownhallMaxParagraphs:     5,
+		DMMaxParagraphs:           10,
+		MsgRingBufferSize:         10,
+	}
+
+	llmClient := llm.NewClient(cfg, llmServer.Client())
+	gw := NewGateway(cfg, llmClient)
+	defer gw.Stop()
+	gw.httpClient = besedkaServer.Client()
+
+	storeProv := NewMemoryStoreProvider(gw.MemoryManager(), cfg.DataDir)
+	fsmEngine := fsm.NewEngine(storeProv, llmClient, gw.ToolsRegistry(), fsm.WithDefaultModel(cfg.OpenAIModel))
+	gw.SetFSMEngine(fsmEngine)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	require.NoError(t, gw.DialWebSocket(ctx))
+	_, err := gw.FetchBotUser(ctx)
+	require.NoError(t, err)
+
+	err = gw.ProcessMessage(ctx, models.Message{
+		ChatID:    "dm_bot_1_u1",
+		UserID:    "u1",
+		Seq:       42,
+		Content:   "Remember that I prefer Go",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+
+	select {
+	case reply := <-sentMsgs:
+		assert.Contains(t, reply.Content, "I have proposed saving your preference.")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for bot response with memory proposal")
+	}
+
+	// Verify proposal exists in knowledge store and has correct provenance (SourceMessageSeq: 42, non-empty FSMRunID)
+	kStore, err := storeProv.GetKnowledgeStore(ctx, "dm_bot_1_u1", true)
+	require.NoError(t, err)
+	items, err := kStore.ListItems(ctx, "dm_bot_1_u1", knowledge.KindMemory, "pending")
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+	vers, err := kStore.ListMemoryVersions(ctx, items[0].ID)
+	require.NoError(t, err)
+	require.Len(t, vers, 1)
+	memVer := vers[0]
+	require.NotNil(t, memVer.Provenance.SourceMessageSeq)
+	assert.Equal(t, int64(42), *memVer.Provenance.SourceMessageSeq)
+	assert.NotEmpty(t, memVer.Provenance.FSMRunID)
+}
+
 
