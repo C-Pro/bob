@@ -37,14 +37,6 @@ type AttachmentProcessor interface {
 	ProcessAttachments(ctx context.Context, attachments []models.Attachment) (string, []chatcontext.ImageAttachment)
 }
 
-// MessageSenderFunc is an adapter for MessageSender.
-type MessageSenderFunc func(chatID, content string) error
-
-// SendMessage calls f(chatID, content).
-func (f MessageSenderFunc) SendMessage(chatID, content string) error {
-	return f(chatID, content)
-}
-
 // FSMRunner executes tool loops.
 type FSMRunner interface {
 	RunToolLoop(ctx context.Context, req fsm.ToolLoopRequest) (*fsm.ToolLoopResult, error)

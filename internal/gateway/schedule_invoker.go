@@ -14,9 +14,6 @@ type AttachmentMessageSender = scheduled.AttachmentMessageSender
 // AttachmentProcessor processes attachments to return context formatting and images.
 type AttachmentProcessor = scheduled.AttachmentProcessor
 
-// MessageSenderFunc is an adapter for MessageSender.
-type MessageSenderFunc = scheduled.MessageSenderFunc
-
 // ChatLocker is a transitional alias for agent.SessionLocker.
 type ChatLocker = agent.SessionLocker
 

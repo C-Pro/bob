@@ -92,13 +92,19 @@ func TestScheduleInvoker_NilSchedule(t *testing.T) {
 	assert.Contains(t, err.Error(), "schedule cannot be nil")
 }
 
+type messageSenderFunc func(chatID, content string) error
+
+func (f messageSenderFunc) SendMessage(chatID, content string) error {
+	return f(chatID, content)
+}
+
 func TestScheduleInvoker_Execute_NoGrant(t *testing.T) {
 	ctx := context.Background()
 	ctxMgr := chatcontext.NewManager(10)
 
 	var sentMsg string
 	var sentChatID string
-	sender := MessageSenderFunc(func(chatID, content string) error {
+	sender := messageSenderFunc(func(chatID, content string) error {
 		sentChatID = chatID
 		sentMsg = content
 		return nil
