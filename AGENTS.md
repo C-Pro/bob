@@ -34,6 +34,7 @@ Bob is an autonomous AI agent service designed for the [Besedka](https://github.
 
 ## Running the Agent Locally
 
+### 1. Besedka Chat Daemon
 1. Ensure the Besedka server is running (e.g. at `http://127.0.0.1:8080`).
 2. Configure required environment variables (or create a `.env` file):
    - `BESEDKA_URL`: `http://127.0.0.1:8080`
@@ -44,6 +45,33 @@ Bob is an autonomous AI agent service designed for the [Besedka](https://github.
 3. Run the service:
    ```bash
    go run ./cmd/agent
+   ```
+
+### 2. Standalone CLI One-Shot Frontend (`bob -p`)
+1. Build the CLI binary:
+   ```bash
+   make build-bob
+   ```
+2. Initialize configuration template (default `~/.config/bob/config.yaml`, or a custom location via `--config`):
+   ```bash
+   # Custom location (recommended to avoid modifying user home directory):
+   ./bin/bob --init-config --config /path/to/custom-config.yaml
+
+   # Or default location:
+   ./bin/bob --init-config
+   ```
+3. Populate `api_key` in the configuration file (ensure mode 0600 permissions).
+4. Run one-shot prompt:
+   ```bash
+   # Using custom config:
+   ./bin/bob --config /path/to/custom-config.yaml -p "What is the capital of France?"
+
+   # Or using default config (~/.config/bob/config.yaml):
+   ./bin/bob -p "What is the capital of France?"
+   ```
+   Or mount a directory to execute sandboxed tasks:
+   ```bash
+   ./bin/bob --config /path/to/custom-config.yaml -p "Run the tests and fix errors" --mount .:rw
    ```
 
 ## Temporary Files

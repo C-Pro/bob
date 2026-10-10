@@ -69,20 +69,23 @@ const (
 
 // UserSandbox holds the state and configuration of a user's single sandbox.
 type UserSandbox struct {
-	mu           sync.RWMutex
-	UserID       string
-	ChatID       string
-	Driver       DriverType
-	DockerImage  string
-	Network      NetworkPolicy
-	Mounts       []UserMount
-	Devices      DevicePolicy
-	Reason       string
-	CreatedAt    time.Time
-	ExpiresAt    time.Time
-	Status       SandboxStatus
-	InternalID   string // Driver-specific handle (e.g. docker container ID)
+	mu                  sync.RWMutex
+	ID                  string // Unique sandbox instance ID
+	UserID              string
+	ChatID              string
+	Driver              DriverType
+	DockerImage         string
+	Network             NetworkPolicy
+	Mounts              []UserMount
+	Devices             DevicePolicy
+	Reason              string
+	CreatedAt           time.Time
+	ExpiresAt           time.Time
+	Status              SandboxStatus
+	InternalID          string // Driver-specific handle (e.g. docker container ID)
 	WorkspaceDir        string // Absolute path to user sandbox workspace on host
+	WorkspaceExternal   bool   // True if workspace is owned externally by host (must not be created/deleted/chmodded by bob)
+	ProxyDir            string // Instance-specific proxy directory for restricted network mode
 	continuationClaimed atomic.Bool
 }
 
@@ -139,19 +142,22 @@ func (s *UserSandbox) Clone() *UserSandbox {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return &UserSandbox{
-		UserID:       s.UserID,
-		ChatID:       s.ChatID,
-		Driver:       s.Driver,
-		DockerImage:  s.DockerImage,
-		Network:      s.Network,
-		Mounts:       s.Mounts,
-		Devices:      s.Devices,
-		Reason:       s.Reason,
-		CreatedAt:    s.CreatedAt,
-		ExpiresAt:    s.ExpiresAt,
-		Status:       s.Status,
-		InternalID:   s.InternalID,
-		WorkspaceDir: s.WorkspaceDir,
+		ID:                s.ID,
+		UserID:            s.UserID,
+		ChatID:            s.ChatID,
+		Driver:            s.Driver,
+		DockerImage:       s.DockerImage,
+		Network:           s.Network,
+		Mounts:            s.Mounts,
+		Devices:           s.Devices,
+		Reason:            s.Reason,
+		CreatedAt:         s.CreatedAt,
+		ExpiresAt:         s.ExpiresAt,
+		Status:            s.Status,
+		InternalID:        s.InternalID,
+		WorkspaceDir:      s.WorkspaceDir,
+		WorkspaceExternal: s.WorkspaceExternal,
+		ProxyDir:          s.ProxyDir,
 	}
 }
 

@@ -984,19 +984,7 @@ func (r *Registry) executeSandboxExec(ctx context.Context, argsJSON string) (str
 		return "", fmt.Errorf("execution failed: %w", err)
 	}
 
-	var b strings.Builder
-	fmt.Fprintf(&b, "Exit Code: %d\nDuration: %s\n", res.ExitCode, res.Duration.Round(time.Millisecond))
-	if res.Stdout != "" {
-		b.WriteString("\n[stdout]\n" + res.Stdout)
-	}
-	if res.Stderr != "" {
-		b.WriteString("\n[stderr]\n" + res.Stderr)
-	}
-	if res.Stdout == "" && res.Stderr == "" {
-		b.WriteString("\n(No output)")
-	}
-
-	return b.String(), nil
+	return FormatExecResult(res), nil
 }
 
 func (r *Registry) executeSandboxDestroy(ctx context.Context, argsJSON string) (string, error) {

@@ -130,10 +130,24 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 	if err != nil {
 		return fmt.Errorf("failed to resolve user workspace directory: %w", err)
 	}
-	if err := os.MkdirAll(absWorkspace, 0o755); err != nil {
-		return fmt.Errorf("failed to create user workspace directory: %w", err)
+	if !sbx.WorkspaceExternal {
+		if err := os.MkdirAll(absWorkspace, 0o755); err != nil {
+			return fmt.Errorf("failed to create user workspace directory: %w", err)
+		}
+	} else {
+		fi, err := os.Stat(absWorkspace)
+		if err != nil || !fi.IsDir() {
+			return fmt.Errorf("external workspace %q does not exist or is not a directory", absWorkspace)
+		}
 	}
 	sbx.SetWorkspaceDir(absWorkspace)
+
+	// Harmless startup probe to verify bwrap execution
+	// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
+	probeCmd := exec.CommandContext(ctx, d.bwrapPath, "--version")
+	if out, err := probeCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("bubblewrap probe failed: %w (output: %s)", err, string(out))
+	}
 
 	if sbx.Network.Mode == sandbox.NetworkRestricted {
 		if _, err := d.getForwarderBinary(); err != nil {
@@ -307,8 +321,15 @@ func (d *Driver) buildArgs(sbx *sandbox.UserSandbox, cmd []string) ([]string, er
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve workspace directory: %w", err)
 	}
-	if err := os.MkdirAll(absWorkspace, 0o755); err != nil {
-		return nil, fmt.Errorf("failed to ensure workspace directory: %w", err)
+	if !sbx.WorkspaceExternal {
+		if err := os.MkdirAll(absWorkspace, 0o755); err != nil {
+			return nil, fmt.Errorf("failed to ensure workspace directory: %w", err)
+		}
+	} else {
+		fi, err := os.Stat(absWorkspace)
+		if err != nil || !fi.IsDir() {
+			return nil, fmt.Errorf("external workspace %q does not exist or is not a directory", absWorkspace)
+		}
 	}
 
 	var wholeWorkspaceMount *sandbox.UserMount

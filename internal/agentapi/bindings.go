@@ -1,6 +1,12 @@
 package agentapi
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrDetachedDeliveryUnsupported indicates the frontend does not support detached delivery.
+var ErrDetachedDeliveryUnsupported = errors.New("detached delivery is not supported")
 
 // Frontend represents an external interaction surface (e.g. Besedka, CLI, TUI).
 type Frontend interface {

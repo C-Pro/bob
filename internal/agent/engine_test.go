@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	openai "github.com/sashabaranov/go-openai"
 	"github.com/stretchr/testify/assert"
@@ -496,5 +497,56 @@ func TestEngine_Run_DeliverFailure_RetainsResult(t *testing.T) {
 	fe.mu.Lock()
 	defer fe.mu.Unlock()
 	require.Len(t, fe.deliverCalls, 1)
+}
+
+func TestEngine_Run_TimeoutBypassesVolatileFallback(t *testing.T) {
+	ctx := context.Background()
+	timeoutErr := &llm.TimeoutError{
+		Kind:  llm.TimeoutKindRequest,
+		Limit: 10 * time.Minute,
+		Cause: context.DeadlineExceeded,
+	}
+
+	fsmEng := &mockFSMEngine{
+		err: timeoutErr,
+	}
+	llmClient := &mockLLMClient{
+		plainReply: "should not be called",
+		loopReply:  "should not be called",
+	}
+	fe := &mockFrontend{}
+
+	eng, err := NewEngine(Dependencies{
+		FSMEngine: fsmEng,
+		LLMClient: llmClient,
+		Frontends: map[string]agentapi.Frontend{
+			"cli": fe,
+		},
+	})
+	require.NoError(t, err)
+
+	turn := agentapi.Turn{
+		Run: agentapi.RunDescriptor{
+			RunID: "run_timeout_bypass",
+			Session: agentapi.SessionRef{
+				FrontendID: "cli",
+				SessionID:  "s1",
+			},
+		},
+		Messages: []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleUser, Content: "hello"},
+		},
+	}
+
+	_, err = eng.Run(ctx, turn)
+	require.Error(t, err)
+	var te *llm.TimeoutError
+	require.ErrorAs(t, err, &te)
+	assert.Equal(t, llm.TimeoutKindRequest, te.Kind)
+
+	llmClient.mu.Lock()
+	defer llmClient.mu.Unlock()
+	assert.Empty(t, llmClient.plainCalls, "volatile fallback should not be invoked on TimeoutError")
+	assert.Empty(t, llmClient.loopCalls, "volatile tool loop should not be invoked on TimeoutError")
 }
 

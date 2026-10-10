@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -103,6 +104,11 @@ func (e *Engine) RegisterFrontend(id string, fe agentapi.Frontend) error {
 	return nil
 }
 
+// SetFSMEngine dynamically updates the durable FSM engine instance.
+func (e *Engine) SetFSMEngine(fe *fsm.Engine) {
+	e.fsmEngine = fe
+}
+
 // DeliveryError indicates that turn execution succeeded, but delivery to the frontend failed.
 type DeliveryError struct {
 	Result agentapi.Result
@@ -119,6 +125,9 @@ func (e *DeliveryError) Unwrap() error {
 
 // Run executes a single turn, implementing agentapi.TurnRunner.
 func (e *Engine) Run(ctx context.Context, turn agentapi.Turn) (agentapi.Result, error) {
+	if e == nil {
+		return agentapi.Result{}, errors.New("engine is nil")
+	}
 	if e.closed.Load() {
 		return agentapi.Result{}, errors.New("engine is closed")
 	}
@@ -204,10 +213,20 @@ func (e *Engine) Run(ctx context.Context, turn agentapi.Turn) (agentapi.Result, 
 			}
 		}
 
+		var sourceMsgSeq *int64
+		if turn.Run.Metadata != nil {
+			if s, ok := turn.Run.Metadata["source_message_seq"]; ok && s != "" {
+				if seq, err := strconv.ParseInt(s, 10, 64); err == nil && seq > 0 {
+					sourceMsgSeq = &seq
+				}
+			}
+		}
+
 		fsmReq := fsm.ToolLoopRequest{
 			RunID:            turn.Run.RunID,
 			ChatID:           turn.Run.Session.SessionID,
 			UserID:           turn.Run.Actor.ID,
+			IsDM:             turn.Run.Session.IsDM,
 			FrontendID:       feID,
 			ScopeID:          turn.Run.Session.ScopeID,
 			ExecutionKind:    turn.Run.Kind,
@@ -215,6 +234,7 @@ func (e *Engine) Run(ctx context.Context, turn agentapi.Turn) (agentapi.Result, 
 			Messages:         llmMsgs,
 			Toolset:          bindings.Tools,
 			MaxIterations:    maxIterations,
+			SourceMessageSeq: sourceMsgSeq,
 			ProgressObserver: fsmProgObs,
 		}
 
@@ -232,13 +252,31 @@ func (e *Engine) Run(ctx context.Context, turn agentapi.Turn) (agentapi.Result, 
 			if ctx.Err() != nil {
 				return agentapi.Result{}, ctx.Err()
 			}
-			slog.Warn("fsm tool loop execution failed, evaluating volatile fallback", "session", turn.Run.Session.SessionID, "error", err)
 			runErr = err
+			var timeoutErr *llm.TimeoutError
+			isTimeout := errors.As(err, &timeoutErr)
+			disableFallback := false
+			if turn.Run.Metadata != nil && turn.Run.Metadata["disable_volatile_fallback"] == "true" {
+				disableFallback = true
+			}
+			if disableFallback || isTimeout {
+				slog.Warn("fsm tool loop execution failed", "session", turn.Run.Session.SessionID, "error", err)
+				return agentapi.Result{}, runErr
+			}
+			slog.Warn("fsm tool loop execution failed, evaluating volatile fallback", "session", turn.Run.Session.SessionID, "error", err)
 		}
 	}
 
 	// 2. Volatile execution fallback (or standalone when FSM is absent or failed)
 	if !executed {
+		disableFallback := false
+		if turn.Run.Metadata != nil && turn.Run.Metadata["disable_volatile_fallback"] == "true" {
+			disableFallback = true
+		}
+		if disableFallback && runErr != nil {
+			return agentapi.Result{}, runErr
+		}
+
 		if e.llmClient == nil {
 			if runErr != nil {
 				return agentapi.Result{}, runErr

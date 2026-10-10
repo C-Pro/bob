@@ -90,12 +90,7 @@ func NewManager(cfg *config.Config, embedder cortexdb.Embedder) *Manager {
 					dbs:      make(map[string]*cortexdb.DB),
 				}
 			}
-			localEmb, err := llm.NewLocalEmbedder(cfg)
-			if err != nil {
-				slog.Warn("could not initialize local embedding engine, falling back to FTS5 lexical search", "error", err)
-			} else {
-				embedder = localEmb
-			}
+			embedder = llm.NewLazyLocalEmbedder(cfg)
 		}
 	}
 	return &Manager{
@@ -103,6 +98,11 @@ func NewManager(cfg *config.Config, embedder cortexdb.Embedder) *Manager {
 		embedder: embedder,
 		dbs:      make(map[string]*cortexdb.DB),
 	}
+}
+
+// HasLocalModelInDir reports whether the default local model weights exist in dataDir.
+func HasLocalModelInDir(dataDir string) bool {
+	return hasLocalModelInDir(dataDir)
 }
 
 func hasLocalModelInDir(dataDir string) bool {

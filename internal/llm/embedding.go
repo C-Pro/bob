@@ -56,13 +56,35 @@ func (c *Client) CreateEmbeddings(ctx context.Context, texts []string, model str
 			return results, nil
 		}
 
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		if tErr := c.classifyTimeout(ctx, err); tErr != nil {
+			err = tErr
+		}
+
+		var timeoutErr *TimeoutError
+		if errors.As(err, &timeoutErr) {
+			if timeoutErr.Kind == TimeoutKindRequest {
+				return nil, timeoutErr
+			}
+			if timeoutErr.Kind == TimeoutKindFirstByte && attempt >= 1 {
+				return nil, timeoutErr
+			}
+		}
+
 		lastErr = err
 		if !isRetryableError(err) {
-			return nil, fmt.Errorf("embedding API error: %w", err)
+			return nil, c.formatAPIError(ctx, err)
 		}
 	}
 
-	return nil, fmt.Errorf("embedding request failed after %d retries; last error: %w", c.maxRetries, lastErr)
+	var timeoutErr *TimeoutError
+	if errors.As(lastErr, &timeoutErr) {
+		return nil, timeoutErr
+	}
+	return nil, fmt.Errorf("embedding request failed after %d retries; last error: %w", c.maxRetries, c.formatAPIError(ctx, lastErr))
 }
 
 // Embedder provides text-to-vector embedding generation conforming to the CortexDB Embedder interface.

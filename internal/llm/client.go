@@ -19,12 +19,63 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 )
 
+// TimeoutKind identifies whether a timeout occurred waiting for headers or the entire request.
+type TimeoutKind int
+
+const (
+	// TimeoutKindFirstByte indicates the server did not return response headers within LLMFirstByteTimeout.
+	TimeoutKindFirstByte TimeoutKind = iota
+	// TimeoutKindRequest indicates the request exceeded LLMRequestTimeout.
+	TimeoutKindRequest
+)
+
+// TimeoutError represents an LLM API request timeout with human-readable formatting.
+type TimeoutError struct {
+	Kind  TimeoutKind
+	Limit time.Duration
+	Cause error
+}
+
+func formatDuration(d time.Duration) string {
+	if d <= 0 {
+		return "0s"
+	}
+	if d%time.Hour == 0 {
+		return fmt.Sprintf("%dh", d/time.Hour)
+	}
+	if d%time.Minute == 0 {
+		return fmt.Sprintf("%dm", d/time.Minute)
+	}
+	if d%time.Second == 0 {
+		return fmt.Sprintf("%ds", d/time.Second)
+	}
+	return d.String()
+}
+
+func (e *TimeoutError) Error() string {
+	limitStr := formatDuration(e.Limit)
+	switch e.Kind {
+	case TimeoutKindFirstByte:
+		return fmt.Sprintf("LLM API first-byte timeout (%s): server did not return response headers within timeout", limitStr)
+	case TimeoutKindRequest:
+		return fmt.Sprintf("LLM API timeout (%s): request exceeded deadline", limitStr)
+	default:
+		return fmt.Sprintf("LLM API timeout (%s)", limitStr)
+	}
+}
+
+func (e *TimeoutError) Unwrap() error {
+	return e.Cause
+}
+
 // Client wraps the official go-openai client and configuration for LLM requests.
 type Client struct {
-	cfg        *config.Config
-	apiClient  *openai.Client
-	maxRetries int
-	baseDelay  time.Duration
+	cfg              *config.Config
+	apiClient        *openai.Client
+	maxRetries       int
+	baseDelay        time.Duration
+	requestTimeout   time.Duration
+	firstByteTimeout time.Duration
 }
 
 // geminiTransport preserves thought_signatures and extra_content metadata required by Google Gemini models during multi-turn tool calling.
@@ -71,10 +122,11 @@ func (g *geminiTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if resp.Body != nil && resp.StatusCode == http.StatusOK && strings.HasSuffix(req.URL.Path, "/chat/completions") {
 		respBytes, err := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
-		if err == nil {
-			g.extractThoughtSignatures(respBytes)
-			resp.Body = io.NopCloser(bytes.NewReader(respBytes))
+		if err != nil {
+			return nil, err
 		}
+		g.extractThoughtSignatures(respBytes)
+		resp.Body = io.NopCloser(bytes.NewReader(respBytes))
 	}
 
 	return resp, nil
@@ -234,29 +286,63 @@ func NewClient(cfg *config.Config, httpClient *http.Client) *Client {
 		clientConfig.BaseURL = strings.TrimSuffix(cfg.OpenAIBaseURL, "/")
 	}
 
-	var baseTransport http.RoundTripper
-	clientTimeout := 120 * time.Second
-	if httpClient != nil {
-		baseTransport = httpClient.Transport
-		if httpClient.Timeout > 0 {
-			clientTimeout = httpClient.Timeout
+	requestTimeout := 10 * time.Minute
+	if cfg != nil {
+		if cfg.LLMRequestTimeout > 0 {
+			requestTimeout = cfg.LLMRequestTimeout
 		}
-	}
-	if baseTransport == nil {
-		baseTransport = http.DefaultTransport
+	} else if httpClient != nil && httpClient.Timeout > 0 {
+		requestTimeout = httpClient.Timeout
 	}
 
-	geminiWrappedClient := &http.Client{
-		Transport: newGeminiTransport(baseTransport),
-		Timeout:   clientTimeout,
+	firstByteTimeout := 1 * time.Minute
+	if cfg != nil {
+		if cfg.LLMFirstByteTimeout > 0 {
+			firstByteTimeout = cfg.LLMFirstByteTimeout
+		}
+	}
+
+	var transportToWrap http.RoundTripper
+	if httpClient != nil && httpClient.Transport != nil {
+		if t, ok := httpClient.Transport.(*http.Transport); ok {
+			cloned := t.Clone()
+			cloned.ResponseHeaderTimeout = firstByteTimeout
+			transportToWrap = cloned
+		} else {
+			transportToWrap = httpClient.Transport
+		}
+	} else {
+		defaultTransport, ok := http.DefaultTransport.(*http.Transport)
+		if ok {
+			cloned := defaultTransport.Clone()
+			cloned.ResponseHeaderTimeout = firstByteTimeout
+			transportToWrap = cloned
+		} else {
+			transportToWrap = http.DefaultTransport
+		}
+	}
+
+	var geminiWrappedClient *http.Client
+	if httpClient != nil {
+		cCopy := *httpClient
+		cCopy.Transport = newGeminiTransport(transportToWrap)
+		cCopy.Timeout = requestTimeout
+		geminiWrappedClient = &cCopy
+	} else {
+		geminiWrappedClient = &http.Client{
+			Transport: newGeminiTransport(transportToWrap),
+			Timeout:   requestTimeout,
+		}
 	}
 	clientConfig.HTTPClient = geminiWrappedClient
 
 	return &Client{
-		cfg:        cfg,
-		apiClient:  openai.NewClientWithConfig(clientConfig),
-		maxRetries: 3,
-		baseDelay:  10 * time.Millisecond,
+		cfg:              cfg,
+		apiClient:        openai.NewClientWithConfig(clientConfig),
+		maxRetries:       3,
+		baseDelay:        10 * time.Millisecond,
+		requestTimeout:   requestTimeout,
+		firstByteTimeout: firstByteTimeout,
 	}
 }
 
@@ -265,13 +351,109 @@ func (c *Client) OpenAIClient() *openai.Client {
 	return c.apiClient
 }
 
+// classifyTimeout checks if an error represents an LLM API timeout and returns a *TimeoutError.
+// If the caller's context was canceled or exceeded its deadline, it returns ctx.Err() directly.
+func (c *Client) classifyTimeout(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	var te *TimeoutError
+	if errors.As(err, &te) {
+		return err
+	}
+
+	// Provider HTTP response errors (4xx, 5xx) must not be classified as local client timeouts,
+	// even if the provider's response body contains "context deadline exceeded".
+	var apiErr *openai.APIError
+	if errors.As(err, &apiErr) {
+		return nil
+	}
+	var reqErr *openai.RequestError
+	if errors.As(err, &reqErr) && reqErr.HTTPStatusCode > 0 {
+		return nil
+	}
+
+	errStr := err.Error()
+
+	if strings.Contains(errStr, "timeout awaiting response headers") {
+		limit := c.firstByteTimeout
+		if limit <= 0 && c.cfg != nil {
+			limit = c.cfg.LLMFirstByteTimeout
+		}
+		if limit <= 0 {
+			limit = 1 * time.Minute
+		}
+		return &TimeoutError{
+			Kind:  TimeoutKindFirstByte,
+			Limit: limit,
+			Cause: err,
+		}
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) ||
+		strings.Contains(errStr, "Client.Timeout exceeded") ||
+		strings.Contains(errStr, "context deadline exceeded") {
+		limit := c.requestTimeout
+		if limit <= 0 && c.cfg != nil {
+			limit = c.cfg.LLMRequestTimeout
+		}
+		if limit <= 0 {
+			limit = 10 * time.Minute
+		}
+		return &TimeoutError{
+			Kind:  TimeoutKindRequest,
+			Limit: limit,
+			Cause: err,
+		}
+	}
+
+	return nil
+}
+
+// formatAPIError transforms low-level or opaque errors into clear human-readable messages.
+func (c *Client) formatAPIError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if tErr := c.classifyTimeout(ctx, err); tErr != nil {
+		return tErr
+	}
+	var te *TimeoutError
+	if errors.As(err, &te) {
+		return err
+	}
+	errStr := err.Error()
+	if strings.HasPrefix(errStr, "LLM API") {
+		return err
+	}
+	return fmt.Errorf("LLM API error: %w", err)
+}
+
 // isRetryableError determines if an error from the OpenAI API is transient.
 func isRetryableError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.Canceled) {
 		return false
+	}
+
+	var te *TimeoutError
+	if errors.As(err, &te) {
+		if te.Kind == TimeoutKindRequest {
+			return false
+		}
+		if te.Kind == TimeoutKindFirstByte {
+			return true
+		}
 	}
 
 	var apiErr *openai.APIError
@@ -291,7 +473,7 @@ func isRetryableError(err error) bool {
 		return false
 	}
 
-	// Network / transport errors are retryable
+	// Network / transport errors (including request timeouts when parent context is still active) are retryable
 	return true
 }
 
@@ -305,6 +487,7 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req openai.ChatComple
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
 		if attempt > 0 {
 			delay := c.baseDelay * (1 << (attempt - 1))
+			slog.Warn("llm request failed, retrying", "attempt", attempt, "max_retries", c.maxRetries, "delay", delay, "error", lastErr)
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
@@ -320,13 +503,35 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req openai.ChatComple
 			return &resp, nil
 		}
 
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		if tErr := c.classifyTimeout(ctx, err); tErr != nil {
+			err = tErr
+		}
+
+		var timeoutErr *TimeoutError
+		if errors.As(err, &timeoutErr) {
+			if timeoutErr.Kind == TimeoutKindRequest {
+				return nil, timeoutErr
+			}
+			if timeoutErr.Kind == TimeoutKindFirstByte && attempt >= 1 {
+				return nil, timeoutErr
+			}
+		}
+
 		lastErr = err
 		if !isRetryableError(err) {
-			return nil, fmt.Errorf("API error: %w", err)
+			return nil, c.formatAPIError(ctx, err)
 		}
 	}
 
-	return nil, fmt.Errorf("request failed after %d retries; last error: %w", c.maxRetries, lastErr)
+	var timeoutErr *TimeoutError
+	if errors.As(lastErr, &timeoutErr) {
+		return nil, timeoutErr
+	}
+	return nil, fmt.Errorf("request failed after %d retries; last error: %w", c.maxRetries, c.formatAPIError(ctx, lastErr))
 }
 
 // GenerateChatResponse sends a multi-turn chat completion request and returns the assistant's reply text.

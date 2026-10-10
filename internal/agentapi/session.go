@@ -5,6 +5,7 @@ type SessionRef struct {
 	FrontendID string `json:"frontend_id"`
 	SessionID  string `json:"session_id"`
 	ScopeID    string `json:"scope_id"`
+	IsDM       bool   `json:"is_dm,omitempty"`
 }
 
 // Actor identifies the initiator or author of a turn.

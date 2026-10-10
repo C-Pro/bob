@@ -64,3 +64,8 @@
 - [x] **Track: Core Agent Engine Decoupling**
 *Link: [./tracks/core-engine-decoupling_20261006/](./tracks/core-engine-decoupling_20261006/)*
 
+
+---
+
+- [x] **Track: CLI One-Shot Frontend (`bob -p`) with shared YAML config and opt-in sandbox**
+*Link: [./tracks/cli-oneshot-frontend_20261008/](./tracks/cli-oneshot-frontend_20261008/)*

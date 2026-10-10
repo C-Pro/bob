@@ -454,3 +454,78 @@ func TestBwrapDriver_GetForwarderBinary_DoesNotBlockMu(t *testing.T) {
 	driver.fwdMu.Unlock()
 }
 
+func TestBwrapDriver_ExternalWorkspace(t *testing.T) {
+	driver := NewDriver()
+	ctx := context.Background()
+
+	if !driver.Available(ctx) {
+		t.Skip("bwrap not available on host, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	externalWS := filepath.Join(tempDir, "host_ext_ws")
+	require.NoError(t, os.MkdirAll(externalWS, 0o750))
+	preStat, err := os.Stat(externalWS)
+	require.NoError(t, err)
+
+	t.Run("external workspace read-only mount", func(t *testing.T) {
+		sbx := &sandbox.UserSandbox{
+			UserID:            "ext-user-ro",
+			Status:            sandbox.StatusRunning,
+			WorkspaceDir:      externalWS,
+			WorkspaceExternal: true,
+			Mounts: []sandbox.UserMount{
+				{
+					RelativePath: ".",
+					SandboxPath:  sandbox.DefaultWorkspaceMountPath,
+					ReadOnly:     true,
+				},
+			},
+		}
+
+		err := driver.Create(ctx, sbx, externalWS)
+		require.NoError(t, err)
+		defer func() { _ = driver.Destroy(ctx, sbx) }()
+
+		// Verify host permissions not modified
+		postStat, err := os.Stat(externalWS)
+		require.NoError(t, err)
+		assert.Equal(t, preStat.Mode(), postStat.Mode())
+
+		// Write inside sandbox should fail
+		res, err := driver.Exec(ctx, sbx, []string{"sh", "-c", "echo test > /workspace/fail.txt"}, 5*time.Second)
+		require.NoError(t, err)
+		assert.NotEqual(t, 0, res.ExitCode)
+		assert.Contains(t, res.Stderr, "Read-only file system")
+	})
+
+	t.Run("external workspace read-write mount", func(t *testing.T) {
+		sbx := &sandbox.UserSandbox{
+			UserID:            "ext-user-rw",
+			Status:            sandbox.StatusRunning,
+			WorkspaceDir:      externalWS,
+			WorkspaceExternal: true,
+			Mounts: []sandbox.UserMount{
+				{
+					RelativePath: ".",
+					SandboxPath:  sandbox.DefaultWorkspaceMountPath,
+					ReadOnly:     false,
+				},
+			},
+		}
+
+		err := driver.Create(ctx, sbx, externalWS)
+		require.NoError(t, err)
+		defer func() { _ = driver.Destroy(ctx, sbx) }()
+
+		// Write inside sandbox should succeed and persist on host
+		res, err := driver.Exec(ctx, sbx, []string{"sh", "-c", "echo 'persisted' > /workspace/saved.txt"}, 5*time.Second)
+		require.NoError(t, err)
+		assert.Equal(t, 0, res.ExitCode)
+
+		content, err := os.ReadFile(filepath.Join(externalWS, "saved.txt"))
+		require.NoError(t, err)
+		assert.Equal(t, "persisted\n", string(content))
+	})
+}
+

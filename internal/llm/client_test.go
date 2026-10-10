@@ -3,11 +3,13 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"bob/internal/config"
 
@@ -527,4 +529,266 @@ func TestGenerateChatResponseWithToolLoop_GeminiThoughtSignaturePreservation(t *
 	require.NoError(t, err)
 	assert.Equal(t, "Here is the information about the fire in Lombok.", reply)
 	assert.Equal(t, int32(2), atomic.LoadInt32(&turn))
+}
+
+func TestCreateChatCompletion_ContextCanceledNoRetry(t *testing.T) {
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		OpenAIAPIKey:  "test-key",
+		OpenAIModel:   "gpt-4o-mini",
+		OpenAIBaseURL: server.URL,
+	}
+
+	client := NewClient(cfg, server.Client())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // canceled before or during call
+
+	_, err := client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{})
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.True(t, atomic.LoadInt32(&attempts) <= 1)
+}
+
+func TestCreateChatCompletion_RequestTimeoutFailsImmediately(t *testing.T) {
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		time.Sleep(80 * time.Millisecond)
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		OpenAIAPIKey:      "test-key",
+		OpenAIModel:       "gpt-4o-mini",
+		OpenAIBaseURL:     server.URL,
+		LLMRequestTimeout: 30 * time.Millisecond,
+	}
+
+	client := NewClient(cfg, nil)
+	_, err := client.CreateChatCompletion(context.Background(), openai.ChatCompletionRequest{})
+	require.Error(t, err)
+
+	var timeoutErr *TimeoutError
+	require.ErrorAs(t, err, &timeoutErr)
+	assert.Equal(t, TimeoutKindRequest, timeoutErr.Kind)
+	assert.Equal(t, 30*time.Millisecond, timeoutErr.Limit)
+	assert.Equal(t, "LLM API timeout (30ms): request exceeded deadline", err.Error())
+	assert.Equal(t, int32(1), atomic.LoadInt32(&attempts), "request timeout must not be retried")
+}
+
+func TestCreateChatCompletion_FirstByteTimeoutRetriedOnce(t *testing.T) {
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := atomic.AddInt32(&attempts, 1)
+		if count == 1 {
+			time.Sleep(80 * time.Millisecond)
+			return
+		}
+		resp := openai.ChatCompletionResponse{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Index: 0,
+					Message: openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "Recovered from first-byte timeout",
+					},
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		OpenAIAPIKey:        "test-key",
+		OpenAIModel:         "gpt-4o-mini",
+		OpenAIBaseURL:       server.URL,
+		LLMRequestTimeout:   5 * time.Second,
+		LLMFirstByteTimeout: 30 * time.Millisecond,
+	}
+
+	client := NewClient(cfg, nil)
+	resp, err := client.CreateChatCompletion(context.Background(), openai.ChatCompletionRequest{})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, "Recovered from first-byte timeout", resp.Choices[0].Message.Content)
+	assert.Equal(t, int32(2), atomic.LoadInt32(&attempts))
+}
+
+func TestCreateChatCompletion_FirstByteTimeoutExhausted(t *testing.T) {
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		time.Sleep(80 * time.Millisecond)
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		OpenAIAPIKey:        "test-key",
+		OpenAIModel:         "gpt-4o-mini",
+		OpenAIBaseURL:       server.URL,
+		LLMRequestTimeout:   5 * time.Second,
+		LLMFirstByteTimeout: 30 * time.Millisecond,
+	}
+
+	client := NewClient(cfg, nil)
+	_, err := client.CreateChatCompletion(context.Background(), openai.ChatCompletionRequest{})
+	require.Error(t, err)
+
+	var timeoutErr *TimeoutError
+	require.ErrorAs(t, err, &timeoutErr)
+	assert.Equal(t, TimeoutKindFirstByte, timeoutErr.Kind)
+	assert.Equal(t, 30*time.Millisecond, timeoutErr.Limit)
+	assert.Equal(t, "LLM API first-byte timeout (30ms): server did not return response headers within timeout", err.Error())
+	assert.Equal(t, int32(2), atomic.LoadInt32(&attempts), "first-byte timeout allows at most one retry (2 attempts total)")
+}
+
+func TestCreateEmbeddings_RequestTimeoutFailsImmediately(t *testing.T) {
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		time.Sleep(80 * time.Millisecond)
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		OpenAIAPIKey:      "test-key",
+		EmbeddingModel:    "text-embedding-3-small",
+		OpenAIBaseURL:     server.URL,
+		LLMRequestTimeout: 30 * time.Millisecond,
+	}
+
+	client := NewClient(cfg, nil)
+	_, err := client.CreateEmbeddings(context.Background(), []string{"test"}, "text-embedding-3-small")
+	require.Error(t, err)
+
+	var timeoutErr *TimeoutError
+	require.ErrorAs(t, err, &timeoutErr)
+	assert.Equal(t, TimeoutKindRequest, timeoutErr.Kind)
+	assert.Equal(t, "LLM API timeout (30ms): request exceeded deadline", err.Error())
+	assert.Equal(t, int32(1), atomic.LoadInt32(&attempts))
+}
+
+func TestGeminiTransport_BodyReadFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		// Close underlying connection abruptly to cause body read error
+		hj, ok := w.(http.Hijacker)
+		if ok {
+			conn, _, _ := hj.Hijack()
+			_ = conn.Close()
+		}
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		OpenAIAPIKey:  "test-key",
+		OpenAIModel:   "gemini-3.7-flash",
+		OpenAIBaseURL: server.URL,
+	}
+
+	client := NewClient(cfg, nil)
+	_, err := client.CreateChatCompletion(context.Background(), openai.ChatCompletionRequest{})
+	require.Error(t, err)
+}
+
+func TestGeminiTransport_StalledBodyReadTimeout(t *testing.T) {
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		// Write partial JSON then hang past request timeout
+		_, _ = w.Write([]byte(`{"choices":[`))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		time.Sleep(100 * time.Millisecond)
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		OpenAIAPIKey:      "test-key",
+		OpenAIModel:       "gemini-3.7-flash",
+		OpenAIBaseURL:     server.URL,
+		LLMRequestTimeout: 30 * time.Millisecond,
+	}
+
+	client := NewClient(cfg, nil)
+	_, err := client.CreateChatCompletion(context.Background(), openai.ChatCompletionRequest{})
+	require.Error(t, err)
+
+	var timeoutErr *TimeoutError
+	require.ErrorAs(t, err, &timeoutErr)
+	assert.Equal(t, TimeoutKindRequest, timeoutErr.Kind)
+	assert.Equal(t, "LLM API timeout (30ms): request exceeded deadline", err.Error())
+	assert.ErrorIs(t, timeoutErr.Cause, context.DeadlineExceeded)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&attempts), "request timeout on stalled body must not retry")
+}
+
+func TestNewClient_ConfigTimeoutPrecedenceAndTransportImmutability(t *testing.T) {
+	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
+	require.True(t, ok)
+	origDefaultHeaderTimeout := defaultTransport.ResponseHeaderTimeout
+
+	cfg := &config.Config{
+		OpenAIAPIKey:        "test-key",
+		LLMRequestTimeout:   10 * time.Minute,
+		LLMFirstByteTimeout: 2 * time.Minute,
+	}
+
+	injectedClient := &http.Client{
+		Timeout: 15 * time.Second, // 15s from bootstrap must NOT override 10m
+	}
+
+	client := NewClient(cfg, injectedClient)
+	assert.Equal(t, 10*time.Minute, client.requestTimeout)
+	assert.Equal(t, 2*time.Minute, client.firstByteTimeout)
+
+	// Ensure shared http.DefaultTransport was not modified
+	assert.Equal(t, origDefaultHeaderTimeout, defaultTransport.ResponseHeaderTimeout)
+}
+
+func TestClassifyTimeout_ProviderErrorNotClassifiedAsClientTimeout(t *testing.T) {
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]interface{}{
+				"message": "context deadline exceeded in remote cluster",
+				"code":    500,
+			},
+		})
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		OpenAIAPIKey:  "test-key",
+		OpenAIModel:   "gemini-3.7-flash",
+		OpenAIBaseURL: server.URL,
+	}
+
+	client := NewClient(cfg, nil)
+	_, err := client.CreateChatCompletion(context.Background(), openai.ChatCompletionRequest{})
+	require.Error(t, err)
+
+	var timeoutErr *TimeoutError
+	assert.False(t, errors.As(err, &timeoutErr), "upstream 500 error containing deadline exceeded text must NOT be classified as TimeoutError")
+	assert.Equal(t, int32(4), atomic.LoadInt32(&attempts), "500 server error should retry normally")
 }
