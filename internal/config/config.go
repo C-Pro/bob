@@ -65,6 +65,7 @@ type Config struct {
 	SandboxMaxExecTimeout      time.Duration
 	SandboxCPULimit            float64
 	SandboxMemoryLimitMB       int
+	SandboxTasksMax            int
 	SandboxHostDataDir         string
 	SandboxProxyFwdPath        string
 	SandboxAllowRuntimeBuild   *bool
@@ -83,6 +84,8 @@ type Config struct {
 	CLIMaxIterations               int
 	SandboxDefaultDriver           string
 	SandboxDockerImage             string
+	SandboxExtraPaths              []string
+	SandboxAutoToolchains          bool
 }
 
 // DefaultSandboxAllowedImages defines standard safe container images.
@@ -136,6 +139,7 @@ func Defaults() *Config {
 		SandboxMaxExecTimeout:          10 * time.Minute,
 		SandboxCPULimit:                1.0,
 		SandboxMemoryLimitMB:           512,
+		SandboxTasksMax:                1024,
 		SchedulerMinRunTimeout:         1 * time.Minute,
 		SchedulerMaxRunTimeout:         1 * time.Hour,
 		SchedulerMinMaxTurns:           10,
@@ -319,8 +323,31 @@ func LoadFromEnv() (*Config, error) {
 	cfg.SandboxMaxExecTimeout = getEnvDurationOrDefault("SANDBOX_MAX_EXEC_TIMEOUT", cfg.SandboxMaxExecTimeout)
 	cfg.SandboxCPULimit = getEnvFloatOrDefault("SANDBOX_CPU_LIMIT", cfg.SandboxCPULimit)
 	cfg.SandboxMemoryLimitMB = getEnvIntOrDefault("SANDBOX_MEMORY_LIMIT_MB", cfg.SandboxMemoryLimitMB)
+	if val := os.Getenv("BOB_SANDBOX_TASKS_MAX"); strings.TrimSpace(val) != "" {
+		cfg.SandboxTasksMax = getEnvIntOrDefault("BOB_SANDBOX_TASKS_MAX", cfg.SandboxTasksMax)
+	} else if val := os.Getenv("SANDBOX_TASKS_MAX"); strings.TrimSpace(val) != "" {
+		cfg.SandboxTasksMax = getEnvIntOrDefault("SANDBOX_TASKS_MAX", cfg.SandboxTasksMax)
+	}
 	cfg.SandboxHostDataDir = getEnvOrDefault("SANDBOX_HOST_DATA_DIR", cfg.SandboxHostDataDir)
 	cfg.SandboxProxyFwdPath = getEnvOrDefault("SANDBOX_PROXY_FWD_PATH", cfg.SandboxProxyFwdPath)
+
+	if val := os.Getenv("BOB_SANDBOX_EXTRA_PATHS"); strings.TrimSpace(val) != "" {
+		cfg.SandboxExtraPaths = parsePathList(val)
+	} else if val := os.Getenv("SANDBOX_EXTRA_PATHS"); strings.TrimSpace(val) != "" {
+		cfg.SandboxExtraPaths = parsePathList(val)
+	}
+
+	if val := os.Getenv("BOB_SANDBOX_AUTO_TOOLCHAINS"); strings.TrimSpace(val) != "" {
+		b, err := strconv.ParseBool(strings.TrimSpace(val))
+		if err == nil {
+			cfg.SandboxAutoToolchains = b
+		}
+	} else if val := os.Getenv("SANDBOX_AUTO_TOOLCHAINS"); strings.TrimSpace(val) != "" {
+		b, err := strconv.ParseBool(strings.TrimSpace(val))
+		if err == nil {
+			cfg.SandboxAutoToolchains = b
+		}
+	}
 
 	if cfg.SandboxHostDataDir != "" {
 		cfg.SandboxHostDataDir = filepath.Clean(cfg.SandboxHostDataDir)
@@ -363,10 +390,13 @@ func (c *Config) SandboxConfig() sandbox.Config {
 		MaxExecTimeout:      c.SandboxMaxExecTimeout,
 		CPULimit:            c.SandboxCPULimit,
 		MemoryLimitMB:       c.SandboxMemoryLimitMB,
+		TasksMax:            c.SandboxTasksMax,
 		DataDir:             c.DataDir,
 		HostDataDir:         c.SandboxHostDataDir,
 		ProxyFwdPath:        c.SandboxProxyFwdPath,
 		AllowRuntimeBuild:   c.SandboxAllowRuntimeBuild,
+		ExtraPaths:          append([]string(nil), c.SandboxExtraPaths...),
+		AutoToolchains:      c.SandboxAutoToolchains,
 	}
 }
 
@@ -601,6 +631,23 @@ func getEnvIntStrict(key string, defaultValue int) (int, error) {
 		return 0, fmt.Errorf("invalid integer for %s: %q", key, val)
 	}
 	return i, nil
+}
+
+func parsePathList(val string) []string {
+	var sep string
+	if strings.Contains(val, ":") {
+		sep = ":"
+	} else {
+		sep = ","
+	}
+	var out []string
+	for _, p := range strings.Split(val, sep) {
+		trimmed := strings.TrimSpace(p)
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 // LoadDotEnv parses a simple .env file and populates environment variables that are not yet set.

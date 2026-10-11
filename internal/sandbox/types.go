@@ -73,10 +73,13 @@ type UserSandbox struct {
 	ID                  string // Unique sandbox instance ID
 	UserID              string
 	ChatID              string
+	IsDM                bool
 	Driver              DriverType
 	DockerImage         string
 	Network             NetworkPolicy
 	Mounts              []UserMount
+	ExtraPaths          []string // Host directories to mount read-only and prepend to $PATH
+	ProtectedPaths      []string // Sensitive directories forbidden from being mounted or traversed into
 	Devices             DevicePolicy
 	Reason              string
 	CreatedAt           time.Time
@@ -86,6 +89,8 @@ type UserSandbox struct {
 	WorkspaceDir        string // Absolute path to user sandbox workspace on host
 	WorkspaceExternal   bool   // True if workspace is owned externally by host (must not be created/deleted/chmodded by bob)
 	ProxyDir            string // Instance-specific proxy directory for restricted network mode
+	CacheDir            string // Private run cache directory mounted at /tmp/bob-cache
+	RunID               string // Active FSM run ID associated with this sandbox
 	continuationClaimed atomic.Bool
 }
 
@@ -137,6 +142,34 @@ func (s *UserSandbox) SetStatus(status SandboxStatus) {
 	s.Status = status
 }
 
+// GetCacheDir returns the sandbox run cache directory safely under read lock.
+func (s *UserSandbox) GetCacheDir() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.CacheDir
+}
+
+// SetCacheDir sets the sandbox run cache directory safely under write lock.
+func (s *UserSandbox) SetCacheDir(dir string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.CacheDir = dir
+}
+
+// GetRunID returns the associated run ID safely under read lock.
+func (s *UserSandbox) GetRunID() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.RunID
+}
+
+// SetRunID sets the associated run ID safely under write lock.
+func (s *UserSandbox) SetRunID(runID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.RunID = runID
+}
+
 // Clone returns a shallow copy of UserSandbox with its own mutex.
 func (s *UserSandbox) Clone() *UserSandbox {
 	s.mu.RLock()
@@ -145,10 +178,13 @@ func (s *UserSandbox) Clone() *UserSandbox {
 		ID:                s.ID,
 		UserID:            s.UserID,
 		ChatID:            s.ChatID,
+		IsDM:              s.IsDM,
 		Driver:            s.Driver,
 		DockerImage:       s.DockerImage,
 		Network:           s.Network,
 		Mounts:            s.Mounts,
+		ExtraPaths:        append([]string(nil), s.ExtraPaths...),
+		ProtectedPaths:    append([]string(nil), s.ProtectedPaths...),
 		Devices:           s.Devices,
 		Reason:            s.Reason,
 		CreatedAt:         s.CreatedAt,
@@ -158,7 +194,52 @@ func (s *UserSandbox) Clone() *UserSandbox {
 		WorkspaceDir:      s.WorkspaceDir,
 		WorkspaceExternal: s.WorkspaceExternal,
 		ProxyDir:          s.ProxyDir,
+		CacheDir:          s.CacheDir,
+		RunID:             s.RunID,
 	}
+}
+
+type runContextKey struct{}
+type runContextStructKey struct{}
+
+// RunContext holds the run ID and chat session metadata for execution cache scoping.
+type RunContext struct {
+	RunID  string
+	ChatID string
+	IsDM   bool
+}
+
+// WithRunID attaches a run ID to the context for sandbox execution scoping.
+func WithRunID(ctx context.Context, runID string) context.Context {
+	return context.WithValue(ctx, runContextKey{}, runID)
+}
+
+// WithRunContext attaches run and session identity to context.
+func WithRunContext(ctx context.Context, rc RunContext) context.Context {
+	ctx = WithRunID(ctx, rc.RunID)
+	return context.WithValue(ctx, runContextStructKey{}, rc)
+}
+
+// RunIDFromContext retrieves the run ID from context if present.
+func RunIDFromContext(ctx context.Context) string {
+	if rc, ok := ctx.Value(runContextStructKey{}).(RunContext); ok && rc.RunID != "" {
+		return rc.RunID
+	}
+	if v, ok := ctx.Value(runContextKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// RunContextFromContext retrieves the RunContext if present.
+func RunContextFromContext(ctx context.Context) (RunContext, bool) {
+	if rc, ok := ctx.Value(runContextStructKey{}).(RunContext); ok {
+		return rc, true
+	}
+	if runID := RunIDFromContext(ctx); runID != "" {
+		return RunContext{RunID: runID}, true
+	}
+	return RunContext{}, false
 }
 
 // ExecResult contains the output and status of a command executed in a sandbox.

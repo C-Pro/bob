@@ -1,9 +1,11 @@
 package bootstrap
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -116,6 +118,7 @@ func New(cfg *config.Config, opts Options) (*Runtime, error) {
 		bwrapDriver := bwrap.NewDriverWithConfig(bwrap.Config{
 			CPULimit:          sbxCfg.CPULimit,
 			MemoryLimitMB:     sbxCfg.MemoryLimitMB,
+			TasksMax:          sbxCfg.TasksMax,
 			DataDir:           sbxCfg.DataDir,
 			ProxyFwdPath:      sbxCfg.ProxyFwdPath,
 			AllowRuntimeBuild: sbxCfg.AllowRuntimeBuild,
@@ -177,6 +180,9 @@ func New(cfg *config.Config, opts Options) (*Runtime, error) {
 				MaxLoadedSkills:      cfg.KnowledgeMaxLoadedSkills,
 				MaxLoadedSkillBytes:  cfg.KnowledgeMaxLoadedSkillBytes,
 			}),
+			fsm.WithRunFinalizer(func(ctx context.Context, run *fsm.FSMRun) error {
+				return sandbox.RemoveRunCache(run.ID)
+			}),
 		)
 
 		var err error
@@ -202,6 +208,29 @@ func New(cfg *config.Config, opts Options) (*Runtime, error) {
 		// Register any provided frontends on fsmEngine
 		for id, fe := range opts.Frontends {
 			fsmEngine.RegisterFrontend(id, fe)
+		}
+	}
+
+	if storeProvider != nil {
+		reapCtx, reapCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer reapCancel()
+		checker := func(ctx context.Context, meta sandbox.RunCacheMetadata) (bool, error) {
+			if meta.DataDir != "" && meta.DataDir != cfg.DataDir {
+				return false, nil
+			}
+			status, found, err := storeProvider.LookupRunStatus(ctx, meta.ChatID, meta.IsDM, meta.RunID)
+			if err != nil {
+				return false, err
+			}
+			if !found {
+				return false, nil
+			}
+			return status.IsTerminal(), nil
+		}
+		if reaped, err := sandbox.ReapStaleCaches(reapCtx, checker, 24*time.Hour); err != nil {
+			slog.Warn("failed to reap stale sandbox caches on startup", "error", err)
+		} else if reaped > 0 {
+			slog.Info("reaped stale sandbox caches on startup", "count", reaped)
 		}
 	}
 

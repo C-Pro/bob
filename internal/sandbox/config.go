@@ -38,10 +38,13 @@ type Config struct {
 	MaxExecTimeout      time.Duration
 	CPULimit            float64
 	MemoryLimitMB       int
+	TasksMax            int
 	DataDir             string
 	HostDataDir         string
 	ProxyFwdPath        string
 	AllowRuntimeBuild   *bool
+	ExtraPaths          []string
+	AutoToolchains      bool
 }
 
 // DefaultConfig returns a sandbox.Config initialized with safe defaults.
@@ -57,6 +60,7 @@ func DefaultConfig() Config {
 		MaxExecTimeout:      10 * time.Minute,
 		CPULimit:            1.0,
 		MemoryLimitMB:       512,
+		TasksMax:            1024,
 		DataDir:             "./data",
 	}
 }
@@ -101,6 +105,9 @@ func (c *Config) Validate() error {
 	}
 	if c.MemoryLimitMB <= 0 {
 		return errors.New("SANDBOX_MEMORY_LIMIT_MB must be greater than 0")
+	}
+	if c.TasksMax <= 0 {
+		return errors.New("SANDBOX_TASKS_MAX must be greater than 0")
 	}
 	if c.HostDataDir != "" && !filepath.IsAbs(c.HostDataDir) {
 		return errors.New("SANDBOX_HOST_DATA_DIR must be an absolute path")

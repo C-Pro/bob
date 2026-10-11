@@ -27,6 +27,7 @@ func TestSandboxConfig_BoundaryValidation(t *testing.T) {
 			SandboxMaxExecTimeout:      10 * time.Minute,
 			SandboxCPULimit:            1.0,
 			SandboxMemoryLimitMB:       512,
+			SandboxTasksMax:            1024,
 		}
 	}
 
@@ -98,6 +99,21 @@ func TestSandboxConfig_BoundaryValidation(t *testing.T) {
 		assert.NoError(t, cfg.Validate(true))
 
 		cfg.SandboxMemoryLimitMB = 131072
+		assert.NoError(t, cfg.Validate(true))
+	})
+
+	t.Run("sandbox tasks max boundaries", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.SandboxTasksMax = 0
+		assert.ErrorContains(t, cfg.Validate(true), "SANDBOX_TASKS_MAX must be greater than 0")
+
+		cfg.SandboxTasksMax = -10
+		assert.ErrorContains(t, cfg.Validate(true), "SANDBOX_TASKS_MAX must be greater than 0")
+
+		cfg.SandboxTasksMax = 1
+		assert.NoError(t, cfg.Validate(true))
+
+		cfg.SandboxTasksMax = 65536
 		assert.NoError(t, cfg.Validate(true))
 	})
 

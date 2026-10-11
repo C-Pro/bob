@@ -73,6 +73,52 @@ func (p *MemoryStoreProvider) storeKey(chatID string, isDM bool) string {
 	return "dm_" + memory.SanitizeChatID(chatID)
 }
 
+// DBPath returns the expected SQLite database file path for a given chat.
+func (p *MemoryStoreProvider) DBPath(chatID string, isDM bool) string {
+	if p == nil || p.dataDir == "" {
+		return ""
+	}
+	if !isDM || chatID == "townhall" {
+		return filepath.Join(p.dataDir, "townhall.db")
+	}
+	return filepath.Join(p.dataDir, fmt.Sprintf("dm_%s.db", memory.SanitizeChatID(chatID)))
+}
+
+// LookupRunStatus queries the read-only status of an FSM run directly from the chat SQLite database.
+func (p *MemoryStoreProvider) LookupRunStatus(ctx context.Context, chatID string, isDM bool, runID string) (fsm.RunStatus, bool, error) {
+	if p == nil || p.dataDir == "" || runID == "" {
+		return "", false, nil
+	}
+	dbPath := p.DBPath(chatID, isDM)
+	fi, err := os.Stat(dbPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	if fi.Size() == 0 {
+		return "", false, nil
+	}
+
+	dsn := fmt.Sprintf("file:%s?mode=ro", dbPath)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return "", false, err
+	}
+	defer func() { _ = db.Close() }()
+
+	var status string
+	err = db.QueryRowContext(ctx, "SELECT status FROM fsm_runs WHERE id = ?", runID).Scan(&status)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	return fsm.RunStatus(status), true, nil
+}
+
 func (p *MemoryStoreProvider) getOrCreateStoreEntry(chatID string, isDM bool) *storeEntry {
 	key := p.storeKey(chatID, isDM)
 	p.mu.Lock()

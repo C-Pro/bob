@@ -156,6 +156,9 @@ func (d *Driver) Available(ctx context.Context) bool {
 
 // Create spawns an idle sandbox container and initializes user mounts.
 func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorkspaceDir string) (err error) {
+	if len(sbx.ExtraPaths) > 0 {
+		return errors.New("extra_paths is currently not supported with docker driver")
+	}
 	d.mu.Lock()
 	needDetect := !d.hostDataDirDetected && d.hostDataDir == "" && d.dataDir != ""
 	if needDetect {

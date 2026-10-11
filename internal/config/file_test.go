@@ -161,6 +161,7 @@ sandbox:
   max_lifetime: "45m"
   cpu_limit: 2.0
   memory_limit_mb: 1024
+  tasks_max: 2048
 `
 
 	require.NoError(t, os.WriteFile(cfgFile, []byte(content), 0600))
@@ -210,6 +211,7 @@ sandbox:
 	assert.Equal(t, 45*time.Minute, cfg.SandboxMaxLifetime)
 	assert.Equal(t, 2.0, cfg.SandboxCPULimit)
 	assert.Equal(t, 1024, cfg.SandboxMemoryLimitMB)
+	assert.Equal(t, 2048, cfg.SandboxTasksMax)
 
 	// Passes ValidateCLI
 	assert.NoError(t, cfg.ValidateCLI())
@@ -409,3 +411,118 @@ data_dir: "~/file-data"
 func TestCheckFileSecurity_UnusedHelper(t *testing.T) {
 	_ = syscall.Stat_t{}
 }
+
+func TestLoadFromFile_SandboxExtraPaths(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgFile := filepath.Join(tempDir, "config.yaml")
+
+	content := `
+llm:
+  api_key: "test-key"
+  model: "test-model"
+
+sandbox:
+  extra_paths:
+    - "/custom/bin"
+    - "/opt/toolchain"
+`
+	require.NoError(t, os.WriteFile(cfgFile, []byte(content), 0600))
+
+	cfg, err := LoadFromFile(cfgFile)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"/custom/bin", "/opt/toolchain"}, cfg.SandboxExtraPaths)
+
+	sbxCfg := cfg.SandboxConfig()
+	assert.Equal(t, []string{"/custom/bin", "/opt/toolchain"}, sbxCfg.ExtraPaths)
+}
+
+func TestLoadFromFile_SandboxExtraPaths_Precedence(t *testing.T) {
+	tempDir := t.TempDir()
+
+	t.Run("YAML overrides environment variables", func(t *testing.T) {
+		t.Setenv("BOB_SANDBOX_EXTRA_PATHS", "/env/path1:/env/path2")
+		t.Setenv("SANDBOX_EXTRA_PATHS", "/env/generic")
+
+		cfgFile := filepath.Join(tempDir, "config_yaml.yaml")
+		content := `
+llm:
+  api_key: "test-key"
+  model: "test-model"
+sandbox:
+  extra_paths:
+    - "/yaml/override"
+`
+		require.NoError(t, os.WriteFile(cfgFile, []byte(content), 0600))
+		cfg, err := LoadFromFile(cfgFile)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"/yaml/override"}, cfg.SandboxExtraPaths)
+	})
+
+	t.Run("Environment fallback when omitted from YAML", func(t *testing.T) {
+		t.Setenv("BOB_SANDBOX_EXTRA_PATHS", "/env/path1:/env/path2")
+
+		cfgFile := filepath.Join(tempDir, "config_noyaml.yaml")
+		content := `
+llm:
+  api_key: "test-key"
+  model: "test-model"
+`
+		require.NoError(t, os.WriteFile(cfgFile, []byte(content), 0600))
+		cfg, err := LoadFromFile(cfgFile)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"/env/path1", "/env/path2"}, cfg.SandboxExtraPaths)
+	})
+}
+
+func TestLoadFromFile_SandboxAutoToolchains(t *testing.T) {
+	tempDir := t.TempDir()
+
+	t.Run("YAML true parses correctly", func(t *testing.T) {
+		cfgFile := filepath.Join(tempDir, "config_auto_true.yaml")
+		content := `
+llm:
+  api_key: "test-key"
+  model: "test-model"
+sandbox:
+  auto_toolchains: true
+`
+		require.NoError(t, os.WriteFile(cfgFile, []byte(content), 0600))
+		cfg, err := LoadFromFile(cfgFile)
+		require.NoError(t, err)
+		assert.True(t, cfg.SandboxAutoToolchains)
+		assert.True(t, cfg.SandboxConfig().AutoToolchains)
+	})
+
+	t.Run("YAML overrides env var", func(t *testing.T) {
+		t.Setenv("BOB_SANDBOX_AUTO_TOOLCHAINS", "true")
+		cfgFile := filepath.Join(tempDir, "config_auto_false.yaml")
+		content := `
+llm:
+  api_key: "test-key"
+  model: "test-model"
+sandbox:
+  auto_toolchains: false
+`
+		require.NoError(t, os.WriteFile(cfgFile, []byte(content), 0600))
+		cfg, err := LoadFromFile(cfgFile)
+		require.NoError(t, err)
+		assert.False(t, cfg.SandboxAutoToolchains)
+	})
+
+	t.Run("Environment fallback when omitted from YAML", func(t *testing.T) {
+		t.Setenv("BOB_SANDBOX_AUTO_TOOLCHAINS", "true")
+		cfgFile := filepath.Join(tempDir, "config_auto_env.yaml")
+		content := `
+llm:
+  api_key: "test-key"
+  model: "test-model"
+`
+		require.NoError(t, os.WriteFile(cfgFile, []byte(content), 0600))
+		cfg, err := LoadFromFile(cfgFile)
+		require.NoError(t, err)
+		assert.True(t, cfg.SandboxAutoToolchains)
+	})
+}
+
+
+

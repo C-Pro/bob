@@ -169,6 +169,16 @@ func WithKnowledgeBudgetLimits(limits tools.KnowledgeBudgetLimits) EngineOption 
 	}
 }
 
+// RunFinalizer defines a lifecycle hook invoked when an FSM run finishes in a terminal status.
+type RunFinalizer func(ctx context.Context, run *FSMRun) error
+
+// WithRunFinalizer configures a finalization callback invoked on terminal FSM run status.
+func WithRunFinalizer(fn RunFinalizer) EngineOption {
+	return func(e *Engine) {
+		e.runFinalizer = fn
+	}
+}
+
 // Engine coordinates durable FSM workflow executions, state dispatching, delayed transitions, and crash recovery.
 type Engine struct {
 	storeProvider           StoreProvider
@@ -182,6 +192,7 @@ type Engine struct {
 	recoveryStalenessCutoff time.Duration
 	maxRecoveryConcurrency  int
 	knowledgeLimits         tools.KnowledgeBudgetLimits
+	runFinalizer            RunFinalizer
 
 	frontendsMu sync.RWMutex
 	frontends   map[string]agentapi.Frontend
@@ -710,6 +721,23 @@ func (e *Engine) RestoreChatSessionContext(ctx context.Context, run *FSMRun) (to
 	return restoreChatSessionContext(ctx, store, run, e.knowledgeLimits)
 }
 
+func (e *Engine) finalizeStoredRun(store *Store, runID string) {
+	if e.runFinalizer == nil || store == nil || runID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	run, err := store.GetRun(ctx, runID)
+	if err != nil || run == nil {
+		return
+	}
+	if run.Status.IsTerminal() {
+		if err := e.runFinalizer(ctx, run); err != nil {
+			slog.Warn("fsm run finalizer failed", "run_id", runID, "error", err)
+		}
+	}
+}
+
 // Recover scans all active stores for interrupted runs and resumes them.
 func (e *Engine) Recover(ctx context.Context) error {
 	stores, err := e.storeProvider.ActiveStores(ctx)
@@ -770,6 +798,7 @@ func (e *Engine) Recover(ctx context.Context) error {
 					return
 				}
 				defer e.releaseRun(runID)
+				defer e.finalizeStoredRun(s, runID)
 
 				// Acquire recovery concurrency semaphore before executing recovery
 				select {
@@ -956,6 +985,7 @@ func (e *Engine) PollDueWaitingRuns(ctx context.Context) error {
 					return
 				}
 				defer e.releaseRun(runID)
+				defer e.finalizeStoredRun(s, runID)
 
 				fresh, err := s.GetRun(runCtx, runID)
 				if err != nil {
@@ -1224,6 +1254,7 @@ func (e *Engine) RunToolLoop(ctx context.Context, req ToolLoopRequest) (result *
 			run.ErrorText = "request context cancelled"
 			_ = store.UpdateRun(bg, run)
 		}
+		e.finalizeStoredRun(store, run.ID)
 		if obs := GetProgressObserver(ctx); obs != nil {
 			var terminalStatus RunStatus
 			var runErr error

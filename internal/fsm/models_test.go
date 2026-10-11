@@ -114,4 +114,49 @@ func TestNewStepFromToolCall(t *testing.T) {
 	tcSkill := openai.ToolCall{Function: openai.FunctionCall{Name: "propose_skill"}}
 	stepSkill := NewStepFromToolCall("run_1", 2, 2, tcSkill, ExecutionModeSequential)
 	assert.Equal(t, 1, stepSkill.MaxAttempts)
+
+	// Custom timeout_seconds
+	// Custom timeout honored up to 1800
+	tcCustomTimeout := openai.ToolCall{
+		ID: "call_exec",
+		Function: openai.FunctionCall{
+			Name:      "execute",
+			Arguments: `{"command":"go test ./...","timeout_seconds":120}`,
+		},
+	}
+	stepCustom := NewStepFromToolCall("run_1", 2, 3, tcCustomTimeout, ExecutionModeSequential)
+	assert.Equal(t, 120, stepCustom.TimeoutSeconds)
+
+	// Clamped to 1800 max
+	tcOverTimeout := openai.ToolCall{
+		ID: "call_exec",
+		Function: openai.FunctionCall{
+			Name:      "execute",
+			Arguments: `{"command":"go test ./...","timeout_seconds":2500}`,
+		},
+	}
+	stepOver := NewStepFromToolCall("run_1", 2, 4, tcOverTimeout, ExecutionModeSequential)
+	assert.Equal(t, 1800, stepOver.TimeoutSeconds)
+
+	// Negative/zero falls back to default 30
+	tcNegativeTimeout := openai.ToolCall{
+		ID: "call_exec",
+		Function: openai.FunctionCall{
+			Name:      "execute",
+			Arguments: `{"command":"go test ./...","timeout_seconds":-10}`,
+		},
+	}
+	stepNeg := NewStepFromToolCall("run_1", 2, 5, tcNegativeTimeout, ExecutionModeSequential)
+	assert.Equal(t, 30, stepNeg.TimeoutSeconds)
+
+	// Non-exec tool ignores timeout_seconds argument and stays at default 30
+	tcNonExec := openai.ToolCall{
+		ID: "call_web",
+		Function: openai.FunctionCall{
+			Name:      "web_search",
+			Arguments: `{"query":"test","timeout_seconds":120}`,
+		},
+	}
+	stepNonExec := NewStepFromToolCall("run_1", 2, 6, tcNonExec, ExecutionModeParallel)
+	assert.Equal(t, 30, stepNonExec.TimeoutSeconds)
 }

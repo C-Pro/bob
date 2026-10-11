@@ -28,6 +28,7 @@ type Driver struct {
 	allowRuntimeBuild  *bool
 	forwarderBinary    string
 	forwarderPort      int
+	tasksMax           int
 	fwdMu              sync.Mutex
 	mu                 sync.Mutex
 	proxies            map[string]*sandbox.FilteringProxy // keyed by userID
@@ -38,6 +39,7 @@ type Driver struct {
 type Config struct {
 	CPULimit           float64
 	MemoryLimitMB      int
+	TasksMax           int
 	CustomBlockedCIDRs []string
 	ForwarderPort      int
 	DataDir            string
@@ -61,6 +63,10 @@ func NewDriverWithConfig(cfg Config) *Driver {
 	if cpu <= 0 {
 		cpu = 1.0
 	}
+	tasks := cfg.TasksMax
+	if tasks <= 0 {
+		tasks = 1024
+	}
 	fwdPort := cfg.ForwarderPort
 	if fwdPort <= 0 {
 		fwdPort = sandbox.DefaultForwarderPort
@@ -73,6 +79,7 @@ func NewDriverWithConfig(cfg Config) *Driver {
 		bwrapPath:          path,
 		cpuLimit:           cpu,
 		memoryLimitMB:      mem,
+		tasksMax:           tasks,
 		dataDir:            dataDir,
 		proxyFwdPath:       cfg.ProxyFwdPath,
 		allowRuntimeBuild:  cfg.AllowRuntimeBuild,
@@ -203,7 +210,7 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 
 	var bwrapCmd *exec.Cmd
 	if hasSystemdUserScope() {
-		sysArgs := buildSystemdArgs(d.memoryLimitMB, d.cpuLimit, d.bwrapPath, args)
+		sysArgs := buildSystemdArgs(d.memoryLimitMB, d.cpuLimit, d.tasksMax, d.bwrapPath, args)
 		// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 		bwrapCmd = exec.CommandContext(execCtx, "systemd-run", sysArgs...)
 	} else {
@@ -222,11 +229,17 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 	duration := time.Since(startTime)
 
 	if execCtx.Err() != nil {
+		var timeoutMsg string
+		if ctx.Err() != nil {
+			timeoutMsg = "command execution cancelled: parent context deadline exceeded or cancelled"
+		} else {
+			timeoutMsg = fmt.Sprintf("command timed out after %v; specify a higher timeout_seconds in tool arguments if needed", timeout.Round(time.Second))
+		}
 		errStr := stderr.String()
 		if errStr != "" {
-			errStr += "\ncommand timed out"
+			errStr += "\n" + timeoutMsg
 		} else {
-			errStr = "command timed out"
+			errStr = timeoutMsg
 		}
 		return &sandbox.ExecResult{
 			ExitCode: -1,
@@ -311,6 +324,34 @@ func (d *Driver) buildArgs(sbx *sandbox.UserSandbox, cmd []string) ([]string, er
 		"--dev", "/dev",
 		"--tmpfs", "/tmp",
 	)
+
+	// Mount extra toolchain/user paths (read-only) and collect bin paths
+	var extraBinPaths []string
+	if len(sbx.ExtraPaths) > 0 {
+		protected := append(sandbox.DefaultSensitivePaths(), sbx.ProtectedPaths...)
+		if d.dataDir != "" {
+			protected = append(protected, d.dataDir)
+		}
+		if sbx.GetWorkspaceDir() != "" {
+			protected = append(protected, sbx.GetWorkspaceDir())
+		}
+		mountedExtra := make(map[string]bool)
+		seenBin := make(map[string]bool)
+		for _, p := range sbx.ExtraPaths {
+			resolved, err := sandbox.ResolveExtraPath(p, "", protected)
+			if err != nil {
+				return nil, fmt.Errorf("invalid extra path %q: %w", p, err)
+			}
+			if !mountedExtra[resolved.HostMountPath] {
+				mountedExtra[resolved.HostMountPath] = true
+				args = append(args, "--ro-bind", resolved.HostMountPath, resolved.HostMountPath)
+			}
+			if !seenBin[resolved.SandboxBinPath] {
+				seenBin[resolved.SandboxBinPath] = true
+				extraBinPaths = append(extraBinPaths, resolved.SandboxBinPath)
+			}
+		}
+	}
 
 	// Mount user workspace directory or subdirectories
 	userWorkspaceDir := sbx.GetWorkspaceDir()
@@ -404,13 +445,41 @@ func (d *Driver) buildArgs(sbx *sandbox.UserSandbox, cmd []string) ([]string, er
 		}
 	}
 
+	sandboxPath := "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	if len(extraBinPaths) > 0 {
+		sandboxPath = strings.Join(extraBinPaths, ":") + ":" + sandboxPath
+	}
+
 	// Configure environment inside the sandbox
 	args = append(args,
 		"--clearenv",
-		"--setenv", "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"--setenv", "PATH", sandboxPath,
 		"--setenv", "HOME", sandbox.DefaultWorkspaceMountPath,
 		"--setenv", "PWD", sandbox.DefaultWorkspaceMountPath,
 		"--setenv", "TERM", "dumb",
+	)
+
+	cacheDir := sbx.GetCacheDir()
+	if cacheDir != "" {
+		if _, err := os.Stat(cacheDir); err == nil {
+			args = append(args, "--bind", cacheDir, "/tmp/bob-cache")
+		} else {
+			args = append(args, "--dir", "/tmp/bob-cache")
+		}
+	} else {
+		args = append(args, "--dir", "/tmp/bob-cache")
+	}
+	args = append(args,
+		"--dir", "/tmp/bob-cache/go",
+		"--dir", "/tmp/bob-cache/go-build",
+		"--dir", "/tmp/bob-cache/golangci-lint",
+		"--dir", "/tmp/bob-cache/npm",
+		"--dir", "/tmp/bob-cache/pip",
+		"--setenv", "GOCACHE", "/tmp/bob-cache/go-build",
+		"--setenv", "GOPATH", "/tmp/bob-cache/go",
+		"--setenv", "GOLANGCI_LINT_CACHE", "/tmp/bob-cache/golangci-lint",
+		"--setenv", "npm_config_cache", "/tmp/bob-cache/npm",
+		"--setenv", "PIP_CACHE_DIR", "/tmp/bob-cache/pip",
 	)
 
 	if sbx.Network.Mode == sandbox.NetworkRestricted {
@@ -461,14 +530,17 @@ func hasSystemdUserScope() bool {
 	return cmd.Run() == nil
 }
 
-func buildSystemdArgs(memMB int, cpuLimit float64, bwrapPath string, bwrapArgs []string) []string {
+func buildSystemdArgs(memMB int, cpuLimit float64, tasksMax int, bwrapPath string, bwrapArgs []string) []string {
 	if memMB <= 0 {
 		memMB = 512
+	}
+	if tasksMax <= 0 {
+		tasksMax = 1024
 	}
 	sysArgs := []string{
 		"--user", "--scope", "-q",
 		"-p", fmt.Sprintf("MemoryMax=%dM", memMB),
-		"-p", "TasksMax=64",
+		"-p", fmt.Sprintf("TasksMax=%d", tasksMax),
 	}
 	if cpuLimit > 0 {
 		sysArgs = append(sysArgs, "-p", fmt.Sprintf("CPUQuota=%d%%", int(cpuLimit*100)))

@@ -30,10 +30,11 @@ func (f *failWriter) Write(p []byte) (n int, err error) {
 }
 
 type mockSandboxDriver struct {
-	available bool
-	lastCmd   []string
-	result    *sandbox.ExecResult
-	err       error
+	available   bool
+	lastCmd     []string
+	lastTimeout time.Duration
+	result      *sandbox.ExecResult
+	err         error
 }
 
 func (m *mockSandboxDriver) Type() sandbox.DriverType {
@@ -50,6 +51,7 @@ func (m *mockSandboxDriver) Create(ctx context.Context, sbx *sandbox.UserSandbox
 
 func (m *mockSandboxDriver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []string, timeout time.Duration) (*sandbox.ExecResult, error) {
 	m.lastCmd = cmd
+	m.lastTimeout = timeout
 	if m.err != nil {
 		return nil, m.err
 	}
@@ -487,6 +489,7 @@ func TestRun_WithSandbox_Execute(t *testing.T) {
 	defer func() { _ = rt.Close() }()
 
 	// Inject sandbox manager with mock driver
+	rt.Config.SandboxDefaultExecTimeout = 3 * time.Minute
 	sbxCfg := config.Defaults().SandboxConfig()
 	sbxCfg.Enabled = true
 	sbxCfg.Drivers = []string{"bwrap"}
@@ -509,6 +512,7 @@ func TestRun_WithSandbox_Execute(t *testing.T) {
 	assert.Contains(t, stdout.String(), "• execute ls -la")
 	assert.Contains(t, stdout.String(), "Workspace is empty.")
 	assert.Equal(t, []string{"sh", "-c", "ls -la"}, driver.lastCmd)
+	assert.Equal(t, 3*time.Minute, driver.lastTimeout, "SandboxDefaultExecTimeout from config must be propagated to ExecTool")
 }
 
 func TestRun_WithSandbox_ExecuteNonZeroExit(t *testing.T) {

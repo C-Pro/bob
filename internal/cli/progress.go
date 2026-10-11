@@ -9,7 +9,6 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"time"
 
 	"bob/internal/agentapi"
 	"bob/internal/fsm"
@@ -112,7 +111,7 @@ func (r *ProgressRenderer) Observe(ctx context.Context, ev agentapi.ProgressEven
 			r.seen[step.ID] = struct{}{}
 			r.mu.Unlock()
 
-			r.renderStepLine(step.Call.Name, step.Call.Arguments, string(step.Status), step.Error, "", 0)
+			r.renderStepLine(step.Call.Name, step.Call.Arguments, string(step.Status), step.Error, "", "")
 		}
 	}
 }
@@ -134,25 +133,25 @@ func (r *ProgressRenderer) OnStepUpdate(ctx context.Context, step *fsm.FSMStep) 
 		r.seen[step.ID] = struct{}{}
 		r.mu.Unlock()
 
-		var duration time.Duration
+		var durStr string
 		if step.StartedAt != nil && step.CompletedAt != nil && *step.CompletedAt >= *step.StartedAt {
-			duration = time.Duration(*step.CompletedAt-*step.StartedAt) * time.Millisecond
+			diff := *step.CompletedAt - *step.StartedAt
+			if diff == 0 {
+				durStr = "<1s"
+			} else {
+				durStr = fmt.Sprintf("%ds", diff)
+			}
 		}
 
-		r.renderStepLine(step.ToolName, step.ArgsJSON, string(step.Status), step.ErrorText, step.ResultJSON, duration)
+		r.renderStepLine(step.ToolName, step.ArgsJSON, string(step.Status), step.ErrorText, step.ResultJSON, durStr)
 	}
 }
 
 // OnRunFinished implements fsm.ProgressObserver.
 func (r *ProgressRenderer) OnRunFinished(ctx context.Context, status fsm.RunStatus, runErr error) {}
 
-func (r *ProgressRenderer) renderStepLine(toolName, argsJSON, status, errorText, resultJSON string, dur time.Duration) {
+func (r *ProgressRenderer) renderStepLine(toolName, argsJSON, status, errorText, resultJSON string, durStr string) {
 	summary := summarizeArgs(toolName, argsJSON)
-
-	durStr := ""
-	if dur > 0 {
-		durStr = dur.Round(time.Millisecond).String()
-	}
 
 	exitCodeStr := ""
 	if resultJSON != "" && toolName == "execute" {
@@ -262,12 +261,48 @@ func summarizeArgs(toolName, argsJSON string) string {
 		}
 	case "load_memory":
 		var m struct {
-			Key string `json:"key"`
+			MemoryID string `json:"memory_id"`
+			Key      string `json:"key"`
+			ItemID   string `json:"item_id"`
 		}
-		if err := json.Unmarshal([]byte(clean), &m); err == nil && m.Key != "" {
-			return sanitizeString(m.Key, 60)
+		if err := json.Unmarshal([]byte(clean), &m); err == nil {
+			id := m.MemoryID
+			if id == "" {
+				id = m.Key
+			}
+			if id == "" {
+				id = m.ItemID
+			}
+			if id != "" {
+				return sanitizeString(id, 60)
+			}
 		}
 	case "load_skill":
+		var m struct {
+			SkillID string `json:"skill_id"`
+			Name    string `json:"name"`
+			ItemID  string `json:"item_id"`
+		}
+		if err := json.Unmarshal([]byte(clean), &m); err == nil {
+			id := m.SkillID
+			if id == "" {
+				id = m.Name
+			}
+			if id == "" {
+				id = m.ItemID
+			}
+			if id != "" {
+				return sanitizeString(id, 60)
+			}
+		}
+	case "propose_memory":
+		var m struct {
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal([]byte(clean), &m); err == nil && m.Content != "" {
+			return sanitizeString(m.Content, 60)
+		}
+	case "propose_skill":
 		var m struct {
 			Name string `json:"name"`
 		}

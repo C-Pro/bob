@@ -233,18 +233,18 @@ func TestBwrapDriver_ExecTimeout(t *testing.T) {
 }
 
 func TestBuildSystemdArgs(t *testing.T) {
-	// Case 1: Default mem, positive cpuLimit
-	args := buildSystemdArgs(0, 1.5, "/usr/bin/bwrap", []string{"--ro-bind", "/usr", "/usr"})
+	// Case 1: Default mem, positive cpuLimit, default tasksMax (0 -> 1024)
+	args := buildSystemdArgs(0, 1.5, 0, "/usr/bin/bwrap", []string{"--ro-bind", "/usr", "/usr"})
 	assert.Contains(t, args, "MemoryMax=512M")
-	assert.Contains(t, args, "TasksMax=64")
+	assert.Contains(t, args, "TasksMax=1024")
 	assert.Contains(t, args, "CPUQuota=150%")
 	assert.Contains(t, args, "/usr/bin/bwrap")
 	assert.Contains(t, args, "--ro-bind")
 
-	// Case 2: Custom mem, zero cpuLimit
-	args2 := buildSystemdArgs(1024, 0, "/usr/bin/bwrap", []string{"--unshare-all"})
+	// Case 2: Custom mem, zero cpuLimit, custom tasksMax
+	args2 := buildSystemdArgs(1024, 0, 2048, "/usr/bin/bwrap", []string{"--unshare-all"})
 	assert.Contains(t, args2, "MemoryMax=1024M")
-	assert.Contains(t, args2, "TasksMax=64")
+	assert.Contains(t, args2, "TasksMax=2048")
 	assert.NotContains(t, strings.Join(args2, " "), "CPUQuota")
 }
 
@@ -527,5 +527,68 @@ func TestBwrapDriver_ExternalWorkspace(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "persisted\n", string(content))
 	})
+}
+
+func TestBwrap_ExtraPaths(t *testing.T) {
+	driver := NewDriver()
+	ctx := context.Background()
+
+	if !driver.Available(ctx) {
+		t.Skip("bwrap not available on host, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	realTemp, err := filepath.EvalSymlinks(tempDir)
+	require.NoError(t, err)
+
+	// Create a mock custom toolchain directory
+	customBinDir := filepath.Join(realTemp, "custom_toolchain", "bin")
+	require.NoError(t, os.MkdirAll(customBinDir, 0o755))
+
+	mockToolScript := filepath.Join(customBinDir, "my-custom-cli")
+	scriptContent := "#!/bin/sh\necho custom-toolchain-works\n"
+	require.NoError(t, os.WriteFile(mockToolScript, []byte(scriptContent), 0o755))
+
+	workspace := filepath.Join(realTemp, "workspace")
+	require.NoError(t, os.MkdirAll(workspace, 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID: "user-extra-path",
+		Status: sandbox.StatusRunning,
+		Network: sandbox.NetworkPolicy{
+			Mode: sandbox.NetworkNone,
+		},
+		ExtraPaths: []string{filepath.Dir(customBinDir)}, // toolchain root with bin/ subdir
+	}
+
+	err = driver.Create(ctx, sbx, workspace)
+	require.NoError(t, err)
+	defer func() { _ = driver.Destroy(ctx, sbx) }()
+
+	// 1. Verify custom executable is found via PATH lookup
+	res, err := driver.Exec(ctx, sbx, []string{"my-custom-cli"}, 5*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, 0, res.ExitCode)
+	assert.Contains(t, res.Stdout, "custom-toolchain-works")
+
+	// 2. Verify cache directories and cache environment variables
+	res, err = driver.Exec(ctx, sbx, []string{"sh", "-c", "echo GOCACHE=$GOCACHE; ls -d /tmp/bob-cache/go-build"}, 5*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, 0, res.ExitCode)
+	assert.Contains(t, res.Stdout, "GOCACHE=/tmp/bob-cache/go-build")
+	assert.Contains(t, res.Stdout, "/tmp/bob-cache/go-build")
+
+	// 3. Verify invalid extra path returns error
+	invalidSbx := &sandbox.UserSandbox{
+		UserID: "user-invalid-path",
+		Status: sandbox.StatusRunning,
+		Network: sandbox.NetworkPolicy{
+			Mode: sandbox.NetworkNone,
+		},
+		ExtraPaths: []string{"/does/not/exist/at/all"},
+	}
+	_, err = driver.Exec(ctx, invalidSbx, []string{"true"}, 5*time.Second)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid extra path")
 }
 

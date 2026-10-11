@@ -28,6 +28,8 @@ type SandboxSpec struct {
 	DockerImage    string
 	NetworkMode    string
 	AllowedDomains []string
+	ExtraPaths     []string
+	ProtectedPaths []string
 }
 
 // Options configures one-shot CLI execution.
@@ -116,6 +118,8 @@ func Run(ctx context.Context, rt *bootstrap.Runtime, opts Options, stdout, stder
 		return nil
 	})
 
+	runID := generateRunID()
+
 	var execTool *tools.ExecTool
 	if opts.Sandbox != nil {
 		if rt.SandboxManager == nil {
@@ -151,6 +155,10 @@ func Run(ctx context.Context, rt *bootstrap.Runtime, opts Options, stdout, stder
 			WorkspaceDir:      opts.Sandbox.WorkspaceDir,
 			WorkspaceReadOnly: opts.Sandbox.ReadOnly,
 			Lifetime:          lifetime,
+			ExtraPaths:        opts.Sandbox.ExtraPaths,
+			ProtectedPaths:    opts.Sandbox.ProtectedPaths,
+			RunID:             runID,
+			IsDM:              true,
 		}
 
 		_, err := rt.SandboxManager.Provision(ctx, "local", "cli", params)
@@ -165,8 +173,13 @@ func Run(ctx context.Context, rt *bootstrap.Runtime, opts Options, stdout, stder
 			if rt.SandboxManager != nil {
 				_ = rt.SandboxManager.Destroy(context.Background(), "local")
 			}
+			_ = sandbox.RemoveRunCache(runID)
 		}()
 
+		defaultTimeout := 1 * time.Minute
+		if rt.Config != nil && rt.Config.SandboxDefaultExecTimeout > 0 {
+			defaultTimeout = rt.Config.SandboxDefaultExecTimeout
+		}
 		maxTimeout := 10 * time.Minute
 		if rt.Config != nil && rt.Config.SandboxMaxExecTimeout > 0 {
 			maxTimeout = rt.Config.SandboxMaxExecTimeout
@@ -176,10 +189,11 @@ func Run(ctx context.Context, rt *bootstrap.Runtime, opts Options, stdout, stder
 			mountMode = "rw"
 		}
 		execTool = tools.NewExecTool(rt.SandboxManager, "local", tools.ExecToolInfo{
-			Driver:         driver,
-			WorkspaceMount: mountMode,
-			Network:        netMode,
-			MaxExecTimeout: maxTimeout,
+			Driver:             driver,
+			WorkspaceMount:     mountMode,
+			Network:            netMode,
+			DefaultExecTimeout: defaultTimeout,
+			MaxExecTimeout:     maxTimeout,
 		})
 	}
 
@@ -202,7 +216,6 @@ func Run(ctx context.Context, rt *bootstrap.Runtime, opts Options, stdout, stder
 		}
 	}
 
-	runID := generateRunID()
 	runDesc := agentapi.RunDescriptor{
 		RunID: runID,
 		Session: agentapi.SessionRef{

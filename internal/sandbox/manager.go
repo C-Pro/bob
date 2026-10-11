@@ -23,6 +23,7 @@ type RequestParams struct {
 	Mounts          []UserMount
 	LifetimeMinutes int
 	Reason          string
+	ExtraPaths      []string
 }
 
 // ProvisionParams specifies the parameters for pre-approved synchronous sandbox provisioning.
@@ -34,6 +35,10 @@ type ProvisionParams struct {
 	WorkspaceDir      string
 	WorkspaceReadOnly bool
 	Lifetime          time.Duration
+	ExtraPaths        []string
+	ProtectedPaths    []string
+	RunID             string
+	IsDM              bool
 }
 
 type creationOp struct {
@@ -266,18 +271,37 @@ func (m *Manager) RequestSandbox(ctx context.Context, userID, chatID string, par
 		lifetime = m.cfg.MaxLifetime
 	}
 
+	extraPaths := params.ExtraPaths
+	if len(extraPaths) == 0 && len(m.cfg.ExtraPaths) > 0 {
+		extraPaths = append([]string(nil), m.cfg.ExtraPaths...)
+	}
+	protected := append(DefaultSensitivePaths(), userWorkspace)
+	if m.cfg.DataDir != "" {
+		protected = append(protected, m.cfg.DataDir)
+	}
+	if len(extraPaths) > 0 {
+		for _, p := range extraPaths {
+			if _, err := ResolveExtraPath(p, "", protected); err != nil {
+				return nil, fmt.Errorf("invalid extra path %q: %w", p, err)
+			}
+		}
+	}
+
 	now := time.Now()
 	sbx := &UserSandbox{
-		ID:           generateSandboxID(),
-		UserID:       userID,
-		ChatID:       chatID,
-		Driver:       params.Driver,
-		DockerImage:  params.DockerImage,
-		Network:      netPolicy,
-		Mounts:       params.Mounts,
-		Reason:       params.Reason,
-		CreatedAt:    now,
-		ExpiresAt:    now.Add(lifetime),
+		ID:             generateSandboxID(),
+		UserID:         userID,
+		ChatID:         chatID,
+		IsDM:           true,
+		Driver:         params.Driver,
+		DockerImage:    params.DockerImage,
+		Network:        netPolicy,
+		Mounts:         params.Mounts,
+		ExtraPaths:     extraPaths,
+		ProtectedPaths: protected,
+		Reason:         params.Reason,
+		CreatedAt:      now,
+		ExpiresAt:      now.Add(lifetime),
 		Status:       StatusPendingApproval,
 		WorkspaceDir: userWorkspace,
 	}
@@ -517,7 +541,41 @@ func (m *Manager) Exec(ctx context.Context, userID string, cmd []string, request
 		execTimeout = m.cfg.MaxExecTimeout
 	}
 
-	res, err := driver.Exec(ctx, sbx, cmd, execTimeout)
+	runCtx, _ := RunContextFromContext(ctx)
+	runID := runCtx.RunID
+	if runID == "" {
+		runID = RunIDFromContext(ctx)
+	}
+	if runID == "" {
+		runID = sbx.GetRunID()
+	}
+	if runID == "" {
+		runID = sbx.ID
+	}
+	chatID := runCtx.ChatID
+	if chatID == "" {
+		chatID = sbx.ChatID
+	}
+	isDM := sbx.IsDM
+	if runCtx.IsDM {
+		isDM = true
+	}
+
+	execSbx := sbx.Clone()
+	runCache, err := AcquireRunCacheDir(runID, RunCacheMetadata{
+		RunID:     runID,
+		ChatID:    chatID,
+		IsDM:      isDM,
+		CreatedAt: time.Now(),
+		ExpiresAt: sbx.ExpiresAt,
+		DataDir:   m.cfg.DataDir,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to acquire sandbox run cache: %w", err)
+	}
+	execSbx.SetCacheDir(runCache)
+
+	res, err := driver.Exec(ctx, execSbx, cmd, execTimeout)
 	if err != nil {
 		errStr := err.Error()
 		if errors.Is(err, ErrContainerNotRunning) || strings.Contains(errStr, "is not running") || strings.Contains(errStr, "409") || strings.Contains(errStr, "not running") {
@@ -728,6 +786,25 @@ func (m *Manager) Provision(ctx context.Context, userID, chatID string, params P
 		return nil, fmt.Errorf("driver %s not found", params.Driver)
 	}
 
+	extraPaths := params.ExtraPaths
+	if len(extraPaths) == 0 && len(m.cfg.ExtraPaths) > 0 {
+		extraPaths = append([]string(nil), m.cfg.ExtraPaths...)
+	}
+	protected := append(DefaultSensitivePaths(), absWorkspace)
+	if m.cfg.DataDir != "" {
+		protected = append(protected, m.cfg.DataDir)
+	}
+	if len(params.ProtectedPaths) > 0 {
+		protected = append(protected, params.ProtectedPaths...)
+	}
+	if len(extraPaths) > 0 {
+		for _, p := range extraPaths {
+			if _, err := ResolveExtraPath(p, "", protected); err != nil {
+				return nil, fmt.Errorf("invalid extra path %q: %w", p, err)
+			}
+		}
+	}
+
 	m.mu.Lock()
 	select {
 	case <-m.stopCh:
@@ -762,6 +839,7 @@ func (m *Manager) Provision(ctx context.Context, userID, chatID string, params P
 		ID:          generateSandboxID(),
 		UserID:      userID,
 		ChatID:      chatID,
+		IsDM:        params.IsDM,
 		Driver:      params.Driver,
 		DockerImage: params.DockerImage,
 		Network:     netPolicy,
@@ -772,11 +850,14 @@ func (m *Manager) Provision(ctx context.Context, userID, chatID string, params P
 				ReadOnly:     params.WorkspaceReadOnly,
 			},
 		},
+		ExtraPaths:        extraPaths,
+		ProtectedPaths:    protected,
 		CreatedAt:         now,
 		ExpiresAt:         now.Add(lifetime),
 		Status:            StatusCreating,
 		WorkspaceDir:      absWorkspace,
 		WorkspaceExternal: true,
+		RunID:             params.RunID,
 	}
 
 	createCtx, cancel := context.WithTimeout(m.closeCtx, 10*time.Minute)

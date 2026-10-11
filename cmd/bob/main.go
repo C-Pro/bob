@@ -19,6 +19,7 @@ import (
 	"bob/internal/bootstrap"
 	"bob/internal/cli"
 	"bob/internal/config"
+	"bob/internal/sandbox"
 )
 
 type stringSliceFlag []string
@@ -28,7 +29,16 @@ func (s *stringSliceFlag) String() string {
 }
 
 func (s *stringSliceFlag) Set(v string) error {
-	*s = append(*s, v)
+	if strings.TrimSpace(v) == "" {
+		return errors.New("flag value cannot be empty")
+	}
+	for _, part := range strings.Split(v, ",") {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			return errors.New("flag value contains empty element")
+		}
+		*s = append(*s, trimmed)
+	}
 	return nil
 }
 
@@ -47,8 +57,9 @@ func runWithFactory(args []string, stdin io.Reader, stdout, stderr io.Writer, fa
 		promptVal     string
 		quietVal      bool
 		verboseVal    bool
-		initConfigVal bool
-		configVal     string
+		initConfigVal  bool
+		purgeCachesVal bool
+		configVal      string
 		mountVal      string
 		sandboxVal    string
 		netVal        string
@@ -56,7 +67,9 @@ func runWithFactory(args []string, stdin io.Reader, stdout, stderr io.Writer, fa
 		modelVal      string
 		maxIterVal    int
 		timeoutVal    time.Duration
-		allowDomains  stringSliceFlag
+		allowDomains       stringSliceFlag
+		extraPaths         stringSliceFlag
+		autoToolchainsVal  bool
 	)
 
 	fs := flag.NewFlagSet("bob", flag.ContinueOnError)
@@ -69,6 +82,7 @@ func runWithFactory(args []string, stdin io.Reader, stdout, stderr io.Writer, fa
 	fs.BoolVar(&verboseVal, "v", false, "Verbose debug logging on stderr")
 	fs.BoolVar(&verboseVal, "verbose", false, "Verbose debug logging on stderr")
 	fs.BoolVar(&initConfigVal, "init-config", false, "Initialize config template and exit")
+	fs.BoolVar(&purgeCachesVal, "purge-caches", false, "Purge all sandbox cache directories and exit")
 	fs.StringVar(&configVal, "config", "", "Path to configuration file")
 	fs.StringVar(&mountVal, "mount", "", "Workspace mount spec (PATH[:ro|:rw])")
 	fs.StringVar(&sandboxVal, "sandbox", "", "Sandbox driver ('bwrap' or 'docker')")
@@ -79,6 +93,9 @@ func runWithFactory(args []string, stdin io.Reader, stdout, stderr io.Writer, fa
 	fs.IntVar(&maxIterVal, "max-iterations", 0, "Maximum tool iterations (default 100)")
 	fs.DurationVar(&timeoutVal, "timeout", 1*time.Hour, "Overall execution timeout")
 	fs.Var(&allowDomains, "allow-domain", "Allowed domain in restricted network mode (repeatable)")
+	fs.Var(&extraPaths, "extra-path", "Extra host directory to mount read-only and add to sandbox $PATH (repeatable)")
+	fs.BoolVar(&autoToolchainsVal, "auto-toolchains", false, "Automatically discover host toolchains (e.g. mise, pyenv, cargo) and mount read-only")
+	fs.BoolVar(&autoToolchainsVal, "discover-toolchains", false, "Alias for --auto-toolchains")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -103,6 +120,8 @@ func runWithFactory(args []string, stdin io.Reader, stdout, stderr io.Writer, fa
 			visited["verbose"] = true
 		case "init-config":
 			visited["init-config"] = true
+		case "purge-caches":
+			visited["purge-caches"] = true
 		case "config":
 			visited["config"] = true
 		case "mount":
@@ -121,10 +140,25 @@ func runWithFactory(args []string, stdin io.Reader, stdout, stderr io.Writer, fa
 			visited["timeout"] = true
 		case "allow-domain":
 			visited["allow-domain"] = true
+		case "extra-path":
+			visited["extra-path"] = true
+		case "auto-toolchains", "discover-toolchains":
+			visited["auto-toolchains"] = true
 		}
 	})
 
-	// 1. Handle --init-config
+	// 1. Handle --purge-caches
+	if visited["purge-caches"] && purgeCachesVal {
+		count, err := sandbox.PurgeAllCaches()
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "Error purging sandbox caches: %v\n", err)
+			return 1
+		}
+		_, _ = fmt.Fprintf(stdout, "Purged %d cache(s).\n", count)
+		return 0
+	}
+
+	// 2. Handle --init-config
 	if visited["init-config"] {
 		targetPath := configVal
 		if !visited["config"] || targetPath == "" {
@@ -139,7 +173,7 @@ func runWithFactory(args []string, stdin io.Reader, stdout, stderr io.Writer, fa
 		return 0
 	}
 
-	// 2. Validate prompt presence
+	// 3. Validate prompt presence
 	if !visited["prompt"] {
 		_, _ = fmt.Fprintln(stderr, "Usage: bob -p <prompt> [options]")
 		_, _ = fmt.Fprintln(stderr, "Error: interactive mode is not implemented yet; provide -p <prompt>")
@@ -253,6 +287,15 @@ func runWithFactory(args []string, stdin io.Reader, stdout, stderr io.Writer, fa
 	defer cancelTimeout()
 
 	// 7. Parse Mount Spec if requested
+	if visited["extra-path"] && !visited["mount"] {
+		_, _ = fmt.Fprintln(stderr, "Error: --extra-path requires --mount (workspace must be mounted)")
+		return 2
+	}
+	if visited["auto-toolchains"] && !visited["mount"] {
+		_, _ = fmt.Fprintln(stderr, "Error: --auto-toolchains requires --mount (workspace must be mounted)")
+		return 2
+	}
+
 	var sbSpec *cli.SandboxSpec
 	if visited["mount"] {
 		cwd, err := os.Getwd()
@@ -261,16 +304,21 @@ func runWithFactory(args []string, stdin io.Reader, stdout, stderr io.Writer, fa
 			return 1
 		}
 
-		cfgDir := filepath.Dir(cfgPath)
-		realCfgDir, err := filepath.EvalSymlinks(cfgDir)
+		expCfgPath, err := config.ExpandPath(cfgPath)
 		if err != nil {
-			realCfgDir = cfgDir
+			expCfgPath = cfgPath
 		}
+		realCfgPath, err := filepath.EvalSymlinks(expCfgPath)
+		if err != nil {
+			realCfgPath = expCfgPath
+		}
+		cfgDir := filepath.Dir(expCfgPath)
+		realCfgDir := filepath.Dir(realCfgPath)
 		realDataDir, err := filepath.EvalSymlinks(cfg.DataDir)
 		if err != nil {
 			realDataDir = cfg.DataDir
 		}
-		protected := []string{cfgDir, realCfgDir, cfg.DataDir, realDataDir}
+		protected := append(sandbox.DefaultSensitivePaths(), cfgDir, realCfgDir, cfg.DataDir, realDataDir)
 
 		mountSpec, err := cli.ParseMountSpec(mountVal, cwd, protected)
 		if err != nil {
@@ -287,6 +335,44 @@ func runWithFactory(args []string, stdin io.Reader, stdout, stderr io.Writer, fa
 			effectiveImage = imageVal
 		}
 
+		var combinedExtraPaths []string
+		seenPaths := make(map[string]bool)
+		for _, p := range cfg.SandboxExtraPaths {
+			if !seenPaths[p] {
+				seenPaths[p] = true
+				combinedExtraPaths = append(combinedExtraPaths, p)
+			}
+		}
+		if visited["extra-path"] {
+			for _, p := range extraPaths {
+				if !seenPaths[p] {
+					seenPaths[p] = true
+					combinedExtraPaths = append(combinedExtraPaths, p)
+				}
+			}
+		}
+
+		effectiveAutoToolchains := cfg.SandboxAutoToolchains
+		if visited["auto-toolchains"] {
+			effectiveAutoToolchains = autoToolchainsVal
+		}
+		if effectiveAutoToolchains {
+			discovered := sandbox.DiscoverToolchains("", cwd, protected)
+			for _, p := range discovered {
+				if !seenPaths[p] {
+					seenPaths[p] = true
+					combinedExtraPaths = append(combinedExtraPaths, p)
+				}
+			}
+		}
+
+		for _, p := range combinedExtraPaths {
+			if _, err := sandbox.ResolveExtraPath(p, cwd, protected); err != nil {
+				_, _ = fmt.Fprintf(stderr, "Error: invalid extra path %q: %v\n", p, err)
+				return 2
+			}
+		}
+
 		sbSpec = &cli.SandboxSpec{
 			WorkspaceDir:   mountSpec.HostPath,
 			ReadOnly:       mountSpec.ReadOnly,
@@ -294,6 +380,8 @@ func runWithFactory(args []string, stdin io.Reader, stdout, stderr io.Writer, fa
 			DockerImage:    effectiveImage,
 			NetworkMode:    effectiveNet,
 			AllowedDomains: allowDomains,
+			ExtraPaths:     combinedExtraPaths,
+			ProtectedPaths: protected,
 		}
 	}
 

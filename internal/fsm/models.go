@@ -162,6 +162,20 @@ func NewStepFromToolCall(runID string, iteration, stepIndex int, tc openai.ToolC
 	if tc.Function.Name == "propose_memory" || tc.Function.Name == "propose_skill" {
 		maxAttempts = 1
 	}
+	timeoutSeconds := 30
+	if tc.Function.Name == "execute" || tc.Function.Name == "sandbox_exec" {
+		var timeoutArg struct {
+			TimeoutSeconds *int `json:"timeout_seconds"`
+		}
+		if err := json.Unmarshal([]byte(tc.Function.Arguments), &timeoutArg); err == nil && timeoutArg.TimeoutSeconds != nil {
+			if *timeoutArg.TimeoutSeconds > 0 {
+				timeoutSeconds = *timeoutArg.TimeoutSeconds
+				if timeoutSeconds > 1800 {
+					timeoutSeconds = 1800
+				}
+			}
+		}
+	}
 	return FSMStep{
 		ID:             fmt.Sprintf("%s_i%d_s%d", runID, iteration, stepIndex),
 		RunID:          runID,
@@ -174,7 +188,7 @@ func NewStepFromToolCall(runID string, iteration, stepIndex int, tc openai.ToolC
 		Status:         StepStatusPending,
 		Attempt:        0,
 		MaxAttempts:    maxAttempts,
-		TimeoutSeconds: 30,
+		TimeoutSeconds: timeoutSeconds,
 	}
 }
 

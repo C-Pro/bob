@@ -80,7 +80,7 @@ func (e *ExecTool) Definitions(ctx context.Context) ([]agentapi.ToolDefinition, 
 		driverDesc = e.info.Driver
 	}
 
-	description := fmt.Sprintf("Runs a shell command inside the pre-provisioned sandbox (driver: %s, workspace: %s, network: %s).",
+	description := fmt.Sprintf("Runs a shell command inside the pre-provisioned sandbox (driver: %s, workspace: %s, network: %s). Default timeout is 30 seconds unless timeout_seconds is specified.",
 		driverDesc, wsDesc, netDesc)
 
 	schema := openai.Tool{
@@ -101,7 +101,7 @@ func (e *ExecTool) Definitions(ctx context.Context) ([]agentapi.ToolDefinition, 
 					},
 					"timeout_seconds": map[string]interface{}{
 						"type":        "integer",
-						"description": "Optional execution timeout in seconds (clamped to sandbox max timeout)",
+						"description": "Optional execution timeout in seconds (default: 30s, max: 600s). Specify a higher limit for long-running commands like tests or builds.",
 					},
 				},
 				"required": []string{"command"},
@@ -145,8 +145,14 @@ func (e *ExecTool) Execute(ctx context.Context, call agentapi.ToolCall) (agentap
 		}, errors.New("command cannot be empty")
 	}
 
-	timeout := time.Duration(args.TimeoutSeconds) * time.Second
-	if timeout <= 0 {
+	var timeout time.Duration
+	if args.TimeoutSeconds > 0 {
+		secs := args.TimeoutSeconds
+		if secs > 1800 {
+			secs = 1800
+		}
+		timeout = time.Duration(secs) * time.Second
+	} else {
 		timeout = e.info.DefaultExecTimeout
 		if timeout <= 0 {
 			timeout = 1 * time.Minute
@@ -154,6 +160,14 @@ func (e *ExecTool) Execute(ctx context.Context, call agentapi.ToolCall) (agentap
 	}
 	if e.info.MaxExecTimeout > 0 && timeout > e.info.MaxExecTimeout {
 		timeout = e.info.MaxExecTimeout
+	}
+
+	if sess, ok := ChatSessionFromContext(ctx); ok {
+		ctx = sandbox.WithRunContext(ctx, sandbox.RunContext{
+			RunID:  sess.FSMRunID,
+			ChatID: sess.ChatID,
+			IsDM:   sess.IsDM,
+		})
 	}
 
 	res, err := e.sandboxManager.Exec(ctx, e.userID, []string{"sh", "-c", cmd}, timeout)

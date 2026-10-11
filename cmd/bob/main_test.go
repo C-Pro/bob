@@ -459,3 +459,272 @@ func TestRun_LLMTimeoutMessage(t *testing.T) {
 	assert.Equal(t, 1, code)
 	assert.Contains(t, stderr.String(), "Error: LLM API timeout (50ms): request exceeded deadline")
 }
+
+type mockDriverWithExtraPaths struct {
+	available bool
+	onExec    func(sbx *sandbox.UserSandbox)
+}
+
+func (m *mockDriverWithExtraPaths) Type() sandbox.DriverType {
+	return sandbox.DriverBwrap
+}
+
+func (m *mockDriverWithExtraPaths) Available(ctx context.Context) bool {
+	return m.available
+}
+
+func (m *mockDriverWithExtraPaths) Create(ctx context.Context, sbx *sandbox.UserSandbox, workspace string) error {
+	if m.onExec != nil {
+		m.onExec(sbx)
+	}
+	return nil
+}
+
+func (m *mockDriverWithExtraPaths) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []string, timeout time.Duration) (*sandbox.ExecResult, error) {
+	if m.onExec != nil {
+		m.onExec(sbx)
+	}
+	return &sandbox.ExecResult{ExitCode: 0, Duration: 10 * time.Millisecond}, nil
+}
+
+func (m *mockDriverWithExtraPaths) Destroy(ctx context.Context, sbx *sandbox.UserSandbox) error {
+	return nil
+}
+
+func TestRun_ExtraPathFlag(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		resp := openai.ChatCompletionResponse{
+			ID: "chatcmpl-test",
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Message: openai.ChatCompletionMessage{
+						Role:    "assistant",
+						Content: "Done",
+					},
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	cfgPath := writeValidConfigFile(t, server.URL)
+	workDir := t.TempDir()
+
+	var recordedExtraPaths []string
+	factory := func(cfg *config.Config, opts bootstrap.Options) (*bootstrap.Runtime, error) {
+		rt, err := bootstrap.New(cfg, opts)
+		if err != nil {
+			return nil, err
+		}
+		mockDrv := &mockDriverWithExtraPaths{
+			available: true,
+			onExec: func(sbx *sandbox.UserSandbox) {
+				recordedExtraPaths = sbx.ExtraPaths
+			},
+		}
+		sbxCfg := cfg.SandboxConfig()
+		sbxCfg.Enabled = true
+		sbxCfg.Drivers = []string{"bwrap"}
+		rt.SandboxManager = sandbox.NewManager(sbxCfg, []sandbox.Driver{mockDrv})
+		return rt, nil
+	}
+
+	extraToolDir1 := filepath.Join(t.TempDir(), "bin1")
+	extraToolDir2 := filepath.Join(t.TempDir(), "bin2")
+	require.NoError(t, os.MkdirAll(extraToolDir1, 0o755))
+	require.NoError(t, os.MkdirAll(extraToolDir2, 0o755))
+
+	var stdout, stderr bytes.Buffer
+	code := runWithFactory([]string{
+		"-p", "hello",
+		"--config", cfgPath,
+		"--mount", workDir,
+		"--extra-path", extraToolDir1 + "," + extraToolDir2,
+	}, nil, &stdout, &stderr, factory)
+	assert.Equal(t, 0, code)
+	assert.Equal(t, []string{extraToolDir1, extraToolDir2}, recordedExtraPaths)
+}
+
+func TestRun_ExtraPathWithoutMount_Error(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfgPath := writeValidConfigFile(t, server.URL)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-p", "hello", "--config", cfgPath, "--extra-path", "/some/dir"}, nil, &stdout, &stderr)
+	assert.Equal(t, 2, code)
+	assert.Contains(t, stderr.String(), "Error: --extra-path requires --mount")
+}
+
+func TestRun_ExtraPath_EmptyFlag(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfgPath := writeValidConfigFile(t, server.URL)
+	workDir := t.TempDir()
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-p", "hello", "--config", cfgPath, "--mount", workDir, "--extra-path", ""}, nil, &stdout, &stderr)
+	assert.Equal(t, 2, code)
+	assert.Contains(t, stderr.String(), "flag value cannot be empty")
+}
+
+func TestRun_ExtraPath_EmptyElement(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfgPath := writeValidConfigFile(t, server.URL)
+	workDir := t.TempDir()
+	validDir := t.TempDir()
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-p", "hello", "--config", cfgPath, "--mount", workDir, "--extra-path", validDir + ","}, nil, &stdout, &stderr)
+	assert.Equal(t, 2, code)
+	assert.Contains(t, stderr.String(), "flag value contains empty element")
+}
+
+func TestRun_ExtraPath_ProtectedDir_Error(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfgPath := writeValidConfigFile(t, server.URL)
+	workDir := t.TempDir()
+	cfgDir := filepath.Dir(cfgPath)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-p", "hello", "--config", cfgPath, "--mount", workDir, "--extra-path", cfgDir}, nil, &stdout, &stderr)
+	assert.Equal(t, 2, code)
+	assert.Contains(t, stderr.String(), "Error: invalid extra path")
+	assert.Contains(t, stderr.String(), "protected")
+
+	// Also test subdirectory under config dir
+	sub := filepath.Join(cfgDir, "subdir")
+	require.NoError(t, os.MkdirAll(sub, 0o755))
+	stderr.Reset()
+	code = run([]string{"-p", "hello", "--config", cfgPath, "--mount", workDir, "--extra-path", sub}, nil, &stdout, &stderr)
+	assert.Equal(t, 2, code)
+	assert.Contains(t, stderr.String(), "Error: invalid extra path")
+	assert.Contains(t, stderr.String(), "protected")
+}
+
+func TestRun_AutoToolchainsWithoutMount_Error(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfgPath := writeValidConfigFile(t, server.URL)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-p", "hello", "--config", cfgPath, "--auto-toolchains"}, nil, &stdout, &stderr)
+	assert.Equal(t, 2, code)
+	assert.Contains(t, stderr.String(), "Error: --auto-toolchains requires --mount")
+}
+
+func TestRun_AutoToolchainsFlag(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := openai.ChatCompletionResponse{
+			ID:    "chatcmpl-test",
+			Model: "test-model",
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Message: openai.ChatCompletionMessage{
+						Role:    "assistant",
+						Content: "Done",
+					},
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// Create fake mise install for Go
+	miseGoDir := filepath.Join(home, ".local", "share", "mise", "installs", "go", "1.27.1")
+	require.NoError(t, os.MkdirAll(filepath.Join(miseGoDir, "bin"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(miseGoDir, "src"), 0o755))
+
+	cfgPath := writeValidConfigFile(t, server.URL)
+	workDir := t.TempDir()
+
+	var recordedExtraPaths []string
+	factory := func(cfg *config.Config, opts bootstrap.Options) (*bootstrap.Runtime, error) {
+		rt, err := bootstrap.New(cfg, opts)
+		if err != nil {
+			return nil, err
+		}
+		mockDrv := &mockDriverWithExtraPaths{
+			available: true,
+			onExec: func(sbx *sandbox.UserSandbox) {
+				recordedExtraPaths = sbx.ExtraPaths
+			},
+		}
+		sbxCfg := cfg.SandboxConfig()
+		sbxCfg.Enabled = true
+		sbxCfg.Drivers = []string{"bwrap"}
+		rt.SandboxManager = sandbox.NewManager(sbxCfg, []sandbox.Driver{mockDrv})
+		return rt, nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runWithFactory([]string{
+		"-p", "hello",
+		"--config", cfgPath,
+		"--mount", workDir,
+		"--auto-toolchains",
+	}, nil, &stdout, &stderr, factory)
+	assert.Equal(t, 0, code)
+	assert.Contains(t, recordedExtraPaths, miseGoDir)
+}
+
+func TestRun_PurgeCaches(t *testing.T) {
+	tempCacheRoot := t.TempDir()
+	sandbox.SetCacheRootOverride(tempCacheRoot)
+	t.Cleanup(func() {
+		sandbox.SetCacheRootOverride("")
+	})
+
+	// Pre-create two run caches
+	_, err := sandbox.AcquireRunCacheDir("test-run-1", sandbox.RunCacheMetadata{RunID: "test-run-1", ChatID: "chat-1"})
+	require.NoError(t, err)
+	_, err = sandbox.AcquireRunCacheDir("test-run-2", sandbox.RunCacheMetadata{RunID: "test-run-2", ChatID: "chat-2", IsDM: true})
+	require.NoError(t, err)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--purge-caches"}, nil, &stdout, &stderr)
+	assert.Equal(t, 0, code)
+	assert.Contains(t, stdout.String(), "Purged 2 cache(s).")
+
+	// Running again should report 0 caches purged
+	stdout.Reset()
+	stderr.Reset()
+	code = run([]string{"--purge-caches"}, nil, &stdout, &stderr)
+	assert.Equal(t, 0, code)
+	assert.Contains(t, stdout.String(), "Purged 0 cache(s).")
+
+	// Pre-create another cache and verify --purge-caches=false does not purge it
+	_, err = sandbox.AcquireRunCacheDir("test-run-3", sandbox.RunCacheMetadata{RunID: "test-run-3", ChatID: "chat-3"})
+	require.NoError(t, err)
+
+	stdout.Reset()
+	stderr.Reset()
+	// When --purge-caches=false without prompt, CLI errors with interactive mode not implemented
+	code = run([]string{"--purge-caches=false"}, nil, &stdout, &stderr)
+	assert.Equal(t, 2, code)
+
+	// Verify test-run-3 cache still exists
+	_, err = os.Stat(filepath.Join(tempCacheRoot, "test-run-3"))
+	assert.NoError(t, err, "cache should still exist after --purge-caches=false")
+}

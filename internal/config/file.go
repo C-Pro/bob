@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -117,6 +118,9 @@ type fileConfig struct {
 		MaxLifetime         *time.Duration `yaml:"max_lifetime"`
 		CPULimit            *float64       `yaml:"cpu_limit"`
 		MemoryLimitMB       *int           `yaml:"memory_limit_mb"`
+		TasksMax            *int           `yaml:"tasks_max"`
+		ExtraPaths          *[]string      `yaml:"extra_paths"`
+		AutoToolchains      *bool          `yaml:"auto_toolchains"`
 	} `yaml:"sandbox"`
 }
 
@@ -315,6 +319,38 @@ func LoadFromFile(path string) (*Config, error) {
 	if fc.Sandbox.MemoryLimitMB != nil {
 		cfg.SandboxMemoryLimitMB = *fc.Sandbox.MemoryLimitMB
 	}
+	if fc.Sandbox.TasksMax != nil {
+		cfg.SandboxTasksMax = *fc.Sandbox.TasksMax
+	} else if val := os.Getenv("BOB_SANDBOX_TASKS_MAX"); strings.TrimSpace(val) != "" {
+		if v, err := strconv.Atoi(strings.TrimSpace(val)); err == nil {
+			cfg.SandboxTasksMax = v
+		}
+	} else if val := os.Getenv("SANDBOX_TASKS_MAX"); strings.TrimSpace(val) != "" {
+		if v, err := strconv.Atoi(strings.TrimSpace(val)); err == nil {
+			cfg.SandboxTasksMax = v
+		}
+	}
+	if fc.Sandbox.ExtraPaths != nil {
+		cfg.SandboxExtraPaths = append([]string(nil), (*fc.Sandbox.ExtraPaths)...)
+	} else if val := os.Getenv("BOB_SANDBOX_EXTRA_PATHS"); strings.TrimSpace(val) != "" {
+		cfg.SandboxExtraPaths = parsePathList(val)
+	} else if val := os.Getenv("SANDBOX_EXTRA_PATHS"); strings.TrimSpace(val) != "" {
+		cfg.SandboxExtraPaths = parsePathList(val)
+	}
+
+	if fc.Sandbox.AutoToolchains != nil {
+		cfg.SandboxAutoToolchains = *fc.Sandbox.AutoToolchains
+	} else if val := os.Getenv("BOB_SANDBOX_AUTO_TOOLCHAINS"); strings.TrimSpace(val) != "" {
+		b, err := strconv.ParseBool(strings.TrimSpace(val))
+		if err == nil {
+			cfg.SandboxAutoToolchains = b
+		}
+	} else if val := os.Getenv("SANDBOX_AUTO_TOOLCHAINS"); strings.TrimSpace(val) != "" {
+		b, err := strconv.ParseBool(strings.TrimSpace(val))
+		if err == nil {
+			cfg.SandboxAutoToolchains = b
+		}
+	}
 
 	if cfg.SandboxDockerImage == "" && len(cfg.SandboxAllowedImages) > 0 {
 		cfg.SandboxDockerImage = cfg.SandboxAllowedImages[0]
@@ -440,6 +476,9 @@ sandbox:
   # max_lifetime: "30m"
   # cpu_limit: 1.0
   # memory_limit_mb: 512
+  # tasks_max: 1024
+  # extra_paths: [] # Additional host directories to mount read-only and prepend to sandbox $PATH
+  # auto_toolchains: false # Automatically discover and mount host dev toolchains (mise, pyenv, cargo)
 `
 
 // WriteTemplate creates a commented default configuration file at path with 0600 permissions,
