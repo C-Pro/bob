@@ -68,7 +68,7 @@ func TestBwrapDriver(t *testing.T) {
 }
 
 func TestBwrap_NetworkRestrictedAirgap(t *testing.T) {
-	driver := NewDriver()
+	driver := NewDriverWithConfig(Config{DataDir: t.TempDir()})
 	ctx := context.Background()
 
 	if !driver.Available(ctx) {
@@ -133,7 +133,7 @@ func TestBwrap_NetworkRestrictedAirgap(t *testing.T) {
 	assert.Contains(t, envRes.Stdout, "localhost,127.0.0.1 localhost,127.0.0.1")
 
 	// 6. In-sandbox local server is accessible directly via loopback without proxy rejection (Finding F7)
-	localRes, err := driver.Exec(ctx, sbx, []string{"sh", "-c", "python3 -m http.server 34567 --bind 127.0.0.1 >/dev/null 2>&1 & PID=$!; sleep 0.3; curl -s http://127.0.0.1:34567/; kill $PID 2>/dev/null || true"}, 5*time.Second)
+	localRes, err := driver.Exec(ctx, sbx, []string{"sh", "-c", "python3 -m http.server 34567 --bind 127.0.0.1 >/dev/null 2>&1 & PID=$!; for i in $(seq 1 30); do out=$(curl -s http://127.0.0.1:34567/ 2>/dev/null); if [ -n \"$out\" ]; then echo \"$out\"; break; fi; sleep 0.1; done; kill $PID 2>/dev/null || true"}, 5*time.Second)
 	require.NoError(t, err)
 	assert.Equal(t, 0, localRes.ExitCode)
 	assert.Contains(t, localRes.Stdout, "Directory listing")
@@ -147,6 +147,12 @@ func TestBwrapDriver_ResolvConf(t *testing.T) {
 		t.Skip("bwrap not available on host, skipping test")
 	}
 
+	hostResolv, err := os.ReadFile("/etc/resolv.conf")
+	if os.IsNotExist(err) {
+		t.Skip("/etc/resolv.conf not found on host, skipping test")
+	}
+	require.NoError(t, err)
+
 	tempDir := t.TempDir()
 	workspace := filepath.Join(tempDir, "user_dns")
 	require.NoError(t, os.MkdirAll(workspace, 0o755))
@@ -159,7 +165,7 @@ func TestBwrapDriver_ResolvConf(t *testing.T) {
 		Status: sandbox.StatusRunning,
 	}
 
-	err := driver.Create(ctx, sbx, workspace)
+	err = driver.Create(ctx, sbx, workspace)
 	require.NoError(t, err)
 	defer func() { _ = driver.Destroy(ctx, sbx) }()
 
@@ -167,7 +173,7 @@ func TestBwrapDriver_ResolvConf(t *testing.T) {
 	require.NoError(t, err)
 	t.Logf("stdout: %q, stderr: %q", res.Stdout, res.Stderr)
 	assert.Equal(t, 0, res.ExitCode, "cat /etc/resolv.conf failed: %s", res.Stderr)
-	assert.NotEmpty(t, res.Stdout)
+	assert.Equal(t, string(hostResolv), res.Stdout)
 }
 
 func TestBwrapDriver_BoundedOutput(t *testing.T) {
@@ -592,3 +598,115 @@ func TestBwrap_ExtraPaths(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid extra path")
 }
 
+func TestBwrap_IsolatedHomeWritableOnReadOnlyWorkspace(t *testing.T) {
+	driver := NewDriver()
+	ctx := context.Background()
+
+	if !driver.Available(ctx) {
+		t.Skip("bwrap not available on host, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	workspace := filepath.Join(tempDir, "workspace")
+	require.NoError(t, os.MkdirAll(workspace, 0o755))
+
+	cacheDir := filepath.Join(tempDir, "cache")
+	require.NoError(t, os.MkdirAll(cacheDir, 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID:            "user-ro-home",
+		Status:            sandbox.StatusRunning,
+		WorkspaceExternal: true,
+		Mounts: []sandbox.UserMount{
+			{
+				RelativePath: ".",
+				SandboxPath:  sandbox.DefaultWorkspaceMountPath,
+				ReadOnly:     true,
+			},
+		},
+		Network: sandbox.NetworkPolicy{
+			Mode: sandbox.NetworkNone,
+		},
+	}
+	sbx.SetWorkspaceDir(workspace)
+	sbx.SetCacheDir(cacheDir)
+
+	err := driver.Create(ctx, sbx, workspace)
+	require.NoError(t, err)
+	defer func() { _ = driver.Destroy(ctx, sbx) }()
+
+	// 1. Verify workspace is indeed read-only
+	res, err := driver.Exec(ctx, sbx, []string{"sh", "-c", "touch /workspace/forbidden.txt"}, 5*time.Second)
+	require.NoError(t, err)
+	assert.NotEqual(t, 0, res.ExitCode, "workspace should be read-only")
+	assert.Contains(t, res.Stderr, "Read-only file system")
+
+	// 2. Verify $HOME is /tmp/bob-cache/home and is writable
+	res, err = driver.Exec(ctx, sbx, []string{"sh", "-c", "echo $HOME; echo 'hello from sandbox' > $HOME/persist.txt"}, 5*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, 0, res.ExitCode, "writing to $HOME should succeed: %s", res.Stderr)
+	assert.Contains(t, res.Stdout, "/tmp/bob-cache/home")
+
+	// 3. Verify file written to $HOME persists across commands within the active run cache
+	res, err = driver.Exec(ctx, sbx, []string{"sh", "-c", "cat $HOME/persist.txt"}, 5*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, 0, res.ExitCode)
+	assert.Contains(t, res.Stdout, "hello from sandbox")
+
+	// 4. Verify host cache directory contains the persisted file
+	hostPersistFile := filepath.Join(cacheDir, "home", "persist.txt")
+	content, err := os.ReadFile(hostPersistFile)
+	require.NoError(t, err)
+	assert.Equal(t, "hello from sandbox\n", string(content))
+}
+
+func TestBwrap_ToolchainPrecedenceEndToEnd(t *testing.T) {
+	driver := NewDriver()
+	ctx := context.Background()
+
+	if !driver.Available(ctx) {
+		t.Skip("bwrap not available on host, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	homeDir := filepath.Join(tempDir, "home")
+	t.Setenv("HOME", homeDir)
+
+	miseDir := filepath.Join(homeDir, ".local", "share", "mise", "installs")
+
+	// 1. Mock Go toolchain containing an older golangci-lint
+	goBin := filepath.Join(miseDir, "go", "1.27.1", "bin")
+	require.NoError(t, os.MkdirAll(goBin, 0o755))
+	goLint := filepath.Join(goBin, "golangci-lint")
+	require.NoError(t, os.WriteFile(goLint, []byte("#!/bin/sh\necho v1.64.8-shadowed\n"), 0o755))
+
+	// 2. Mock dedicated golangci-lint toolchain
+	dedicatedDir := filepath.Join(miseDir, "golangci-lint", "2.13.2", "golangci-lint-2.13.2-linux-amd64")
+	require.NoError(t, os.MkdirAll(dedicatedDir, 0o755))
+	dedicatedLint := filepath.Join(dedicatedDir, "golangci-lint")
+	require.NoError(t, os.WriteFile(dedicatedLint, []byte("#!/bin/sh\necho v2.13.2-dedicated\n"), 0o755))
+
+	// Host PATH deliberately lists go before dedicated linter
+	pathEnv := strings.Join([]string{goBin, dedicatedDir, "/usr/bin"}, string(filepath.ListSeparator))
+	discovered := sandbox.DiscoverToolchains(pathEnv, tempDir, nil)
+	require.Len(t, discovered, 2)
+
+	workspace := filepath.Join(tempDir, "workspace")
+	require.NoError(t, os.MkdirAll(workspace, 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID:     "user-tool-precedence",
+		Status:     sandbox.StatusRunning,
+		Network:    sandbox.NetworkPolicy{Mode: sandbox.NetworkNone},
+		ExtraPaths: discovered,
+	}
+
+	err := driver.Create(ctx, sbx, workspace)
+	require.NoError(t, err)
+	defer func() { _ = driver.Destroy(ctx, sbx) }()
+
+	res, err := driver.Exec(ctx, sbx, []string{"golangci-lint"}, 5*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, 0, res.ExitCode)
+	assert.Equal(t, "v2.13.2-dedicated\n", res.Stdout)
+}

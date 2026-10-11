@@ -123,6 +123,36 @@ func TestDiscoverToolchains_RealHostEnvironment(t *testing.T) {
 	assert.True(t, foundGo, "expected to discover mise go install, got: %v", discovered)
 }
 
+func TestDiscoverToolchains_DedicatedUtilityPrecedence(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	miseDir := filepath.Join(home, ".local", "share", "mise", "installs")
+
+	// Set up go install
+	goDir := filepath.Join(miseDir, "go", "1.27.1")
+	require.NoError(t, os.MkdirAll(filepath.Join(goDir, "bin"), 0o755))
+
+	// Set up golangci-lint install
+	lintDir := filepath.Join(miseDir, "golangci-lint", "2.13.2", "golangci-lint-2.13.2-linux-amd64")
+	require.NoError(t, os.MkdirAll(lintDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(lintDir, "golangci-lint"), []byte("#!/bin/sh\n"), 0o755))
+
+	// Host PATH deliberately lists go BEFORE golangci-lint
+	pathEnv := stringsJoinPath(
+		filepath.Join(goDir, "bin"),
+		lintDir,
+		"/usr/bin",
+	)
+
+	discovered := DiscoverToolchains(pathEnv, t.TempDir(), nil)
+	require.Len(t, discovered, 2)
+
+	// Verify golangci-lint (dedicated utility) precedes go (general SDK) regardless of PATH order
+	assert.Equal(t, lintDir, discovered[0], "expected dedicated utility to take first precedence")
+	assert.Equal(t, goDir, discovered[1], "expected general language SDK to follow dedicated utilities")
+}
+
 func stringsJoinPath(elems ...string) string {
 	res := ""
 	for i, e := range elems {

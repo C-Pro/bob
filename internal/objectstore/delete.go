@@ -2,6 +2,7 @@ package objectstore
 
 import (
 	"context"
+	"errors"
 	"net/http"
 )
 
@@ -11,7 +12,8 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 
 	resp, err := c.doRequest(ctx, "DELETE", u, host, 0, nil)
 	if err != nil {
-		if apiErr, ok := err.(*APIError); ok && apiErr.StatusCode == http.StatusNotFound {
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
 			return nil
 		}
 		return err

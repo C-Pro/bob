@@ -559,7 +559,7 @@ func TestCreateChatCompletion_RequestTimeoutFailsImmediately(t *testing.T) {
 	var attempts int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&attempts, 1)
-		time.Sleep(80 * time.Millisecond)
+		time.Sleep(250 * time.Millisecond)
 	}))
 	defer server.Close()
 
@@ -567,7 +567,7 @@ func TestCreateChatCompletion_RequestTimeoutFailsImmediately(t *testing.T) {
 		OpenAIAPIKey:      "test-key",
 		OpenAIModel:       "gpt-4o-mini",
 		OpenAIBaseURL:     server.URL,
-		LLMRequestTimeout: 30 * time.Millisecond,
+		LLMRequestTimeout: 100 * time.Millisecond,
 	}
 
 	client := NewClient(cfg, nil)
@@ -577,8 +577,8 @@ func TestCreateChatCompletion_RequestTimeoutFailsImmediately(t *testing.T) {
 	var timeoutErr *TimeoutError
 	require.ErrorAs(t, err, &timeoutErr)
 	assert.Equal(t, TimeoutKindRequest, timeoutErr.Kind)
-	assert.Equal(t, 30*time.Millisecond, timeoutErr.Limit)
-	assert.Equal(t, "LLM API timeout (30ms): request exceeded deadline", err.Error())
+	assert.Equal(t, 100*time.Millisecond, timeoutErr.Limit)
+	assert.Equal(t, "LLM API timeout (100ms): request exceeded deadline", err.Error())
 	assert.Equal(t, int32(1), atomic.LoadInt32(&attempts), "request timeout must not be retried")
 }
 
@@ -587,7 +587,7 @@ func TestCreateChatCompletion_FirstByteTimeoutRetriedOnce(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		count := atomic.AddInt32(&attempts, 1)
 		if count == 1 {
-			time.Sleep(80 * time.Millisecond)
+			time.Sleep(250 * time.Millisecond)
 			return
 		}
 		resp := openai.ChatCompletionResponse{
@@ -611,7 +611,7 @@ func TestCreateChatCompletion_FirstByteTimeoutRetriedOnce(t *testing.T) {
 		OpenAIModel:         "gpt-4o-mini",
 		OpenAIBaseURL:       server.URL,
 		LLMRequestTimeout:   5 * time.Second,
-		LLMFirstByteTimeout: 30 * time.Millisecond,
+		LLMFirstByteTimeout: 100 * time.Millisecond,
 	}
 
 	client := NewClient(cfg, nil)
@@ -626,7 +626,7 @@ func TestCreateChatCompletion_FirstByteTimeoutExhausted(t *testing.T) {
 	var attempts int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&attempts, 1)
-		time.Sleep(80 * time.Millisecond)
+		time.Sleep(250 * time.Millisecond)
 	}))
 	defer server.Close()
 
@@ -635,7 +635,7 @@ func TestCreateChatCompletion_FirstByteTimeoutExhausted(t *testing.T) {
 		OpenAIModel:         "gpt-4o-mini",
 		OpenAIBaseURL:       server.URL,
 		LLMRequestTimeout:   5 * time.Second,
-		LLMFirstByteTimeout: 30 * time.Millisecond,
+		LLMFirstByteTimeout: 100 * time.Millisecond,
 	}
 
 	client := NewClient(cfg, nil)
@@ -645,8 +645,8 @@ func TestCreateChatCompletion_FirstByteTimeoutExhausted(t *testing.T) {
 	var timeoutErr *TimeoutError
 	require.ErrorAs(t, err, &timeoutErr)
 	assert.Equal(t, TimeoutKindFirstByte, timeoutErr.Kind)
-	assert.Equal(t, 30*time.Millisecond, timeoutErr.Limit)
-	assert.Equal(t, "LLM API first-byte timeout (30ms): server did not return response headers within timeout", err.Error())
+	assert.Equal(t, 100*time.Millisecond, timeoutErr.Limit)
+	assert.Equal(t, "LLM API first-byte timeout (100ms): server did not return response headers within timeout", err.Error())
 	assert.Equal(t, int32(2), atomic.LoadInt32(&attempts), "first-byte timeout allows at most one retry (2 attempts total)")
 }
 
@@ -654,7 +654,7 @@ func TestCreateEmbeddings_RequestTimeoutFailsImmediately(t *testing.T) {
 	var attempts int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&attempts, 1)
-		time.Sleep(80 * time.Millisecond)
+		time.Sleep(250 * time.Millisecond)
 	}))
 	defer server.Close()
 
@@ -662,7 +662,7 @@ func TestCreateEmbeddings_RequestTimeoutFailsImmediately(t *testing.T) {
 		OpenAIAPIKey:      "test-key",
 		EmbeddingModel:    "text-embedding-3-small",
 		OpenAIBaseURL:     server.URL,
-		LLMRequestTimeout: 30 * time.Millisecond,
+		LLMRequestTimeout: 100 * time.Millisecond,
 	}
 
 	client := NewClient(cfg, nil)
@@ -672,7 +672,7 @@ func TestCreateEmbeddings_RequestTimeoutFailsImmediately(t *testing.T) {
 	var timeoutErr *TimeoutError
 	require.ErrorAs(t, err, &timeoutErr)
 	assert.Equal(t, TimeoutKindRequest, timeoutErr.Kind)
-	assert.Equal(t, "LLM API timeout (30ms): request exceeded deadline", err.Error())
+	assert.Equal(t, "LLM API timeout (100ms): request exceeded deadline", err.Error())
 	assert.Equal(t, int32(1), atomic.LoadInt32(&attempts))
 }
 

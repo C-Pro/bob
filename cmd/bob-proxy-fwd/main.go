@@ -143,8 +143,9 @@ acceptLoop:
 				} else {
 					tempDelay *= 2
 				}
-				if max := 1 * time.Second; tempDelay > max {
-					tempDelay = max
+				const maxDelay = 1 * time.Second
+				if tempDelay > maxDelay {
+					tempDelay = maxDelay
 				}
 				slog.Warn("temporary forwarder accept error, backing off", "error", err, "delay", tempDelay)
 				select {

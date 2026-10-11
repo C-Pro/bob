@@ -454,7 +454,7 @@ func (d *Driver) buildArgs(sbx *sandbox.UserSandbox, cmd []string) ([]string, er
 	args = append(args,
 		"--clearenv",
 		"--setenv", "PATH", sandboxPath,
-		"--setenv", "HOME", sandbox.DefaultWorkspaceMountPath,
+		"--setenv", "HOME", "/tmp/bob-cache/home",
 		"--setenv", "PWD", sandbox.DefaultWorkspaceMountPath,
 		"--setenv", "TERM", "dumb",
 	)
@@ -470,6 +470,7 @@ func (d *Driver) buildArgs(sbx *sandbox.UserSandbox, cmd []string) ([]string, er
 		args = append(args, "--dir", "/tmp/bob-cache")
 	}
 	args = append(args,
+		"--dir", "/tmp/bob-cache/home",
 		"--dir", "/tmp/bob-cache/go",
 		"--dir", "/tmp/bob-cache/go-build",
 		"--dir", "/tmp/bob-cache/golangci-lint",

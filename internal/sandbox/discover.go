@@ -27,10 +27,18 @@ var AllowedToolchainNames = map[string]bool{
 	"java":          true,
 }
 
+// DedicatedToolchainNames defines standalone utility toolchains (linters, formatters, etc.)
+// that take precedence over general language SDK/compiler toolchains in the sandbox PATH.
+var DedicatedToolchainNames = map[string]bool{
+	"golangci-lint": true,
+}
+
 // DiscoverToolchains scans the host environment and standard version managers
 // (such as mise, pyenv, and cargo) for supported developer toolchains and returns
 // validated host mount paths suitable for sandbox ExtraPaths.
 //
+// Dedicated utility toolchains (e.g. golangci-lint) are partitioned to precede general
+// language SDK toolchains (e.g. go, rust, python) in the returned list.
 // Each candidate path is validated via ResolveExtraPath against protectedPaths
 // and blocked roots.
 func DiscoverToolchains(pathEnv, cwd string, protectedPaths []string) []string {
@@ -43,7 +51,8 @@ func DiscoverToolchains(pathEnv, cwd string, protectedPaths []string) []string {
 		return nil
 	}
 
-	var discovered []string
+	var utilityCandidates []string
+	var generalCandidates []string
 	seenMounts := make(map[string]bool)
 	seenTools := make(map[string]bool)
 
@@ -54,7 +63,11 @@ func DiscoverToolchains(pathEnv, cwd string, protectedPaths []string) []string {
 		}
 		if !seenMounts[resolved.HostMountPath] {
 			seenMounts[resolved.HostMountPath] = true
-			discovered = append(discovered, resolved.HostMountPath)
+			if DedicatedToolchainNames[toolName] {
+				utilityCandidates = append(utilityCandidates, resolved.HostMountPath)
+			} else {
+				generalCandidates = append(generalCandidates, resolved.HostMountPath)
+			}
 			if toolName != "" {
 				seenTools[toolName] = true
 			}
@@ -131,7 +144,7 @@ func DiscoverToolchains(pathEnv, cwd string, protectedPaths []string) []string {
 		}
 	}
 
-	return discovered
+	return append(utilityCandidates, generalCandidates...)
 }
 
 // findBestMiseVersionDir locates the active or newest version directory under a mise tool folder.

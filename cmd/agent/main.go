@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"flag"
 	"log/slog"
 	"net/http"
@@ -219,7 +220,7 @@ func main() {
 		}
 		scheduler = backup.NewScheduler(cfg, objClient, activeDBsProvider)
 		go func() {
-			if err := scheduler.Run(ctx); err != nil && err != context.Canceled {
+			if err := scheduler.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				slog.Error("backup scheduler stopped with error", "error", err)
 			}
 		}()
@@ -244,7 +245,7 @@ func main() {
 	}()
 
 	slog.Info("starting agent gateway event loop")
-	if err := gw.Start(ctx); err != nil && err != context.Canceled {
+	if err := gw.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		slog.Error("gateway exited with error", "error", err)
 		os.Exit(1)
 	}

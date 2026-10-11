@@ -2,6 +2,7 @@ package backup
 
 import (
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -97,7 +98,7 @@ func DecodeSnapshot(r io.Reader, secret string, destPath string) error {
 	}()
 
 	const maxDecompressedBytes = 5 << 30 // 5 GiB safety limit
-	if _, err := io.CopyN(tmpFile, gr, maxDecompressedBytes); err != nil && err != io.EOF {
+	if _, err := io.CopyN(tmpFile, gr, maxDecompressedBytes); err != nil && !errors.Is(err, io.EOF) {
 		return fmt.Errorf("failed to write decompressed data: %w", err)
 	}
 	if err := tmpFile.Sync(); err != nil {
