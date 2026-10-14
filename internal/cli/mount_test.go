@@ -172,4 +172,31 @@ func TestParseMountSpec(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "contains protected directory")
 	})
+
+	t.Run("reject user home directory", func(t *testing.T) {
+		home, err := os.UserHomeDir()
+		if err == nil && home != "" {
+			_, err := ParseMountSpec("~", "", protected)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "user home directory")
+
+			_, err = ParseMountSpec("~:rw", "", protected)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "user home directory")
+
+			_, err = ParseMountSpec(home, "", protected)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "user home directory")
+		}
+	})
+
+	t.Run("reject blocked system paths", func(t *testing.T) {
+		for _, blocked := range []string{"/etc", "/proc", "/sys", "/dev", "/run", "/var/run", "/tmp"} {
+			if _, err := os.Stat(blocked); err == nil {
+				_, err := ParseMountSpec(blocked+":rw", "", protected)
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "conflicts with system directory")
+			}
+		}
+	})
 }

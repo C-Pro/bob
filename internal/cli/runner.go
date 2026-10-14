@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"runtime"
 	"strings"
 	"time"
@@ -112,6 +113,7 @@ func Run(ctx context.Context, rt *bootstrap.Runtime, opts Options, stdout, stder
 
 	outWriter := NewOutputWriter(stdout)
 	progress := NewProgressRenderer(outWriter, opts.Quiet)
+	defer progress.Close()
 
 	// Authorize knowledge tools for CLI session
 	rt.ToolsRegistry.SetDMAuthorizer(func(ctx context.Context, chatID, userID string) error {
@@ -121,26 +123,29 @@ func Run(ctx context.Context, rt *bootstrap.Runtime, opts Options, stdout, stder
 	runID := generateRunID()
 
 	var execTool *tools.ExecTool
+	var effectiveDriver string
+	var effectiveNet string
+	var effectiveImage string
 	if opts.Sandbox != nil {
 		if rt.SandboxManager == nil {
 			_, _ = fmt.Fprintln(stderr, "Error: sandbox manager is not enabled or available")
 			return 1
 		}
 
-		driver := opts.Sandbox.Driver
-		if driver == "" && rt.Config != nil {
-			driver = rt.Config.SandboxDefaultDriver
+		effectiveDriver = opts.Sandbox.Driver
+		if effectiveDriver == "" && rt.Config != nil {
+			effectiveDriver = rt.Config.SandboxDefaultDriver
 		}
-		if driver == "" {
-			driver = "bwrap"
+		if effectiveDriver == "" {
+			effectiveDriver = "bwrap"
 		}
-		image := opts.Sandbox.DockerImage
-		if image == "" && rt.Config != nil {
-			image = rt.Config.SandboxDockerImage
+		effectiveImage = opts.Sandbox.DockerImage
+		if effectiveImage == "" && rt.Config != nil {
+			effectiveImage = rt.Config.SandboxDockerImage
 		}
-		netMode := opts.Sandbox.NetworkMode
-		if netMode == "" {
-			netMode = "none"
+		effectiveNet = opts.Sandbox.NetworkMode
+		if effectiveNet == "" {
+			effectiveNet = "none"
 		}
 		lifetime := 30 * time.Minute
 		if rt.Config != nil && rt.Config.SandboxMaxLifetime > 0 {
@@ -148,9 +153,9 @@ func Run(ctx context.Context, rt *bootstrap.Runtime, opts Options, stdout, stder
 		}
 
 		params := sandbox.ProvisionParams{
-			Driver:            sandbox.DriverType(driver),
-			DockerImage:       image,
-			NetworkMode:       sandbox.NetworkMode(netMode),
+			Driver:            sandbox.DriverType(effectiveDriver),
+			DockerImage:       effectiveImage,
+			NetworkMode:       sandbox.NetworkMode(effectiveNet),
 			AllowedDomains:    opts.Sandbox.AllowedDomains,
 			WorkspaceDir:      opts.Sandbox.WorkspaceDir,
 			WorkspaceReadOnly: opts.Sandbox.ReadOnly,
@@ -171,7 +176,11 @@ func Run(ctx context.Context, rt *bootstrap.Runtime, opts Options, stdout, stder
 		}
 		defer func() {
 			if rt.SandboxManager != nil {
-				_ = rt.SandboxManager.Destroy(context.Background(), "local")
+				destroyCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				if err := rt.SandboxManager.Destroy(destroyCtx, "local"); err != nil {
+					slog.Warn("error destroying sandbox during cleanup", "error", err)
+				}
 			}
 			_ = sandbox.RemoveRunCache(runID)
 		}()
@@ -189,15 +198,15 @@ func Run(ctx context.Context, rt *bootstrap.Runtime, opts Options, stdout, stder
 			mountMode = "rw"
 		}
 		execTool = tools.NewExecTool(rt.SandboxManager, "local", tools.ExecToolInfo{
-			Driver:             driver,
+			Driver:             effectiveDriver,
 			WorkspaceMount:     mountMode,
-			Network:            netMode,
+			Network:            effectiveNet,
 			DefaultExecTimeout: defaultTimeout,
 			MaxExecTimeout:     maxTimeout,
 		})
 	}
 
-	fe := NewFrontend(rt.ToolsRegistry, rt.SandboxManager, execTool, progress)
+	fe := NewFrontend(rt.ToolsRegistry, rt.SandboxManager, execTool, progress, effectiveNet)
 	if err := rt.RegisterFrontend("cli", fe); err != nil {
 		_, _ = fmt.Fprintf(stderr, "Error registering frontend: %v\n", err)
 		return 1
@@ -212,7 +221,7 @@ func Run(ctx context.Context, rt *bootstrap.Runtime, opts Options, stdout, stder
 		if rt.Config != nil && rt.Config.CLIMaxIterations > 0 {
 			maxIter = rt.Config.CLIMaxIterations
 		} else {
-			maxIter = 100
+			maxIter = 20
 		}
 	}
 
@@ -255,22 +264,11 @@ func Run(ctx context.Context, rt *bootstrap.Runtime, opts Options, stdout, stder
 
 	var sbInfo *prompt.CLISandboxInfo
 	if opts.Sandbox != nil {
-		driver := opts.Sandbox.Driver
-		if driver == "" && rt.Config != nil {
-			driver = rt.Config.SandboxDefaultDriver
-		}
-		if driver == "" {
-			driver = "bwrap"
-		}
-		netMode := opts.Sandbox.NetworkMode
-		if netMode == "" {
-			netMode = "none"
-		}
 		sbInfo = &prompt.CLISandboxInfo{
 			HostWorkspace:     opts.Sandbox.WorkspaceDir,
 			WorkspaceReadOnly: opts.Sandbox.ReadOnly,
-			Driver:            driver,
-			Network:           netMode,
+			Driver:            effectiveDriver,
+			Network:           effectiveNet,
 		}
 	}
 

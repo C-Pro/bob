@@ -23,57 +23,57 @@ const DefaultMaxAttachmentSizeBytes int64 = 25 * 1024 * 1024
 
 // Config holds runtime configuration settings for the agent.
 type Config struct {
-	BotHandle                  string
-	BesedkaURL                 string
-	BesedkaAPIKey              string
-	OpenAIAPIKey               string
-	OpenAIModel                string
-	OpenAIBaseURL              string
-	GeminiAPIKey               string // Deprecated: backward-compatible fallback for OpenAIAPIKey
-	GeminiModel                string // Deprecated: backward-compatible fallback for OpenAIModel
-	GeminiBaseURL              string // Deprecated: backward-compatible fallback for OpenAIBaseURL
-	LLMRequestTimeout          time.Duration
-	LLMFirstByteTimeout        time.Duration
-	TownhallMaxParagraphs      int
-	DMMaxParagraphs            int
-	MsgRingBufferSize          int
-	TownhallToolMaxIterations  int
-	DMToolMaxIterations        int
-	FSMRetentionDays           int
-	TavilyAPIKey               string
-	TavilyBaseURL              string
-	DataDir                    string
-	EmbeddingModel             string
-	EmbeddingPrecision         string
-	Secret                     string
-	S3Endpoint                 string
-	S3Region                   string
-	S3Bucket                   string
-	S3AccessKey                string
-	S3SecretKey                string
-	S3PathStyle                bool
-	S3BackupInterval           time.Duration
-	S3BackupKeep               int
-	S3BackupPrefix             string
-	SandboxEnabled             bool
-	SandboxDrivers             []string
-	SandboxDockerSocket        string
-	SandboxAllowedImages       []string
-	SandboxAllowedNetworkModes []string
-	SandboxMaxLifetime         time.Duration
-	SandboxDefaultExecTimeout  time.Duration
-	SandboxMaxExecTimeout      time.Duration
-	SandboxCPULimit            float64
-	SandboxMemoryLimitMB       int
-	SandboxTasksMax            int
-	SandboxHostDataDir         string
-	SandboxProxyFwdPath        string
-	SandboxAllowRuntimeBuild   *bool
-	SchedulerMinRunTimeout     time.Duration
-	SchedulerMaxRunTimeout     time.Duration
-	SchedulerMinMaxTurns       int
-	SchedulerMaxMaxTurns       int
-	MaxAttachmentSizeBytes     int64
+	BotHandle                      string
+	BesedkaURL                     string
+	BesedkaAPIKey                  string
+	OpenAIAPIKey                   string
+	OpenAIModel                    string
+	OpenAIBaseURL                  string
+	GeminiAPIKey                   string // Deprecated: backward-compatible fallback for OpenAIAPIKey
+	GeminiModel                    string // Deprecated: backward-compatible fallback for OpenAIModel
+	GeminiBaseURL                  string // Deprecated: backward-compatible fallback for OpenAIBaseURL
+	LLMRequestTimeout              time.Duration
+	LLMFirstByteTimeout            time.Duration
+	TownhallMaxParagraphs          int
+	DMMaxParagraphs                int
+	MsgRingBufferSize              int
+	TownhallToolMaxIterations      int
+	DMToolMaxIterations            int
+	FSMRetentionDays               int
+	TavilyAPIKey                   string
+	TavilyBaseURL                  string
+	DataDir                        string
+	EmbeddingModel                 string
+	EmbeddingPrecision             string
+	Secret                         string
+	S3Endpoint                     string
+	S3Region                       string
+	S3Bucket                       string
+	S3AccessKey                    string
+	S3SecretKey                    string
+	S3PathStyle                    bool
+	S3BackupInterval               time.Duration
+	S3BackupKeep                   int
+	S3BackupPrefix                 string
+	SandboxEnabled                 bool
+	SandboxDrivers                 []string
+	SandboxDockerSocket            string
+	SandboxAllowedImages           []string
+	SandboxAllowedNetworkModes     []string
+	SandboxMaxLifetime             time.Duration
+	SandboxDefaultExecTimeout      time.Duration
+	SandboxMaxExecTimeout          time.Duration
+	SandboxCPULimit                float64
+	SandboxMemoryLimitMB           int
+	SandboxTasksMax                int
+	SandboxHostDataDir             string
+	SandboxProxyFwdPath            string
+	SandboxAllowRuntimeBuild       *bool
+	SchedulerMinRunTimeout         time.Duration
+	SchedulerMaxRunTimeout         time.Duration
+	SchedulerMinMaxTurns           int
+	SchedulerMaxMaxTurns           int
+	MaxAttachmentSizeBytes         int64
 	KnowledgeMaxLoadedMemories     int
 	KnowledgeMaxLoadedMemoryBytes  int
 	KnowledgeMaxLoadedSkills       int
@@ -139,7 +139,7 @@ func Defaults() *Config {
 		SandboxMaxExecTimeout:          10 * time.Minute,
 		SandboxCPULimit:                1.0,
 		SandboxMemoryLimitMB:           512,
-		SandboxTasksMax:                1024,
+		SandboxTasksMax:                64,
 		SchedulerMinRunTimeout:         1 * time.Minute,
 		SchedulerMaxRunTimeout:         1 * time.Hour,
 		SchedulerMinMaxTurns:           10,

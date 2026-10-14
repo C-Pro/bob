@@ -104,7 +104,7 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	assert.Equal(t, 10*time.Minute, cfg.SandboxMaxExecTimeout)
 	assert.Equal(t, 1.0, cfg.SandboxCPULimit)
 	assert.Equal(t, 512, cfg.SandboxMemoryLimitMB)
-	assert.Equal(t, 1024, cfg.SandboxTasksMax)
+	assert.Equal(t, 64, cfg.SandboxTasksMax)
 	assert.Equal(t, "", cfg.SandboxHostDataDir)
 	assert.Equal(t, 1*time.Minute, cfg.SchedulerMinRunTimeout)
 	assert.Equal(t, 1*time.Hour, cfg.SchedulerMaxRunTimeout)
@@ -800,4 +800,3 @@ func TestValidateBesedka(t *testing.T) {
 		assert.ErrorContains(t, cfg.ValidateBesedka(), "invalid TOWNHALL_MAX_PARAGRAPHS: 0")
 	})
 }
-

@@ -56,13 +56,16 @@ func TestRunCache_PurgeAll(t *testing.T) {
 	SetCacheRootOverride(tmpDir)
 	defer SetCacheRootOverride("")
 
-	// Create 3 run caches
+	// Create 3 run caches and release leases to simulate stale/completed runs
 	_, err := AcquireRunCacheDir("run_a", RunCacheMetadata{RunID: "run_a"})
 	require.NoError(t, err)
+	ReleaseRunCache("run_a")
 	_, err = AcquireRunCacheDir("run_b", RunCacheMetadata{RunID: "run_b"})
 	require.NoError(t, err)
+	ReleaseRunCache("run_b")
 	_, err = AcquireRunCacheDir("run_c", RunCacheMetadata{RunID: "run_c"})
 	require.NoError(t, err)
+	ReleaseRunCache("run_c")
 
 	count, err := PurgeAllCaches()
 	require.NoError(t, err)
@@ -74,6 +77,33 @@ func TestRunCache_PurgeAll(t *testing.T) {
 	assert.Equal(t, 0, count2)
 }
 
+func TestRunCache_PurgeAll_PreservesActiveLease(t *testing.T) {
+	tmpDir := t.TempDir()
+	SetCacheRootOverride(tmpDir)
+	defer SetCacheRootOverride("")
+
+	// Create active run (lease held) and stale run (lease released)
+	_, err := AcquireRunCacheDir("active_run", RunCacheMetadata{RunID: "active_run"})
+	require.NoError(t, err)
+	defer ReleaseRunCache("active_run")
+
+	_, err = AcquireRunCacheDir("stale_run", RunCacheMetadata{RunID: "stale_run"})
+	require.NoError(t, err)
+	ReleaseRunCache("stale_run")
+
+	count, err := PurgeAllCaches()
+	require.NoError(t, err)
+	assert.Equal(t, 1, count, "only stale run cache should be purged")
+
+	// Verify active run directory still exists
+	_, err = os.Stat(filepath.Join(tmpDir, "active_run"))
+	assert.NoError(t, err, "active run cache must be preserved")
+
+	// Verify stale run directory was removed
+	_, err = os.Stat(filepath.Join(tmpDir, "stale_run"))
+	assert.True(t, os.IsNotExist(err), "stale run cache must be deleted")
+}
+
 func TestRunCache_ReapStaleCaches(t *testing.T) {
 	tmpDir := t.TempDir()
 	SetCacheRootOverride(tmpDir)
@@ -82,12 +112,13 @@ func TestRunCache_ReapStaleCaches(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
 
-	// 1. Expired cache (by ExpiresAt)
+	// 1. Expired cache (by ExpiresAt, lease released)
 	_, err := AcquireRunCacheDir("expired_run", RunCacheMetadata{
 		RunID:     "expired_run",
 		ExpiresAt: now.Add(-10 * time.Minute),
 	})
 	require.NoError(t, err)
+	ReleaseRunCache("expired_run")
 
 	// 2. Active run in DB (should NOT be reaped)
 	_, err = AcquireRunCacheDir("active_run", RunCacheMetadata{
@@ -95,13 +126,15 @@ func TestRunCache_ReapStaleCaches(t *testing.T) {
 		ExpiresAt: now.Add(1 * time.Hour),
 	})
 	require.NoError(t, err)
+	defer ReleaseRunCache("active_run")
 
-	// 3. Terminal run in DB (should be reaped)
+	// 3. Terminal run in DB (lease released, should be reaped)
 	_, err = AcquireRunCacheDir("terminal_run", RunCacheMetadata{
 		RunID:     "terminal_run",
 		ExpiresAt: now.Add(1 * time.Hour),
 	})
 	require.NoError(t, err)
+	ReleaseRunCache("terminal_run")
 
 	checker := func(_ context.Context, meta RunCacheMetadata) (bool, error) {
 		switch meta.RunID {
@@ -136,4 +169,3 @@ func TestSanitizeRunKey_NoCollision(t *testing.T) {
 	assert.Equal(t, "a_run", k1)
 	assert.Equal(t, "b_run", k2)
 }
-

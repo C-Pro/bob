@@ -299,7 +299,7 @@ func TestRun_ToolCall_ProgressAndQuiet(t *testing.T) {
 									ID:   "call_fetch_1",
 									Type: "function",
 									Function: openai.FunctionCall{
-										Name: "web_fetch",
+										Name:      "web_fetch",
 										Arguments: fmt.Sprintf(`{"url": "%s"}`, pageServer.URL),
 									},
 								},

@@ -60,7 +60,7 @@ func DefaultConfig() Config {
 		MaxExecTimeout:      10 * time.Minute,
 		CPULimit:            1.0,
 		MemoryLimitMB:       512,
-		TasksMax:            1024,
+		TasksMax:            64,
 		DataDir:             "./data",
 	}
 }

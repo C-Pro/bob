@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -54,22 +55,22 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 func runWithFactory(args []string, stdin io.Reader, stdout, stderr io.Writer, factory runtimeFactoryFunc) int {
 	var (
-		promptVal     string
-		quietVal      bool
-		verboseVal    bool
-		initConfigVal  bool
-		purgeCachesVal bool
-		configVal      string
-		mountVal      string
-		sandboxVal    string
-		netVal        string
-		imageVal      string
-		modelVal      string
-		maxIterVal    int
-		timeoutVal    time.Duration
-		allowDomains       stringSliceFlag
-		extraPaths         stringSliceFlag
-		autoToolchainsVal  bool
+		promptVal         string
+		quietVal          bool
+		verboseVal        bool
+		initConfigVal     bool
+		purgeCachesVal    bool
+		configVal         string
+		mountVal          string
+		sandboxVal        string
+		netVal            string
+		imageVal          string
+		modelVal          string
+		maxIterVal        int
+		timeoutVal        time.Duration
+		allowDomains      stringSliceFlag
+		extraPaths        stringSliceFlag
+		autoToolchainsVal bool
 	)
 
 	fs := flag.NewFlagSet("bob", flag.ContinueOnError)
@@ -90,7 +91,7 @@ func runWithFactory(args []string, stdin io.Reader, stdout, stderr io.Writer, fa
 	fs.StringVar(&netVal, "net", "", "Sandbox network mode ('none', 'restricted', 'full')")
 	fs.StringVar(&imageVal, "image", "", "Docker container image")
 	fs.StringVar(&modelVal, "model", "", "LLM model override")
-	fs.IntVar(&maxIterVal, "max-iterations", 0, "Maximum tool iterations (default 100)")
+	fs.IntVar(&maxIterVal, "max-iterations", 0, "Maximum tool iterations (default 20)")
 	fs.DurationVar(&timeoutVal, "timeout", 1*time.Hour, "Overall execution timeout")
 	fs.Var(&allowDomains, "allow-domain", "Allowed domain in restricted network mode (repeatable)")
 	fs.Var(&extraPaths, "extra-path", "Extra host directory to mount read-only and add to sandbox $PATH (repeatable)")
@@ -283,6 +284,11 @@ func runWithFactory(args []string, stdin io.Reader, stdout, stderr io.Writer, fa
 	sigCtx, stopSignal := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignal()
 
+	go func() {
+		<-sigCtx.Done()
+		stopSignal() // Unregister signal handler so a second signal terminates process immediately
+	}()
+
 	ctx, cancelTimeout := context.WithTimeout(sigCtx, timeoutVal)
 	defer cancelTimeout()
 
@@ -394,9 +400,19 @@ func runWithFactory(args []string, stdin io.Reader, stdout, stderr io.Writer, fa
 	opts.Timeout = timeoutVal
 
 	if promptVal == "-" {
-		lr := io.LimitReader(stdin, cfg.MaxAttachmentSizeBytes+1)
-		data, err := io.ReadAll(lr)
+		if stdin == nil {
+			_, _ = fmt.Fprintln(stderr, "Error: stdin is not available")
+			return 1
+		}
+		data, err := readAllWithContext(ctx, stdin, cfg.MaxAttachmentSizeBytes+1)
 		if err != nil {
+			if errors.Is(err, context.Canceled) || (sigCtx.Err() != nil && errors.Is(sigCtx.Err(), context.Canceled)) {
+				return 130
+			}
+			if errors.Is(err, context.DeadlineExceeded) || (ctx.Err() != nil && errors.Is(ctx.Err(), context.DeadlineExceeded)) {
+				_, _ = fmt.Fprintln(stderr, "Error: timed out reading stdin")
+				return 1
+			}
 			_, _ = fmt.Fprintf(stderr, "Error reading stdin: %v\n", err)
 			return 1
 		}
@@ -418,9 +434,15 @@ func runWithFactory(args []string, stdin io.Reader, stdout, stderr io.Writer, fa
 			isTTY = isatty.IsTerminal(f.Fd()) || isatty.IsCygwinTerminal(f.Fd())
 		}
 		if !isTTY && stdin != nil {
-			lr := io.LimitReader(stdin, cfg.MaxAttachmentSizeBytes+1)
-			data, err := io.ReadAll(lr)
+			data, err := readAllWithContext(ctx, stdin, cfg.MaxAttachmentSizeBytes+1)
 			if err != nil {
+				if errors.Is(err, context.Canceled) || (sigCtx.Err() != nil && errors.Is(sigCtx.Err(), context.Canceled)) {
+					return 130
+				}
+				if errors.Is(err, context.DeadlineExceeded) || (ctx.Err() != nil && errors.Is(ctx.Err(), context.DeadlineExceeded)) {
+					_, _ = fmt.Fprintln(stderr, "Error: timed out reading stdin")
+					return 1
+				}
 				_, _ = fmt.Fprintf(stderr, "Error reading stdin: %v\n", err)
 				return 1
 			}
@@ -442,24 +464,56 @@ func runWithFactory(args []string, stdin io.Reader, stdout, stderr io.Writer, fa
 		return 1
 	}
 
+	var closeOnce sync.Once
 	var closeErr error
+	closeRuntime := func() error {
+		closeOnce.Do(func() {
+			closeErr = rt.Close()
+			if closeErr != nil {
+				slog.Warn("error closing runtime", "error", closeErr)
+			}
+		})
+		return closeErr
+	}
 	defer func() {
-		if err := rt.Close(); err != nil {
-			closeErr = err
-			slog.Warn("error closing runtime", "error", err)
-		}
+		_ = closeRuntime()
 	}()
 
 	exitCode := cli.Run(ctx, rt, opts, stdout, stderr)
+	if err := closeRuntime(); err != nil {
+		_, _ = fmt.Fprintf(stderr, "Error closing runtime: %v\n", err)
+		if exitCode == 0 {
+			exitCode = 1
+		}
+	}
 	if sigCtx.Err() != nil && errors.Is(sigCtx.Err(), context.Canceled) {
 		return 130
 	}
 	if ctx.Err() != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return 1
 	}
-	if exitCode == 0 && closeErr != nil {
-		_, _ = fmt.Fprintf(stderr, "Error closing runtime: %v\n", closeErr)
-		return 1
-	}
 	return exitCode
+}
+
+func readAllWithContext(ctx context.Context, r io.Reader, limit int64) ([]byte, error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	ch := make(chan readResult, 1)
+	go func() {
+		lr := io.LimitReader(r, limit)
+		data, err := io.ReadAll(lr)
+		ch <- readResult{data: data, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-ch:
+		return res.data, res.err
+	}
 }

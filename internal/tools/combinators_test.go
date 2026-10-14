@@ -12,9 +12,9 @@ import (
 )
 
 type mockToolset struct {
-	defs      []agentapi.ToolDefinition
-	calls     []agentapi.ToolCall
-	execFunc  func(ctx context.Context, call agentapi.ToolCall) (agentapi.ToolResult, error)
+	defs     []agentapi.ToolDefinition
+	calls    []agentapi.ToolCall
+	execFunc func(ctx context.Context, call agentapi.ToolCall) (agentapi.ToolResult, error)
 }
 
 func (m *mockToolset) Definitions(ctx context.Context) ([]agentapi.ToolDefinition, error) {

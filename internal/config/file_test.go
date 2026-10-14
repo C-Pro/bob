@@ -369,7 +369,7 @@ func TestWriteTemplate(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, cfg)
 	assert.Equal(t, "gemini-3.8-flash", cfg.OpenAIModel)
-	assert.Equal(t, 100, cfg.CLIMaxIterations)
+	assert.Equal(t, 20, cfg.CLIMaxIterations)
 	assert.Equal(t, "bwrap", cfg.SandboxDefaultDriver)
 
 	// Template has blank api_key, so ValidateCLI reports missing api_key
@@ -523,6 +523,3 @@ llm:
 		assert.True(t, cfg.SandboxAutoToolchains)
 	})
 }
-
-
-

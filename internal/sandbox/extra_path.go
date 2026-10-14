@@ -23,6 +23,7 @@ var BlockedHostPathRoots = []string{
 	"/sys",
 	"/dev",
 	"/run",
+	"/var/run",
 	"/root",
 	"/etc",
 	"/boot",
@@ -37,6 +38,7 @@ var BlockedHostExactPaths = []string{
 	"/lib",
 	"/lib64",
 	"/tmp",
+	"/var/tmp",
 }
 
 func isBlockedHostPath(p string) (string, bool) {
@@ -51,6 +53,11 @@ func isBlockedHostPath(p string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// IsBlockedHostPath reports whether path p matches a blocked host root, exact path, or descendant.
+func IsBlockedHostPath(p string) (string, bool) {
+	return isBlockedHostPath(p)
 }
 
 // DefaultSensitivePaths returns standard sensitive host paths that must never
@@ -130,12 +137,12 @@ func CanonicalizeProtected(path string) string {
 
 // ResolveExtraPath validates a raw path specification for an extra sandbox mount.
 // It verifies:
-// 1. Path is non-empty and contains no colons or newlines (which break $PATH).
-// 2. Tilde and relative paths are expanded securely.
-// 3. The target exists, is a directory, and symlinks are evaluated.
-// 4. The path is not root ('/'), user $HOME, or equal/ancestor/descendant of any protected path.
-// 5. If the path has a bin/ subdirectory, the root is mounted and root/bin is prepended to $PATH.
-//    If the path is already a bin directory with a valid toolchain parent, the toolchain parent
+//  1. Path is non-empty and contains no colons or newlines (which break $PATH).
+//  2. Tilde and relative paths are expanded securely.
+//  3. The target exists, is a directory, and symlinks are evaluated.
+//  4. The path is not root ('/'), user $HOME, or equal/ancestor/descendant of any protected path.
+//  5. If the path has a bin/ subdirectory, the root is mounted and root/bin is prepended to $PATH.
+//     If the path is already a bin directory with a valid toolchain parent, the toolchain parent
 func ResolveExtraPath(rawPath, cwd string, protectedPaths []string) (*ResolvedExtraPath, error) {
 	if strings.ContainsAny(rawPath, "\n\r") {
 		return nil, fmt.Errorf("extra path %q contains invalid characters (newlines)", rawPath)
@@ -216,7 +223,7 @@ func ResolveExtraPath(rawPath, cwd string, protectedPaths []string) (*ResolvedEx
 	mountRoot := canonical
 	binPath := canonical
 
-	// Case 1: Target directory has a bin/ subdirectory (e.g. toolchain root)
+	// If target directory has a bin/ subdirectory (e.g. toolchain root), mount root and add bin to PATH.
 	binSubdir := filepath.Join(canonical, "bin")
 	if fi, err := os.Stat(binSubdir); err == nil && fi.IsDir() {
 		binCanon, err := filepath.EvalSymlinks(binSubdir)
@@ -227,51 +234,6 @@ func ResolveExtraPath(rawPath, cwd string, protectedPaths []string) (*ResolvedEx
 			return nil, fmt.Errorf("bin subdirectory %q symlink escapes mount root %q", binCanon, canonical)
 		}
 		binPath = binCanon
-	} else if filepath.Base(canonical) == "bin" {
-		// Case 2: Target directory ends in bin. Check if parent is a dedicated toolchain directory
-		// that should be mounted to provide stdlib/headers/libraries, while strictly ensuring
-		// parent is not home, not ~/.local, and not violating any protected paths or system prefixes.
-		parent := filepath.Dir(canonical)
-		parentCanon, err := filepath.EvalSymlinks(parent)
-		if err == nil && parentCanon != "/" && parentCanon != home && parentCanon != realHome {
-			// Avoid promoting ~/.local/bin to ~/.local
-			localDir := filepath.Join(home, ".local")
-			realLocalDir, _ := filepath.EvalSymlinks(localDir)
-			isLocalRoot := parentCanon == localDir || (realLocalDir != "" && parentCanon == realLocalDir)
-
-			if !isLocalRoot {
-				hasToolchainFiles := false
-				for _, marker := range []string{"lib", "src", "pkg", "include"} {
-					if fi, err := os.Stat(filepath.Join(parentCanon, marker)); err == nil && fi.IsDir() {
-						hasToolchainFiles = true
-						break
-					}
-				}
-				if hasToolchainFiles {
-					// Guard: verify parent against all protected paths and system directories before promoting
-					parentSafe := true
-					for _, p := range protectedPaths {
-						if p == "" {
-							continue
-						}
-						pCanon := CanonicalizeProtected(p)
-						if IsSubpath(parentCanon, pCanon) || IsSubpath(pCanon, parentCanon) {
-							parentSafe = false
-							break
-						}
-					}
-					if parentSafe {
-						if _, isBlocked := isBlockedHostPath(parentCanon); isBlocked {
-							parentSafe = false
-						}
-					}
-					if parentSafe {
-						mountRoot = parentCanon
-						binPath = canonical
-					}
-				}
-			}
-		}
 	}
 
 	// Final check on mountRoot against blocked system paths

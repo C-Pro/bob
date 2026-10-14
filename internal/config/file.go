@@ -74,8 +74,8 @@ func ExpandPath(p string) (string, error) {
 
 type fileConfig struct {
 	LLM struct {
-		APIKey             string  `yaml:"api_key"`
-		BaseURL            *string `yaml:"base_url"`
+		APIKey             string         `yaml:"api_key"`
+		BaseURL            *string        `yaml:"base_url"`
 		Model              *string        `yaml:"model"`
 		RequestTimeout     *time.Duration `yaml:"request_timeout"`
 		FirstByteTimeout   *time.Duration `yaml:"first_byte_timeout"`
@@ -95,8 +95,8 @@ type fileConfig struct {
 		TavilyAPIKey  *string `yaml:"tavily_api_key"`
 		TavilyBaseURL *string `yaml:"tavily_base_url"`
 	} `yaml:"web"`
-	DataDir   *string `yaml:"data_dir"`
-	CLI       struct {
+	DataDir *string `yaml:"data_dir"`
+	CLI     struct {
 		MaxIterations *int `yaml:"max_iterations"`
 	} `yaml:"cli"`
 	Knowledge struct {
@@ -192,6 +192,7 @@ func LoadFromFile(path string) (*Config, error) {
 	}
 	cfg.SandboxEnabled = false
 	cfg.SandboxAllowedNetworkModes = []string{"none", "restricted", "full"}
+	cfg.SandboxTasksMax = 1024
 
 	// 1. LLM Settings
 	apiKey := strings.TrimSpace(fc.LLM.APIKey)
@@ -456,7 +457,7 @@ web:
 # data_dir: "~/.local/share/bob"
 
 cli:
-  max_iterations: 100
+  max_iterations: 20
 
 knowledge:
   # max_loaded_memories: 8
@@ -519,4 +520,3 @@ func WriteTemplate(path string) error {
 
 	return nil
 }
-

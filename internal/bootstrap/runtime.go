@@ -128,6 +128,7 @@ func New(cfg *config.Config, opts Options) (*Runtime, error) {
 			AllowedImages:     sbxCfg.AllowedImages,
 			CPULimit:          sbxCfg.CPULimit,
 			MemoryLimitMB:     sbxCfg.MemoryLimitMB,
+			TasksMax:          sbxCfg.TasksMax,
 			DataDir:           sbxCfg.DataDir,
 			HostDataDir:       sbxCfg.HostDataDir,
 			ProxyFwdPath:      sbxCfg.ProxyFwdPath,

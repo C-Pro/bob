@@ -419,7 +419,6 @@ func TestDockerDriver_Create_ForwarderBinaryMissing(t *testing.T) {
 	assert.Nil(t, driver.proxies[sbx.UserID], "no proxy should be stored on failure")
 }
 
-
 func TestDockerDriver_AutoPullMissingImage_Success(t *testing.T) {
 	tempDir := t.TempDir()
 	sockPath := filepath.Join(tempDir, "mock_docker_pull.sock")
@@ -1371,7 +1370,6 @@ func TestDockerDriver_RealDocker_NetworkRestricted_ConcurrentExec(t *testing.T) 
 		assert.NoError(t, err)
 	}
 }
-
 
 func TestDockerDriver_Destroy_ProxySocketCleanup(t *testing.T) {
 	tempDir := t.TempDir()

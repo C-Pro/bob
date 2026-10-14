@@ -31,14 +31,20 @@ Running `bob` without `-p` is reserved for the future TUI. In this track it prin
 | `--config PATH` | `$XDG_CONFIG_HOME/bob/config.yaml` (fallback `~/.config/bob/config.yaml`) | — |
 | `--mount PATH[:ro\|:rw]` | none (no sandbox) | Single workspace. `.` = CWD. Access defaults to `:ro`. |
 | `--sandbox bwrap\|docker` | `bwrap` (or `sandbox.default_driver`) | Requires `--mount`. |
+| `--driver bwrap\|docker` | Alias for `--sandbox` | Requires `--mount`. |
 | `--net none\|restricted\|full` | `none` | Requires `--mount`. |
 | `--allow-domain HOST` (repeatable) | — | Requires `--net restricted`. |
 | `--image IMAGE` | `sandbox.docker_image` | Requires `--sandbox docker`; must be in `sandbox.allowed_images`. |
+| `--extra-path PATH` (repeatable) | `sandbox.extra_paths` | Requires `--mount`. Mounts host directory read-only and adds contained `bin/` (or directory itself) to sandbox $PATH. |
+| `--auto-toolchains` | `sandbox.auto_toolchains` (false) | Requires `--mount`. Discovers host version managers (mise, asdf, pyenv, cargo, rustup, nvm) and mounts toolchains read-only. |
+| `--discover-toolchains` | Alias for `--auto-toolchains` | Requires `--mount`. |
 | `--model NAME` | `llm.model` | — |
 | `--max-iterations N` | `cli.max_iterations` (20) | `N > 0` |
+| `--timeout DURATION` | 1h | Overall execution timeout covering stdin reading and LLM execution. |
 | `-q`, `--quiet` | false | Suppresses intermediate step output; stdout contains only the final answer. |
 | `-v`, `--verbose` | false | Debug-level structured logs on stderr. |
 | `--init-config` | — | Writes a commented template config (mode 0600, dir 0700), refuses to overwrite, then exits. |
+| `--purge-caches` | — | Purges inactive sandbox cache directories and reports count, skipping actively leased caches. |
 
 Invalid combinations (for example `--sandbox` without `--mount`, or `--allow-domain` without `--net restricted`) are usage errors that exit with code 2 before any network or LLM activity.
 
@@ -120,7 +126,9 @@ The CLI frontend provisions the sandbox **before** the run starts, so failures s
 
 | Tool | Description |
 |------|-------------|
-| `execute` | Runs `sh -c <command>` inside the pre-provisioned sandbox. Args: `command` (required), `description`, `timeout_seconds` (clamped to `max_exec_timeout`). `ReadOnly: false` so dispatch is sequential. The tool description states driver, `/workspace` access (ro/rw) and network mode. Output format matches `sandbox_exec` through a shared formatter. |
+| `execute` | Runs `sh -c <command>` inside the pre-provisioned sandbox. Args: `command` (required), `description`, `timeout_seconds` (default 60s, clamped between 5s and `max_exec_timeout` 600s). `ReadOnly: false` so dispatch is sequential. The tool description states driver, `/workspace` access (ro/rw) and network mode. Output format matches `sandbox_exec` through a shared formatter. |
+
+When a workspace is mounted and the network mode is `none` or `restricted`, host web tools (`web_search`, `web_fetch`) are omitted from the allowed toolset to prevent model prompt-injection data exfiltration. Web tools are only enabled when no workspace is mounted or when `--net full` is explicitly requested.
 
 ### 4.3 Enforcement
 - `tools.AllowlistToolset(base, names...)` filters both `Definitions` and `Execute`. Calls to tools outside the allowlist are rejected and never reach the registry, which preserves the strict tool authority from the decoupling track.
@@ -129,12 +137,16 @@ The CLI frontend provisions the sandbox **before** the run starts, so failures s
 
 ## 5. Sandbox Provisioning
 
-### 5.1 Mount Specification
-`ParseMountSpec(spec, cwd)`:
+### 5.1 Mount Specification & Security Policy
+`sandbox.ValidateWorkspaceDir(rawPath, cwd, protectedPaths)` (enforced in both `ParseMountSpec` and `Manager.Provision`):
 1. Split an optional trailing `:ro` / `:rw` suffix (only these exact suffixes, so paths containing `:` still work). Default is `ro`.
 2. Expand `.` and relative paths against CWD, plus leading `~/`. Resolve with `filepath.Abs` + `filepath.EvalSymlinks`.
 3. The path must exist and be a directory.
-4. **Reject** `/`, and any path that is equal to, an ancestor of, or a descendant of the resolved **config directory** or **data directory**. This prevents leaking `config.yaml` (API keys) or SQLite databases into the sandbox. Example: mounting `$HOME` is rejected while `~/.config/bob` lives under it, with an explanatory error.
+4. **Reject root `/` and user home directory `~`** to prevent catastrophic host exposure.
+5. **System-path blocklist:** Rejects system directories and their descendants (`/proc`, `/sys`, `/dev`, `/run`, `/var/run`, `/root`, `/etc`, `/boot`, `/usr`, `/bin`, `/lib`, `/tmp`, `/var/tmp`).
+6. **Bidirectional containment check:** Rejects any path that is equal to, an ancestor of, or a descendant of protected paths (e.g. data directory, config directory containing API keys).
+7. Extra paths (`--extra-path`) mount canonical paths read-only without sibling/parent directory promotion.
+8. Cache directories are protected with advisory process locks (`flock`) to prevent concurrent runs or `--purge-caches` from deleting active caches.
 
 ### 5.2 Pre-Approved Provisioning
 New `sandbox.Manager.Provision(ctx, userID, chatID string, p ProvisionParams) (*UserSandbox, error)`:

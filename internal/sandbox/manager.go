@@ -302,8 +302,8 @@ func (m *Manager) RequestSandbox(ctx context.Context, userID, chatID string, par
 		Reason:         params.Reason,
 		CreatedAt:      now,
 		ExpiresAt:      now.Add(lifetime),
-		Status:       StatusPendingApproval,
-		WorkspaceDir: userWorkspace,
+		Status:         StatusPendingApproval,
+		WorkspaceDir:   userWorkspace,
 	}
 
 	m.mu.Lock()
@@ -714,19 +714,9 @@ func (m *Manager) Provision(ctx context.Context, userID, chatID string, params P
 	}
 
 	// Validate workspace directory
-	if strings.TrimSpace(params.WorkspaceDir) == "" {
-		return nil, errors.New("workspace directory cannot be empty")
-	}
-	absWorkspace, err := filepath.Abs(params.WorkspaceDir)
+	absWorkspace, err := ValidateWorkspaceDir(params.WorkspaceDir, "", params.ProtectedPaths)
 	if err != nil {
-		return nil, fmt.Errorf("failed to resolve workspace directory: %w", err)
-	}
-	stat, err := os.Stat(absWorkspace)
-	if err != nil {
-		return nil, fmt.Errorf("workspace directory %q does not exist: %w", absWorkspace, err)
-	}
-	if !stat.IsDir() {
-		return nil, fmt.Errorf("workspace directory %q is not a directory", absWorkspace)
+		return nil, fmt.Errorf("invalid workspace directory: %w", err)
 	}
 
 	// Validate network mode
@@ -924,4 +914,3 @@ func (m *Manager) Provision(ctx context.Context, userID, chatID string, params P
 
 	return sbx, nil
 }
-

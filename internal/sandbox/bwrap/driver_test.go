@@ -239,10 +239,10 @@ func TestBwrapDriver_ExecTimeout(t *testing.T) {
 }
 
 func TestBuildSystemdArgs(t *testing.T) {
-	// Case 1: Default mem, positive cpuLimit, default tasksMax (0 -> 1024)
+	// Case 1: Default mem, positive cpuLimit, default tasksMax (0 -> 64)
 	args := buildSystemdArgs(0, 1.5, 0, "/usr/bin/bwrap", []string{"--ro-bind", "/usr", "/usr"})
 	assert.Contains(t, args, "MemoryMax=512M")
-	assert.Contains(t, args, "TasksMax=1024")
+	assert.Contains(t, args, "TasksMax=64")
 	assert.Contains(t, args, "CPUQuota=150%")
 	assert.Contains(t, args, "/usr/bin/bwrap")
 	assert.Contains(t, args, "--ro-bind")
@@ -658,6 +658,45 @@ func TestBwrap_IsolatedHomeWritableOnReadOnlyWorkspace(t *testing.T) {
 	content, err := os.ReadFile(hostPersistFile)
 	require.NoError(t, err)
 	assert.Equal(t, "hello from sandbox\n", string(content))
+}
+
+func TestBwrap_InternalWorkspace_HOME(t *testing.T) {
+	driver := NewDriver()
+	ctx := context.Background()
+
+	if !driver.Available(ctx) {
+		t.Skip("bwrap not available on host, skipping test")
+	}
+
+	tempDir := t.TempDir()
+	workspace := filepath.Join(tempDir, "workspace")
+	require.NoError(t, os.MkdirAll(workspace, 0o755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID:            "user-daemon-scratch",
+		Status:            sandbox.StatusRunning,
+		WorkspaceExternal: false,
+		Mounts: []sandbox.UserMount{
+			{
+				RelativePath: ".",
+				SandboxPath:  sandbox.DefaultWorkspaceMountPath,
+				ReadOnly:     false,
+			},
+		},
+		Network: sandbox.NetworkPolicy{
+			Mode: sandbox.NetworkNone,
+		},
+	}
+	sbx.SetWorkspaceDir(workspace)
+
+	err := driver.Create(ctx, sbx, workspace)
+	require.NoError(t, err)
+	defer func() { _ = driver.Destroy(ctx, sbx) }()
+
+	res, err := driver.Exec(ctx, sbx, []string{"sh", "-c", "echo $HOME"}, 5*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, 0, res.ExitCode)
+	assert.Equal(t, "/workspace", strings.TrimSpace(res.Stdout), "daemon scratch workspace must have HOME=/workspace")
 }
 
 func TestBwrap_ToolchainPrecedenceEndToEnd(t *testing.T) {

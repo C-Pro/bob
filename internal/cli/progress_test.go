@@ -3,8 +3,10 @@ package cli
 import (
 	"bytes"
 	"context"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"bob/internal/agentapi"
 	"bob/internal/fsm"
@@ -178,4 +180,239 @@ func TestSummarizeArgs_KnowledgeTools(t *testing.T) {
 
 	// propose_skill
 	assert.Equal(t, "docker_build", summarizeArgs("propose_skill", `{"name":"docker_build","description":"builds docker images"}`))
+}
+
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *safeBuffer) Write(p []byte) (n int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *safeBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+func TestProgressRenderer_LiveStep_TTY(t *testing.T) {
+	var buf safeBuffer
+	writer := NewOutputWriter(&buf)
+	writer.SetTTY(true)
+	renderer := NewProgressRenderer(writer, false)
+	defer renderer.Close()
+
+	curTime := time.Unix(1000, 0)
+	var timeMu sync.Mutex
+	renderer.timeNow = func() time.Time {
+		timeMu.Lock()
+		defer timeMu.Unlock()
+		return curTime
+	}
+	renderer.SetTickerInterval(10 * time.Millisecond)
+
+	ctx := context.Background()
+	start := int64(1000)
+
+	// Step starts running
+	step := &fsm.FSMStep{
+		ID:        "step-live-1",
+		ToolName:  "execute",
+		ArgsJSON:  `{"command":"go test ./..."}`,
+		Status:    fsm.StepStatusRunning,
+		StartedAt: &start,
+	}
+	renderer.OnStepUpdate(ctx, step)
+
+	// Verify initial (0s) was rendered
+	assert.Contains(t, buf.String(), "\r\x1b[K\x1b[36m•\x1b[0m \x1b[1mexecute\x1b[0m go test ./... \x1b[2m(0s)\x1b[0m")
+
+	// Advance time by 1s and sleep for ticker to fire
+	timeMu.Lock()
+	curTime = time.Unix(1001, 0)
+	timeMu.Unlock()
+	time.Sleep(25 * time.Millisecond)
+
+	assert.Contains(t, buf.String(), "\r\x1b[K\x1b[36m•\x1b[0m \x1b[1mexecute\x1b[0m go test ./... \x1b[2m(1s)\x1b[0m")
+
+	// Advance time by another 1s and sleep for ticker to fire
+	timeMu.Lock()
+	curTime = time.Unix(1002, 0)
+	timeMu.Unlock()
+	time.Sleep(25 * time.Millisecond)
+
+	assert.Contains(t, buf.String(), "\r\x1b[K\x1b[36m•\x1b[0m \x1b[1mexecute\x1b[0m go test ./... \x1b[2m(2s)\x1b[0m")
+
+	// Step completes
+	finish := int64(1002)
+	completedStep := &fsm.FSMStep{
+		ID:          "step-live-1",
+		ToolName:    "execute",
+		ArgsJSON:    `{"command":"go test ./..."}`,
+		Status:      fsm.StepStatusCompleted,
+		StartedAt:   &start,
+		CompletedAt: &finish,
+	}
+	renderer.OnStepUpdate(ctx, completedStep)
+
+	// Final answer
+	err := writer.WriteFinalAnswer("Done.")
+	require.NoError(t, err)
+
+	out := buf.String()
+	expectedSuffix := "\r\x1b[K\x1b[36m•\x1b[0m \x1b[1mexecute\x1b[0m go test ./... \x1b[2m(2s)\x1b[0m\n\nDone.\n"
+	assert.True(t, strings.HasSuffix(out, expectedSuffix), "expected output to end with:\n%q\nbut got:\n%q", expectedSuffix, out)
+}
+
+func TestProgressRenderer_LiveStep_NonTTY(t *testing.T) {
+	var buf safeBuffer
+	writer := NewOutputWriter(&buf)
+	writer.SetTTY(false)
+	renderer := NewProgressRenderer(writer, false)
+	defer renderer.Close()
+
+	curTime := time.Unix(1000, 0)
+	var timeMu sync.Mutex
+	renderer.timeNow = func() time.Time {
+		timeMu.Lock()
+		defer timeMu.Unlock()
+		return curTime
+	}
+	renderer.SetTickerInterval(10 * time.Millisecond)
+
+	ctx := context.Background()
+	start := int64(1000)
+
+	step := &fsm.FSMStep{
+		ID:        "step-live-2",
+		ToolName:  "web_search",
+		ArgsJSON:  `{"query":"golang"}`,
+		Status:    fsm.StepStatusRunning,
+		StartedAt: &start,
+	}
+	renderer.OnStepUpdate(ctx, step)
+	assert.Contains(t, buf.String(), "\r• web_search \"golang\" (0s)")
+
+	timeMu.Lock()
+	curTime = time.Unix(1001, 0)
+	timeMu.Unlock()
+	time.Sleep(25 * time.Millisecond)
+
+	assert.Contains(t, buf.String(), "\r• web_search \"golang\" (1s)")
+
+	finish := int64(1001)
+	completedStep := &fsm.FSMStep{
+		ID:          "step-live-2",
+		ToolName:    "web_search",
+		ArgsJSON:    `{"query":"golang"}`,
+		Status:      fsm.StepStatusCompleted,
+		StartedAt:   &start,
+		CompletedAt: &finish,
+	}
+	renderer.OnStepUpdate(ctx, completedStep)
+
+	err := writer.WriteFinalAnswer("Found results.")
+	require.NoError(t, err)
+
+	out := buf.String()
+	assert.True(t, strings.HasSuffix(out, "\r• web_search \"golang\" (1s)\n\nFound results.\n"))
+}
+
+func TestProgressRenderer_LiveStep_Failure(t *testing.T) {
+	var buf safeBuffer
+	writer := NewOutputWriter(&buf)
+	writer.SetTTY(false)
+	renderer := NewProgressRenderer(writer, false)
+	defer renderer.Close()
+
+	ctx := context.Background()
+	start := int64(1000)
+
+	step := &fsm.FSMStep{
+		ID:        "step-fail-1",
+		ToolName:  "execute",
+		ArgsJSON:  `{"command":"make broken"}`,
+		Status:    fsm.StepStatusRunning,
+		StartedAt: &start,
+	}
+	renderer.OnStepUpdate(ctx, step)
+	assert.Contains(t, buf.String(), "\r• execute make broken (0s)")
+
+	finish := int64(1003)
+	failedStep := &fsm.FSMStep{
+		ID:          "step-fail-1",
+		ToolName:    "execute",
+		ArgsJSON:    `{"command":"make broken"}`,
+		Status:      fsm.StepStatusCompleted,
+		ResultJSON:  "Exit Code: 1\nDuration: 3s\nError output",
+		StartedAt:   &start,
+		CompletedAt: &finish,
+	}
+	renderer.OnStepUpdate(ctx, failedStep)
+
+	out := buf.String()
+	assert.True(t, strings.HasSuffix(out, "\r✗ execute make broken (exit 1, 3s)\n"))
+}
+
+func TestProgressRenderer_LiveStep_AgentAPI(t *testing.T) {
+	var buf safeBuffer
+	writer := NewOutputWriter(&buf)
+	writer.SetTTY(false)
+	renderer := NewProgressRenderer(writer, false)
+	defer renderer.Close()
+
+	curTime := time.Unix(1000, 0)
+	var timeMu sync.Mutex
+	renderer.timeNow = func() time.Time {
+		timeMu.Lock()
+		defer timeMu.Unlock()
+		return curTime
+	}
+	renderer.SetTickerInterval(10 * time.Millisecond)
+
+	ctx := context.Background()
+
+	evRunning := agentapi.ProgressEvent{
+		RunID: "run-api-1",
+		Type:  agentapi.ProgressStepUpdated,
+		Step: &agentapi.StepProgress{
+			ID: "step-api-1",
+			Call: agentapi.ToolCall{
+				Name:      "web_fetch",
+				Arguments: `{"url":"https://example.com"}`,
+			},
+			Status: agentapi.StepRunning,
+		},
+	}
+	renderer.Observe(ctx, evRunning)
+	assert.Contains(t, buf.String(), "\r• web_fetch https://example.com (0s)")
+
+	timeMu.Lock()
+	curTime = time.Unix(1002, 0)
+	timeMu.Unlock()
+	time.Sleep(25 * time.Millisecond)
+
+	evCompleted := agentapi.ProgressEvent{
+		RunID: "run-api-1",
+		Type:  agentapi.ProgressStepUpdated,
+		Step: &agentapi.StepProgress{
+			ID: "step-api-1",
+			Call: agentapi.ToolCall{
+				Name:      "web_fetch",
+				Arguments: `{"url":"https://example.com"}`,
+			},
+			Status: agentapi.StepCompleted,
+		},
+	}
+	renderer.Observe(ctx, evCompleted)
+
+	err := writer.WriteFinalAnswer("Fetched.")
+	require.NoError(t, err)
+
+	out := buf.String()
+	assert.True(t, strings.HasSuffix(out, "\r• web_fetch https://example.com (2s)\n\nFetched.\n"))
 }

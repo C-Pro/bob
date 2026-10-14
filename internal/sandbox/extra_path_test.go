@@ -124,10 +124,10 @@ func TestResolveExtraPath(t *testing.T) {
 		assert.Equal(t, toolchainBin, resolved.SandboxBinPath)
 	})
 
-	t.Run("toolchain bin promoted to root with lib", func(t *testing.T) {
+	t.Run("toolchain bin mounts only bin and does not promote to parent", func(t *testing.T) {
 		resolved, err := ResolveExtraPath(toolchainBin, realTmp, []string{protectedDir})
 		require.NoError(t, err)
-		assert.Equal(t, toolchainRoot, resolved.HostMountPath)
+		assert.Equal(t, toolchainBin, resolved.HostMountPath)
 		assert.Equal(t, toolchainBin, resolved.SandboxBinPath)
 	})
 

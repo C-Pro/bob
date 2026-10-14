@@ -80,8 +80,17 @@ func (e *ExecTool) Definitions(ctx context.Context) ([]agentapi.ToolDefinition, 
 		driverDesc = e.info.Driver
 	}
 
-	description := fmt.Sprintf("Runs a shell command inside the pre-provisioned sandbox (driver: %s, workspace: %s, network: %s). Default timeout is 30 seconds unless timeout_seconds is specified.",
-		driverDesc, wsDesc, netDesc)
+	defaultSec := int(e.info.DefaultExecTimeout.Seconds())
+	if defaultSec <= 0 {
+		defaultSec = 60
+	}
+	maxSec := int(e.info.MaxExecTimeout.Seconds())
+	if maxSec <= 0 {
+		maxSec = 600
+	}
+
+	description := fmt.Sprintf("Runs a shell command inside the pre-provisioned sandbox (driver: %s, workspace: %s, network: %s). Default timeout is %d seconds unless timeout_seconds is specified.",
+		driverDesc, wsDesc, netDesc, defaultSec)
 
 	schema := openai.Tool{
 		Type: openai.ToolTypeFunction,
@@ -101,7 +110,7 @@ func (e *ExecTool) Definitions(ctx context.Context) ([]agentapi.ToolDefinition, 
 					},
 					"timeout_seconds": map[string]interface{}{
 						"type":        "integer",
-						"description": "Optional execution timeout in seconds (default: 30s, max: 600s). Specify a higher limit for long-running commands like tests or builds.",
+						"description": fmt.Sprintf("Optional execution timeout in seconds (default: %ds, max: %ds). Specify a higher limit for long-running commands like tests or builds.", defaultSec, maxSec),
 					},
 				},
 				"required": []string{"command"},
@@ -148,8 +157,11 @@ func (e *ExecTool) Execute(ctx context.Context, call agentapi.ToolCall) (agentap
 	var timeout time.Duration
 	if args.TimeoutSeconds > 0 {
 		secs := args.TimeoutSeconds
-		if secs > 1800 {
-			secs = 1800
+		if secs < 5 {
+			secs = 5
+		}
+		if secs > 600 {
+			secs = 600
 		}
 		timeout = time.Duration(secs) * time.Second
 	} else {

@@ -26,21 +26,22 @@ import (
 // Driver implements sandbox.Driver using the Docker Engine API over Unix socket.
 // It is 100% pure Go and CGO-free, requiring no 3rd-party Docker SDK dependencies.
 type Driver struct {
-	socketPath         string
-	allowedImages      []string
-	cpuLimit           float64
-	memoryLimitMB      int
-	dataDir            string
-	hostDataDir        string
-	proxyFwdPath       string
-	allowRuntimeBuild  *bool
-	client             *http.Client
-	mu                 sync.Mutex
-	proxies            map[string]*sandbox.FilteringProxy // keyed by userID
-	customBlockedCIDRs   []string
-	forwarderPort        int
-	resolver             *net.Resolver
-	hostDataDirDetected  bool
+	socketPath          string
+	allowedImages       []string
+	cpuLimit            float64
+	memoryLimitMB       int
+	tasksMax            int
+	dataDir             string
+	hostDataDir         string
+	proxyFwdPath        string
+	allowRuntimeBuild   *bool
+	client              *http.Client
+	mu                  sync.Mutex
+	proxies             map[string]*sandbox.FilteringProxy // keyed by userID
+	customBlockedCIDRs  []string
+	forwarderPort       int
+	resolver            *net.Resolver
+	hostDataDirDetected bool
 }
 
 // Config provides configuration parameters for the Docker driver.
@@ -49,6 +50,7 @@ type Config struct {
 	AllowedImages      []string
 	CPULimit           float64
 	MemoryLimitMB      int
+	TasksMax           int
 	DataDir            string
 	HostDataDir        string
 	ProxyFwdPath       string
@@ -71,6 +73,10 @@ func NewDriver(cfg Config) *Driver {
 	mem := cfg.MemoryLimitMB
 	if mem <= 0 {
 		mem = 512
+	}
+	tasks := cfg.TasksMax
+	if tasks <= 0 {
+		tasks = 64
 	}
 
 	transport := &http.Transport{
@@ -95,6 +101,7 @@ func NewDriver(cfg Config) *Driver {
 		allowedImages:      cfg.AllowedImages,
 		cpuLimit:           cpu,
 		memoryLimitMB:      mem,
+		tasksMax:           tasks,
 		dataDir:            strings.TrimSpace(cfg.DataDir),
 		hostDataDir:        hostData,
 		proxyFwdPath:       cfg.ProxyFwdPath,
@@ -372,10 +379,13 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 		networkMode = "bridge"
 	}
 
+	tasksMax := d.tasksMax
+	if tasksMax <= 0 {
+		tasksMax = 64
+	}
+	pidsLimit := int64(tasksMax)
 	memBytes := int64(d.memoryLimitMB) * 1024 * 1024
 	nanoCPUs := int64(d.cpuLimit * 1e9)
-
-	pidsLimit := int64(64)
 	hostConfig := map[string]interface{}{
 		"NetworkMode": networkMode,
 		"Binds":       binds,
@@ -581,9 +591,14 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 	h := sha256.Sum256([]byte(fmt.Sprintf("%s-%d", sbx.UserID, time.Now().UnixNano())))
 	execToken := hex.EncodeToString(h[:8])
 
+	homeDir := sandbox.DefaultWorkspaceMountPath
+	if sbx.WorkspaceExternal {
+		homeDir = "/tmp/bob-cache/home"
+	}
+
 	var env []string
 	env = append(env,
-		"HOME="+sandbox.DefaultWorkspaceMountPath,
+		"HOME="+homeDir,
 		"PWD="+sandbox.DefaultWorkspaceMountPath,
 		"BOB_EXEC_TOKEN="+execToken,
 	)

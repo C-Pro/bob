@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -696,11 +698,13 @@ func TestRun_PurgeCaches(t *testing.T) {
 		sandbox.SetCacheRootOverride("")
 	})
 
-	// Pre-create two run caches
+	// Pre-create two run caches (release leases to simulate completed/abandoned runs)
 	_, err := sandbox.AcquireRunCacheDir("test-run-1", sandbox.RunCacheMetadata{RunID: "test-run-1", ChatID: "chat-1"})
 	require.NoError(t, err)
+	sandbox.ReleaseRunCache("test-run-1")
 	_, err = sandbox.AcquireRunCacheDir("test-run-2", sandbox.RunCacheMetadata{RunID: "test-run-2", ChatID: "chat-2", IsDM: true})
 	require.NoError(t, err)
+	sandbox.ReleaseRunCache("test-run-2")
 
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"--purge-caches"}, nil, &stdout, &stderr)
@@ -717,6 +721,7 @@ func TestRun_PurgeCaches(t *testing.T) {
 	// Pre-create another cache and verify --purge-caches=false does not purge it
 	_, err = sandbox.AcquireRunCacheDir("test-run-3", sandbox.RunCacheMetadata{RunID: "test-run-3", ChatID: "chat-3"})
 	require.NoError(t, err)
+	sandbox.ReleaseRunCache("test-run-3")
 
 	stdout.Reset()
 	stderr.Reset()
@@ -727,4 +732,70 @@ func TestRun_PurgeCaches(t *testing.T) {
 	// Verify test-run-3 cache still exists
 	_, err = os.Stat(filepath.Join(tempCacheRoot, "test-run-3"))
 	assert.NoError(t, err, "cache should still exist after --purge-caches=false")
+}
+
+type errCloserEmbedder struct {
+	closeErr error
+}
+
+func (e *errCloserEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
+	return make([]float32, 384), nil
+}
+
+func (e *errCloserEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	res := make([][]float32, len(texts))
+	for i := range texts {
+		res[i] = make([]float32, 384)
+	}
+	return res, nil
+}
+
+func (e *errCloserEmbedder) Dim() int {
+	return 384
+}
+
+func (e *errCloserEmbedder) Close() error {
+	return e.closeErr
+}
+
+func TestRun_RuntimeCloseError_Reported(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := openai.ChatCompletionResponse{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Message: openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "All good",
+					},
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer ts.Close()
+
+	cfgPath := writeValidConfigFile(t, ts.URL)
+
+	factoryWithCloseErr := func(cfg *config.Config, opts bootstrap.Options) (*bootstrap.Runtime, error) {
+		opts.Embedder = &errCloserEmbedder{closeErr: errors.New("simulated disk flush failure")}
+		return bootstrap.New(cfg, opts)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runWithFactory([]string{"-p", "test prompt", "--config", cfgPath}, nil, &stdout, &stderr, factoryWithCloseErr)
+	assert.Equal(t, 1, code)
+	assert.Contains(t, stderr.String(), "Error closing runtime: error closing memory manager: simulated disk flush failure")
+}
+
+func TestRun_Stdin_Timeout(t *testing.T) {
+	cfgPath := writeValidConfigFile(t, "http://localhost:9999")
+
+	// Hanging pipe
+	r, w := io.Pipe()
+	defer func() { _ = w.Close() }()
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-p", "-", "--config", cfgPath, "--timeout", "50ms"}, r, &stdout, &stderr)
+	assert.Equal(t, 1, code)
+	assert.Contains(t, stderr.String(), "Error: timed out reading stdin")
 }

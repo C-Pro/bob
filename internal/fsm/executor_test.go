@@ -641,6 +641,3 @@ func TestStepExecutor_StepResultTruncation(t *testing.T) {
 	assert.True(t, len(decoded.Content) <= MaxStepResultBytes+len(StepTruncationNotice))
 	assert.True(t, strings.HasSuffix(decoded.Content, StepTruncationNotice))
 }
-
-
-

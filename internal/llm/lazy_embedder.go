@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 
@@ -21,10 +22,10 @@ type LazyLocalEmbedder struct {
 	factory func() (cortexdb.Embedder, error)
 	dim     int
 
-	mu     sync.Mutex
-	inst   cortexdb.Embedder
+	mu      sync.Mutex
+	inst    cortexdb.Embedder
 	initErr error
-	closed bool
+	closed  bool
 }
 
 // NewLazyLocalEmbedder creates a LazyLocalEmbedder with the default local embedding engine.
@@ -47,12 +48,8 @@ func NewLazyLocalEmbedderWithFactory(cfg *config.Config, dim int, factory func()
 }
 
 // Dim returns the embedding dimensionality without initializing the underlying model.
+// The dimension is immutable once configured.
 func (l *LazyLocalEmbedder) Dim() int {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.inst != nil {
-		return l.inst.Dim()
-	}
 	return l.dim
 }
 
@@ -83,6 +80,15 @@ func (l *LazyLocalEmbedder) getOrInit(ctx context.Context) (cortexdb.Embedder, e
 		}
 		l.initErr = err
 		return nil, err
+	}
+
+	if instDim := inst.Dim(); instDim != l.dim {
+		if closer, ok := inst.(io.Closer); ok {
+			_ = closer.Close()
+		}
+		dimErr := fmt.Errorf("underlying embedder dimension %d does not match expected dimension %d", instDim, l.dim)
+		l.initErr = dimErr
+		return nil, dimErr
 	}
 
 	l.inst = inst

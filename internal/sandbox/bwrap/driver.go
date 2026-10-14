@@ -65,7 +65,7 @@ func NewDriverWithConfig(cfg Config) *Driver {
 	}
 	tasks := cfg.TasksMax
 	if tasks <= 0 {
-		tasks = 1024
+		tasks = 64
 	}
 	fwdPort := cfg.ForwarderPort
 	if fwdPort <= 0 {
@@ -450,11 +450,16 @@ func (d *Driver) buildArgs(sbx *sandbox.UserSandbox, cmd []string) ([]string, er
 		sandboxPath = strings.Join(extraBinPaths, ":") + ":" + sandboxPath
 	}
 
+	homeDir := sandbox.DefaultWorkspaceMountPath
+	if sbx.WorkspaceExternal {
+		homeDir = "/tmp/bob-cache/home"
+	}
+
 	// Configure environment inside the sandbox
 	args = append(args,
 		"--clearenv",
 		"--setenv", "PATH", sandboxPath,
-		"--setenv", "HOME", "/tmp/bob-cache/home",
+		"--setenv", "HOME", homeDir,
 		"--setenv", "PWD", sandbox.DefaultWorkspaceMountPath,
 		"--setenv", "TERM", "dumb",
 	)
@@ -536,7 +541,7 @@ func buildSystemdArgs(memMB int, cpuLimit float64, tasksMax int, bwrapPath strin
 		memMB = 512
 	}
 	if tasksMax <= 0 {
-		tasksMax = 1024
+		tasksMax = 64
 	}
 	sysArgs := []string{
 		"--user", "--scope", "-q",

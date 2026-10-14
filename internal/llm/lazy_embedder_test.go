@@ -158,3 +158,18 @@ func TestLazyLocalEmbedder_ContextCancellationDoesNotPermanentlyFail(t *testing.
 	assert.Len(t, vec, 384)
 	assert.Equal(t, int32(2), attempts.Load())
 }
+
+func TestLazyLocalEmbedder_DimensionMismatch(t *testing.T) {
+	mock := &mockEmbedder{dim: 768}
+	lazy := NewLazyLocalEmbedderWithFactory(&config.Config{}, 384, func() (cortexdb.Embedder, error) {
+		return mock, nil
+	})
+
+	assert.Equal(t, 384, lazy.Dim())
+
+	_, err := lazy.Embed(context.Background(), "test")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "underlying embedder dimension 768 does not match expected dimension 384")
+	assert.True(t, mock.closed.Load(), "mismatched embedder should be closed")
+	assert.Equal(t, 384, lazy.Dim(), "Dim() must remain immutable")
+}

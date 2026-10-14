@@ -3,12 +3,14 @@ package sandbox
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -28,7 +30,84 @@ type RunCacheMetadata struct {
 var (
 	cacheRootOverride string
 	cacheRootMu       sync.RWMutex
+
+	activeLocksMu sync.Mutex
+	activeLocks   = make(map[string]*os.File)
 )
+
+var errCacheActive = errors.New("sandbox cache is actively locked")
+
+func lockRunCache(baseDir, cleanID string) error {
+	activeLocksMu.Lock()
+	defer activeLocksMu.Unlock()
+
+	if _, ok := activeLocks[cleanID]; ok {
+		return nil
+	}
+
+	lockPath := filepath.Join(baseDir, "run.lock")
+	f, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return err
+	}
+
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		return err
+	}
+
+	activeLocks[cleanID] = f
+	return nil
+}
+
+// ReleaseRunCache releases the process advisory lock on a run cache without deleting the directory.
+func ReleaseRunCache(runID string) {
+	cleanID := SanitizeRunKey(runID)
+	activeLocksMu.Lock()
+	defer activeLocksMu.Unlock()
+
+	if f, ok := activeLocks[cleanID]; ok {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+		delete(activeLocks, cleanID)
+	}
+}
+
+// tryLockRunCache attempts to acquire an exclusive lock on the run cache directory.
+// Returns the open lock file and true on success, or nil and false if the cache is actively locked.
+func tryLockRunCache(entryPath string) (*os.File, bool) {
+	cleanID := filepath.Base(entryPath)
+	activeLocksMu.Lock()
+	if _, ok := activeLocks[cleanID]; ok {
+		activeLocksMu.Unlock()
+		return nil, false
+	}
+	activeLocksMu.Unlock()
+
+	lockPath := filepath.Join(entryPath, "run.lock")
+	f, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, false
+	}
+
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		return nil, false
+	}
+
+	return f, true
+}
+
+func tryLockAndRemove(entryPath string) error {
+	lockFile, locked := tryLockRunCache(entryPath)
+	if !locked {
+		return errCacheActive
+	}
+	defer func() {
+		_ = lockFile.Close()
+	}()
+	return os.RemoveAll(entryPath)
+}
 
 // SetCacheRootOverride sets an override directory for sandbox run caches (used in tests).
 func SetCacheRootOverride(dir string) {
@@ -114,6 +193,11 @@ func AcquireRunCacheDir(runID string, meta RunCacheMetadata) (string, error) {
 		}
 	}
 
+	// Acquire process lease on the run cache directory
+	if err := lockRunCache(baseDir, cleanID); err != nil {
+		slog.Warn("failed to acquire advisory lock on run cache", "run_id", runID, "error", err)
+	}
+
 	return cacheDir, nil
 }
 
@@ -124,10 +208,12 @@ func RemoveRunCache(runID string) error {
 		return nil
 	}
 	baseDir := filepath.Join(CacheRootDir(), cleanID)
+	ReleaseRunCache(runID)
 	return os.RemoveAll(baseDir)
 }
 
-// PurgeAllCaches removes all run caches under the sandbox cache root directory.
+// PurgeAllCaches removes all inactive run caches under the sandbox cache root directory.
+// Entries currently held by an active sandbox or runner process are skipped.
 func PurgeAllCaches() (int, error) {
 	rootDir := CacheRootDir()
 	entries, err := os.ReadDir(rootDir)
@@ -141,8 +227,16 @@ func PurgeAllCaches() (int, error) {
 	count := 0
 	var firstErr error
 	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
 		entryPath := filepath.Join(rootDir, entry.Name())
-		if err := os.RemoveAll(entryPath); err != nil {
+		err := tryLockAndRemove(entryPath)
+		if errors.Is(err, errCacheActive) {
+			slog.Info("skipping active sandbox cache during purge", "path", entryPath)
+			continue
+		}
+		if err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -159,6 +253,7 @@ type RunStatusChecker func(ctx context.Context, meta RunCacheMetadata) (isTermin
 
 // ReapStaleCaches scans the cache root directory and deletes caches that have expired
 // or whose associated FSM runs have completed/failed.
+// Entries currently locked by an active process are preserved.
 func ReapStaleCaches(ctx context.Context, checker RunStatusChecker, maxAge time.Duration) (int, error) {
 	rootDir := CacheRootDir()
 	entries, err := os.ReadDir(rootDir)
@@ -172,9 +267,21 @@ func ReapStaleCaches(ctx context.Context, checker RunStatusChecker, maxAge time.
 	now := time.Now()
 	reaped := 0
 
+	removeIfInactive := func(entryPath string) bool {
+		err := tryLockAndRemove(entryPath)
+		if errors.Is(err, errCacheActive) {
+			slog.Info("skipping active sandbox cache during reaping", "path", entryPath)
+			return false
+		}
+		return err == nil
+	}
+
 	for _, entry := range entries {
 		if ctx.Err() != nil {
 			return reaped, ctx.Err()
+		}
+		if !entry.IsDir() {
+			continue
 		}
 		entryPath := filepath.Join(rootDir, entry.Name())
 		metaPath := filepath.Join(entryPath, "metadata.json")
@@ -184,7 +291,7 @@ func ReapStaleCaches(ctx context.Context, checker RunStatusChecker, maxAge time.
 			// No metadata. Check folder mtime against maxAge fallback
 			if fi, sErr := entry.Info(); sErr == nil && maxAge > 0 {
 				if now.Sub(fi.ModTime()) > maxAge {
-					if rmErr := os.RemoveAll(entryPath); rmErr == nil {
+					if removeIfInactive(entryPath) {
 						reaped++
 					}
 				}
@@ -197,7 +304,7 @@ func ReapStaleCaches(ctx context.Context, checker RunStatusChecker, maxAge time.
 			// Corrupt metadata; fallback to mtime
 			if fi, sErr := entry.Info(); sErr == nil && maxAge > 0 {
 				if now.Sub(fi.ModTime()) > maxAge {
-					if rmErr := os.RemoveAll(entryPath); rmErr == nil {
+					if removeIfInactive(entryPath) {
 						reaped++
 					}
 				}
@@ -207,7 +314,7 @@ func ReapStaleCaches(ctx context.Context, checker RunStatusChecker, maxAge time.
 
 		// Check if expired
 		if !meta.ExpiresAt.IsZero() && now.After(meta.ExpiresAt) {
-			if rmErr := os.RemoveAll(entryPath); rmErr == nil {
+			if removeIfInactive(entryPath) {
 				reaped++
 			}
 			continue
@@ -221,7 +328,7 @@ func ReapStaleCaches(ctx context.Context, checker RunStatusChecker, maxAge time.
 				continue
 			}
 			if terminal {
-				if rmErr := os.RemoveAll(entryPath); rmErr == nil {
+				if removeIfInactive(entryPath) {
 					reaped++
 				}
 				continue

@@ -419,7 +419,11 @@ func (e *StepExecutor) executeSingleStep(ctx context.Context, store StepStore, s
 		timeoutSec = 30
 		step.TimeoutSeconds = timeoutSec
 	}
-	timeout := time.Duration(timeoutSec) * time.Second
+	envelopeSec := timeoutSec
+	if step.ToolName == "execute" || step.ToolName == "sandbox_exec" {
+		envelopeSec = timeoutSec + 5
+	}
+	timeout := time.Duration(envelopeSec) * time.Second
 
 	maxAttempts := step.MaxAttempts
 	if maxAttempts <= 0 {
