@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"flag"
 	"log/slog"
 	"net/http"
@@ -11,18 +12,15 @@ import (
 	"syscall"
 	"time"
 
-	"bob/internal/agent"
-	"bob/internal/agentapi"
 	"bob/internal/backup"
+	"bob/internal/bootstrap"
 	"bob/internal/config"
-	"bob/internal/fsm"
 	"bob/internal/gateway"
 	"bob/internal/geoip"
 	"bob/internal/llm"
 	"bob/internal/memory"
 	"bob/internal/objectstore"
 	"bob/internal/store"
-	"bob/internal/tools"
 
 	"github.com/liliang-cn/cortexdb/v2/pkg/cortexdb"
 )
@@ -192,52 +190,19 @@ func main() {
 		slog.Info("server location determined via GEOIP", "lat", loc.Lat, "lng", loc.Lng)
 	}
 
-	llmClient := llm.NewClient(cfg, nil)
-	gw := gateway.NewGateway(cfg, llmClient)
+	rt, err := bootstrap.New(cfg, bootstrap.Options{
+		HTTPClient: httpClient,
+	})
+	if err != nil {
+		slog.Error("failed to initialize runtime", "error", err)
+		os.Exit(1)
+	}
+	defer func() { _ = rt.Close() }()
+
+	gw := gateway.NewGatewayWithRuntime(cfg, rt)
 	if loc != nil {
 		gw.SetLocation(loc)
 	}
-
-	// Initialize durable FSM engine and attach to Gateway
-	storeProv := gw.StoreProvider()
-	fsmEngine := fsm.NewEngine(
-		storeProv,
-		llmClient,
-		gw.ToolsRegistry(),
-		fsm.WithDefaultModel(cfg.OpenAIModel),
-		fsm.WithFrontend("besedka", gw),
-		fsm.WithToolDefinitionProvider(gw),
-		fsm.WithPollInterval(2*time.Second),
-		fsm.WithKnowledgeBudgetLimits(tools.KnowledgeBudgetLimits{
-			MaxLoadedMemories:    cfg.KnowledgeMaxLoadedMemories,
-			MaxLoadedMemoryBytes: cfg.KnowledgeMaxLoadedMemoryBytes,
-			MaxLoadedSkills:      cfg.KnowledgeMaxLoadedSkills,
-			MaxLoadedSkillBytes:  cfg.KnowledgeMaxLoadedSkillBytes,
-		}),
-	)
-	gw.SetFSMEngine(fsmEngine)
-
-	// Initialize core Agent Engine
-	agentEngine, err := agent.NewEngine(agent.Dependencies{
-		Config: agent.Config{
-			DefaultModel:  cfg.OpenAIModel,
-			MaxIterations: cfg.TownhallToolMaxIterations,
-			LockTimeout:   30 * time.Second,
-		},
-		LLMClient:     llmClient,
-		FSMEngine:     fsmEngine,
-		SessionLocker: gw.ChatLocker(),
-		Frontends: map[string]agentapi.Frontend{
-			"besedka": gw,
-		},
-	})
-	if err != nil {
-		slog.Error("failed to initialize agent engine", "error", err)
-		os.Exit(1)
-	}
-	defer func() { _ = agentEngine.Close() }()
-
-	gw.SetRunner(agentEngine)
 
 	// Start periodic backup scheduler if S3 is enabled
 	var scheduler *backup.Scheduler
@@ -255,7 +220,7 @@ func main() {
 		}
 		scheduler = backup.NewScheduler(cfg, objClient, activeDBsProvider)
 		go func() {
-			if err := scheduler.Run(ctx); err != nil && err != context.Canceled {
+			if err := scheduler.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				slog.Error("backup scheduler stopped with error", "error", err)
 			}
 		}()
@@ -280,7 +245,7 @@ func main() {
 	}()
 
 	slog.Info("starting agent gateway event loop")
-	if err := gw.Start(ctx); err != nil && err != context.Canceled {
+	if err := gw.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		slog.Error("gateway exited with error", "error", err)
 		os.Exit(1)
 	}

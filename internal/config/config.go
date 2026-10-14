@@ -23,54 +23,57 @@ const DefaultMaxAttachmentSizeBytes int64 = 25 * 1024 * 1024
 
 // Config holds runtime configuration settings for the agent.
 type Config struct {
-	BotHandle                  string
-	BesedkaURL                 string
-	BesedkaAPIKey              string
-	OpenAIAPIKey               string
-	OpenAIModel                string
-	OpenAIBaseURL              string
-	GeminiAPIKey               string // Deprecated: backward-compatible fallback for OpenAIAPIKey
-	GeminiModel                string // Deprecated: backward-compatible fallback for OpenAIModel
-	GeminiBaseURL              string // Deprecated: backward-compatible fallback for OpenAIBaseURL
-	TownhallMaxParagraphs      int
-	DMMaxParagraphs            int
-	MsgRingBufferSize          int
-	TownhallToolMaxIterations  int
-	DMToolMaxIterations        int
-	FSMRetentionDays           int
-	TavilyAPIKey               string
-	TavilyBaseURL              string
-	DataDir                    string
-	EmbeddingModel             string
-	EmbeddingPrecision         string
-	Secret                     string
-	S3Endpoint                 string
-	S3Region                   string
-	S3Bucket                   string
-	S3AccessKey                string
-	S3SecretKey                string
-	S3PathStyle                bool
-	S3BackupInterval           time.Duration
-	S3BackupKeep               int
-	S3BackupPrefix             string
-	SandboxEnabled             bool
-	SandboxDrivers             []string
-	SandboxDockerSocket        string
-	SandboxAllowedImages       []string
-	SandboxAllowedNetworkModes []string
-	SandboxMaxLifetime         time.Duration
-	SandboxDefaultExecTimeout  time.Duration
-	SandboxMaxExecTimeout      time.Duration
-	SandboxCPULimit            float64
-	SandboxMemoryLimitMB       int
-	SandboxHostDataDir         string
-	SandboxProxyFwdPath        string
-	SandboxAllowRuntimeBuild   *bool
-	SchedulerMinRunTimeout     time.Duration
-	SchedulerMaxRunTimeout     time.Duration
-	SchedulerMinMaxTurns       int
-	SchedulerMaxMaxTurns       int
-	MaxAttachmentSizeBytes     int64
+	BotHandle                      string
+	BesedkaURL                     string
+	BesedkaAPIKey                  string
+	OpenAIAPIKey                   string
+	OpenAIModel                    string
+	OpenAIBaseURL                  string
+	GeminiAPIKey                   string // Deprecated: backward-compatible fallback for OpenAIAPIKey
+	GeminiModel                    string // Deprecated: backward-compatible fallback for OpenAIModel
+	GeminiBaseURL                  string // Deprecated: backward-compatible fallback for OpenAIBaseURL
+	LLMRequestTimeout              time.Duration
+	LLMFirstByteTimeout            time.Duration
+	TownhallMaxParagraphs          int
+	DMMaxParagraphs                int
+	MsgRingBufferSize              int
+	TownhallToolMaxIterations      int
+	DMToolMaxIterations            int
+	FSMRetentionDays               int
+	TavilyAPIKey                   string
+	TavilyBaseURL                  string
+	DataDir                        string
+	EmbeddingModel                 string
+	EmbeddingPrecision             string
+	Secret                         string
+	S3Endpoint                     string
+	S3Region                       string
+	S3Bucket                       string
+	S3AccessKey                    string
+	S3SecretKey                    string
+	S3PathStyle                    bool
+	S3BackupInterval               time.Duration
+	S3BackupKeep                   int
+	S3BackupPrefix                 string
+	SandboxEnabled                 bool
+	SandboxDrivers                 []string
+	SandboxDockerSocket            string
+	SandboxAllowedImages           []string
+	SandboxAllowedNetworkModes     []string
+	SandboxMaxLifetime             time.Duration
+	SandboxDefaultExecTimeout      time.Duration
+	SandboxMaxExecTimeout          time.Duration
+	SandboxCPULimit                float64
+	SandboxMemoryLimitMB           int
+	SandboxTasksMax                int
+	SandboxHostDataDir             string
+	SandboxProxyFwdPath            string
+	SandboxAllowRuntimeBuild       *bool
+	SchedulerMinRunTimeout         time.Duration
+	SchedulerMaxRunTimeout         time.Duration
+	SchedulerMinMaxTurns           int
+	SchedulerMaxMaxTurns           int
+	MaxAttachmentSizeBytes         int64
 	KnowledgeMaxLoadedMemories     int
 	KnowledgeMaxLoadedMemoryBytes  int
 	KnowledgeMaxLoadedSkills       int
@@ -78,6 +81,11 @@ type Config struct {
 	KnowledgeDefaultDiscoveryLimit int
 	KnowledgeMaxDiscoveryLimit     int
 	KnowledgeReconcileInterval     time.Duration
+	CLIMaxIterations               int
+	SandboxDefaultDriver           string
+	SandboxDockerImage             string
+	SandboxExtraPaths              []string
+	SandboxAutoToolchains          bool
 }
 
 // DefaultSandboxAllowedImages defines standard safe container images.
@@ -91,37 +99,118 @@ func (c *Config) S3Enabled() bool {
 	return c.S3Bucket != "" && c.S3Endpoint != ""
 }
 
+// Defaults returns a Config populated with sensible base defaults.
+// Slices and pointers returned are freshly allocated and isolated.
+func Defaults() *Config {
+	return &Config{
+		BotHandle:                      "@bot",
+		BesedkaURL:                     "http://127.0.0.1:8080",
+		OpenAIModel:                    "gemini-3.8-flash",
+		OpenAIBaseURL:                  "https://generativelanguage.googleapis.com/v1beta/openai/",
+		GeminiModel:                    "gemini-3.8-flash",
+		GeminiBaseURL:                  "https://generativelanguage.googleapis.com/v1beta/openai/",
+		LLMRequestTimeout:              10 * time.Minute,
+		LLMFirstByteTimeout:            1 * time.Minute,
+		TavilyBaseURL:                  "https://api.tavily.com",
+		TownhallMaxParagraphs:          2,
+		DMMaxParagraphs:                10,
+		MsgRingBufferSize:              100,
+		TownhallToolMaxIterations:      10,
+		DMToolMaxIterations:            20,
+		CLIMaxIterations:               100,
+		FSMRetentionDays:               7,
+		DataDir:                        "./data",
+		EmbeddingModel:                 "",
+		EmbeddingPrecision:             "bf16",
+		S3Region:                       "us-east-1",
+		S3BackupInterval:               1 * time.Hour,
+		S3BackupKeep:                   7,
+		S3BackupPrefix:                 "bob_agent/",
+		S3PathStyle:                    true,
+		SandboxEnabled:                 true,
+		SandboxDefaultDriver:           "bwrap",
+		SandboxDrivers:                 []string{"bwrap", "docker"},
+		SandboxDockerSocket:            "/var/run/docker.sock",
+		SandboxDockerImage:             "python:3.12-slim",
+		SandboxAllowedImages:           append([]string(nil), DefaultSandboxAllowedImages...),
+		SandboxAllowedNetworkModes:     append([]string(nil), DefaultSandboxAllowedNetworkModes...),
+		SandboxMaxLifetime:             30 * time.Minute,
+		SandboxDefaultExecTimeout:      1 * time.Minute,
+		SandboxMaxExecTimeout:          10 * time.Minute,
+		SandboxCPULimit:                1.0,
+		SandboxMemoryLimitMB:           512,
+		SandboxTasksMax:                64,
+		SchedulerMinRunTimeout:         1 * time.Minute,
+		SchedulerMaxRunTimeout:         1 * time.Hour,
+		SchedulerMinMaxTurns:           10,
+		SchedulerMaxMaxTurns:           100,
+		MaxAttachmentSizeBytes:         DefaultMaxAttachmentSizeBytes,
+		KnowledgeMaxLoadedMemories:     8,
+		KnowledgeMaxLoadedMemoryBytes:  16384,
+		KnowledgeMaxLoadedSkills:       3,
+		KnowledgeMaxLoadedSkillBytes:   24576,
+		KnowledgeDefaultDiscoveryLimit: 5,
+		KnowledgeMaxDiscoveryLimit:     10,
+		KnowledgeReconcileInterval:     1 * time.Minute,
+	}
+}
+
 // LoadFromEnv loads configuration from environment variables (or .env file) with sensible defaults.
 func LoadFromEnv() (*Config, error) {
 	LoadDotEnv(".env")
 
+	cfg := Defaults()
+
 	defaultBesedkaURL := os.Getenv("BASE_URL")
 	if defaultBesedkaURL == "" {
-		defaultBesedkaURL = "http://127.0.0.1:8080"
+		defaultBesedkaURL = cfg.BesedkaURL
 	}
+	cfg.BesedkaURL = getEnvOrDefault("BESEDKA_URL", defaultBesedkaURL)
+	cfg.BesedkaAPIKey = os.Getenv("BESEDKA_API_KEY")
 
 	apiKey := getEnvOrDefault("OPENAI_API_KEY", os.Getenv("GEMINI_API_KEY"))
-	model := getEnvOrDefault("OPENAI_MODEL", getEnvOrDefault("GEMINI_MODEL", "gemini-3.8-flash"))
-	baseURL := getEnvOrDefault("OPENAI_BASE_URL", getEnvOrDefault("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"))
-	tavilyBaseURL := strings.TrimSuffix(getEnvOrDefault("TAVILY_BASE_URL", "https://api.tavily.com"), "/")
+	if apiKey != "" {
+		cfg.OpenAIAPIKey = apiKey
+		cfg.GeminiAPIKey = apiKey
+	}
+
+	model := getEnvOrDefault("OPENAI_MODEL", getEnvOrDefault("GEMINI_MODEL", cfg.OpenAIModel))
+	cfg.OpenAIModel = model
+	cfg.GeminiModel = model
+
+	baseURL := getEnvOrDefault("OPENAI_BASE_URL", getEnvOrDefault("GEMINI_BASE_URL", cfg.OpenAIBaseURL))
+	cfg.OpenAIBaseURL = baseURL
+	cfg.GeminiBaseURL = baseURL
+
+	cfg.LLMRequestTimeout = getEnvDurationOrDefault("LLM_REQUEST_TIMEOUT", getEnvDurationOrDefault("OPENAI_REQUEST_TIMEOUT", cfg.LLMRequestTimeout))
+	cfg.LLMFirstByteTimeout = getEnvDurationOrDefault("LLM_FIRST_BYTE_TIMEOUT", getEnvDurationOrDefault("OPENAI_FIRST_BYTE_TIMEOUT", cfg.LLMFirstByteTimeout))
+
+	cfg.BotHandle = getEnvOrDefault("BOT_HANDLE", cfg.BotHandle)
+	cfg.TavilyAPIKey = getEnvOrDefault("TAVILY_API_KEY", "")
+	cfg.TavilyBaseURL = strings.TrimSuffix(getEnvOrDefault("TAVILY_BASE_URL", cfg.TavilyBaseURL), "/")
+
 	backupIntervalStr := getEnvOrDefault("S3_BACKUP_INTERVAL", "1h")
 	backupInterval, err := time.ParseDuration(backupIntervalStr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid S3_BACKUP_INTERVAL: %w", err)
 	}
+	cfg.S3BackupInterval = backupInterval
 
-	secret := getEnvOrDefault("SECRET", os.Getenv("AUTH_SECRET"))
-	s3Prefix := getEnvOrDefault("S3_BACKUP_PREFIX", "bob_agent/")
+	cfg.Secret = getEnvOrDefault("SECRET", os.Getenv("AUTH_SECRET"))
+	s3Prefix := getEnvOrDefault("S3_BACKUP_PREFIX", cfg.S3BackupPrefix)
 	if s3Prefix != "" && !strings.HasSuffix(s3Prefix, "/") {
 		s3Prefix = s3Prefix + "/"
 	}
-	s3PathStyleStr := getEnvOrDefault("S3_PATH_STYLE", "true")
-	s3PathStyle := s3PathStyleStr == "true" || s3PathStyleStr == "1"
+	cfg.S3BackupPrefix = s3Prefix
 
-	sandboxEnabled, err := getEnvBoolOrDefault("SANDBOX_ENABLED", true)
+	s3PathStyleStr := getEnvOrDefault("S3_PATH_STYLE", "true")
+	cfg.S3PathStyle = s3PathStyleStr == "true" || s3PathStyleStr == "1"
+
+	sandboxEnabled, err := getEnvBoolOrDefault("SANDBOX_ENABLED", cfg.SandboxEnabled)
 	if err != nil {
 		return nil, err
 	}
+	cfg.SandboxEnabled = sandboxEnabled
 
 	defaultRuntimeBuild := os.Getenv("ENV") == "development"
 	for _, arg := range os.Args {
@@ -134,114 +223,130 @@ func LoadFromEnv() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	cfg.SandboxAllowRuntimeBuild = &sandboxAllowRuntimeBuild
 
-	schedMinTimeout, err := getEnvDurationStrict("SCHEDULER_MIN_RUN_TIMEOUT", 1*time.Minute)
+	schedMinTimeout, err := getEnvDurationStrict("SCHEDULER_MIN_RUN_TIMEOUT", cfg.SchedulerMinRunTimeout)
 	if err != nil {
 		return nil, err
 	}
-	schedMaxTimeout, err := getEnvDurationStrict("SCHEDULER_MAX_RUN_TIMEOUT", 1*time.Hour)
-	if err != nil {
-		return nil, err
-	}
-	schedMinTurns, err := getEnvIntStrict("SCHEDULER_MIN_MAX_TURNS", 10)
-	if err != nil {
-		return nil, err
-	}
-	schedMaxTurns, err := getEnvIntStrict("SCHEDULER_MAX_MAX_TURNS", 100)
-	if err != nil {
-		return nil, err
-	}
+	cfg.SchedulerMinRunTimeout = schedMinTimeout
 
-	maxAttachmentSizeBytes, err := parseAttachmentSize(os.Getenv("MAX_ATTACHMENT_SIZE"), DefaultMaxAttachmentSizeBytes)
+	schedMaxTimeout, err := getEnvDurationStrict("SCHEDULER_MAX_RUN_TIMEOUT", cfg.SchedulerMaxRunTimeout)
+	if err != nil {
+		return nil, err
+	}
+	cfg.SchedulerMaxRunTimeout = schedMaxTimeout
+
+	schedMinTurns, err := getEnvIntStrict("SCHEDULER_MIN_MAX_TURNS", cfg.SchedulerMinMaxTurns)
+	if err != nil {
+		return nil, err
+	}
+	cfg.SchedulerMinMaxTurns = schedMinTurns
+
+	schedMaxTurns, err := getEnvIntStrict("SCHEDULER_MAX_MAX_TURNS", cfg.SchedulerMaxMaxTurns)
+	if err != nil {
+		return nil, err
+	}
+	cfg.SchedulerMaxMaxTurns = schedMaxTurns
+
+	maxAttachmentSizeBytes, err := parseAttachmentSize(os.Getenv("MAX_ATTACHMENT_SIZE"), cfg.MaxAttachmentSizeBytes)
 	if err != nil {
 		return nil, fmt.Errorf("invalid MAX_ATTACHMENT_SIZE: %w", err)
 	}
+	cfg.MaxAttachmentSizeBytes = maxAttachmentSizeBytes
 
-	knowledgeMaxMemories, err := getEnvIntStrict("KNOWLEDGE_MAX_LOADED_MEMORIES", 8)
+	knowledgeMaxMemories, err := getEnvIntStrict("KNOWLEDGE_MAX_LOADED_MEMORIES", cfg.KnowledgeMaxLoadedMemories)
 	if err != nil {
 		return nil, err
 	}
-	knowledgeMaxMemoryBytes, err := getEnvIntStrict("KNOWLEDGE_MAX_LOADED_MEMORY_BYTES", 16384)
+	cfg.KnowledgeMaxLoadedMemories = knowledgeMaxMemories
+
+	knowledgeMaxMemoryBytes, err := getEnvIntStrict("KNOWLEDGE_MAX_LOADED_MEMORY_BYTES", cfg.KnowledgeMaxLoadedMemoryBytes)
 	if err != nil {
 		return nil, err
 	}
-	knowledgeMaxSkills, err := getEnvIntStrict("KNOWLEDGE_MAX_LOADED_SKILLS", 3)
+	cfg.KnowledgeMaxLoadedMemoryBytes = knowledgeMaxMemoryBytes
+
+	knowledgeMaxSkills, err := getEnvIntStrict("KNOWLEDGE_MAX_LOADED_SKILLS", cfg.KnowledgeMaxLoadedSkills)
 	if err != nil {
 		return nil, err
 	}
-	knowledgeMaxSkillBytes, err := getEnvIntStrict("KNOWLEDGE_MAX_LOADED_SKILL_BYTES", 24576)
+	cfg.KnowledgeMaxLoadedSkills = knowledgeMaxSkills
+
+	knowledgeMaxSkillBytes, err := getEnvIntStrict("KNOWLEDGE_MAX_LOADED_SKILL_BYTES", cfg.KnowledgeMaxLoadedSkillBytes)
 	if err != nil {
 		return nil, err
 	}
-	knowledgeDefaultLimit, err := getEnvIntStrict("KNOWLEDGE_DEFAULT_DISCOVERY_LIMIT", 5)
+	cfg.KnowledgeMaxLoadedSkillBytes = knowledgeMaxSkillBytes
+
+	knowledgeDefaultLimit, err := getEnvIntStrict("KNOWLEDGE_DEFAULT_DISCOVERY_LIMIT", cfg.KnowledgeDefaultDiscoveryLimit)
 	if err != nil {
 		return nil, err
 	}
-	knowledgeMaxLimit, err := getEnvIntStrict("KNOWLEDGE_MAX_DISCOVERY_LIMIT", 10)
+	cfg.KnowledgeDefaultDiscoveryLimit = knowledgeDefaultLimit
+
+	knowledgeMaxLimit, err := getEnvIntStrict("KNOWLEDGE_MAX_DISCOVERY_LIMIT", cfg.KnowledgeMaxDiscoveryLimit)
 	if err != nil {
 		return nil, err
 	}
-	knowledgeReconcileInterval, err := getEnvDurationStrict("KNOWLEDGE_RECONCILE_INTERVAL", 1*time.Minute)
+	cfg.KnowledgeMaxDiscoveryLimit = knowledgeMaxLimit
+
+	knowledgeReconcileInterval, err := getEnvDurationStrict("KNOWLEDGE_RECONCILE_INTERVAL", cfg.KnowledgeReconcileInterval)
 	if err != nil {
 		return nil, err
+	}
+	cfg.KnowledgeReconcileInterval = knowledgeReconcileInterval
+
+	cfg.TownhallMaxParagraphs = getEnvIntOrDefault("TOWNHALL_MAX_PARAGRAPHS", cfg.TownhallMaxParagraphs)
+	cfg.DMMaxParagraphs = getEnvIntOrDefault("DM_MAX_PARAGRAPHS", cfg.DMMaxParagraphs)
+	cfg.MsgRingBufferSize = getEnvIntOrDefault("MSG_RING_BUFFER_SIZE", cfg.MsgRingBufferSize)
+	cfg.TownhallToolMaxIterations = getEnvIntOrDefault("TOWNHALL_TOOL_MAX_ITERATIONS", cfg.TownhallToolMaxIterations)
+	cfg.DMToolMaxIterations = getEnvIntOrDefault("DM_TOOL_MAX_ITERATIONS", cfg.DMToolMaxIterations)
+	cfg.FSMRetentionDays = getEnvIntOrDefault("FSM_RETENTION_DAYS", cfg.FSMRetentionDays)
+	cfg.DataDir = getEnvOrDefault("DATA_DIR", cfg.DataDir)
+	cfg.EmbeddingModel = getEnvOrDefault("EMBEDDING_MODEL", cfg.EmbeddingModel)
+	cfg.EmbeddingPrecision = strings.ToLower(getEnvOrDefault("EMBEDDING_PRECISION", cfg.EmbeddingPrecision))
+
+	cfg.S3Endpoint = os.Getenv("S3_ENDPOINT")
+	cfg.S3Region = getEnvOrDefault("S3_REGION", cfg.S3Region)
+	cfg.S3Bucket = os.Getenv("S3_BUCKET")
+	cfg.S3AccessKey = os.Getenv("S3_ACCESS_KEY")
+	cfg.S3SecretKey = os.Getenv("S3_SECRET_KEY")
+	cfg.S3BackupKeep = getEnvIntOrDefault("S3_BACKUP_KEEP", cfg.S3BackupKeep)
+
+	cfg.SandboxDrivers = getEnvSliceOrDefault("SANDBOX_DRIVERS", cfg.SandboxDrivers)
+	cfg.SandboxDockerSocket = getEnvOrDefault("SANDBOX_DOCKER_SOCKET", cfg.SandboxDockerSocket)
+	cfg.SandboxAllowedImages = getEnvSliceOrDefault("SANDBOX_ALLOWED_IMAGES", cfg.SandboxAllowedImages)
+	cfg.SandboxAllowedNetworkModes = getEnvSliceOrDefault("SANDBOX_ALLOWED_NETWORK_MODES", cfg.SandboxAllowedNetworkModes)
+	cfg.SandboxMaxLifetime = getEnvDurationOrDefault("SANDBOX_MAX_LIFETIME", cfg.SandboxMaxLifetime)
+	cfg.SandboxDefaultExecTimeout = getEnvDurationOrDefault("SANDBOX_DEFAULT_EXEC_TIMEOUT", cfg.SandboxDefaultExecTimeout)
+	cfg.SandboxMaxExecTimeout = getEnvDurationOrDefault("SANDBOX_MAX_EXEC_TIMEOUT", cfg.SandboxMaxExecTimeout)
+	cfg.SandboxCPULimit = getEnvFloatOrDefault("SANDBOX_CPU_LIMIT", cfg.SandboxCPULimit)
+	cfg.SandboxMemoryLimitMB = getEnvIntOrDefault("SANDBOX_MEMORY_LIMIT_MB", cfg.SandboxMemoryLimitMB)
+	if val := os.Getenv("BOB_SANDBOX_TASKS_MAX"); strings.TrimSpace(val) != "" {
+		cfg.SandboxTasksMax = getEnvIntOrDefault("BOB_SANDBOX_TASKS_MAX", cfg.SandboxTasksMax)
+	} else if val := os.Getenv("SANDBOX_TASKS_MAX"); strings.TrimSpace(val) != "" {
+		cfg.SandboxTasksMax = getEnvIntOrDefault("SANDBOX_TASKS_MAX", cfg.SandboxTasksMax)
+	}
+	cfg.SandboxHostDataDir = getEnvOrDefault("SANDBOX_HOST_DATA_DIR", cfg.SandboxHostDataDir)
+	cfg.SandboxProxyFwdPath = getEnvOrDefault("SANDBOX_PROXY_FWD_PATH", cfg.SandboxProxyFwdPath)
+
+	if val := os.Getenv("BOB_SANDBOX_EXTRA_PATHS"); strings.TrimSpace(val) != "" {
+		cfg.SandboxExtraPaths = parsePathList(val)
+	} else if val := os.Getenv("SANDBOX_EXTRA_PATHS"); strings.TrimSpace(val) != "" {
+		cfg.SandboxExtraPaths = parsePathList(val)
 	}
 
-	cfg := &Config{
-		BotHandle:                  getEnvOrDefault("BOT_HANDLE", "@bot"),
-		BesedkaURL:                 getEnvOrDefault("BESEDKA_URL", defaultBesedkaURL),
-		BesedkaAPIKey:              os.Getenv("BESEDKA_API_KEY"),
-		OpenAIAPIKey:               apiKey,
-		OpenAIModel:                model,
-		OpenAIBaseURL:              baseURL,
-		GeminiAPIKey:               apiKey,
-		GeminiModel:                model,
-		GeminiBaseURL:              baseURL,
-		TavilyAPIKey:               getEnvOrDefault("TAVILY_API_KEY", ""),
-		TavilyBaseURL:              tavilyBaseURL,
-		TownhallMaxParagraphs:      getEnvIntOrDefault("TOWNHALL_MAX_PARAGRAPHS", 2),
-		DMMaxParagraphs:            getEnvIntOrDefault("DM_MAX_PARAGRAPHS", 10),
-		MsgRingBufferSize:          getEnvIntOrDefault("MSG_RING_BUFFER_SIZE", 100),
-		TownhallToolMaxIterations:  getEnvIntOrDefault("TOWNHALL_TOOL_MAX_ITERATIONS", 10),
-		DMToolMaxIterations:        getEnvIntOrDefault("DM_TOOL_MAX_ITERATIONS", 20),
-		FSMRetentionDays:           getEnvIntOrDefault("FSM_RETENTION_DAYS", 7),
-		DataDir:                    getEnvOrDefault("DATA_DIR", "./data"),
-		EmbeddingModel:             getEnvOrDefault("EMBEDDING_MODEL", ""),
-		EmbeddingPrecision:         strings.ToLower(getEnvOrDefault("EMBEDDING_PRECISION", "bf16")),
-		Secret:                     secret,
-		S3Endpoint:                 os.Getenv("S3_ENDPOINT"),
-		S3Region:                   getEnvOrDefault("S3_REGION", "us-east-1"),
-		S3Bucket:                   os.Getenv("S3_BUCKET"),
-		S3AccessKey:                os.Getenv("S3_ACCESS_KEY"),
-		S3SecretKey:                os.Getenv("S3_SECRET_KEY"),
-		S3PathStyle:                s3PathStyle,
-		S3BackupInterval:           backupInterval,
-		S3BackupKeep:               getEnvIntOrDefault("S3_BACKUP_KEEP", 7),
-		S3BackupPrefix:             s3Prefix,
-		SandboxEnabled:             sandboxEnabled,
-		SandboxDrivers:             getEnvSliceOrDefault("SANDBOX_DRIVERS", []string{"bwrap", "docker"}),
-		SandboxDockerSocket:        getEnvOrDefault("SANDBOX_DOCKER_SOCKET", "/var/run/docker.sock"),
-		SandboxAllowedImages:       getEnvSliceOrDefault("SANDBOX_ALLOWED_IMAGES", DefaultSandboxAllowedImages),
-		SandboxAllowedNetworkModes: getEnvSliceOrDefault("SANDBOX_ALLOWED_NETWORK_MODES", DefaultSandboxAllowedNetworkModes),
-		SandboxMaxLifetime:         getEnvDurationOrDefault("SANDBOX_MAX_LIFETIME", 30*time.Minute),
-		SandboxDefaultExecTimeout:  getEnvDurationOrDefault("SANDBOX_DEFAULT_EXEC_TIMEOUT", 1*time.Minute),
-		SandboxMaxExecTimeout:      getEnvDurationOrDefault("SANDBOX_MAX_EXEC_TIMEOUT", 10*time.Minute),
-		SandboxCPULimit:            getEnvFloatOrDefault("SANDBOX_CPU_LIMIT", 1.0),
-		SandboxMemoryLimitMB:       getEnvIntOrDefault("SANDBOX_MEMORY_LIMIT_MB", 512),
-		SandboxHostDataDir:         getEnvOrDefault("SANDBOX_HOST_DATA_DIR", ""),
-		SandboxProxyFwdPath:        getEnvOrDefault("SANDBOX_PROXY_FWD_PATH", ""),
-		SandboxAllowRuntimeBuild:   &sandboxAllowRuntimeBuild,
-		SchedulerMinRunTimeout:     schedMinTimeout,
-		SchedulerMaxRunTimeout:     schedMaxTimeout,
-		SchedulerMinMaxTurns:       schedMinTurns,
-		SchedulerMaxMaxTurns:       schedMaxTurns,
-		MaxAttachmentSizeBytes:     maxAttachmentSizeBytes,
-		KnowledgeMaxLoadedMemories:     knowledgeMaxMemories,
-		KnowledgeMaxLoadedMemoryBytes:  knowledgeMaxMemoryBytes,
-		KnowledgeMaxLoadedSkills:       knowledgeMaxSkills,
-		KnowledgeMaxLoadedSkillBytes:   knowledgeMaxSkillBytes,
-		KnowledgeDefaultDiscoveryLimit: knowledgeDefaultLimit,
-		KnowledgeMaxDiscoveryLimit:     knowledgeMaxLimit,
-		KnowledgeReconcileInterval:     knowledgeReconcileInterval,
+	if val := os.Getenv("BOB_SANDBOX_AUTO_TOOLCHAINS"); strings.TrimSpace(val) != "" {
+		b, err := strconv.ParseBool(strings.TrimSpace(val))
+		if err == nil {
+			cfg.SandboxAutoToolchains = b
+		}
+	} else if val := os.Getenv("SANDBOX_AUTO_TOOLCHAINS"); strings.TrimSpace(val) != "" {
+		b, err := strconv.ParseBool(strings.TrimSpace(val))
+		if err == nil {
+			cfg.SandboxAutoToolchains = b
+		}
 	}
 
 	if cfg.SandboxHostDataDir != "" {
@@ -285,10 +390,13 @@ func (c *Config) SandboxConfig() sandbox.Config {
 		MaxExecTimeout:      c.SandboxMaxExecTimeout,
 		CPULimit:            c.SandboxCPULimit,
 		MemoryLimitMB:       c.SandboxMemoryLimitMB,
+		TasksMax:            c.SandboxTasksMax,
 		DataDir:             c.DataDir,
 		HostDataDir:         c.SandboxHostDataDir,
 		ProxyFwdPath:        c.SandboxProxyFwdPath,
 		AllowRuntimeBuild:   c.SandboxAllowRuntimeBuild,
+		ExtraPaths:          append([]string(nil), c.SandboxExtraPaths...),
+		AutoToolchains:      c.SandboxAutoToolchains,
 	}
 }
 
@@ -306,6 +414,18 @@ func (c *Config) Validate(requireAPIKey bool) error {
 		if err := validateURL(c.BesedkaURL); err != nil {
 			return fmt.Errorf("invalid BESEDKA_URL: %w", err)
 		}
+	}
+	if c.LLMRequestTimeout < 0 {
+		return fmt.Errorf("invalid LLM request timeout: %v", c.LLMRequestTimeout)
+	}
+	if c.LLMRequestTimeout == 0 {
+		c.LLMRequestTimeout = 10 * time.Minute
+	}
+	if c.LLMFirstByteTimeout < 0 {
+		return fmt.Errorf("invalid LLM first byte timeout: %v", c.LLMFirstByteTimeout)
+	}
+	if c.LLMFirstByteTimeout == 0 {
+		c.LLMFirstByteTimeout = 1 * time.Minute
 	}
 	if c.TownhallMaxParagraphs <= 0 {
 		return fmt.Errorf("invalid TOWNHALL_MAX_PARAGRAPHS: %d", c.TownhallMaxParagraphs)
@@ -511,6 +631,23 @@ func getEnvIntStrict(key string, defaultValue int) (int, error) {
 		return 0, fmt.Errorf("invalid integer for %s: %q", key, val)
 	}
 	return i, nil
+}
+
+func parsePathList(val string) []string {
+	var sep string
+	if strings.Contains(val, ":") {
+		sep = ":"
+	} else {
+		sep = ","
+	}
+	var out []string
+	for _, p := range strings.Split(val, sep) {
+		trimmed := strings.TrimSpace(p)
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 // LoadDotEnv parses a simple .env file and populates environment variables that are not yet set.

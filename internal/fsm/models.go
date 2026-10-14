@@ -86,18 +86,18 @@ type FSMRun struct {
 	ExecutionKind    agentapi.ExecutionKind `json:"execution_kind,omitempty"`
 	FSMType          FSMType                `json:"fsm_type"`
 	Status           RunStatus              `json:"status"`
-	CurrentState  RunState  `json:"current_state"`
-	Iteration     int       `json:"iteration"`
-	MaxIterations int       `json:"max_iterations"`
-	WaitCycles    int       `json:"wait_cycles"`
-	ContextJSON   string    `json:"context_json"`
-	ResultJSON    string    `json:"result_json"`
-	ErrorText     string    `json:"error_text"`
-	ResumeAt         *int64    `json:"resume_at"` // Unix timestamp in seconds; nil if not waiting
-	Version          int       `json:"version"`
-	SourceMessageSeq *int64    `json:"source_message_seq,omitempty"`
-	CreatedAt        int64     `json:"created_at"`
-	UpdatedAt        int64     `json:"updated_at"`
+	CurrentState     RunState               `json:"current_state"`
+	Iteration        int                    `json:"iteration"`
+	MaxIterations    int                    `json:"max_iterations"`
+	WaitCycles       int                    `json:"wait_cycles"`
+	ContextJSON      string                 `json:"context_json"`
+	ResultJSON       string                 `json:"result_json"`
+	ErrorText        string                 `json:"error_text"`
+	ResumeAt         *int64                 `json:"resume_at"` // Unix timestamp in seconds; nil if not waiting
+	Version          int                    `json:"version"`
+	SourceMessageSeq *int64                 `json:"source_message_seq,omitempty"`
+	CreatedAt        int64                  `json:"created_at"`
+	UpdatedAt        int64                  `json:"updated_at"`
 
 	// Unexported fields tracking database synchronization to avoid unnecessary rewrites of context_json.
 	lastSavedContextJSON string
@@ -162,6 +162,24 @@ func NewStepFromToolCall(runID string, iteration, stepIndex int, tc openai.ToolC
 	if tc.Function.Name == "propose_memory" || tc.Function.Name == "propose_skill" {
 		maxAttempts = 1
 	}
+	timeoutSeconds := 30
+	if tc.Function.Name == "execute" || tc.Function.Name == "sandbox_exec" {
+		timeoutSeconds = 60
+		var timeoutArg struct {
+			TimeoutSeconds *int `json:"timeout_seconds"`
+		}
+		if err := json.Unmarshal([]byte(tc.Function.Arguments), &timeoutArg); err == nil && timeoutArg.TimeoutSeconds != nil {
+			if *timeoutArg.TimeoutSeconds > 0 {
+				timeoutSeconds = *timeoutArg.TimeoutSeconds
+				if timeoutSeconds > 600 {
+					timeoutSeconds = 600
+				}
+				if timeoutSeconds < 5 {
+					timeoutSeconds = 5
+				}
+			}
+		}
+	}
 	return FSMStep{
 		ID:             fmt.Sprintf("%s_i%d_s%d", runID, iteration, stepIndex),
 		RunID:          runID,
@@ -174,7 +192,7 @@ func NewStepFromToolCall(runID string, iteration, stepIndex int, tc openai.ToolC
 		Status:         StepStatusPending,
 		Attempt:        0,
 		MaxAttempts:    maxAttempts,
-		TimeoutSeconds: 30,
+		TimeoutSeconds: timeoutSeconds,
 	}
 }
 
@@ -189,4 +207,3 @@ func (s FSMStep) ToToolCall() openai.ToolCall {
 		},
 	}
 }
-

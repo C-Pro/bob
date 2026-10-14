@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -22,6 +23,22 @@ type RequestParams struct {
 	Mounts          []UserMount
 	LifetimeMinutes int
 	Reason          string
+	ExtraPaths      []string
+}
+
+// ProvisionParams specifies the parameters for pre-approved synchronous sandbox provisioning.
+type ProvisionParams struct {
+	Driver            DriverType
+	DockerImage       string
+	NetworkMode       NetworkMode
+	AllowedDomains    []string
+	WorkspaceDir      string
+	WorkspaceReadOnly bool
+	Lifetime          time.Duration
+	ExtraPaths        []string
+	ProtectedPaths    []string
+	RunID             string
+	IsDM              bool
 }
 
 type creationOp struct {
@@ -254,19 +271,39 @@ func (m *Manager) RequestSandbox(ctx context.Context, userID, chatID string, par
 		lifetime = m.cfg.MaxLifetime
 	}
 
+	extraPaths := params.ExtraPaths
+	if len(extraPaths) == 0 && len(m.cfg.ExtraPaths) > 0 {
+		extraPaths = append([]string(nil), m.cfg.ExtraPaths...)
+	}
+	protected := append(DefaultSensitivePaths(), userWorkspace)
+	if m.cfg.DataDir != "" {
+		protected = append(protected, m.cfg.DataDir)
+	}
+	if len(extraPaths) > 0 {
+		for _, p := range extraPaths {
+			if _, err := ResolveExtraPath(p, "", protected); err != nil {
+				return nil, fmt.Errorf("invalid extra path %q: %w", p, err)
+			}
+		}
+	}
+
 	now := time.Now()
 	sbx := &UserSandbox{
-		UserID:       userID,
-		ChatID:       chatID,
-		Driver:       params.Driver,
-		DockerImage:  params.DockerImage,
-		Network:      netPolicy,
-		Mounts:       params.Mounts,
-		Reason:       params.Reason,
-		CreatedAt:    now,
-		ExpiresAt:    now.Add(lifetime),
-		Status:       StatusPendingApproval,
-		WorkspaceDir: userWorkspace,
+		ID:             generateSandboxID(),
+		UserID:         userID,
+		ChatID:         chatID,
+		IsDM:           true,
+		Driver:         params.Driver,
+		DockerImage:    params.DockerImage,
+		Network:        netPolicy,
+		Mounts:         params.Mounts,
+		ExtraPaths:     extraPaths,
+		ProtectedPaths: protected,
+		Reason:         params.Reason,
+		CreatedAt:      now,
+		ExpiresAt:      now.Add(lifetime),
+		Status:         StatusPendingApproval,
+		WorkspaceDir:   userWorkspace,
 	}
 
 	m.mu.Lock()
@@ -504,7 +541,41 @@ func (m *Manager) Exec(ctx context.Context, userID string, cmd []string, request
 		execTimeout = m.cfg.MaxExecTimeout
 	}
 
-	res, err := driver.Exec(ctx, sbx, cmd, execTimeout)
+	runCtx, _ := RunContextFromContext(ctx)
+	runID := runCtx.RunID
+	if runID == "" {
+		runID = RunIDFromContext(ctx)
+	}
+	if runID == "" {
+		runID = sbx.GetRunID()
+	}
+	if runID == "" {
+		runID = sbx.ID
+	}
+	chatID := runCtx.ChatID
+	if chatID == "" {
+		chatID = sbx.ChatID
+	}
+	isDM := sbx.IsDM
+	if runCtx.IsDM {
+		isDM = true
+	}
+
+	execSbx := sbx.Clone()
+	runCache, err := AcquireRunCacheDir(runID, RunCacheMetadata{
+		RunID:     runID,
+		ChatID:    chatID,
+		IsDM:      isDM,
+		CreatedAt: time.Now(),
+		ExpiresAt: sbx.ExpiresAt,
+		DataDir:   m.cfg.DataDir,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to acquire sandbox run cache: %w", err)
+	}
+	execSbx.SetCacheDir(runCache)
+
+	res, err := driver.Exec(ctx, execSbx, cmd, execTimeout)
 	if err != nil {
 		errStr := err.Error()
 		if errors.Is(err, ErrContainerNotRunning) || strings.Contains(errStr, "is not running") || strings.Contains(errStr, "409") || strings.Contains(errStr, "not running") {
@@ -625,4 +696,221 @@ func (m *Manager) pruneExpired() {
 			}
 		}
 	}
+}
+
+func generateSandboxID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return fmt.Sprintf("sbx-%x", b)
+}
+
+// Provision performs pre-approved, synchronous sandbox creation with an explicit external host workspace.
+func (m *Manager) Provision(ctx context.Context, userID, chatID string, params ProvisionParams) (*UserSandbox, error) {
+	if !m.cfg.Enabled {
+		return nil, errors.New("sandbox execution is disabled by configuration")
+	}
+	if strings.TrimSpace(userID) == "" {
+		return nil, errors.New("userID cannot be empty")
+	}
+
+	// Validate workspace directory
+	absWorkspace, err := ValidateWorkspaceDir(params.WorkspaceDir, "", params.ProtectedPaths)
+	if err != nil {
+		return nil, fmt.Errorf("invalid workspace directory: %w", err)
+	}
+
+	// Validate network mode
+	allowedModes := m.AllowedNetworkModes()
+	modeAllowed := false
+	for _, mode := range allowedModes {
+		if strings.EqualFold(mode, string(params.NetworkMode)) {
+			modeAllowed = true
+			break
+		}
+	}
+	if !modeAllowed {
+		return nil, fmt.Errorf("network mode %q is not permitted by server policy (allowed: %s)", params.NetworkMode, strings.Join(allowedModes, ", "))
+	}
+
+	// Validate driver
+	available := false
+	for _, driverName := range m.cfg.Drivers {
+		if DriverType(strings.TrimSpace(driverName)) == params.Driver {
+			if d, ok := m.drivers[params.Driver]; ok && d.Available(ctx) {
+				available = true
+				break
+			}
+		}
+	}
+	if !available {
+		return nil, fmt.Errorf("requested driver %q is not available", params.Driver)
+	}
+
+	// Validate docker image if docker driver
+	if params.Driver == DriverDocker {
+		if err := ValidateImage(params.DockerImage, m.cfg.AllowedImages); err != nil {
+			return nil, err
+		}
+	}
+
+	// Validate network policy
+	netPolicy, err := ValidateNetworkPolicy(NetworkPolicy{
+		Mode:         params.NetworkMode,
+		AllowedHosts: params.AllowedDomains,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("invalid network configuration: %w", err)
+	}
+
+	// Calculate lifetime (clamped to configured max lifetime)
+	lifetime := params.Lifetime
+	if lifetime <= 0 || (m.cfg.MaxLifetime > 0 && lifetime > m.cfg.MaxLifetime) {
+		lifetime = m.cfg.MaxLifetime
+		if lifetime <= 0 {
+			lifetime = 1 * time.Hour
+		}
+	}
+
+	driver, ok := m.drivers[params.Driver]
+	if !ok {
+		return nil, fmt.Errorf("driver %s not found", params.Driver)
+	}
+
+	extraPaths := params.ExtraPaths
+	if len(extraPaths) == 0 && len(m.cfg.ExtraPaths) > 0 {
+		extraPaths = append([]string(nil), m.cfg.ExtraPaths...)
+	}
+	protected := append(DefaultSensitivePaths(), absWorkspace)
+	if m.cfg.DataDir != "" {
+		protected = append(protected, m.cfg.DataDir)
+	}
+	if len(params.ProtectedPaths) > 0 {
+		protected = append(protected, params.ProtectedPaths...)
+	}
+	if len(extraPaths) > 0 {
+		for _, p := range extraPaths {
+			if _, err := ResolveExtraPath(p, "", protected); err != nil {
+				return nil, fmt.Errorf("invalid extra path %q: %w", p, err)
+			}
+		}
+	}
+
+	m.mu.Lock()
+	select {
+	case <-m.stopCh:
+		m.mu.Unlock()
+		return nil, errors.New("sandbox manager is closed")
+	default:
+	}
+
+	var toDestroy *UserSandbox
+	if existing, ok := m.sandboxes[userID]; ok {
+		if existing.GetStatus() == StatusRunning {
+			if time.Now().Before(existing.ExpiresAt) {
+				m.mu.Unlock()
+				return nil, errors.New("user already has an active sandbox; execute commands using sandbox_exec")
+			}
+			toDestroy = existing
+			delete(m.sandboxes, userID)
+		} else if existing.GetStatus() == StatusCreating {
+			m.mu.Unlock()
+			return nil, errors.New("a sandbox is currently being created for user")
+		} else if existing.GetStatus() == StatusPendingApproval {
+			m.mu.Unlock()
+			return nil, errors.New("user has a pending sandbox awaiting approval")
+		} else if existing.GetStatus() == StatusExpired {
+			toDestroy = existing
+			delete(m.sandboxes, userID)
+		}
+	}
+
+	now := time.Now()
+	sbx := &UserSandbox{
+		ID:          generateSandboxID(),
+		UserID:      userID,
+		ChatID:      chatID,
+		IsDM:        params.IsDM,
+		Driver:      params.Driver,
+		DockerImage: params.DockerImage,
+		Network:     netPolicy,
+		Mounts: []UserMount{
+			{
+				RelativePath: ".",
+				SandboxPath:  DefaultWorkspaceMountPath,
+				ReadOnly:     params.WorkspaceReadOnly,
+			},
+		},
+		ExtraPaths:        extraPaths,
+		ProtectedPaths:    protected,
+		CreatedAt:         now,
+		ExpiresAt:         now.Add(lifetime),
+		Status:            StatusCreating,
+		WorkspaceDir:      absWorkspace,
+		WorkspaceExternal: true,
+		RunID:             params.RunID,
+	}
+
+	createCtx, cancel := context.WithTimeout(m.closeCtx, 10*time.Minute)
+	op := &creationOp{
+		done:   make(chan struct{}),
+		cancel: cancel,
+		sbx:    sbx,
+	}
+	m.sandboxes[userID] = sbx
+	m.creations[userID] = op
+	m.wg.Add(1)
+	m.mu.Unlock()
+
+	// Destroy previous expired sandbox if any
+	if toDestroy != nil {
+		if d, ok := m.drivers[toDestroy.Driver]; ok {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = d.Destroy(cleanupCtx, toDestroy)
+			cleanupCancel()
+		}
+	}
+
+	// Link caller cancellation
+	stopCallerWatch := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			cancel()
+		case <-createCtx.Done():
+		case <-stopCallerWatch:
+		}
+	}()
+
+	defer func() {
+		close(stopCallerWatch)
+		cancel()
+		m.wg.Done()
+	}()
+
+	createErr := driver.Create(createCtx, sbx, absWorkspace)
+	if createErr != nil || createCtx.Err() != nil {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_ = driver.Destroy(cleanupCtx, sbx)
+		cleanupCancel()
+
+		m.mu.Lock()
+		delete(m.sandboxes, userID)
+		delete(m.creations, userID)
+		m.mu.Unlock()
+
+		if errors.Is(createCtx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+			return nil, errors.New("sandbox creation was cancelled")
+		}
+		if createErr != nil {
+			return nil, fmt.Errorf("failed to create sandbox: %w", createErr)
+		}
+		return nil, createCtx.Err()
+	}
+
+	m.mu.Lock()
+	sbx.SetStatus(StatusRunning)
+	delete(m.creations, userID)
+	m.mu.Unlock()
+
+	return sbx, nil
 }

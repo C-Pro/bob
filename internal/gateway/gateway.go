@@ -21,6 +21,7 @@ import (
 
 	"bob/internal/agent"
 	"bob/internal/agentapi"
+	"bob/internal/bootstrap"
 	"bob/internal/chatcontext"
 	"bob/internal/commands"
 	"bob/internal/config"
@@ -30,15 +31,11 @@ import (
 	"bob/internal/models"
 	"bob/internal/prompt"
 	"bob/internal/sandbox"
-	"bob/internal/sandbox/bwrap"
-	"bob/internal/sandbox/docker"
 	"bob/internal/scheduler"
 	"bob/internal/tools"
-	"bob/internal/tools/tavily"
 
 	"github.com/c-pro/geche"
 	"github.com/fasthttp/websocket"
-	"github.com/liliang-cn/cortexdb/v2/pkg/cortexdb"
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -77,75 +74,44 @@ type Gateway struct {
 	runner               agentapi.TurnRunner
 }
 
-// NewGateway creates a new Besedka Gateway instance.
-func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
-	httpClient := &http.Client{Timeout: 10 * time.Second}
-
-	var embedder cortexdb.Embedder
-	modelSetting := strings.ToLower(strings.TrimSpace(cfg.EmbeddingModel))
-	if modelSetting != "" && modelSetting != "none" && modelSetting != "disabled" && modelSetting != "off" && llmClient != nil {
-		embedder = llm.NewEmbedder(llmClient, cfg.EmbeddingModel)
-	}
-	memoryManager := memory.NewManager(cfg, embedder)
-
-	var tavilyClient *tavily.Client
-	if cfg.TavilyAPIKey != "" {
-		tavilyClient = tavily.NewClient(cfg.TavilyAPIKey, cfg.TavilyBaseURL, httpClient)
+// NewGatewayWithRuntime creates a Besedka Gateway wired onto an initialized bootstrap.Runtime.
+func NewGatewayWithRuntime(cfg *config.Config, rt *bootstrap.Runtime) *Gateway {
+	if rt == nil {
+		panic("bootstrap.Runtime is required")
 	}
 
-	var sandboxManager *sandbox.Manager
-	if cfg.SandboxEnabled {
-		sbxCfg := cfg.SandboxConfig()
-		bwrapDriver := bwrap.NewDriverWithConfig(bwrap.Config{
-			CPULimit:          sbxCfg.CPULimit,
-			MemoryLimitMB:     sbxCfg.MemoryLimitMB,
-			DataDir:           sbxCfg.DataDir,
-			ProxyFwdPath:      sbxCfg.ProxyFwdPath,
-			AllowRuntimeBuild: sbxCfg.AllowRuntimeBuild,
-		})
-		dockerDriver := docker.NewDriver(docker.Config{
-			SocketPath:        sbxCfg.DockerSocket,
-			AllowedImages:     sbxCfg.AllowedImages,
-			CPULimit:          sbxCfg.CPULimit,
-			MemoryLimitMB:     sbxCfg.MemoryLimitMB,
-			DataDir:           sbxCfg.DataDir,
-			HostDataDir:       sbxCfg.HostDataDir,
-			ProxyFwdPath:      sbxCfg.ProxyFwdPath,
-			AllowRuntimeBuild: sbxCfg.AllowRuntimeBuild,
-		})
-		sandboxManager = sandbox.NewManager(sbxCfg, []sandbox.Driver{bwrapDriver, dockerDriver})
+	httpClient := rt.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 10 * time.Second}
 	}
-
-	storeProvider := NewMemoryStoreProvider(memoryManager, cfg.DataDir)
-	toolsRegistry := tools.NewRegistry(tavilyClient, memoryManager, sandboxManager)
-	toolsRegistry.SetSchedulerStoreProvider(storeProvider)
-	toolsRegistry.SetKnowledgeStoreProvider(storeProvider)
-	toolsRegistry.SetKnowledgeSearcherProvider(storeProvider)
-	toolsRegistry.SetSchedulerLimits(
-		cfg.SchedulerMinRunTimeout,
-		cfg.SchedulerMaxRunTimeout,
-		cfg.SchedulerMinMaxTurns,
-		cfg.SchedulerMaxMaxTurns,
-	)
 
 	var kw *KnowledgeWorker
-	if storeProvider != nil {
+	if rt.StoreProvider != nil {
 		workerCfg := DefaultKnowledgeWorkerConfig()
 		if cfg.KnowledgeReconcileInterval > 0 {
 			workerCfg.Interval = cfg.KnowledgeReconcileInterval
 		}
-		kw = NewKnowledgeWorker(storeProvider, workerCfg)
+		kw = NewKnowledgeWorker(rt.StoreProvider, workerCfg)
 	}
 
-	chatLocker := NewChatLocker()
+	chatLocker := rt.SessionLocker
+	if chatLocker == nil {
+		chatLocker = NewChatLocker()
+	}
+
+	var runner agentapi.TurnRunner
+	if rt.AgentEngine != nil {
+		runner = rt.AgentEngine
+	}
+
 	gw := &Gateway{
 		cfg:                  cfg,
-		llmClient:            llmClient,
+		llmClient:            rt.LLMClient,
 		httpClient:           httpClient,
-		toolsRegistry:        toolsRegistry,
-		memoryManager:        memoryManager,
-		sandboxManager:       sandboxManager,
-		storeProvider:        storeProvider,
+		toolsRegistry:        rt.ToolsRegistry,
+		memoryManager:        rt.MemoryManager,
+		sandboxManager:       rt.SandboxManager,
+		storeProvider:        rt.StoreProvider,
 		knowledgeWorker:      kw,
 		userCache:            NewUserCache(),
 		contextManager:       chatcontext.NewManager(cfg.MsgRingBufferSize),
@@ -155,26 +121,19 @@ func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 		userContextInjected:  geche.NewMapCache[string, bool](),
 		chatLocker:           chatLocker,
 		chatCache:            NewChatCache(),
+		fsmEngine:            rt.FSMEngine,
+		runner:               runner,
 	}
 
-	toolsRegistry.SetAttachmentClient(gw)
-	toolsRegistry.SetMaxAttachmentSize(cfg.MaxAttachmentSizeBytes)
-	toolsRegistry.SetDMAuthorizer(gw.VerifyDMOwner)
-	if storeProvider != nil {
-		storeProvider.SetMaxDiscoveryLimit(cfg.KnowledgeMaxDiscoveryLimit)
-		toolsRegistry.SetKnowledgeStoreProvider(storeProvider)
-		toolsRegistry.SetKnowledgeSearcherProvider(storeProvider)
+	if rt.ToolsRegistry != nil {
+		rt.ToolsRegistry.SetAttachmentClient(gw)
+		rt.ToolsRegistry.SetMaxAttachmentSize(cfg.MaxAttachmentSizeBytes)
+		rt.ToolsRegistry.SetDMAuthorizer(gw.VerifyDMOwner)
 	}
-	toolsRegistry.SetKnowledgeLimits(tools.KnowledgeBudgetLimits{
-		MaxLoadedMemories:    cfg.KnowledgeMaxLoadedMemories,
-		MaxLoadedMemoryBytes: cfg.KnowledgeMaxLoadedMemoryBytes,
-		MaxLoadedSkills:      cfg.KnowledgeMaxLoadedSkills,
-		MaxLoadedSkillBytes:  cfg.KnowledgeMaxLoadedSkillBytes,
-	}, cfg.KnowledgeDefaultDiscoveryLimit, cfg.KnowledgeMaxDiscoveryLimit)
 
 	invokerCfg := InvokerConfig{
-		Tools:               toolsRegistry,
-		Sandbox:             sandboxManager,
+		Tools:               rt.ToolsRegistry,
+		Sandbox:             rt.SandboxManager,
 		Sender:              gw,
 		AttachmentProcessor: gw,
 		ContextMgr:          gw.contextManager,
@@ -189,13 +148,29 @@ func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 		},
 	}
 	gw.schedulerInvoker = NewScheduleInvoker(invokerCfg, chatLocker)
-	gw.schedulerEngine = scheduler.NewEngine(storeProvider, gw.schedulerInvoker)
+	gw.schedulerEngine = scheduler.NewEngine(rt.StoreProvider, gw.schedulerInvoker)
 
 	gw.contextManager.SetOnEvict(func(chatID string, evicted []chatcontext.Entry) {
 		gw.handleEvictedBatch(chatID, evicted)
 	})
 
+	if rt.FSMEngine != nil {
+		rt.FSMEngine.SetToolDefinitionProvider(gw)
+	}
+	_ = rt.RegisterFrontend("besedka", gw)
+
 	return gw
+}
+
+// NewGateway creates a new Besedka Gateway instance by constructing a default bootstrap.Runtime.
+func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
+	rt, err := bootstrap.New(cfg, bootstrap.Options{
+		LLMClient: llmClient,
+	})
+	if err != nil {
+		panic(fmt.Sprintf("failed to bootstrap runtime for gateway: %v", err))
+	}
+	return NewGatewayWithRuntime(cfg, rt)
 }
 
 // MemoryManager returns the Gateway's memory Manager.
@@ -359,6 +334,9 @@ func (g *Gateway) SetFSMEngine(e *fsm.Engine) {
 	if g.schedulerInvoker != nil {
 		g.schedulerInvoker.SetFSM(e)
 	}
+	if ae, ok := g.runner.(*agent.Engine); ok {
+		ae.SetFSMEngine(e)
+	}
 }
 
 // ToolDefinitions implements fsm.ToolDefinitionProvider to supply tool definitions for a chat.
@@ -442,6 +420,18 @@ func (g *Gateway) Bind(ctx context.Context, run agentapi.RunDescriptor) (agentap
 	sessionCtx := tools.NewChatSessionContext(chatID, userID, isAuthorizedDMOwner, budgetLimits)
 	sessionCtx.Notifier = func(targetChatID, text string) error {
 		return g.SendMessage(targetChatID, text)
+	}
+	sessionCtx.SandboxRequestCreated = new(bool)
+	sessionCtx.FSMRunID = run.RunID
+	if run.Kind == agentapi.Scheduled {
+		sessionCtx.IsScheduled = true
+	}
+	if run.Metadata != nil {
+		if s, ok := run.Metadata["source_message_seq"]; ok && s != "" {
+			if seq, err := strconv.ParseInt(s, 10, 64); err == nil && seq > 0 {
+				sessionCtx.SourceMessageSeq = &seq
+			}
+		}
 	}
 
 	var toolset agentapi.Toolset
@@ -1694,6 +1684,7 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 					FrontendID: "besedka",
 					SessionID:  msg.ChatID,
 					ScopeID:    msg.ChatID,
+					IsDM:       isDM,
 				},
 				Actor: agentapi.Actor{
 					ID: msg.UserID,

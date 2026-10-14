@@ -419,7 +419,11 @@ func (e *StepExecutor) executeSingleStep(ctx context.Context, store StepStore, s
 		timeoutSec = 30
 		step.TimeoutSeconds = timeoutSec
 	}
-	timeout := time.Duration(timeoutSec) * time.Second
+	envelopeSec := timeoutSec
+	if step.ToolName == "execute" || step.ToolName == "sandbox_exec" {
+		envelopeSec = timeoutSec + 5
+	}
+	timeout := time.Duration(envelopeSec) * time.Second
 
 	maxAttempts := step.MaxAttempts
 	if maxAttempts <= 0 {
@@ -472,7 +476,7 @@ func (e *StepExecutor) executeSingleStep(ctx context.Context, store StepStore, s
 			errText := ctx.Err().Error()
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				status = StepStatusTimedOut
-				errText = fmt.Sprintf("tool execution timed out after %ds", step.TimeoutSeconds)
+				errText = "run execution timed out: parent deadline exceeded"
 			}
 			step.Status = status
 			step.ErrorText = errText
@@ -515,7 +519,7 @@ func (e *StepExecutor) executeSingleStep(ctx context.Context, store StepStore, s
 		// Step timed out and attempts exhausted
 		if isTimeout {
 			step.Status = StepStatusTimedOut
-			step.ErrorText = fmt.Sprintf("tool execution timed out after %ds", step.TimeoutSeconds)
+			step.ErrorText = fmt.Sprintf("tool execution timed out after %ds; specify a higher timeout_seconds in tool arguments if needed", step.TimeoutSeconds)
 			step.CompletedAt = &completedTime
 			updateErr := e.updateStep(ctx, store, step)
 			return errors.Join(err, updateErr)

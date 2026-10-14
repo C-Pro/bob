@@ -1,0 +1,8 @@
+{
+  "track_id": "cli-oneshot-frontend_20261008",
+  "type": "feature",
+  "status": "complete",
+  "created_at": "2026-10-08T00:55:00Z",
+  "updated_at": "2026-10-08T19:25:00Z",
+  "description": "Command-line one-shot frontend (bob -p) with shared YAML user config, read-only knowledge + web tools by default, and opt-in bwrap/docker sandbox with execute tool via --mount"
+}

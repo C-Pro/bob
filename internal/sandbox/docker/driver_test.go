@@ -419,7 +419,6 @@ func TestDockerDriver_Create_ForwarderBinaryMissing(t *testing.T) {
 	assert.Nil(t, driver.proxies[sbx.UserID], "no proxy should be stored on failure")
 }
 
-
 func TestDockerDriver_AutoPullMissingImage_Success(t *testing.T) {
 	tempDir := t.TempDir()
 	sockPath := filepath.Join(tempDir, "mock_docker_pull.sock")
@@ -1372,7 +1371,6 @@ func TestDockerDriver_RealDocker_NetworkRestricted_ConcurrentExec(t *testing.T) 
 	}
 }
 
-
 func TestDockerDriver_Destroy_ProxySocketCleanup(t *testing.T) {
 	tempDir := t.TempDir()
 	sockPath := filepath.Join(tempDir, "docker.sock")
@@ -1787,4 +1785,81 @@ func TestCheckNoExec(t *testing.T) {
 	// Non-existent path should return nil without erroring out
 	err = checkNoExec(filepath.Join(tempDir, "nonexistent"))
 	assert.NoError(t, err)
+}
+
+func TestDockerDriver_ExternalWorkspaceMount(t *testing.T) {
+	tempDir := t.TempDir()
+	sockPath := filepath.Join(tempDir, "docker.sock")
+
+	listener, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+	defer func() { _ = listener.Close() }()
+
+	var capturedCreateHostConfig map[string]interface{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_ping", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/containers/create", func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		if hc, ok := payload["HostConfig"].(map[string]interface{}); ok {
+			capturedCreateHostConfig = hc
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"Id":"ext-container-id"}`))
+	})
+	mux.HandleFunc("/containers/ext-container-id/start", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/containers/ext-container-id/json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"State":{"Running":true,"ExitCode":0}}`))
+	})
+	mux.HandleFunc("/containers/ext-container-id", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	server := &http.Server{Handler: mux}
+	go func() { _ = server.Serve(listener) }()
+	defer func() { _ = server.Close() }()
+
+	driver := NewDriver(Config{
+		SocketPath:    sockPath,
+		AllowedImages: []string{"alpine:latest"},
+	})
+
+	extWS := filepath.Join(tempDir, "host:workspace:colons")
+	require.NoError(t, os.Mkdir(extWS, 0755))
+
+	sbx := &sandbox.UserSandbox{
+		UserID:            "ext-user",
+		DockerImage:       "alpine:latest",
+		Network:           sandbox.NetworkPolicy{Mode: sandbox.NetworkNone},
+		WorkspaceDir:      extWS,
+		WorkspaceExternal: true,
+		Mounts: []sandbox.UserMount{
+			{
+				RelativePath: ".",
+				SandboxPath:  sandbox.DefaultWorkspaceMountPath,
+				ReadOnly:     true,
+			},
+		},
+	}
+
+	err = driver.Create(context.Background(), sbx, extWS)
+	require.NoError(t, err)
+	defer func() { _ = driver.Destroy(context.Background(), sbx) }()
+
+	require.NotNil(t, capturedCreateHostConfig)
+	mountsRaw, ok := capturedCreateHostConfig["Mounts"].([]interface{})
+	require.True(t, ok, "HostConfig should contain structured Mounts for external workspace")
+	require.Len(t, mountsRaw, 1)
+
+	mountMap, ok := mountsRaw[0].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, extWS, mountMap["Source"])
+	assert.Equal(t, sandbox.DefaultWorkspaceMountPath, mountMap["Target"])
+	assert.Equal(t, "bind", mountMap["Type"])
+	assert.Equal(t, true, mountMap["ReadOnly"])
 }

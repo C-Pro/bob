@@ -121,6 +121,7 @@ Bob supports running bash commands and editing files in isolated sandboxes:
 
 ### Run
 
+#### Besedka Daemon
 ```sh
 # Run agent service
 go run ./cmd/agent
@@ -128,6 +129,59 @@ go run ./cmd/agent
 # Regenerate all vector embeddings across all chat databases (e.g. after changing embedding models)
 go run ./cmd/agent -regenerate-vectors
 ```
+
+#### Standalone CLI One-Shot Frontend (`bob -p`)
+Bob includes a command-line frontend that executes one-shot queries directly from your terminal:
+
+```sh
+# Build the binary
+make build-bob
+
+# Initialize the config file template (default ~/.config/bob/config.yaml, or pass --config PATH)
+./bin/bob --init-config
+# Or with a custom config path:
+./bin/bob --init-config --config /path/to/config.yaml
+
+# Execute a one-shot prompt (web + knowledge tools, no local filesystem access)
+./bin/bob -p "What changed in Go 1.26?"
+
+# Execute with local workspace mounted read-only (enables sandbox 'execute' tool)
+./bin/bob -p "Summarize TODOs in this repository" --mount .
+
+# Execute with local workspace mounted read-write
+./bin/bob -p "Run the test suite and fix errors" --mount .:rw
+
+# Pipe stdin as prompt context
+git diff | ./bin/bob -p "Write a commit message for this diff"
+
+# Output only the final answer (suitable for shell pipelines and redirection)
+./bin/bob -q -p "Generate a Dockerfile for Go" > Dockerfile
+```
+
+##### CLI Flags & Options
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `-p`, `--prompt STRING` | *(required)* | Prompt instruction to execute. `-p -` reads the prompt from stdin. |
+| `-q`, `--quiet` | `false` | Suppresses intermediate step lines; prints only the final answer on stdout. |
+| `-v`, `--verbose` | `false` | Enables debug logging on stderr. |
+| `--config PATH` | `~/.config/bob/config.yaml` | Path to YAML configuration file (must have mode `0600` permissions). |
+| `--mount PATH[:ro\|:rw]` | none | Workspace directory to mount at `/workspace`. Default mode is `:ro`. |
+| `--sandbox DRIVER` | `bwrap` | Sandbox driver (`bwrap` or `docker`). Requires `--mount`. |
+| `--net MODE` | `none` | Network access mode inside sandbox (`none`, `restricted`, `full`). Requires `--mount`. |
+| `--allow-domain HOST` | none | Allowed domain for HTTP/HTTPS egress (repeatable). Requires `--net restricted`. |
+| `--image IMAGE` | `python:3.12-slim` | Container image for Docker driver (must be in `allowed_images`). |
+| `--model MODEL` | from config | LLM model identifier override. |
+| `--max-iterations N` | from config (100) | Maximum tool loop iterations. |
+| `--timeout DURATION` | `1h` | Overall execution timeout (e.g. `1h`, `30m`, `5m`). |
+| `--init-config` | — | Writes a commented template config file (mode `0600`) and exits. |
+
+##### Security & Sandboxing Principles
+- **Safe by default:** Without `--mount`, Bob has no sandbox and cannot read, write, or inspect local files on the host filesystem.
+- **Explicit consent through flags:** Command-line flags act as explicit operator authorization; there is no interactive approval prompt in one-shot mode.
+- **Mount Guard:** To prevent credential and state leakage, `--mount` rejects `/` and any directory that equals, contains, or is contained within the configuration directory (`~/.config/bob`) or data directory (`~/.local/share/bob`).
+- **Strict Configuration Permissions:** The configuration file (`config.yaml`) must be owned by the current user and have permissions `0600` (`mode & 0o077 == 0`).
+- **Knowledge Store Isolation:** In one-shot mode, mutating proposals (`propose_memory`, `propose_skill`) are excluded. Long-term memory is queried in read-only mode from the local database.
 
 ### Docker
 
@@ -152,6 +206,10 @@ When running Bob inside Docker and using the `docker` sandbox driver (sibling co
 # Run tests
 make test
 
+# Build binaries
+make build-bob
+make build-fwd
+
 # Or full check (lint + test + semgrep + osv-scanner)
 make check
 ```
@@ -159,21 +217,26 @@ make check
 ## Project Structure
 
 ```
-cmd/agent/          — entrypoint
+cmd/
+  agent/            — Besedka chat daemon service entrypoint
+  bob/              — Standalone CLI one-shot (and future TUI) entrypoint
+  bob-proxy-fwd/    — Static helper utility for sandbox network proxying
 internal/
-  backup/           — automated S3/object storage backups
-  chatcontext/      — per-chat ring buffer context management
-  config/           — environment-based configuration
-  gateway/          — WebSocket/REST gateway to Besedka
-  geoip/            — server location lookup
-  llm/              — OpenAI-compatible LLM & embeddings client
-  memory/           — isolated SQLite vector + FTS5 long-term memory store
-  models/           — shared data types
-  objectstore/      — S3-compatible client wrapper
-  prompt/           — system prompt rendering
-  sandbox/          — secure code execution isolation (bwrap, docker, network proxy)
-  store/            — SQLite database storage & single-step migrations
-  tools/            — tool registry, memory recall, Tavily search, web fetch
+  agent/            — High-level agent orchestration engine and turn loop
+  agentapi/         — Transport-agnostic frontend interfaces, tools, and attachments
+  agentstore/       — Chat context and SQLite memory store provider
+  bootstrap/        — Shared agent runtime initialization and lifecycle composition
+  cli/              — CLI frontend, mount parsing, progress renderer, and runner
+  config/           — Environment and YAML file configuration loaders
+  fsm/              — Durable SQLite-backed workflow state machine and tool loop
+  gateway/          — WebSocket/REST gateway integration with Besedka chat platform
+  geoip/            — Server location reporting across public GEOIP providers
+  knowledge/        — User-approved long-term knowledge and skill storage
+  llm/              — OpenAI-compatible LLM client and embedding generators
+  memory/           — Per-chat SQLite vector & FTS5 memory store
+  prompt/           — Contextual system prompt formatters for Besedka and CLI
+  sandbox/          — Process isolation drivers (Bubblewrap, Docker) and network proxy
+  tools/            — Tool registry, combinators, execute tool, web search & fetch
 ```
 
 ## License

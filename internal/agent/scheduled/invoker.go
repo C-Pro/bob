@@ -288,6 +288,7 @@ func (inv *Invoker) ExecuteSchedule(ctx context.Context, sched *scheduler.Schedu
 					FrontendID: "besedka",
 					SessionID:  sched.ChatID,
 					ScopeID:    sched.ChatID,
+					IsDM:       sched.ChatID != "townhall",
 				},
 				Actor: agentapi.Actor{
 					ID: sched.UserID,

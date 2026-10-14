@@ -334,7 +334,7 @@ func (r *Registry) initToolDefinitions() {
 			},
 			"timeout_seconds": map[string]interface{}{
 				"type":        "integer",
-				"description": "Command execution timeout in seconds (default 60, min 5, max 600).",
+				"description": "Command execution timeout in seconds (default 30, min 5, max 600). Specify a higher limit for long-running commands like tests or builds.",
 			},
 		},
 		"required": []string{"command", "description"},
@@ -977,26 +977,27 @@ func (r *Registry) executeSandboxExec(ctx context.Context, argsJSON string) (str
 		return "", errors.New("command cannot be empty")
 	}
 
-	timeout := time.Duration(args.TimeoutSeconds) * time.Second
+	var timeout time.Duration
+	if args.TimeoutSeconds > 0 {
+		secs := args.TimeoutSeconds
+		if secs > 1800 {
+			secs = 1800
+		}
+		timeout = time.Duration(secs) * time.Second
+	}
+
+	ctx = sandbox.WithRunContext(ctx, sandbox.RunContext{
+		RunID:  session.FSMRunID,
+		ChatID: session.ChatID,
+		IsDM:   session.IsDM,
+	})
 
 	res, err := r.sandboxManager.Exec(ctx, session.UserID, []string{"sh", "-c", cmdStr}, timeout)
 	if err != nil {
 		return "", fmt.Errorf("execution failed: %w", err)
 	}
 
-	var b strings.Builder
-	fmt.Fprintf(&b, "Exit Code: %d\nDuration: %s\n", res.ExitCode, res.Duration.Round(time.Millisecond))
-	if res.Stdout != "" {
-		b.WriteString("\n[stdout]\n" + res.Stdout)
-	}
-	if res.Stderr != "" {
-		b.WriteString("\n[stderr]\n" + res.Stderr)
-	}
-	if res.Stdout == "" && res.Stderr == "" {
-		b.WriteString("\n(No output)")
-	}
-
-	return b.String(), nil
+	return FormatExecResult(res), nil
 }
 
 func (r *Registry) executeSandboxDestroy(ctx context.Context, argsJSON string) (string, error) {

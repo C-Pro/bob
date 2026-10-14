@@ -255,18 +255,102 @@ func TestFilteringProxyHopByHopHeaders(t *testing.T) {
 	assert.Equal(t, "allowed", resp.Header.Get("X-Regular-Header"))
 }
 
-func TestFilteringProxyDNSRebindingPrevention(t *testing.T) {
-	ips, err := net.LookupIP("example.com")
+func startMockDNSServer(t *testing.T, ip net.IP) (*net.Resolver, func()) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
-	require.NotEmpty(t, ips)
+
+	stop := make(chan struct{})
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = pc.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				continue
+			}
+			if n < 12 {
+				continue
+			}
+			// Find end of QNAME (starts at byte 12)
+			qnameEnd := 12
+			for qnameEnd < n && buf[qnameEnd] != 0 {
+				qnameEnd += int(buf[qnameEnd]) + 1
+			}
+			qnameEnd++ // skip trailing 0
+			if qnameEnd+4 > n {
+				continue
+			}
+			qtype := uint16(buf[qnameEnd])<<8 | uint16(buf[qnameEnd+1])
+			questionSectionEnd := qnameEnd + 4
+
+			// Response includes header (12 bytes) + question section
+			resp := make([]byte, questionSectionEnd)
+			copy(resp, buf[:questionSectionEnd])
+			resp[2] = 0x81 // QR=1, RD=1
+			resp[3] = 0x80 // RA=1, RCODE=0
+			resp[4] = 0x00 // QDCOUNT = 1
+			resp[5] = 0x01
+			resp[8] = 0x00 // NSCOUNT = 0
+			resp[9] = 0x00
+			resp[10] = 0x00 // ARCOUNT = 0
+			resp[11] = 0x00
+
+			ip4 := ip.To4()
+			if qtype == 1 && ip4 != nil { // Type A
+				resp[6] = 0x00 // ANCOUNT = 1
+				resp[7] = 0x01
+				ans := []byte{
+					0xc0, 0x0c, // name pointer to QNAME at byte 12
+					0x00, 0x01, // Type A
+					0x00, 0x01, // Class IN
+					0x00, 0x00, 0x00, 0x3c, // TTL 60s
+					0x00, 0x04, // RDLENGTH 4
+					ip4[0], ip4[1], ip4[2], ip4[3],
+				}
+				resp = append(resp, ans...)
+			} else {
+				resp[6] = 0x00 // ANCOUNT = 0
+				resp[7] = 0x00
+			}
+			_, _ = pc.WriteTo(resp, addr)
+		}
+	}()
+
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "udp", pc.LocalAddr().String())
+		},
+	}
+
+	cleanup := func() {
+		close(stop)
+		_ = pc.Close()
+	}
+	return resolver, cleanup
+}
+
+func TestFilteringProxyDNSRebindingPrevention(t *testing.T) {
+	testIP := net.ParseIP("93.184.216.34")
+	resolver, cleanup := startMockDNSServer(t, testIP)
+	defer cleanup()
 
 	// Block the resolved IP of example.com
-	blockedCIDR := ips[0].String() + "/32"
+	blockedCIDR := testIP.String() + "/32"
 
-	proxy, err := NewFilteringProxy(NetworkPolicy{
-		Mode:         NetworkRestricted,
-		AllowedHosts: []string{"example.com"},
-		BlockedCIDRs: []string{blockedCIDR},
+	proxy, err := NewFilteringProxyWithConfig(ProxyConfig{
+		Policy: NetworkPolicy{
+			Mode:         NetworkRestricted,
+			AllowedHosts: []string{"example.com"},
+			BlockedCIDRs: []string{blockedCIDR},
+		},
+		Resolver: resolver,
 	})
 	require.NoError(t, err)
 	defer func() { _ = proxy.Close() }()
@@ -275,6 +359,7 @@ func TestFilteringProxyDNSRebindingPrevention(t *testing.T) {
 	require.NoError(t, err)
 
 	client := &http.Client{
+		Timeout: 5 * time.Second,
 		Transport: &http.Transport{
 			Proxy: http.ProxyURL(proxyURL),
 		},
@@ -285,6 +370,10 @@ func TestFilteringProxyDNSRebindingPrevention(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
 	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Contains(t, string(body), "matches blocked CIDR "+blockedCIDR)
 }
 
 func TestFilteringProxyUnixSocket(t *testing.T) {
@@ -765,10 +854,10 @@ func TestFilteringProxy_TunnelUnidirectionalActive(t *testing.T) {
 		}
 		defer func() { _ = conn.Close() }()
 
-		// Stream 3 chunks with 15ms pause between them (total duration ~45ms)
+		// Stream 4 chunks with 30ms pause between them (total duration ~120ms > 100ms idle timeout)
 		// Client sends 0 bytes during this entire time.
-		for i := 0; i < 3; i++ {
-			time.Sleep(15 * time.Millisecond)
+		for i := 0; i < 4; i++ {
+			time.Sleep(30 * time.Millisecond)
 			_, _ = fmt.Fprintf(conn, "chunk-%d\n", i)
 		}
 		close(streamDone)
@@ -780,7 +869,7 @@ func TestFilteringProxy_TunnelUnidirectionalActive(t *testing.T) {
 			AllowedHosts: []string{"127.0.0.1"},
 		},
 		CustomBlocked:     []string{},
-		TunnelIdleTimeout: 30 * time.Millisecond, // 30ms idle timeout < 45ms transfer time
+		TunnelIdleTimeout: 100 * time.Millisecond, // 100ms idle timeout < 120ms transfer time
 	})
 	require.NoError(t, err)
 	defer func() { _ = proxy.Close() }()
@@ -799,16 +888,16 @@ func TestFilteringProxy_TunnelUnidirectionalActive(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(buf[:n]), "200 Connection Established")
 
-	// Read all 3 chunks from upstream
+	// Read all 4 chunks from upstream
 	var received []string
 	scanner := bufio.NewScanner(conn)
 	for scanner.Scan() {
 		received = append(received, scanner.Text())
-		if len(received) == 3 {
+		if len(received) == 4 {
 			break
 		}
 	}
-	assert.Len(t, received, 3, "all chunks must be received without premature idle timeout")
+	assert.Len(t, received, 4, "all chunks must be received without premature idle timeout")
 	<-streamDone
 }
 

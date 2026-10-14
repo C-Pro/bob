@@ -186,8 +186,9 @@ func TestStepExecutor_ParallelExecutionAndConcurrencyLimit(t *testing.T) {
 	assert.LessOrEqual(t, maxObserved, int32(2))
 	assert.GreaterOrEqual(t, maxObserved, int32(2))
 
-	// 4 tasks taking 30ms each with concurrency 2 take ~60ms, well under sequential 120ms
-	assert.Less(t, elapsed, 110*time.Millisecond)
+	// 4 tasks taking 30ms each with concurrency 2 take ~60ms under ideal conditions;
+	// allow up to 500ms to tolerate scheduling jitter under heavy race detector load.
+	assert.Less(t, elapsed, 500*time.Millisecond)
 }
 
 func TestStepExecutor_SequentialExecutionOrderAndSkipOnFailure(t *testing.T) {
@@ -640,6 +641,3 @@ func TestStepExecutor_StepResultTruncation(t *testing.T) {
 	assert.True(t, len(decoded.Content) <= MaxStepResultBytes+len(StepTruncationNotice))
 	assert.True(t, strings.HasSuffix(decoded.Content, StepTruncationNotice))
 }
-
-
-

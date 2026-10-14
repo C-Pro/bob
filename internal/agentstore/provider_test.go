@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -590,4 +591,61 @@ func TestKnowledgeWorker_DiscoversAndReconcilesUnopenedDMDatabases(t *testing.T)
 	reconciledVer, err := reopenedStore.GetSkillVersion(ctx, skillVer.ID)
 	require.NoError(t, err)
 	assert.Equal(t, knowledge.IndexStatusReady, reconciledVer.IndexStatus)
+}
+
+func TestMemoryStoreProvider_DBPath_And_LookupRunStatus(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &config.Config{
+		DataDir: tempDir,
+	}
+
+	memMgr := memory.NewManager(cfg, nil)
+	defer func() {
+		_ = memMgr.Close()
+	}()
+
+	provider := NewMemoryStoreProvider(memMgr, tempDir)
+	ctx := context.Background()
+
+	// 1. Verify DBPath calculation
+	assert.Equal(t, filepath.Join(tempDir, "townhall.db"), provider.DBPath("townhall", false))
+	assert.Equal(t, filepath.Join(tempDir, "dm_alice.db"), provider.DBPath("alice", true))
+
+	// 2. Unopened DB lookup returns found=false without creating file
+	status, found, err := provider.LookupRunStatus(ctx, "townhall", false, "run-123")
+	require.NoError(t, err)
+	assert.False(t, found)
+	assert.Empty(t, status)
+
+	// Verify file was NOT created by LookupRunStatus
+	_, statErr := os.Stat(provider.DBPath("townhall", false))
+	assert.True(t, os.IsNotExist(statErr))
+
+	// 3. Open store and create terminal run
+	store, err := provider.GetStore(ctx, "townhall", false)
+	require.NoError(t, err)
+
+	run := &fsm.FSMRun{
+		ID:           "run-terminal-1",
+		ChatID:       "townhall",
+		UserID:       "alice",
+		IsDM:         false,
+		FSMType:      fsm.FSMTypeToolLoop,
+		CurrentState: fsm.StateTerminated,
+		Status:       fsm.RunStatusCompleted,
+		ContextJSON:  "[]",
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	// 4. Lookup existing run
+	status, found, err = provider.LookupRunStatus(ctx, "townhall", false, "run-terminal-1")
+	require.NoError(t, err)
+	assert.True(t, found)
+	assert.Equal(t, fsm.RunStatusCompleted, status)
+
+	// 5. Lookup non-existent run in existing DB
+	status, found, err = provider.LookupRunStatus(ctx, "townhall", false, "run-nonexistent")
+	require.NoError(t, err)
+	assert.False(t, found)
+	assert.Empty(t, status)
 }

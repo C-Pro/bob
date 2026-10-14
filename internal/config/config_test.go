@@ -53,6 +53,8 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	_ = os.Unsetenv("SANDBOX_MAX_EXEC_TIMEOUT")
 	_ = os.Unsetenv("SANDBOX_CPU_LIMIT")
 	_ = os.Unsetenv("SANDBOX_MEMORY_LIMIT_MB")
+	_ = os.Unsetenv("BOB_SANDBOX_TASKS_MAX")
+	_ = os.Unsetenv("SANDBOX_TASKS_MAX")
 	_ = os.Unsetenv("SANDBOX_HOST_DATA_DIR")
 	_ = os.Unsetenv("SCHEDULER_MIN_RUN_TIMEOUT")
 	_ = os.Unsetenv("SCHEDULER_MAX_RUN_TIMEOUT")
@@ -102,6 +104,7 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	assert.Equal(t, 10*time.Minute, cfg.SandboxMaxExecTimeout)
 	assert.Equal(t, 1.0, cfg.SandboxCPULimit)
 	assert.Equal(t, 512, cfg.SandboxMemoryLimitMB)
+	assert.Equal(t, 64, cfg.SandboxTasksMax)
 	assert.Equal(t, "", cfg.SandboxHostDataDir)
 	assert.Equal(t, 1*time.Minute, cfg.SchedulerMinRunTimeout)
 	assert.Equal(t, 1*time.Hour, cfg.SchedulerMaxRunTimeout)
@@ -315,6 +318,7 @@ func TestSandboxConfigValidation(t *testing.T) {
 		SandboxMaxExecTimeout:      10 * time.Minute,
 		SandboxCPULimit:            1.0,
 		SandboxMemoryLimitMB:       512,
+		SandboxTasksMax:            1024,
 	}
 	require.NoError(t, cfg.Validate(true))
 
@@ -363,6 +367,12 @@ func TestSandboxConfigValidation(t *testing.T) {
 	assert.ErrorContains(t, err, "SANDBOX_MEMORY_LIMIT_MB must be greater than 0")
 	cfg.SandboxMemoryLimitMB = 1024
 
+	// Tasks max > 0
+	cfg.SandboxTasksMax = 0
+	err = cfg.Validate(true)
+	assert.ErrorContains(t, err, "SANDBOX_TASKS_MAX must be greater than 0")
+	cfg.SandboxTasksMax = 1024
+
 	// Valid now
 	assert.NoError(t, cfg.Validate(true))
 
@@ -384,6 +394,7 @@ func TestSandboxCustomEnv(t *testing.T) {
 	t.Setenv("SANDBOX_MAX_EXEC_TIMEOUT", "15m")
 	t.Setenv("SANDBOX_CPU_LIMIT", "2.5")
 	t.Setenv("SANDBOX_MEMORY_LIMIT_MB", "1024")
+	t.Setenv("SANDBOX_TASKS_MAX", "2048")
 
 	cfg, err := LoadFromEnv()
 	require.NoError(t, err)
@@ -397,6 +408,16 @@ func TestSandboxCustomEnv(t *testing.T) {
 	assert.Equal(t, 15*time.Minute, cfg.SandboxMaxExecTimeout)
 	assert.Equal(t, 2.5, cfg.SandboxCPULimit)
 	assert.Equal(t, 1024, cfg.SandboxMemoryLimitMB)
+	assert.Equal(t, 2048, cfg.SandboxTasksMax)
+}
+
+func TestLoadFromEnv_SandboxTasksMaxPrecedence(t *testing.T) {
+	t.Setenv("SANDBOX_TASKS_MAX", "2048")
+	t.Setenv("BOB_SANDBOX_TASKS_MAX", "4096")
+
+	cfg, err := LoadFromEnv()
+	require.NoError(t, err)
+	assert.Equal(t, 4096, cfg.SandboxTasksMax)
 }
 
 func TestLoadFromEnv_SandboxEnabledParsing(t *testing.T) {
@@ -446,6 +467,7 @@ func TestConfig_Validate_SandboxHostDataDir(t *testing.T) {
 		SandboxMaxExecTimeout:      10 * time.Minute,
 		SandboxCPULimit:            1.0,
 		SandboxMemoryLimitMB:       512,
+		SandboxTasksMax:            1024,
 	}
 
 	// Valid absolute path passes validation
@@ -778,4 +800,3 @@ func TestValidateBesedka(t *testing.T) {
 		assert.ErrorContains(t, cfg.ValidateBesedka(), "invalid TOWNHALL_MAX_PARAGRAPHS: 0")
 	})
 }
-

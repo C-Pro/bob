@@ -5,6 +5,7 @@ type SessionRef struct {
 	FrontendID string `json:"frontend_id"`
 	SessionID  string `json:"session_id"`
 	ScopeID    string `json:"scope_id"`
+	IsDM       bool   `json:"is_dm,omitempty"`
 }
 
 // Actor identifies the initiator or author of a turn.
@@ -22,10 +23,10 @@ const (
 
 // RunDescriptor captures the execution context and constraints of an agent run.
 type RunDescriptor struct {
-	RunID         string        `json:"run_id"`
-	Session       SessionRef    `json:"session"`
-	Actor         Actor         `json:"actor"`
-	Kind          ExecutionKind `json:"kind"`
+	RunID         string            `json:"run_id"`
+	Session       SessionRef        `json:"session"`
+	Actor         Actor             `json:"actor"`
+	Kind          ExecutionKind     `json:"kind"`
 	Model         string            `json:"model"`
 	MaxIterations int               `json:"max_iterations"`
 	Metadata      map[string]string `json:"metadata,omitempty"`

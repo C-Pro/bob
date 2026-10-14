@@ -26,21 +26,22 @@ import (
 // Driver implements sandbox.Driver using the Docker Engine API over Unix socket.
 // It is 100% pure Go and CGO-free, requiring no 3rd-party Docker SDK dependencies.
 type Driver struct {
-	socketPath         string
-	allowedImages      []string
-	cpuLimit           float64
-	memoryLimitMB      int
-	dataDir            string
-	hostDataDir        string
-	proxyFwdPath       string
-	allowRuntimeBuild  *bool
-	client             *http.Client
-	mu                 sync.Mutex
-	proxies            map[string]*sandbox.FilteringProxy // keyed by userID
-	customBlockedCIDRs   []string
-	forwarderPort        int
-	resolver             *net.Resolver
-	hostDataDirDetected  bool
+	socketPath          string
+	allowedImages       []string
+	cpuLimit            float64
+	memoryLimitMB       int
+	tasksMax            int
+	dataDir             string
+	hostDataDir         string
+	proxyFwdPath        string
+	allowRuntimeBuild   *bool
+	client              *http.Client
+	mu                  sync.Mutex
+	proxies             map[string]*sandbox.FilteringProxy // keyed by userID
+	customBlockedCIDRs  []string
+	forwarderPort       int
+	resolver            *net.Resolver
+	hostDataDirDetected bool
 }
 
 // Config provides configuration parameters for the Docker driver.
@@ -49,6 +50,7 @@ type Config struct {
 	AllowedImages      []string
 	CPULimit           float64
 	MemoryLimitMB      int
+	TasksMax           int
 	DataDir            string
 	HostDataDir        string
 	ProxyFwdPath       string
@@ -71,6 +73,10 @@ func NewDriver(cfg Config) *Driver {
 	mem := cfg.MemoryLimitMB
 	if mem <= 0 {
 		mem = 512
+	}
+	tasks := cfg.TasksMax
+	if tasks <= 0 {
+		tasks = 64
 	}
 
 	transport := &http.Transport{
@@ -95,6 +101,7 @@ func NewDriver(cfg Config) *Driver {
 		allowedImages:      cfg.AllowedImages,
 		cpuLimit:           cpu,
 		memoryLimitMB:      mem,
+		tasksMax:           tasks,
 		dataDir:            strings.TrimSpace(cfg.DataDir),
 		hostDataDir:        hostData,
 		proxyFwdPath:       cfg.ProxyFwdPath,
@@ -156,6 +163,9 @@ func (d *Driver) Available(ctx context.Context) bool {
 
 // Create spawns an idle sandbox container and initializes user mounts.
 func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorkspaceDir string) (err error) {
+	if len(sbx.ExtraPaths) > 0 {
+		return errors.New("extra_paths is currently not supported with docker driver")
+	}
 	d.mu.Lock()
 	needDetect := !d.hostDataDirDetected && d.hostDataDir == "" && d.dataDir != ""
 	if needDetect {
@@ -186,8 +196,15 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 		return err
 	}
 
-	if err := os.MkdirAll(userWorkspaceDir, 0o755); err != nil {
-		return fmt.Errorf("failed to create user workspace directory: %w", err)
+	if !sbx.WorkspaceExternal {
+		if err := os.MkdirAll(userWorkspaceDir, 0o755); err != nil {
+			return fmt.Errorf("failed to create user workspace directory: %w", err)
+		}
+	} else {
+		fi, err := os.Stat(userWorkspaceDir)
+		if err != nil || !fi.IsDir() {
+			return fmt.Errorf("external workspace %q does not exist or is not a directory", userWorkspaceDir)
+		}
 	}
 
 	absWorkspace, err := filepath.Abs(userWorkspaceDir)
@@ -208,7 +225,7 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 			return fmt.Errorf("failed to ensure proxy forwarder binary: %w", err)
 		}
 
-		proxyDir := d.getProxyDir(sbx.UserID)
+		proxyDir := d.getProxyDirForSandbox(sbx)
 		if err := os.MkdirAll(proxyDir, 0o755); err != nil {
 			return fmt.Errorf("failed to create proxy directory: %w", err)
 		}
@@ -271,11 +288,12 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 				delete(d.proxies, sbx.UserID)
 			}
 			d.mu.Unlock()
-			_ = os.RemoveAll(d.getProxyDir(sbx.UserID))
+			_ = os.RemoveAll(d.getProxyDirForSandbox(sbx))
 		}
 	}()
 
 	var binds []string
+	var mounts []map[string]interface{}
 	var wholeWorkspaceMount *sandbox.UserMount
 	var subMounts []sandbox.UserMount
 
@@ -295,15 +313,36 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 	}
 
 	if wholeWorkspaceMount != nil {
-		mode := "rw"
-		if wholeWorkspaceMount.ReadOnly {
-			mode = "ro"
+		if sbx.WorkspaceExternal {
+			hostMountSource := absWorkspace
+			if d.hostDataDir != "" && d.dataDir != "" {
+				absData, _ := filepath.Abs(d.dataDir)
+				rel, relErr := filepath.Rel(absData, absWorkspace)
+				if relErr == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+					translated, err := d.toHostPath(absWorkspace)
+					if err != nil {
+						return fmt.Errorf("failed to resolve host path for workspace: %w", err)
+					}
+					hostMountSource = translated
+				}
+			}
+			mounts = append(mounts, map[string]interface{}{
+				"Target":   sandbox.DefaultWorkspaceMountPath,
+				"Source":   hostMountSource,
+				"Type":     "bind",
+				"ReadOnly": wholeWorkspaceMount.ReadOnly,
+			})
+		} else {
+			mode := "rw"
+			if wholeWorkspaceMount.ReadOnly {
+				mode = "ro"
+			}
+			hostMountSource, err := d.toHostPath(absWorkspace)
+			if err != nil {
+				return fmt.Errorf("failed to resolve host path for workspace: %w", err)
+			}
+			binds = append(binds, fmt.Sprintf("%s:%s:%s", hostMountSource, sandbox.DefaultWorkspaceMountPath, mode))
 		}
-		hostMountSource, err := d.toHostPath(absWorkspace)
-		if err != nil {
-			return fmt.Errorf("failed to resolve host path for workspace: %w", err)
-		}
-		binds = append(binds, fmt.Sprintf("%s:%s:%s", hostMountSource, sandbox.DefaultWorkspaceMountPath, mode))
 	} else {
 		for _, m := range subMounts {
 			hostSubpath, _, err := sandbox.ValidateMountPath(absWorkspace, m.RelativePath)
@@ -340,10 +379,13 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 		networkMode = "bridge"
 	}
 
+	tasksMax := d.tasksMax
+	if tasksMax <= 0 {
+		tasksMax = 64
+	}
+	pidsLimit := int64(tasksMax)
 	memBytes := int64(d.memoryLimitMB) * 1024 * 1024
 	nanoCPUs := int64(d.cpuLimit * 1e9)
-
-	pidsLimit := int64(64)
 	hostConfig := map[string]interface{}{
 		"NetworkMode": networkMode,
 		"Binds":       binds,
@@ -353,6 +395,9 @@ func (d *Driver) Create(ctx context.Context, sbx *sandbox.UserSandbox, userWorks
 		"SecurityOpt": []string{"no-new-privileges"},
 		"CapDrop":     []string{"ALL"},
 		"Init":        true,
+	}
+	if len(mounts) > 0 {
+		hostConfig["Mounts"] = mounts
 	}
 
 	containerCmd := []string{"sleep", "infinity"}
@@ -546,9 +591,14 @@ func (d *Driver) Exec(ctx context.Context, sbx *sandbox.UserSandbox, cmd []strin
 	h := sha256.Sum256([]byte(fmt.Sprintf("%s-%d", sbx.UserID, time.Now().UnixNano())))
 	execToken := hex.EncodeToString(h[:8])
 
+	homeDir := sandbox.DefaultWorkspaceMountPath
+	if sbx.WorkspaceExternal {
+		homeDir = "/tmp/bob-cache/home"
+	}
+
 	var env []string
 	env = append(env,
-		"HOME="+sandbox.DefaultWorkspaceMountPath,
+		"HOME="+homeDir,
 		"PWD="+sandbox.DefaultWorkspaceMountPath,
 		"BOB_EXEC_TOKEN="+execToken,
 	)
@@ -703,7 +753,7 @@ func (d *Driver) Destroy(ctx context.Context, sbx *sandbox.UserSandbox) error {
 	}
 	d.mu.Unlock()
 	if d.dataDir != "" {
-		_ = os.RemoveAll(d.getProxyDir(sbx.UserID))
+		_ = os.RemoveAll(d.getProxyDirForSandbox(sbx))
 	}
 
 	internalID := sbx.GetInternalID()
@@ -910,6 +960,31 @@ func (d *Driver) getProxyDir(userID string) string {
 		return filepath.Join(os.TempDir(), "b-p", hashStr)
 	}
 	return shortPath
+}
+
+func (d *Driver) getProxyDirForSandbox(sbx *sandbox.UserSandbox) string {
+	if sbx.ProxyDir != "" {
+		return sbx.ProxyDir
+	}
+	if sbx.ID != "" {
+		absData := d.dataDir
+		if abs, err := filepath.Abs(d.dataDir); err == nil {
+			absData = abs
+		}
+		candidate := filepath.Join(absData, "proxies", sbx.ID)
+		if len(filepath.Join(candidate, "proxy.sock")) < 104 {
+			sbx.ProxyDir = candidate
+			return candidate
+		}
+		shortCandidate := filepath.Join(absData, "p", sbx.ID)
+		if len(filepath.Join(shortCandidate, "proxy.sock")) < 104 {
+			sbx.ProxyDir = shortCandidate
+			return shortCandidate
+		}
+	}
+	dir := d.getProxyDir(sbx.UserID)
+	sbx.ProxyDir = dir
+	return dir
 }
 
 // detectHostDataDir inspects the container Bob is running in (by hostname) to find

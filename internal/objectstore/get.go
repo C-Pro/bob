@@ -2,6 +2,7 @@ package objectstore
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 )
@@ -13,7 +14,8 @@ func (c *Client) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 
 	resp, err := c.doRequest(ctx, "GET", u, host, 0, nil)
 	if err != nil {
-		if apiErr, ok := err.(*APIError); ok && apiErr.StatusCode == http.StatusNotFound {
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
 			return nil, ErrNotFound
 		}
 		return nil, err

@@ -19,7 +19,8 @@
 - **Future Readiness:** Compatible with local open-weights inference servers (vLLM / SGLang) running local models in future phases.
 
 ## 4. Configuration & State Management
-- **Configuration:** Environment variables (`env` / `os.Getenv`)
+- **Configuration:** Environment variables (`env` / `os.Getenv`) for Besedka daemon; strict YAML configuration (`~/.config/bob/config.yaml`, mode 0600) via `gopkg.in/yaml.v3` for CLI and TUI modes with path expansion and permission verification.
+- **Terminal Detection:** `github.com/mattn/go-isatty` for TTY and Cygwin terminal detection on file descriptors.
 - **Context & State Storage:** In-memory thread-safe per-chat ring buffers (`internal/chatcontext`) bounded by `MSG_RING_BUFFER_SIZE` (default 100) with chunked stepped eviction ($1/3$ capacity batch pruning) to maximize LLM prompt prefix caching, dynamic templated prompt generation (`internal/prompt`), and user metadata caching (`internal/gateway`).
 - **Database & Persistent Storage:** SQLite via pure Go `modernc.org/sqlite` (no CGO) in `internal/store`, supporting configurable `DATA_DIR`, automated schema initialization (`schema.tmpl`), single-step version migrations (`migrate.tmpl`), and automated git tagging (`db-release-N`).
 
