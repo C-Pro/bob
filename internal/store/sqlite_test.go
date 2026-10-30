@@ -187,4 +187,10 @@ insert into schema_version(version, description, is_current) values(2, 'intermed
 	err = s.DB().QueryRowContext(context.Background(), "select id from test_v2").Scan(&val)
 	require.NoError(t, err)
 	assert.Equal(t, 42, val)
+
+	// Verify trajectory tables are available
+	var trajTableCount int
+	err = s.DB().QueryRowContext(context.Background(), "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='agent_trajectories'").Scan(&trajTableCount)
+	require.NoError(t, err)
+	assert.Equal(t, 1, trajTableCount)
 }

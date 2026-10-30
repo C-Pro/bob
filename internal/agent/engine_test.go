@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"sync"
@@ -11,10 +12,12 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	_ "modernc.org/sqlite"
 
 	"bob/internal/agentapi"
 	"bob/internal/fsm"
 	"bob/internal/llm"
+	"bob/internal/trajectory"
 )
 
 type mockLLMClient struct {
@@ -601,3 +604,259 @@ func TestEngine_SetFSMEngine_Concurrent(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func setupTestTrajectoryStore(t *testing.T) (*trajectory.SQLiteStore, *sql.DB) {
+	t.Helper()
+	db, err := sql.Open("sqlite", ":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	st, err := trajectory.NewSQLiteStore(db, false)
+	require.NoError(t, err)
+	return st, db
+}
+
+func TestEngine_TrajectoryRecording_FSMSuccess(t *testing.T) {
+	ctx := context.Background()
+	trajStore, db := setupTestTrajectoryStore(t)
+
+	fsmEng := &mockFSMEngine{
+		res: &fsm.ToolLoopResult{
+			RunID:           "run_fsm_success",
+			Content:         "fsm completed successfully",
+			TotalIterations: 1,
+		},
+	}
+	fe := &mockFrontend{}
+
+	eng, err := NewEngine(Dependencies{
+		FSMEngine:       fsmEng,
+		TrajectoryStore: trajStore,
+		Frontends: map[string]agentapi.Frontend{
+			"cli": fe,
+		},
+	})
+	require.NoError(t, err)
+
+	turn := agentapi.Turn{
+		Run: agentapi.RunDescriptor{
+			RunID: "run_fsm_success",
+			Session: agentapi.SessionRef{
+				FrontendID: "cli",
+				SessionID:  "townhall",
+			},
+			Actor: agentapi.Actor{
+				ID: "user_1",
+			},
+		},
+		Messages: []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleUser, Content: "Hello world"},
+		},
+	}
+
+	res, err := eng.Run(ctx, turn)
+	require.NoError(t, err)
+	assert.Equal(t, "fsm completed successfully", res.Content)
+
+	// Verify events in outbox
+	var count int
+	err = db.QueryRow("SELECT count(*) FROM agent_trajectory_events WHERE run_id = ?", "run_fsm_success").Scan(&count)
+	require.NoError(t, err)
+	assert.Equal(t, 2, count, "should record turn_start and turn_terminal events")
+
+	// Verify staged rollout
+	var status string
+	var rEval float64
+	err = db.QueryRow("SELECT status, r_eval FROM agent_trajectories WHERE id = ?", "run_fsm_success").Scan(&status, &rEval)
+	require.NoError(t, err)
+	assert.Equal(t, "staged", status)
+	assert.Equal(t, 0.2, rEval) // Conversational 0-tool completion baseline is +0.20
+}
+
+func TestEngine_TrajectoryRecording_StoreError_BlocksFallback(t *testing.T) {
+	ctx := context.Background()
+	trajStore, db := setupTestTrajectoryStore(t)
+
+	fsmEng := &mockFSMEngine{
+		err: &fsm.StoreError{
+			StepID: "step_err",
+			Err:    errors.New("disk I/O error"),
+		},
+	}
+	llmClient := &mockLLMClient{
+		plainReply: "volatile reply should NOT be called",
+	}
+	fe := &mockFrontend{}
+
+	eng, err := NewEngine(Dependencies{
+		FSMEngine:       fsmEng,
+		LLMClient:       llmClient,
+		TrajectoryStore: trajStore,
+		Frontends: map[string]agentapi.Frontend{
+			"cli": fe,
+		},
+	})
+	require.NoError(t, err)
+
+	turn := agentapi.Turn{
+		Run: agentapi.RunDescriptor{
+			RunID: "run_store_fail",
+			Session: agentapi.SessionRef{
+				FrontendID: "cli",
+				SessionID:  "townhall",
+			},
+		},
+		Messages: []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleUser, Content: "Run mutating tool"},
+		},
+	}
+
+	_, err = eng.Run(ctx, turn)
+	require.Error(t, err)
+	var storeErr *fsm.StoreError
+	require.ErrorAs(t, err, &storeErr)
+
+	llmClient.mu.Lock()
+	assert.Empty(t, llmClient.plainCalls, "volatile fallback MUST NOT execute on StoreError")
+	llmClient.mu.Unlock()
+
+	// Verify terminal event recorded failure
+	var reason string
+	err = db.QueryRow("SELECT json_extract(payload, '$.reason') FROM agent_trajectory_events WHERE run_id = ? AND event_type = 'turn_terminal'",
+		"run_store_fail").Scan(&reason)
+	require.NoError(t, err)
+	assert.Equal(t, "fsm_failed", reason)
+}
+
+func TestEngine_TrajectoryRecording_VolatileFallback_Generation2(t *testing.T) {
+	ctx := context.Background()
+	trajStore, db := setupTestTrajectoryStore(t)
+
+	fsmEng := &mockFSMEngine{
+		err: errors.New("transient fsm worker error"),
+	}
+	llmClient := &mockLLMClient{
+		loopReply: "volatile tool loop reply",
+	}
+	fe := &mockFrontend{
+		bindings: agentapi.Bindings{
+			Tools: &mockToolset{
+				tools: []agentapi.ToolDefinition{
+					{
+						Schema: openai.Tool{
+							Type: openai.ToolTypeFunction,
+							Function: &openai.FunctionDefinition{
+								Name: "web_search",
+							},
+						},
+						ReadOnly: true,
+					},
+				},
+			},
+		},
+	}
+
+	eng, err := NewEngine(Dependencies{
+		FSMEngine:       fsmEng,
+		LLMClient:       llmClient,
+		TrajectoryStore: trajStore,
+		Frontends: map[string]agentapi.Frontend{
+			"cli": fe,
+		},
+	})
+	require.NoError(t, err)
+
+	turn := agentapi.Turn{
+		Run: agentapi.RunDescriptor{
+			RunID: "run_fallback_gen2",
+			Session: agentapi.SessionRef{
+				FrontendID: "cli",
+				SessionID:  "townhall",
+			},
+		},
+		Messages: []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleUser, Content: "Search for golang"},
+		},
+	}
+
+	res, err := eng.Run(ctx, turn)
+	require.NoError(t, err)
+	assert.Equal(t, "volatile tool loop reply", res.Content)
+
+	// Verify terminal event in outbox has generation 2
+	var gen int
+	err = db.QueryRow("SELECT generation FROM agent_trajectory_events WHERE run_id = ? AND event_type = 'turn_terminal'",
+		"run_fallback_gen2").Scan(&gen)
+	require.NoError(t, err)
+	assert.Equal(t, 2, gen)
+
+	// Verify staged rollout has generation 2
+	var trajGen int
+	err = db.QueryRow("SELECT json_extract(payload, '$.generation') FROM agent_trajectories WHERE id = ?",
+		"run_fallback_gen2").Scan(&trajGen)
+	require.NoError(t, err)
+	assert.Equal(t, 2, trajGen)
+}
+
+func TestEngine_TrajectoryRecording_DeliveryFailure_UpdatesReason(t *testing.T) {
+	ctx := context.Background()
+	trajStore, db := setupTestTrajectoryStore(t)
+
+	fsmEng := &mockFSMEngine{
+		res: &fsm.ToolLoopResult{
+			RunID:   "run_deliver_fail",
+			Content: "fsm output ready to send",
+		},
+	}
+	fe := &mockFrontend{
+		deliverErr: errors.New("network disconnect"),
+	}
+
+	eng, err := NewEngine(Dependencies{
+		FSMEngine:       fsmEng,
+		TrajectoryStore: trajStore,
+		Frontends: map[string]agentapi.Frontend{
+			"cli": fe,
+		},
+	})
+	require.NoError(t, err)
+
+	turn := agentapi.Turn{
+		Deliver: true,
+		Run: agentapi.RunDescriptor{
+			RunID: "run_deliver_fail",
+			Session: agentapi.SessionRef{
+				FrontendID: "cli",
+				SessionID:  "townhall",
+			},
+		},
+		Messages: []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleUser, Content: "Hi"},
+		},
+	}
+
+	_, err = eng.Run(ctx, turn)
+	require.Error(t, err)
+	var delErr *DeliveryError
+	require.ErrorAs(t, err, &delErr)
+
+	// Verify terminal event in outbox recorded delivery_failed
+	var reasons []string
+	rows, err := db.Query("SELECT json_extract(payload, '$.reason') FROM agent_trajectory_events WHERE run_id = ? AND event_type = 'turn_terminal' ORDER BY created_at ASC", "run_deliver_fail")
+	require.NoError(t, err)
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var r string
+		require.NoError(t, rows.Scan(&r))
+		reasons = append(reasons, r)
+	}
+	require.NotEmpty(t, reasons)
+	assert.Equal(t, "delivery_failed", reasons[len(reasons)-1])
+
+	// Verify staged rollout has termination_reason = delivery_failed
+	var reason string
+	err = db.QueryRow("SELECT json_extract(payload, '$.eval_breakdown.termination_reason') FROM agent_trajectories WHERE id = ?",
+		"run_deliver_fail").Scan(&reason)
+	require.NoError(t, err)
+	assert.Equal(t, "delivery_failed", reason)
+}
+

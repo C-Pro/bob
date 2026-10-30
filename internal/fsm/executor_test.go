@@ -2,6 +2,7 @@ package fsm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -9,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"bob/internal/trajectory"
 
 	openai "github.com/sashabaranov/go-openai"
 	"github.com/stretchr/testify/assert"
@@ -641,3 +644,59 @@ func TestStepExecutor_StepResultTruncation(t *testing.T) {
 	assert.True(t, len(decoded.Content) <= MaxStepResultBytes+len(StepTruncationNotice))
 	assert.True(t, strings.HasSuffix(decoded.Content, StepTruncationNotice))
 }
+
+func TestStepExecutor_TrajectoryEventRecordedAtomicallyWithRawObservation(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+
+	rawOutput := "Exit Code: 0\nDuration: 25ms\n[stdout]\nUncompressed raw tool observation"
+	invoker := ToolInvokerFunc(func(ctx context.Context, name string, argsJSON string) (string, error) {
+		return rawOutput, nil
+	})
+	executor := NewStepExecutor(invoker)
+
+	run := &FSMRun{
+		ID:        "run_traj_test_1",
+		ChatID:    "chat_1",
+		UserID:    "user_1",
+		FSMType:   FSMTypeToolLoop,
+		Status:    RunStatusRunning,
+		Iteration: 1,
+	}
+	require.NoError(t, store.CreateRun(context.Background(), run))
+
+	step := &FSMStep{
+		ID:             "step_traj_1",
+		RunID:          "run_traj_test_1",
+		Iteration:      1,
+		StepIndex:      0,
+		ToolName:       "web_search",
+		ToolCallID:     "call_1",
+		ArgsJSON:       `{"query":"golang"}`,
+		Status:         StepStatusPending,
+		ExecutionMode:  ExecutionModeSequential,
+		TimeoutSeconds: 10,
+	}
+	require.NoError(t, store.CreateSteps(context.Background(), []FSMStep{*step}))
+
+	err := executor.Execute(context.Background(), store, []*FSMStep{step})
+	require.NoError(t, err)
+	assert.Equal(t, StepStatusCompleted, step.Status)
+
+	// Check agent_trajectory_events in SQLite
+	var eventType, payloadStr string
+	var attempt int
+	err = db.QueryRow("SELECT event_type, attempt, payload FROM agent_trajectory_events WHERE run_id = ? AND step_id = ?",
+		"run_traj_test_1", "step_traj_1").Scan(&eventType, &attempt, &payloadStr)
+	require.NoError(t, err)
+	assert.Equal(t, "tool_attempt", eventType)
+	assert.Equal(t, 1, attempt)
+
+	var loggedStep trajectory.Step
+	require.NoError(t, json.Unmarshal([]byte(payloadStr), &loggedStep))
+	assert.Equal(t, "web_search", loggedStep.Action)
+	assert.Equal(t, rawOutput, loggedStep.Observation)
+	require.NotNil(t, loggedStep.ExitCode)
+	assert.Equal(t, 0, *loggedStep.ExitCode)
+}
+

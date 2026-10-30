@@ -72,6 +72,8 @@ type Gateway struct {
 	chatLocker           *ChatLocker
 	chatCache            *ChatCache
 	runner               agentapi.TurnRunner
+	runtime              *bootstrap.Runtime
+	ownsRuntime          bool
 }
 
 // NewGatewayWithRuntime creates a Besedka Gateway wired onto an initialized bootstrap.Runtime.
@@ -158,6 +160,8 @@ func NewGatewayWithRuntime(cfg *config.Config, rt *bootstrap.Runtime) *Gateway {
 		rt.FSMEngine.SetToolDefinitionProvider(gw)
 	}
 	_ = rt.RegisterFrontend("besedka", gw)
+	gw.runtime = rt
+	gw.ownsRuntime = false
 
 	return gw
 }
@@ -170,7 +174,9 @@ func NewGateway(cfg *config.Config, llmClient *llm.Client) *Gateway {
 	if err != nil {
 		panic(fmt.Sprintf("failed to bootstrap runtime for gateway: %v", err))
 	}
-	return NewGatewayWithRuntime(cfg, rt)
+	gw := NewGatewayWithRuntime(cfg, rt)
+	gw.ownsRuntime = true
+	return gw
 }
 
 // MemoryManager returns the Gateway's memory Manager.
@@ -1537,7 +1543,8 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 	if cmdToCheck == "" {
 		cmdToCheck = strings.ToLower(promptRootCommand)
 	}
-	if cmdToCheck == "/memory" || cmdToCheck == "/skill" || cmdToCheck == "/schedule" || cmdToCheck == "/sandbox" {
+	if cmdToCheck == "/memory" || cmdToCheck == "/skill" || cmdToCheck == "/schedule" || cmdToCheck == "/sandbox" ||
+		cmdToCheck == "/good" || cmdToCheck == "/bad" || cmdToCheck == "/rate" {
 		shouldProcess = true
 		if promptText == "" {
 			promptText = cleanText
@@ -1597,6 +1604,15 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 	}
 	if strings.EqualFold(rootCommand, "/skill") {
 		return g.handleSkillCommand(ctx, msg, skillCmdText, senderName, isChatDM)
+	}
+
+	feedbackCmdText := cleanText
+	if strings.EqualFold(promptRootCommand, "/good") || strings.EqualFold(promptRootCommand, "/bad") || strings.EqualFold(promptRootCommand, "/rate") {
+		feedbackCmdText = strings.TrimSpace(promptText)
+		rootCommand = promptRootCommand
+	}
+	if strings.EqualFold(rootCommand, "/good") || strings.EqualFold(rootCommand, "/bad") || strings.EqualFold(rootCommand, "/rate") {
+		return g.handleFeedbackCommand(ctx, msg, feedbackCmdText, senderName, isChatDM)
 	}
 
 	return g.generateAndSendAgentReply(ctx, msg, isChatDM, senderName, "", 0)
@@ -2140,14 +2156,20 @@ func (g *Gateway) Stop() {
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.memoryManager != nil {
-		if err := g.memoryManager.Close(); err != nil {
-			slog.Warn("error closing memory manager on gateway stop", "error", err)
+	if g.ownsRuntime && g.runtime != nil {
+		if err := g.runtime.Close(); err != nil {
+			slog.Warn("error closing runtime on gateway stop", "error", err)
 		}
-	}
-	if g.sandboxManager != nil {
-		if err := g.sandboxManager.Close(); err != nil {
-			slog.Warn("error closing sandbox manager on gateway stop", "error", err)
+	} else if g.ownsRuntime {
+		if g.memoryManager != nil {
+			if err := g.memoryManager.Close(); err != nil {
+				slog.Warn("error closing memory manager on gateway stop", "error", err)
+			}
+		}
+		if g.sandboxManager != nil {
+			if err := g.sandboxManager.Close(); err != nil {
+				slog.Warn("error closing sandbox manager on gateway stop", "error", err)
+			}
 		}
 	}
 }

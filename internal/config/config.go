@@ -86,6 +86,11 @@ type Config struct {
 	SandboxDockerImage             string
 	SandboxExtraPaths              []string
 	SandboxAutoToolchains          bool
+	TrajectoryEnabled              bool
+	TrajectoryS3Bucket             string
+	TrajectoryS3Prefix             string
+	TrajectoryFlushDelay           time.Duration
+	TrajectoryAllowPrivate         bool
 }
 
 // DefaultSandboxAllowedImages defines standard safe container images.
@@ -97,6 +102,14 @@ var DefaultSandboxAllowedNetworkModes = sandbox.DefaultSandboxAllowedNetworkMode
 // S3Enabled reports whether object-storage backup is configured.
 func (c *Config) S3Enabled() bool {
 	return c.S3Bucket != "" && c.S3Endpoint != ""
+}
+
+// TrajectoryBucket returns the resolved S3 bucket for trajectory export.
+func (c *Config) TrajectoryBucket() string {
+	if c.TrajectoryS3Bucket != "" {
+		return c.TrajectoryS3Bucket
+	}
+	return c.S3Bucket
 }
 
 // Defaults returns a Config populated with sensible base defaults.
@@ -152,6 +165,11 @@ func Defaults() *Config {
 		KnowledgeDefaultDiscoveryLimit: 5,
 		KnowledgeMaxDiscoveryLimit:     10,
 		KnowledgeReconcileInterval:     1 * time.Minute,
+		TrajectoryEnabled:              false,
+		TrajectoryS3Bucket:             "",
+		TrajectoryS3Prefix:             "trajectories/",
+		TrajectoryFlushDelay:           15 * time.Minute,
+		TrajectoryAllowPrivate:         false,
 	}
 }
 
@@ -313,6 +331,35 @@ func LoadFromEnv() (*Config, error) {
 	cfg.S3AccessKey = os.Getenv("S3_ACCESS_KEY")
 	cfg.S3SecretKey = os.Getenv("S3_SECRET_KEY")
 	cfg.S3BackupKeep = getEnvIntOrDefault("S3_BACKUP_KEEP", cfg.S3BackupKeep)
+
+	trajEnabled, err := getEnvBoolOrDefault("TRAJECTORY_ENABLED", cfg.TrajectoryEnabled)
+	if err != nil {
+		return nil, err
+	}
+	cfg.TrajectoryEnabled = trajEnabled
+
+	cfg.TrajectoryS3Bucket = getEnvOrDefault("TRAJECTORY_S3_BUCKET", cfg.TrajectoryS3Bucket)
+	if cfg.TrajectoryS3Bucket == "" {
+		cfg.TrajectoryS3Bucket = cfg.S3Bucket
+	}
+
+	trajPrefix := getEnvOrDefault("TRAJECTORY_S3_PREFIX", cfg.TrajectoryS3Prefix)
+	if trajPrefix != "" && !strings.HasSuffix(trajPrefix, "/") {
+		trajPrefix = trajPrefix + "/"
+	}
+	cfg.TrajectoryS3Prefix = trajPrefix
+
+	trajFlushDelay, err := getEnvDurationStrict("TRAJECTORY_FLUSH_DELAY", cfg.TrajectoryFlushDelay)
+	if err != nil {
+		return nil, err
+	}
+	cfg.TrajectoryFlushDelay = trajFlushDelay
+
+	trajAllowPrivate, err := getEnvBoolOrDefault("TRAJECTORY_ALLOW_PRIVATE", cfg.TrajectoryAllowPrivate)
+	if err != nil {
+		return nil, err
+	}
+	cfg.TrajectoryAllowPrivate = trajAllowPrivate
 
 	cfg.SandboxDrivers = getEnvSliceOrDefault("SANDBOX_DRIVERS", cfg.SandboxDrivers)
 	cfg.SandboxDockerSocket = getEnvOrDefault("SANDBOX_DOCKER_SOCKET", cfg.SandboxDockerSocket)
@@ -490,7 +537,10 @@ func (c *Config) Validate(requireAPIKey bool) error {
 	if c.KnowledgeReconcileInterval <= 0 {
 		c.KnowledgeReconcileInterval = 1 * time.Minute
 	}
-	if (c.S3Bucket == "") != (c.S3Endpoint == "") {
+	if c.S3Bucket != "" && c.S3Endpoint == "" {
+		return errors.New("S3_BUCKET and S3_ENDPOINT must be set together")
+	}
+	if c.S3Bucket == "" && (!c.TrajectoryEnabled || c.TrajectoryBucket() == "") && c.S3Endpoint != "" {
 		return errors.New("S3_BUCKET and S3_ENDPOINT must be set together")
 	}
 	if c.S3Enabled() {
@@ -505,6 +555,21 @@ func (c *Config) Validate(requireAPIKey bool) error {
 		}
 		if c.S3BackupKeep <= 0 {
 			return errors.New("S3_BACKUP_KEEP must be greater than 0")
+		}
+	}
+	if c.TrajectoryEnabled {
+		bucket := c.TrajectoryBucket()
+		if strings.TrimSpace(bucket) == "" {
+			return errors.New("TRAJECTORY_S3_BUCKET (or S3_BUCKET) is required when TRAJECTORY_ENABLED is true")
+		}
+		if strings.TrimSpace(c.S3Endpoint) == "" {
+			return errors.New("S3_ENDPOINT is required when TRAJECTORY_ENABLED is true")
+		}
+		if strings.TrimSpace(c.S3AccessKey) == "" || strings.TrimSpace(c.S3SecretKey) == "" {
+			return errors.New("S3_ACCESS_KEY and S3_SECRET_KEY are required when TRAJECTORY_ENABLED is true")
+		}
+		if c.TrajectoryFlushDelay <= 0 {
+			return errors.New("TRAJECTORY_FLUSH_DELAY must be greater than 0")
 		}
 	}
 	sbxCfg := c.SandboxConfig()

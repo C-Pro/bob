@@ -103,6 +103,9 @@ func New(cfg *config.Config, opts Options) (*Runtime, error) {
 	if cfg.KnowledgeMaxDiscoveryLimit > 0 {
 		storeProvider.SetMaxDiscoveryLimit(cfg.KnowledgeMaxDiscoveryLimit)
 	}
+	if cfg.TrajectoryFlushDelay > 0 {
+		storeProvider.SetTrajectoryFlushDelay(cfg.TrajectoryFlushDelay)
+	}
 
 	// Determine effective sandbox enablement
 	enableSandbox := cfg.SandboxEnabled
@@ -182,7 +185,24 @@ func New(cfg *config.Config, opts Options) (*Runtime, error) {
 				MaxLoadedSkillBytes:  cfg.KnowledgeMaxLoadedSkillBytes,
 			}),
 			fsm.WithRunFinalizer(func(ctx context.Context, run *fsm.FSMRun) error {
-				return sandbox.RemoveRunCache(run.ID)
+				var errs []error
+				if err := sandbox.RemoveRunCache(run.ID); err != nil {
+					errs = append(errs, err)
+				}
+				if storeProvider != nil {
+					isDM := run.ChatID != "townhall"
+					tStore, err := storeProvider.GetTrajectoryStore(ctx, run.ChatID, isDM)
+					if err != nil {
+						slog.Warn("failed to resolve trajectory store in finalizer", "run_id", run.ID, "chatID", run.ChatID, "error", err)
+						errs = append(errs, fmt.Errorf("failed to get trajectory store: %w", err))
+					} else if tStore != nil {
+						if err := tStore.ReconcileTerminalRuns(ctx); err != nil {
+							slog.Warn("failed to reconcile terminal runs in finalizer", "run_id", run.ID, "error", err)
+							errs = append(errs, fmt.Errorf("trajectory reconciliation error: %w", err))
+						}
+					}
+				}
+				return errors.Join(errs...)
 			}),
 		)
 
@@ -193,10 +213,12 @@ func New(cfg *config.Config, opts Options) (*Runtime, error) {
 				MaxIterations: cfg.TownhallToolMaxIterations,
 				LockTimeout:   30 * time.Second,
 			},
-			LLMClient:     llmClient,
-			FSMEngine:     fsmEngine,
-			SessionLocker: sessionLocker,
-			Frontends:     opts.Frontends,
+			LLMClient:          llmClient,
+			FSMEngine:          fsmEngine,
+			SessionLocker:      sessionLocker,
+			Frontends:          opts.Frontends,
+			TrajectoryProvider: storeProvider,
+			TrajectoryDelay:    cfg.TrajectoryFlushDelay,
 		})
 		if err != nil {
 			if sandboxManager != nil {

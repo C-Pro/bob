@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"bob/internal/agentapi"
+	"bob/internal/trajectory"
 
 	openai "github.com/sashabaranov/go-openai"
 )
@@ -224,6 +225,10 @@ func (r *ToolLoopRunner) handleLLMRequest(ctx context.Context, run *FSMRun, stor
 	}
 
 	assistantMsg := resp.Choices[0].Message
+
+	if ev, evErr := trajectory.MakeLLMResponseEvent(run.ID, run.ID, 1, run.Iteration, "loop", assistantMsg.Content, assistantMsg.ReasoningContent, assistantMsg.ToolCalls); evErr == nil {
+		_ = store.RecordEvent(ctx, ev)
+	}
 
 	// If model requested tool calls, enforce strict tool authority
 	if len(assistantMsg.ToolCalls) > 0 {
@@ -506,6 +511,10 @@ func (r *ToolLoopRunner) handleSynthesis(ctx context.Context, run *FSMRun, store
 	}
 
 	finalMsg := resp.Choices[0].Message
+
+	if ev, evErr := trajectory.MakeLLMResponseEvent(run.ID, run.ID, 1, run.Iteration, "synthesis", finalMsg.Content, finalMsg.ReasoningContent, nil); evErr == nil {
+		_ = store.RecordEvent(ctx, ev)
+	}
 
 	baseMessages, err := DecodeMessages(run.ContextJSON)
 	if err != nil {

@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+
+	"bob/internal/trajectory"
 )
 
 const (
@@ -230,6 +232,9 @@ func ensureFSMColumns(ctx context.Context, db *sql.DB) error {
 		if _, err := db.ExecContext(ctx, "ALTER TABLE fsm_runs ADD COLUMN execution_kind TEXT NOT NULL DEFAULT ''"); err != nil {
 			return fmt.Errorf("failed to add execution_kind column to fsm_runs: %w", err)
 		}
+	}
+	if err := trajectory.EnsureSchema(ctx, db); err != nil {
+		return fmt.Errorf("failed to ensure trajectory schema: %w", err)
 	}
 	return nil
 }

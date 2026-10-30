@@ -40,6 +40,7 @@ type SandboxContinuation struct {
 
 // Request encapsulates a slash command invocation across any frontend.
 type Request struct {
+	MessageID  string
 	Session    agentapi.SessionRef
 	Actor      agentapi.Actor
 	ActorName  string

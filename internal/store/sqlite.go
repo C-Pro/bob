@@ -11,10 +11,13 @@ import (
 	"path/filepath"
 	"strings"
 	"text/template" // nosemgrep: go.lang.security.audit.xss.import-text-template.import-text-template
+	"time"
 
 	_ "embed"
 
 	_ "modernc.org/sqlite"
+
+	"bob/internal/trajectory"
 )
 
 var (
@@ -88,20 +91,24 @@ func NewSQLiteStore(fname string, init bool) (*SQLiteStorage, error) {
 
 		switch v {
 		case version.Version:
-			// nothing to do
+			// Ensure trajectory tables exist (e.g. for legacy v2 databases)
+			var count int
+			if err := s.db.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='agent_trajectories'").Scan(&count); err == nil && count == 0 {
+				if err := s.applyTrajectorySchema(); err != nil {
+					_ = db.Close()
+					return nil, fmt.Errorf("failed to apply trajectory schema to legacy v2 database: %w", err)
+				}
+			}
 		case version.Version - 1:
 			// run migration
 			if err := s.migrate(); err != nil {
 				_ = db.Close()
 				return nil, fmt.Errorf("migration failed: %w", err)
 			}
-		case 2:
-			// TODO(migration): Version 2 was an intermediate development schema version for bob.db before
-			// FSM tables were decoupled into per-chat databases. It is fully compatible with version 1.
 		default:
 			_ = db.Close()
 			return nil, fmt.Errorf(
-				"database version mismatch: expected %d or %d (or legacy 2), but got %d",
+				"database version mismatch: expected %d or %d, but got %d",
 				version.Version-1,
 				version.Version,
 				v)
@@ -170,4 +177,10 @@ func (s *SQLiteStorage) migrate() error {
 
 func (s *SQLiteStorage) getSchemaVersion() (int, error) {
 	return s.GetSchemaVersion(context.Background())
+}
+
+func (s *SQLiteStorage) applyTrajectorySchema() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return trajectory.EnsureSchema(ctx, s.db)
 }
