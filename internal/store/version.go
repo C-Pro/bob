@@ -3,7 +3,7 @@ package store
 var version = struct {
 	Version     int
 	Description string
-}{1, "initial schema"}
+}{2, "add trajectory tables"}
 
 // CurrentVersion returns the active schema version.
 func CurrentVersion() int {

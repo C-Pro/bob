@@ -21,6 +21,7 @@ import (
 	"bob/internal/memory"
 	"bob/internal/objectstore"
 	"bob/internal/store"
+	"bob/internal/trajectory"
 
 	"github.com/liliang-cn/cortexdb/v2/pkg/cortexdb"
 )
@@ -99,6 +100,24 @@ func main() {
 		})
 		if err != nil {
 			slog.Error("failed to initialize object storage client", "error", err)
+			os.Exit(1)
+		}
+	}
+
+	// Initialize S3 object storage client for trajectory export if enabled
+	var trajObjClient *objectstore.Client
+	if cfg.TrajectoryEnabled {
+		trajBucket := cfg.TrajectoryBucket()
+		trajObjClient, err = objectstore.New(objectstore.Config{
+			Endpoint:  cfg.S3Endpoint,
+			Region:    cfg.S3Region,
+			Bucket:    trajBucket,
+			AccessKey: cfg.S3AccessKey,
+			SecretKey: cfg.S3SecretKey,
+			PathStyle: cfg.S3PathStyle,
+		})
+		if err != nil {
+			slog.Error("failed to initialize trajectory object storage client", "error", err)
 			os.Exit(1)
 		}
 	}
@@ -226,28 +245,52 @@ func main() {
 		}()
 	}
 
-	go func() {
-		<-ctx.Done()
-		slog.Info("shutdown signal received, closing agent gateway...")
-		gw.Stop()
-
-		// Perform final database backup on shutdown
-		if scheduler != nil {
-			slog.Info("performing final database backup on shutdown...")
-			bCtx, bCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer bCancel()
-			if err := scheduler.DoBackup(bCtx); err != nil {
-				slog.Error("final shutdown database backup failed", "error", err)
-			} else {
-				slog.Info("final shutdown database backup completed")
-			}
+	// Start asynchronous trajectory exporter if enabled
+	var trajExporter *trajectory.Exporter
+	if cfg.TrajectoryEnabled && trajObjClient != nil {
+		exporterCfg := trajectory.ExporterConfig{
+			Enabled:      true,
+			Bucket:       cfg.TrajectoryBucket(),
+			Prefix:       cfg.TrajectoryS3Prefix,
+			FlushDelay:   cfg.TrajectoryFlushDelay,
+			AllowPrivate: cfg.TrajectoryAllowPrivate,
+			PruneAge:     time.Duration(cfg.FSMRetentionDays) * 24 * time.Hour,
 		}
-	}()
+		trajExporter = trajectory.NewExporter(exporterCfg, gw.StoreProvider(), trajObjClient)
+		trajExporter.Start(ctx)
+		slog.Info("trajectory exporter started", "bucket", cfg.TrajectoryBucket(), "prefix", cfg.TrajectoryS3Prefix)
+	}
 
 	slog.Info("starting agent gateway event loop")
 	if err := gw.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		slog.Error("gateway exited with error", "error", err)
-		os.Exit(1)
+	}
+
+	slog.Info("shutdown signal received, stopping agent gateway...")
+	gw.Stop()
+
+	// Stop trajectory exporter and run bounded final flush before database backup and close
+	if trajExporter != nil {
+		slog.Info("stopping trajectory exporter and flushing eligible staged trajectories...")
+		flushCtx, flushCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := trajExporter.Stop(flushCtx); err != nil && !errors.Is(err, context.Canceled) {
+			slog.Warn("trajectory exporter final flush encountered errors", "error", err)
+		} else {
+			slog.Info("trajectory exporter final flush completed")
+		}
+		flushCancel()
+	}
+
+	// Perform final database backup on shutdown
+	if scheduler != nil {
+		slog.Info("performing final database backup on shutdown...")
+		bCtx, bCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := scheduler.DoBackup(bCtx); err != nil {
+			slog.Error("final shutdown database backup failed", "error", err)
+		} else {
+			slog.Info("final shutdown database backup completed")
+		}
+		bCancel()
 	}
 
 	slog.Info("agent service stopped gracefully")

@@ -125,24 +125,25 @@ func (g *geminiTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		if err != nil {
 			return nil, err
 		}
-		g.extractThoughtSignatures(respBytes)
+		respBytes = g.extractThoughtSignaturesAndNormalize(respBytes)
 		resp.Body = io.NopCloser(bytes.NewReader(respBytes))
 	}
 
 	return resp, nil
 }
 
-func (g *geminiTransport) extractThoughtSignatures(data []byte) {
+func (g *geminiTransport) extractThoughtSignaturesAndNormalize(data []byte) []byte {
 	var respMap map[string]interface{}
 	if err := json.Unmarshal(data, &respMap); err != nil {
-		return
+		return data
 	}
 
 	choices, ok := respMap["choices"].([]interface{})
 	if !ok {
-		return
+		return data
 	}
 
+	modified := false
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -154,6 +155,18 @@ func (g *geminiTransport) extractThoughtSignatures(data []byte) {
 		msg, ok := choice["message"].(map[string]interface{})
 		if !ok {
 			continue
+		}
+
+		// Normalize reasoning if reasoning_content is absent or empty, but thought/reasoning is present
+		curReasoning, _ := msg["reasoning_content"].(string)
+		if strings.TrimSpace(curReasoning) == "" {
+			if thoughtStr, ok := msg["thought"].(string); ok && strings.TrimSpace(thoughtStr) != "" {
+				msg["reasoning_content"] = thoughtStr
+				modified = true
+			} else if reasonStr, ok := msg["reasoning"].(string); ok && strings.TrimSpace(reasonStr) != "" {
+				msg["reasoning_content"] = reasonStr
+				modified = true
+			}
 		}
 
 		var msgSig string
@@ -204,6 +217,13 @@ func (g *geminiTransport) extractThoughtSignatures(data []byte) {
 			}
 		}
 	}
+
+	if modified {
+		if newBytes, err := json.Marshal(respMap); err == nil {
+			return newBytes
+		}
+	}
+	return data
 }
 
 func (g *geminiTransport) injectThoughtSignatures(bodyMap map[string]interface{}) bool {

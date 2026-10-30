@@ -1,0 +1,95 @@
+package trajectory
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+)
+
+// SchemaSQL contains DDL statements for trajectory tables and indexes.
+const SchemaSQL = `
+CREATE TABLE IF NOT EXISTS agent_trajectory_events (
+    id TEXT PRIMARY KEY,
+    trajectory_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 1,
+    iteration INTEGER NOT NULL,
+    phase TEXT NOT NULL DEFAULT 'loop',
+    step_id TEXT NOT NULL DEFAULT '',
+    attempt INTEGER NOT NULL DEFAULT 1,
+    event_type TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    created_at DATETIME NOT NULL,
+    CONSTRAINT uq_trajectory_events UNIQUE (run_id, generation, iteration, phase, step_id, attempt, event_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_trajectory_events_traj
+    ON agent_trajectory_events (trajectory_id, created_at ASC);
+
+CREATE TABLE IF NOT EXISTS agent_trajectories (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    frontend_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    scope_id TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    execution_kind TEXT NOT NULL DEFAULT 'interactive',
+    privacy_level TEXT NOT NULL DEFAULT 'private',
+    export_approved INTEGER NOT NULL DEFAULT 0,
+    generation INTEGER NOT NULL DEFAULT 1,
+    payload BLOB NOT NULL,
+    r_eval REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'staged',
+    revision INTEGER NOT NULL DEFAULT 1,
+    exported_revision INTEGER NOT NULL DEFAULT 0,
+    created_at DATETIME NOT NULL,
+    completed_at DATETIME NOT NULL,
+    eligible_at DATETIME NOT NULL,
+    exported_at DATETIME
+);
+
+CREATE INDEX IF NOT EXISTS idx_trajectories_export 
+    ON agent_trajectories (status, eligible_at) 
+    WHERE status = 'staged';
+
+CREATE INDEX IF NOT EXISTS idx_trajectories_session 
+    ON agent_trajectories (frontend_id, session_id, scope_id, completed_at DESC);
+
+CREATE TABLE IF NOT EXISTS agent_trajectory_feedback (
+    id TEXT PRIMARY KEY,
+    message_id TEXT NOT NULL UNIQUE,
+    trajectory_id TEXT NOT NULL REFERENCES agent_trajectories(id) ON DELETE CASCADE,
+    frontend_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    scope_id TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    rating REAL NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    created_at DATETIME NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_trajectory_feedback_target 
+    ON agent_trajectory_feedback (trajectory_id, created_at ASC);
+
+CREATE TABLE IF NOT EXISTS agent_trajectory_pruned (
+    trajectory_id TEXT PRIMARY KEY,
+    pruned_at DATETIME NOT NULL
+);
+`
+
+// EnsureSchema creates the trajectory tables and indexes if they do not already exist.
+func EnsureSchema(ctx context.Context, db *sql.DB) error {
+	if db == nil {
+		return fmt.Errorf("database connection is nil")
+	}
+
+	if _, err := db.ExecContext(ctx, "PRAGMA foreign_keys = ON;"); err != nil {
+		return fmt.Errorf("failed to enable foreign keys: %w", err)
+	}
+
+	if _, err := db.ExecContext(ctx, SchemaSQL); err != nil {
+		return fmt.Errorf("failed to apply trajectory schema: %w", err)
+	}
+
+	return nil
+}

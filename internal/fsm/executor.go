@@ -3,6 +3,7 @@ package fsm
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"bob/internal/agentapi"
+	"bob/internal/trajectory"
 
 	openai "github.com/sashabaranov/go-openai"
 )
@@ -175,6 +177,12 @@ type StepStore interface {
 	UpdateStep(ctx context.Context, step *FSMStep) error
 }
 
+// StepEventStore optionally extends StepStore to atomically record trajectory outbox events with step updates.
+type StepEventStore interface {
+	StepStore
+	UpdateStepWithEvent(ctx context.Context, step *FSMStep, event *trajectory.Event) error
+}
+
 // StepExecutor executes FSM steps sequentially or concurrently with per-step timeouts and transient retries.
 type StepExecutor struct {
 	invoker     ToolInvoker
@@ -210,10 +218,21 @@ func (e *StoreError) Unwrap() error {
 }
 
 // updateStep persists the given step to the store if configured, returning any storage error.
-func (e *StepExecutor) updateStep(ctx context.Context, store StepStore, step *FSMStep) error {
+func (e *StepExecutor) updateStep(ctx context.Context, store StepStore, step *FSMStep, event ...*trajectory.Event) error {
+	var ev *trajectory.Event
+	if len(event) > 0 && event[0] != nil {
+		ev = event[0]
+	}
+
 	if store != nil {
-		if err := store.UpdateStep(ctx, step); err != nil {
-			return &StoreError{StepID: step.ID, Err: err}
+		if es, ok := store.(StepEventStore); ok && ev != nil {
+			if err := es.UpdateStepWithEvent(ctx, step, ev); err != nil {
+				return &StoreError{StepID: step.ID, Err: err}
+			}
+		} else {
+			if err := store.UpdateStep(ctx, step); err != nil {
+				return &StoreError{StepID: step.ID, Err: err}
+			}
 		}
 	}
 	if obs := GetProgressObserver(ctx); obs != nil && step != nil {
@@ -328,9 +347,22 @@ func (e *StepExecutor) executeParallel(ctx context.Context, store StepStore, ste
 				s.Status = StepStatusFailed
 				s.ErrorText = ctx.Err().Error()
 				s.CompletedAt = &now
-				if err := e.updateStep(ctx, store, s); err != nil {
+				failCode := 1
+				trajStep := trajectory.Step{
+					Index:       s.StepIndex,
+					Iteration:   s.Iteration,
+					Attempt:     s.Attempt,
+					Action:      s.ToolName,
+					ActionArgs:  json.RawMessage(s.ArgsJSON),
+					Observation: s.ErrorText,
+					ExitCode:    &failCode,
+				}
+				ev, _ := trajectory.MakeToolAttemptEvent(s.RunID, s.RunID, 1, s.Iteration, "loop", s.ID, s.Attempt, trajStep)
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if err := e.updateStep(cleanupCtx, store, s, ev); err != nil {
 					recordErr(err)
 				}
+				cleanupCancel()
 				recordErr(ctx.Err())
 			}
 		}(step)
@@ -352,8 +384,22 @@ func (e *StepExecutor) executeSequential(ctx context.Context, store StepStore, s
 			step.Status = StepStatusFailed
 			step.ErrorText = ctx.Err().Error()
 			step.CompletedAt = &now
-			if err := e.updateStep(ctx, store, step); err != nil {
-				return errors.Join(ctx.Err(), err)
+			failCode := 1
+			trajStep := trajectory.Step{
+				Index:       step.StepIndex,
+				Iteration:   step.Iteration,
+				Attempt:     step.Attempt,
+				Action:      step.ToolName,
+				ActionArgs:  json.RawMessage(step.ArgsJSON),
+				Observation: step.ErrorText,
+				ExitCode:    &failCode,
+			}
+			ev, _ := trajectory.MakeToolAttemptEvent(step.RunID, step.RunID, 1, step.Iteration, "loop", step.ID, step.Attempt, trajStep)
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			updateErr := e.updateStep(cleanupCtx, store, step, ev)
+			cleanupCancel()
+			if updateErr != nil {
+				return errors.Join(ctx.Err(), updateErr)
 			}
 			return ctx.Err()
 		}
@@ -385,7 +431,13 @@ func (e *StepExecutor) skipRemainingSteps(ctx context.Context, store StepStore, 
 		s.Status = StepStatusSkipped
 		s.ErrorText = fmt.Sprintf("skipped due to failure in step %s", failedStepID)
 		s.CompletedAt = &now
-		if err := e.updateStep(ctx, store, s); err != nil {
+		cleanupCtx := ctx
+		if ctx.Err() != nil {
+			var cancel context.CancelFunc
+			cleanupCtx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+		}
+		if err := e.updateStep(cleanupCtx, store, s); err != nil {
 			errs = errors.Join(errs, err)
 		}
 	}
@@ -402,7 +454,18 @@ func (e *StepExecutor) executeSingleStep(ctx context.Context, store StepStore, s
 		step.ErrorText = fmt.Sprintf("unauthorized tool: %q is not in the allowed toolset", step.ToolName)
 		now := time.Now().Unix()
 		step.CompletedAt = &now
-		return e.updateStep(ctx, store, step)
+		failCode := 1
+		trajStep := trajectory.Step{
+			Index:       step.StepIndex,
+			Iteration:   step.Iteration,
+			Attempt:     step.Attempt,
+			Action:      step.ToolName,
+			ActionArgs:  json.RawMessage(step.ArgsJSON),
+			Observation: step.ErrorText,
+			ExitCode:    &failCode,
+		}
+		ev, _ := trajectory.MakeToolAttemptEvent(step.RunID, step.RunID, 1, step.Iteration, "loop", step.ID, step.Attempt, trajStep)
+		return e.updateStep(ctx, store, step, ev)
 	}
 
 	def, _ := binding.Definition(step.ToolName)
@@ -411,7 +474,18 @@ func (e *StepExecutor) executeSingleStep(ctx context.Context, store StepStore, s
 		step.ErrorText = "interrupted mid-execution; not retried (non-idempotent tool)"
 		now := time.Now().Unix()
 		step.CompletedAt = &now
-		return e.updateStep(ctx, store, step)
+		failCode := 1
+		trajStep := trajectory.Step{
+			Index:       step.StepIndex,
+			Iteration:   step.Iteration,
+			Attempt:     step.Attempt,
+			Action:      step.ToolName,
+			ActionArgs:  json.RawMessage(step.ArgsJSON),
+			Observation: step.ErrorText,
+			ExitCode:    &failCode,
+		}
+		ev, _ := trajectory.MakeToolAttemptEvent(step.RunID, step.RunID, 1, step.Iteration, "loop", step.ID, step.Attempt, trajStep)
+		return e.updateStep(ctx, store, step, ev)
 	}
 
 	timeoutSec := step.TimeoutSeconds
@@ -442,6 +516,7 @@ func (e *StepExecutor) executeSingleStep(ctx context.Context, store StepStore, s
 
 	for {
 		step.Attempt++
+		startTime := time.Now()
 		stepCtx, cancel := context.WithTimeout(ctx, timeout)
 		call := agentapi.ToolCall{
 			ID:        step.ToolCallID,
@@ -450,21 +525,40 @@ func (e *StepExecutor) executeSingleStep(ctx context.Context, store StepStore, s
 		}
 		res, err := binding.Execute(stepCtx, call)
 		cancel()
+		durationMs := time.Since(startTime).Milliseconds()
 
 		completedTime := time.Now().Unix()
 		if err == nil {
+			rawObs := res.Content
+			exitCode := trajectory.ParseExitCode(rawObs)
+			if exitCode == nil {
+				zero := 0
+				exitCode = &zero
+			}
+			trajStep := trajectory.Step{
+				Index:       step.StepIndex,
+				Iteration:   step.Iteration,
+				Attempt:     step.Attempt,
+				Action:      step.ToolName,
+				ActionArgs:  json.RawMessage(step.ArgsJSON),
+				Observation: rawObs,
+				ExitCode:    exitCode,
+				DurationMs:  durationMs,
+			}
+			ev, _ := trajectory.MakeToolAttemptEvent(step.RunID, step.RunID, 1, step.Iteration, "loop", step.ID, step.Attempt, trajStep)
+
 			step.Status = StepStatusCompleted
 			encoded, encErr := EncodeStoredToolResult(res)
 			if encErr != nil {
 				step.Status = StepStatusFailed
 				step.ErrorText = fmt.Sprintf("failed to encode step result: %v", encErr)
 				step.CompletedAt = &completedTime
-				return e.updateStep(ctx, store, step)
+				return e.updateStep(ctx, store, step, ev)
 			}
 			step.ResultJSON = encoded
 			step.ErrorText = ""
 			step.CompletedAt = &completedTime
-			if updateErr := e.updateStep(ctx, store, step); updateErr != nil {
+			if updateErr := e.updateStep(ctx, store, step, ev); updateErr != nil {
 				return updateErr
 			}
 			return nil
@@ -481,13 +575,49 @@ func (e *StepExecutor) executeSingleStep(ctx context.Context, store StepStore, s
 			step.Status = status
 			step.ErrorText = errText
 			step.CompletedAt = &completedTime
-			updateErr := e.updateStep(ctx, store, step)
+
+			failCode := 1
+			trajStep := trajectory.Step{
+				Index:       step.StepIndex,
+				Iteration:   step.Iteration,
+				Attempt:     step.Attempt,
+				Action:      step.ToolName,
+				ActionArgs:  json.RawMessage(step.ArgsJSON),
+				Observation: errText,
+				ExitCode:    &failCode,
+				DurationMs:  durationMs,
+			}
+			ev, _ := trajectory.MakeToolAttemptEvent(step.RunID, step.RunID, 1, step.Iteration, "loop", step.ID, step.Attempt, trajStep)
+
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			updateErr := e.updateStep(cleanupCtx, store, step, ev)
+			cleanupCancel()
 			return errors.Join(ctx.Err(), updateErr)
 		}
 
 		// Check if step timed out or encountered a transient error
 		isTimeout := errors.Is(stepCtx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded)
 		isRetryable := isTimeout || IsTransientError(err)
+
+		failCode := 1
+		obs := err.Error()
+		if res.Content != "" {
+			obs = res.Content + "\n" + obs
+		}
+		if code := trajectory.ParseExitCode(res.Content); code != nil {
+			failCode = *code
+		}
+		trajStep := trajectory.Step{
+			Index:       step.StepIndex,
+			Iteration:   step.Iteration,
+			Attempt:     step.Attempt,
+			Action:      step.ToolName,
+			ActionArgs:  json.RawMessage(step.ArgsJSON),
+			Observation: obs,
+			ExitCode:    &failCode,
+			DurationMs:  durationMs,
+		}
+		ev, _ := trajectory.MakeToolAttemptEvent(step.RunID, step.RunID, 1, step.Iteration, "loop", step.ID, step.Attempt, trajStep)
 
 		if isRetryable && step.Attempt < maxAttempts {
 			step.Status = StepStatusRunning
@@ -501,15 +631,17 @@ func (e *StepExecutor) executeSingleStep(ctx context.Context, store StepStore, s
 				"timeout", isTimeout,
 				"error", err,
 			)
-			if updateErr := e.updateStep(ctx, store, step); updateErr != nil {
+			if updateErr := e.updateStep(ctx, store, step, ev); updateErr != nil {
 				return updateErr
 			}
 			select {
 			case <-ctx.Done():
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				step.Status = StepStatusFailed
 				step.ErrorText = ctx.Err().Error()
 				step.CompletedAt = &completedTime
-				updateErr := e.updateStep(ctx, store, step)
+				updateErr := e.updateStep(cleanupCtx, store, step, nil)
+				cleanupCancel()
 				return errors.Join(ctx.Err(), updateErr)
 			case <-time.After(backoff):
 				continue
@@ -521,7 +653,7 @@ func (e *StepExecutor) executeSingleStep(ctx context.Context, store StepStore, s
 			step.Status = StepStatusTimedOut
 			step.ErrorText = fmt.Sprintf("tool execution timed out after %ds; specify a higher timeout_seconds in tool arguments if needed", step.TimeoutSeconds)
 			step.CompletedAt = &completedTime
-			updateErr := e.updateStep(ctx, store, step)
+			updateErr := e.updateStep(ctx, store, step, ev)
 			return errors.Join(err, updateErr)
 		}
 
@@ -529,7 +661,7 @@ func (e *StepExecutor) executeSingleStep(ctx context.Context, store StepStore, s
 		step.Status = StepStatusFailed
 		step.ErrorText = err.Error()
 		step.CompletedAt = &completedTime
-		updateErr := e.updateStep(ctx, store, step)
+		updateErr := e.updateStep(ctx, store, step, ev)
 		return errors.Join(err, updateErr)
 	}
 }

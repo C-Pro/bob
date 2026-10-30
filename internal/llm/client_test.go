@@ -792,3 +792,48 @@ func TestClassifyTimeout_ProviderErrorNotClassifiedAsClientTimeout(t *testing.T)
 	assert.False(t, errors.As(err, &timeoutErr), "upstream 500 error containing deadline exceeded text must NOT be classified as TimeoutError")
 	assert.Equal(t, int32(4), atomic.LoadInt32(&attempts), "500 server error should retry normally")
 }
+
+func TestGeminiTransport_ReasoningNormalization(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Simulate a Gemini/vLLM response that includes "thought" and one that already has "reasoning_content"
+		respJSON := `{
+			"id": "chatcmpl-test",
+			"object": "chat.completion",
+			"created": 1234567890,
+			"model": "gemini-2.5-flash",
+			"choices": [
+				{
+					"index": 0,
+					"message": {
+						"role": "assistant",
+						"content": "Hello world",
+						"thought": "Let's think carefully step by step."
+					},
+					"finish_reason": "stop"
+				}
+			]
+		}`
+		_, _ = w.Write([]byte(respJSON))
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		OpenAIAPIKey:  "test-key",
+		OpenAIModel:   "gemini-2.5-flash",
+		OpenAIBaseURL: server.URL,
+	}
+
+	client := NewClient(cfg, nil)
+	resp, err := client.CreateChatCompletion(context.Background(), openai.ChatCompletionRequest{
+		Model: "gemini-2.5-flash",
+		Messages: []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleUser, Content: "Hi"},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.Choices, 1)
+	assert.Equal(t, "Let's think carefully step by step.", resp.Choices[0].Message.ReasoningContent)
+	assert.Equal(t, "Hello world", resp.Choices[0].Message.Content)
+}
+

@@ -67,6 +67,11 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	_ = os.Unsetenv("KNOWLEDGE_MAX_LOADED_SKILL_BYTES")
 	_ = os.Unsetenv("KNOWLEDGE_DEFAULT_DISCOVERY_LIMIT")
 	_ = os.Unsetenv("KNOWLEDGE_MAX_DISCOVERY_LIMIT")
+	_ = os.Unsetenv("TRAJECTORY_ENABLED")
+	_ = os.Unsetenv("TRAJECTORY_S3_BUCKET")
+	_ = os.Unsetenv("TRAJECTORY_S3_PREFIX")
+	_ = os.Unsetenv("TRAJECTORY_FLUSH_DELAY")
+	_ = os.Unsetenv("TRAJECTORY_ALLOW_PRIVATE")
 
 	cfg, err := LoadFromEnv()
 	require.NoError(t, err)
@@ -117,6 +122,11 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	assert.Equal(t, 24576, cfg.KnowledgeMaxLoadedSkillBytes)
 	assert.Equal(t, 5, cfg.KnowledgeDefaultDiscoveryLimit)
 	assert.Equal(t, 10, cfg.KnowledgeMaxDiscoveryLimit)
+	assert.False(t, cfg.TrajectoryEnabled)
+	assert.Equal(t, "", cfg.TrajectoryS3Bucket)
+	assert.Equal(t, "trajectories/", cfg.TrajectoryS3Prefix)
+	assert.Equal(t, 15*time.Minute, cfg.TrajectoryFlushDelay)
+	assert.False(t, cfg.TrajectoryAllowPrivate)
 }
 
 func TestLoadFromEnvStandardOpenAI(t *testing.T) {
@@ -181,6 +191,71 @@ func TestLoadFromEnvS3(t *testing.T) {
 	assert.Equal(t, 2*time.Hour, cfg.S3BackupInterval)
 	assert.Equal(t, 14, cfg.S3BackupKeep)
 	assert.Equal(t, "custom_bob/", cfg.S3BackupPrefix)
+}
+
+func TestLoadFromEnvTrajectory(t *testing.T) {
+	t.Setenv("TRAJECTORY_ENABLED", "true")
+	t.Setenv("TRAJECTORY_S3_BUCKET", "custom-traj-bucket")
+	t.Setenv("TRAJECTORY_S3_PREFIX", "custom-prefix")
+	t.Setenv("TRAJECTORY_FLUSH_DELAY", "5m")
+	t.Setenv("TRAJECTORY_ALLOW_PRIVATE", "true")
+
+	cfg, err := LoadFromEnv()
+	require.NoError(t, err)
+	assert.True(t, cfg.TrajectoryEnabled)
+	assert.Equal(t, "custom-traj-bucket", cfg.TrajectoryS3Bucket)
+	assert.Equal(t, "custom-traj-bucket", cfg.TrajectoryBucket())
+	assert.Equal(t, "custom-prefix/", cfg.TrajectoryS3Prefix)
+	assert.Equal(t, 5*time.Minute, cfg.TrajectoryFlushDelay)
+	assert.True(t, cfg.TrajectoryAllowPrivate)
+
+	// Fallback to S3_BUCKET when TRAJECTORY_S3_BUCKET is empty
+	t.Setenv("S3_BUCKET", "fallback-bucket")
+	t.Setenv("TRAJECTORY_S3_BUCKET", "")
+	cfgFallback, err := LoadFromEnv()
+	require.NoError(t, err)
+	assert.Equal(t, "fallback-bucket", cfgFallback.TrajectoryBucket())
+}
+
+func TestTrajectoryValidation(t *testing.T) {
+	cfg := Defaults()
+	cfg.OpenAIAPIKey = "test-key"
+	cfg.OpenAIModel = "test-model"
+
+	// Trajectory disabled: does not require S3 credentials
+	cfg.TrajectoryEnabled = false
+	assert.NoError(t, cfg.Validate(true))
+
+	// Trajectory enabled: missing bucket
+	cfg.TrajectoryEnabled = true
+	cfg.TrajectoryS3Bucket = ""
+	cfg.S3Bucket = ""
+	err := cfg.Validate(true)
+	assert.ErrorContains(t, err, "TRAJECTORY_S3_BUCKET (or S3_BUCKET) is required")
+
+	// Missing endpoint
+	cfg.TrajectoryS3Bucket = "traj-bucket"
+	cfg.S3Endpoint = ""
+	err = cfg.Validate(true)
+	assert.ErrorContains(t, err, "S3_ENDPOINT is required when TRAJECTORY_ENABLED is true")
+
+	// Missing credentials
+	cfg.S3Endpoint = "http://127.0.0.1:9000"
+	cfg.S3AccessKey = ""
+	cfg.S3SecretKey = ""
+	err = cfg.Validate(true)
+	assert.ErrorContains(t, err, "S3_ACCESS_KEY and S3_SECRET_KEY are required")
+
+	// Invalid flush delay
+	cfg.S3AccessKey = "access"
+	cfg.S3SecretKey = "secret"
+	cfg.TrajectoryFlushDelay = 0
+	err = cfg.Validate(true)
+	assert.ErrorContains(t, err, "TRAJECTORY_FLUSH_DELAY must be greater than 0")
+
+	// Valid configuration
+	cfg.TrajectoryFlushDelay = 15 * time.Minute
+	assert.NoError(t, cfg.Validate(true))
 }
 
 func TestLoadFromEnvGeminiFallback(t *testing.T) {

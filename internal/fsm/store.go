@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"bob/internal/agentapi"
+	"bob/internal/trajectory"
 )
 
 var (
@@ -511,8 +512,8 @@ func (s *Store) querySteps(ctx context.Context, query string, args ...any) ([]FS
 	return steps, nil
 }
 
-// UpdateStep updates the execution results, attempt counter, status, and timestamps of a step.
-func (s *Store) UpdateStep(ctx context.Context, step *FSMStep) error {
+// UpdateStepTx updates a step within an existing database transaction.
+func (s *Store) UpdateStepTx(ctx context.Context, tx *sql.Tx, step *FSMStep) error {
 	if step == nil {
 		return fmt.Errorf("step cannot be nil")
 	}
@@ -532,12 +533,12 @@ func (s *Store) UpdateStep(ctx context.Context, step *FSMStep) error {
 		completedAt = sql.NullInt64{Int64: *step.CompletedAt, Valid: true}
 	}
 
-	res, err := s.db.ExecContext(ctx, query,
+	res, err := tx.ExecContext(ctx, query,
 		string(step.Status), step.Attempt, step.ResultJSON, step.ErrorText,
 		startedAt, completedAt, step.ID,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to update fsm_step %s: %w", step.ID, err)
+		return fmt.Errorf("failed to update fsm_step %s in tx: %w", step.ID, err)
 	}
 
 	affected, err := res.RowsAffected()
@@ -549,4 +550,48 @@ func (s *Store) UpdateStep(ctx context.Context, step *FSMStep) error {
 	}
 
 	return nil
+}
+
+// UpdateStepWithEvent updates a step and atomically logs an outbox event in the same transaction.
+func (s *Store) UpdateStepWithEvent(ctx context.Context, step *FSMStep, event *trajectory.Event) error {
+	if step == nil {
+		return fmt.Errorf("step cannot be nil")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if err := s.UpdateStepTx(ctx, tx, step); err != nil {
+		return err
+	}
+
+	if event != nil {
+		if err := trajectory.RecordEventTx(ctx, tx, event); err != nil {
+			return fmt.Errorf("failed to record step event in tx: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit step and event tx: %w", err)
+	}
+
+	return nil
+}
+
+// UpdateStep updates the execution results, attempt counter, status, and timestamps of a step.
+func (s *Store) UpdateStep(ctx context.Context, step *FSMStep) error {
+	return s.UpdateStepWithEvent(ctx, step, nil)
+}
+
+// RecordEvent logs an outbox event to agent_trajectory_events using the store's database.
+func (s *Store) RecordEvent(ctx context.Context, event *trajectory.Event) error {
+	return trajectory.RecordEvent(ctx, s.db, event)
+}
+
+// RecordEventTx logs an outbox event to agent_trajectory_events within an existing transaction.
+func (s *Store) RecordEventTx(ctx context.Context, tx *sql.Tx, event *trajectory.Event) error {
+	return trajectory.RecordEventTx(ctx, tx, event)
 }

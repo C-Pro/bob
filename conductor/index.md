@@ -23,6 +23,8 @@
 - **Track: Isolated Sandbox Execution Subsystem** (`sandbox-execution_20260906`) - [Plan](archive/sandbox-execution_20260906/plan.md) | [Spec](archive/sandbox-execution_20260906/spec.md)
 - **Track: Restricted Docker Network Isolation** (`docker-restricted-net_20260911`) - [Plan](archive/docker-restricted-net_20260911/plan.md) | [Spec](archive/docker-restricted-net_20260911/spec.md)
 - **Track: Attachment Tools for Isolated Sandbox Execution** (`attachment-tools_20260921`) - [Plan](archive/attachment-tools_20260921/plan.md) | [Spec](archive/attachment-tools_20260921/spec.md)
+- **Track: CLI One-Shot Frontend (`bob -p`) with shared YAML config and opt-in sandbox** (`cli-oneshot-frontend_20261008`) - [Plan](archive/cli-oneshot-frontend_20261008/plan.md) | [Spec](archive/cli-oneshot-frontend_20261008/spec.md)
+- **Track: Trajectory Logger (Phase 5)** (`trajectory-logger_20261014`) - [Plan](archive/trajectory-logger_20261014/plan.md) | [Spec](archive/trajectory-logger_20261014/spec.md)
 
 ---
 
@@ -63,9 +65,3 @@
 
 - [x] **Track: Core Agent Engine Decoupling**
 *Link: [./tracks/core-engine-decoupling_20261006/](./tracks/core-engine-decoupling_20261006/)*
-
-
----
-
-- [x] **Track: CLI One-Shot Frontend (`bob -p`) with shared YAML config and opt-in sandbox**
-*Link: [./tracks/cli-oneshot-frontend_20261008/](./tracks/cli-oneshot-frontend_20261008/)*

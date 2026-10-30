@@ -1,0 +1,8 @@
+{
+  "track_id": "trajectory-logger_20261014",
+  "type": "feature",
+  "status": "completed",
+  "created_at": "2026-10-14T14:30:00Z",
+  "updated_at": "2026-10-30T02:28:00Z",
+  "description": "Phase 5 Trajectory Logger: capture full execution rollouts (x, phi_task, z, a, o, y, R_eval), 2-stage SQLite staging with delayed S3/MinIO flush, feedback mutation, and reward engine"
+}

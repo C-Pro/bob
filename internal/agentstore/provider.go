@@ -16,12 +16,14 @@ import (
 	"bob/internal/knowledge"
 	"bob/internal/memory"
 	"bob/internal/scheduler"
+	"bob/internal/trajectory"
 )
 
 type storeEntry struct {
 	mu     sync.Mutex
 	store  *fsm.Store
 	sStore *scheduler.Store
+	tStore *trajectory.SQLiteStore
 }
 
 type knowledgeEntry struct {
@@ -38,9 +40,10 @@ type MemoryStoreProvider struct {
 	dataDir           string
 	mu                sync.RWMutex
 	storeEntries      map[string]*storeEntry
-	knowledgeEntries  map[string]*knowledgeEntry
-	maxDiscoveryLimit int
-	initOnce          sync.Once
+	knowledgeEntries     map[string]*knowledgeEntry
+	maxDiscoveryLimit    int
+	trajectoryFlushDelay time.Duration
+	initOnce             sync.Once
 }
 
 // NewMemoryStoreProvider creates a new MemoryStoreProvider.
@@ -64,6 +67,16 @@ func (p *MemoryStoreProvider) SetMaxDiscoveryLimit(limit int) {
 	if limit > 0 {
 		p.maxDiscoveryLimit = limit
 	}
+}
+
+// SetTrajectoryFlushDelay configures the staging delay applied to new trajectory stores.
+func (p *MemoryStoreProvider) SetTrajectoryFlushDelay(d time.Duration) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.trajectoryFlushDelay = d
 }
 
 func (p *MemoryStoreProvider) storeKey(chatID string, isDM bool) string {
@@ -208,6 +221,44 @@ func (p *MemoryStoreProvider) GetSchedulerStore(ctx context.Context, chatID stri
 
 	entry.sStore = scheduler.NewStore(rawDB)
 	return entry.sStore, nil
+}
+
+// GetTrajectoryStore retrieves or initializes the isolated trajectory store for the given chat context.
+func (p *MemoryStoreProvider) GetTrajectoryStore(ctx context.Context, chatID string, isDM bool) (*trajectory.SQLiteStore, error) {
+	if p.memMgr == nil {
+		return nil, fmt.Errorf("memory manager is nil")
+	}
+
+	entry := p.getOrCreateStoreEntry(chatID, isDM)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+
+	if entry.tStore != nil {
+		return entry.tStore, nil
+	}
+
+	cortexDB, err := p.memMgr.GetDB(ctx, chatID, isDM)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get database for chat %s: %w", chatID, err)
+	}
+
+	rawDB := cortexDB.SQL()
+	if err := trajectory.EnsureSchema(ctx, rawDB); err != nil {
+		return nil, fmt.Errorf("failed to ensure trajectory schema for chat %s: %w", chatID, err)
+	}
+
+	tStore, err := trajectory.NewStore(rawDB)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create trajectory store for chat %s: %w", chatID, err)
+	}
+	p.mu.RLock()
+	delay := p.trajectoryFlushDelay
+	p.mu.RUnlock()
+	if delay > 0 {
+		tStore.SetStagingDelay(delay)
+	}
+	entry.tStore = tStore
+	return entry.tStore, nil
 }
 
 // GetKnowledgeStore retrieves or initializes the isolated knowledge store for the given chat context.
@@ -488,6 +539,56 @@ func hasPendingKnowledgeWork(dbPath string) (bool, error) {
 	return false, nil
 }
 
+func hasPendingTrajectories(dbPath string) (bool, error) {
+	fi, err := os.Stat(dbPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if fi.Size() == 0 {
+		return false, nil
+	}
+
+	dsn := fmt.Sprintf("file:%s?mode=ro", dbPath)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = db.Close() }()
+
+	var trajTableExists int
+	err = db.QueryRow("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_trajectories'").Scan(&trajTableExists)
+	if err == nil {
+		var hasStaged int
+		err = db.QueryRow("SELECT 1 FROM agent_trajectories WHERE status = 'staged' LIMIT 1").Scan(&hasStaged)
+		if err == nil {
+			return true, nil
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return false, err
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+
+	var eventsTableExists int
+	err = db.QueryRow("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_trajectory_events'").Scan(&eventsTableExists)
+	if err == nil {
+		var hasEvents int
+		err = db.QueryRow("SELECT 1 FROM agent_trajectory_events LIMIT 1").Scan(&hasEvents)
+		if err == nil {
+			return true, nil
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return false, err
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+
+	return false, nil
+}
+
 func (p *MemoryStoreProvider) discoverStore(ctx context.Context, filePath, chatID string, isDM bool) {
 	hasFSM, err := hasActiveRuns(filePath)
 	if err != nil {
@@ -521,6 +622,17 @@ func (p *MemoryStoreProvider) discoverStore(ctx context.Context, filePath, chatI
 			if _, err := p.GetKnowledgeIndexer(ctx, chatID, isDM); err != nil {
 				slog.Warn("failed to open chat database for knowledge indexer recovery", "path", filePath, "error", err)
 			}
+		}
+	}
+
+	hasTraj, err := hasPendingTrajectories(filePath)
+	if err != nil {
+		slog.Warn("failed to inspect chat database for pending trajectories; opening for safety", "path", filePath, "error", err)
+		hasTraj = true
+	}
+	if hasTraj {
+		if _, err := p.GetTrajectoryStore(ctx, chatID, isDM); err != nil {
+			slog.Warn("failed to open chat database for trajectory store recovery", "path", filePath, "error", err)
 		}
 	}
 }
@@ -660,6 +772,36 @@ func (p *MemoryStoreProvider) ActiveSchedulerStores(ctx context.Context) ([]*sch
 	for _, entry := range entries {
 		entry.mu.Lock()
 		st := entry.sStore
+		entry.mu.Unlock()
+		if st != nil {
+			stores = append(stores, st)
+		}
+	}
+
+	return stores, nil
+}
+
+// ActiveTrajectoryStores discovers and returns isolated trajectory stores for all active chat databases.
+func (p *MemoryStoreProvider) ActiveTrajectoryStores(ctx context.Context) ([]trajectory.Store, error) {
+	if p.memMgr == nil {
+		return nil, nil
+	}
+
+	p.initOnce.Do(func() {
+		p.discoverStores(ctx)
+	})
+
+	p.mu.RLock()
+	entries := make([]*storeEntry, 0, len(p.storeEntries))
+	for _, entry := range p.storeEntries {
+		entries = append(entries, entry)
+	}
+	p.mu.RUnlock()
+
+	stores := make([]trajectory.Store, 0, len(entries))
+	for _, entry := range entries {
+		entry.mu.Lock()
+		st := entry.tStore
 		entry.mu.Unlock()
 		if st != nil {
 			stores = append(stores, st)

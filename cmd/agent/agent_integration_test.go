@@ -3,17 +3,22 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"bob/internal/bootstrap"
 	"bob/internal/config"
 	"bob/internal/gateway"
 	"bob/internal/geoip"
 	"bob/internal/llm"
 	"bob/internal/models"
+	"bob/internal/objectstore"
+	"bob/internal/trajectory"
 
 	"github.com/fasthttp/websocket"
 	openai "github.com/sashabaranov/go-openai"
@@ -495,6 +500,280 @@ func TestAgentIntegration_StartupLocationReporting(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for initial location frame in integration test")
 	}
+
+	gw.Stop()
+}
+
+func TestAgentIntegration_TrajectoryLogger_ToolTurnWithFeedbackAndExport(t *testing.T) {
+	// 1. Mock S3 Object Store Server
+	var uploadedKey string
+	var uploadedBody []byte
+	var uploadMu sync.Mutex
+
+	s3Server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			uploadMu.Lock()
+			uploadedKey = r.URL.Path
+			uploadedBody = body
+			uploadMu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer s3Server.Close()
+
+	// 2. Mock LLM Completion & Embeddings Server
+	var llmCallCount int
+	var llmMu sync.Mutex
+
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "embeddings") {
+			resp := openai.EmbeddingResponse{
+				Data: []openai.Embedding{
+					{Index: 0, Embedding: make([]float32, 128)},
+				},
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		llmMu.Lock()
+		llmCallCount++
+		currentCall := llmCallCount
+		llmMu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		if currentCall == 1 {
+			// First call triggers tool call 'recall_memory'
+			resp := openai.ChatCompletionResponse{
+				ID: "call-1",
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Index: 0,
+						Message: openai.ChatCompletionMessage{
+							Role: openai.ChatMessageRoleAssistant,
+							ToolCalls: []openai.ToolCall{
+								{
+									ID:   "call_recall_1",
+									Type: openai.ToolTypeFunction,
+									Function: openai.FunctionCall{
+										Name:      "recall_memory",
+										Arguments: `{"query":"test-memories"}`,
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		// Second call returns final conversational response
+		resp := openai.ChatCompletionResponse{
+			ID: "call-2",
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Index: 0,
+					Message: openai.ChatCompletionMessage{
+						Role:    openai.ChatMessageRoleAssistant,
+						Content: "Found test memories successfully.",
+					},
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer llmServer.Close()
+
+	// 3. Mock Besedka WebSocket & REST Server
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	botReplies := make(chan models.ClientMessage, 10)
+
+	besedkaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/me":
+			_ = json.NewEncoder(w).Encode(models.User{
+				ID:          "bot-user-id",
+				UserName:    "bot",
+				DisplayName: "Bot",
+			})
+		case r.URL.Path == "/api/users":
+			_ = json.NewEncoder(w).Encode([]models.User{
+				{ID: "bot-user-id", UserName: "bot", DisplayName: "Bot"},
+				{ID: "human-user", UserName: "alice", DisplayName: "Alice"},
+			})
+		case r.URL.Path == "/api/chats":
+			_ = json.NewEncoder(w).Encode([]models.Chat{
+				{ID: "townhall", Type: "townhall"},
+			})
+		case strings.HasPrefix(r.URL.Path, "/api/chats/") && strings.HasSuffix(r.URL.Path, "/messages") && r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode([]models.Message{})
+		case strings.HasPrefix(r.URL.Path, "/api/chats/") && strings.HasSuffix(r.URL.Path, "/messages") && r.Method == http.MethodPost:
+			var req struct {
+				Content string `json:"content"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"seq":       10,
+				"timestamp": time.Now().Unix(),
+			})
+		case strings.HasPrefix(r.URL.Path, "/api/chats/") && !strings.Contains(r.URL.Path, "/messages"):
+			_ = json.NewEncoder(w).Encode(models.Chat{ID: "townhall", Type: "townhall"})
+		case r.URL.Path == "/api/chat":
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer func() { _ = conn.Close() }()
+			for {
+				var cm models.ClientMessage
+				if err := conn.ReadJSON(&cm); err != nil {
+					return
+				}
+				botReplies <- cm
+			}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer besedkaServer.Close()
+
+	// 4. Initialize Config & Runtime with Trajectory Logger enabled
+	tempDir := t.TempDir()
+	cfg := &config.Config{
+		BotHandle:             "@bot",
+		BesedkaURL:            besedkaServer.URL,
+		BesedkaAPIKey:         "test-key",
+		OpenAIAPIKey:          "test-openai-key",
+		OpenAIModel:           "gemini-3.7-flash",
+		OpenAIBaseURL:         llmServer.URL,
+		TownhallMaxParagraphs: 2,
+		DMMaxParagraphs:       10,
+		MsgRingBufferSize:     100,
+		DataDir:               tempDir,
+		EmbeddingModel:        "mock-model",
+		TrajectoryEnabled:     true,
+		TrajectoryS3Bucket:    "test-traj-bucket",
+		TrajectoryS3Prefix:    "trajectories/",
+		TrajectoryFlushDelay:  15 * time.Minute,
+		S3Endpoint:            s3Server.URL,
+		S3Region:              "us-east-1",
+		S3AccessKey:           "TEST_KEY",
+		S3SecretKey:           "TEST_SECRET",
+		S3PathStyle:           true,
+	}
+	require.NoError(t, cfg.Validate(true))
+
+	llmClient := llm.NewClient(cfg, llmServer.Client())
+	rt, err := bootstrap.New(cfg, bootstrap.Options{
+		LLMClient: llmClient,
+	})
+	require.NoError(t, err)
+	defer func() { _ = rt.Close() }()
+
+	gw := gateway.NewGatewayWithRuntime(cfg, rt)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err = gw.DialWebSocket(ctx)
+	require.NoError(t, err)
+
+	// 5. Execute Turn 1: User mentions @bot requesting memories, requiring tool invocation
+	err = gw.ProcessMessage(ctx, models.Message{
+		Seq:       1,
+		ChatID:    "townhall",
+		UserID:    "human-user",
+		Content:   "@bot find memories",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+
+	// 6. Execute Turn 2: User provides positive feedback via /good command
+	err = gw.ProcessMessage(ctx, models.Message{
+		Seq:       2,
+		ChatID:    "townhall",
+		UserID:    "human-user",
+		Content:   "/good Great answer!",
+		Timestamp: time.Now().Unix(),
+	})
+	require.NoError(t, err)
+
+	// 7. Initialize Trajectory Exporter and trigger FlushOnce
+	s3Client, err := objectstore.New(objectstore.Config{
+		Endpoint:  s3Server.URL,
+		Region:    cfg.S3Region,
+		Bucket:    cfg.TrajectoryBucket(),
+		AccessKey: cfg.S3AccessKey,
+		SecretKey: cfg.S3SecretKey,
+		PathStyle: cfg.S3PathStyle,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, s3Client)
+
+	exporterCfg := trajectory.ExporterConfig{
+		Enabled:      true,
+		Prefix:       cfg.TrajectoryS3Prefix,
+		AllowPrivate: cfg.TrajectoryAllowPrivate,
+		BatchLimit:   50,
+	}
+	trajExporter := trajectory.NewExporter(exporterCfg, rt.StoreProvider, s3Client)
+	// Override exporter time into the future to satisfy feedback quiescence delay
+	trajExporter.SetNow(func() time.Time {
+		return time.Now().UTC().Add(5 * time.Minute)
+	})
+
+	err = trajExporter.FlushOnce(ctx)
+	require.NoError(t, err)
+
+	// 8. Verify S3 Object Store Upload
+	uploadMu.Lock()
+	key := uploadedKey
+	body := uploadedBody
+	uploadMu.Unlock()
+
+	require.NotEmpty(t, key, "expected trajectory upload to mock S3 object store")
+	assert.True(t, strings.HasPrefix(key, "/test-traj-bucket/trajectories/"), "expected key path prefix: %s", key)
+	assert.True(t, strings.HasSuffix(key, "/r2.json"), "expected uploaded revision 2 key: %s", key)
+
+	// Assert typed unmarshaling
+	var uploadedTraj trajectory.Trajectory
+	err = json.Unmarshal(body, &uploadedTraj)
+	require.NoError(t, err)
+
+	assert.Contains(t, uploadedTraj.UserInput, "find memories")
+	assert.NotEmpty(t, uploadedTraj.TaskState, "phi_task should be present")
+	assert.Equal(t, "Found test memories successfully.", uploadedTraj.FinalOutput)
+	require.Len(t, uploadedTraj.Steps, 1)
+	assert.Equal(t, "recall_memory", uploadedTraj.Steps[0].Action)
+	require.NotNil(t, uploadedTraj.Steps[0].ExitCode)
+	assert.Equal(t, 0, *uploadedTraj.Steps[0].ExitCode)
+	assert.True(t, uploadedTraj.Breakdown.HasUserFeedback)
+	assert.Equal(t, 1.0, uploadedTraj.Breakdown.UserFeedback)
+	assert.Equal(t, "Great answer!", uploadedTraj.Breakdown.FeedbackNote)
+	assert.Greater(t, uploadedTraj.Reward, 0.8, "reward should exceed 0.8 on positive feedback and tool success")
+	assert.Equal(t, 2, uploadedTraj.Revision)
+
+	// Assert canonical raw JSON schema fields (x, phi_task, steps, y, r_eval)
+	var raw map[string]interface{}
+	err = json.Unmarshal(body, &raw)
+	require.NoError(t, err)
+
+	assert.Contains(t, raw, "x")
+	assert.Contains(t, raw, "phi_task")
+	assert.Contains(t, raw, "steps")
+	assert.Contains(t, raw, "y")
+	assert.Contains(t, raw, "r_eval")
+	assert.Equal(t, float64(2), raw["revision"])
 
 	gw.Stop()
 }
