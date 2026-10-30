@@ -32,6 +32,28 @@ func formatTime(t time.Time) string {
 	return t.UTC().Format(timeLayout)
 }
 
+// parseTime parses timestamps from SQLite or payload strings, handling RFC3339Nano,
+// fixed-width microsecond layouts, and driver-stripped trailing zero formats.
+func parseTime(s string) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t.UTC(), nil
+	}
+	if t, err := time.Parse(timeLayout, s); err == nil {
+		return t.UTC(), nil
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t.UTC(), nil
+	}
+	if t, err := time.Parse("2006-01-02 15:04:05.999999999", s); err == nil {
+		return t.UTC(), nil
+	}
+	t, err := time.Parse("2006-01-02 15:04:05", s)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return t.UTC(), nil
+}
+
 // ListExportOptions configures trajectory export queries.
 type ListExportOptions struct {
 	AllowPrivate bool
@@ -844,7 +866,7 @@ func (s *SQLiteStore) ReconcileTerminalRuns(ctx context.Context) error {
 					_ = evRows.Close()
 					return err
 				}
-				evTime, _ := time.Parse(timeLayout, createdAtStr)
+				evTime, _ := parseTime(createdAtStr)
 				if startTime.IsZero() {
 					startTime = evTime
 				}

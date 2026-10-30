@@ -854,7 +854,7 @@ func TestStore_ConfiguredStagingDelay(t *testing.T) {
 	err = db.QueryRowContext(ctx, "SELECT eligible_at FROM agent_trajectories WHERE id = ?", trajID).Scan(&eligibleAtStr)
 	require.NoError(t, err)
 
-	eligibleAt, err := time.Parse(timeLayout, eligibleAtStr)
+	eligibleAt, err := parseTime(eligibleAtStr)
 	require.NoError(t, err)
 
 	// Eligible at should be at least now + 40m (honoring the 45m delay, not hardcoded 15m)
@@ -955,4 +955,51 @@ func TestStore_InsertStaged_PreservesFeedbackAndNoopOnIdenticalReplay(t *testing
 	err = db.QueryRowContext(ctx, "SELECT eligible_at FROM agent_trajectories WHERE id = ?", trajID).Scan(&finalEligibleAt)
 	require.NoError(t, err)
 	assert.Equal(t, feedbackEligibleAt, finalEligibleAt, "eligible_at should remain unchanged after identical execution replay")
+}
+
+func TestParseTime(t *testing.T) {
+	testCases := []struct {
+		name     string
+		input    string
+		expected time.Time
+	}{
+		{
+			name:     "microsecond with trailing zero stripped (5 digits)",
+			input:    "2026-10-30T04:48:47.93654Z",
+			expected: time.Date(2026, 10, 30, 4, 48, 47, 936540000, time.UTC),
+		},
+		{
+			name:     "full 6-digit microsecond layout",
+			input:    "2026-10-30T04:48:47.936540Z",
+			expected: time.Date(2026, 10, 30, 4, 48, 47, 936540000, time.UTC),
+		},
+		{
+			name:     "millisecond 3-digit layout",
+			input:    "2026-10-30T04:48:47.936Z",
+			expected: time.Date(2026, 10, 30, 4, 48, 47, 936000000, time.UTC),
+		},
+		{
+			name:     "standard RFC3339 second precision",
+			input:    "2026-10-30T04:48:47Z",
+			expected: time.Date(2026, 10, 30, 4, 48, 47, 0, time.UTC),
+		},
+		{
+			name:     "sqlite standard datetime with subseconds",
+			input:    "2026-10-30 04:48:47.93654",
+			expected: time.Date(2026, 10, 30, 4, 48, 47, 936540000, time.UTC),
+		},
+		{
+			name:     "sqlite standard datetime without subseconds",
+			input:    "2026-10-30 04:48:47",
+			expected: time.Date(2026, 10, 30, 4, 48, 47, 0, time.UTC),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseTime(tc.input)
+			require.NoError(t, err)
+			assert.Equal(t, tc.expected, got)
+		})
+	}
 }
