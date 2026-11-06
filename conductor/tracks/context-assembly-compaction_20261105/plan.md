@@ -18,26 +18,26 @@
 ---
 
 ## Step 2: SelfCompact Adaptive Task Compaction in FSM Tool Loop (`internal/fsm`)
-- [ ] Task: Implement compacted view construction in `ToolLoopRunner.buildChatMessages`
-    - [ ] Load latest `CompactedTaskState` for `run.ID` in `buildChatMessages`
-    - [ ] Pin initial system prompt, prior conversation turns, and the run's original user request message
-    - [ ] Render `CompactedTaskState` as a structured context message covering iterations `1..CompactedUpToIter`
-    - [ ] Append raw assistant tool-call and tool-result messages only for iterations `> CompactedUpToIter`
-- [ ] Task: Implement SelfCompact trigger logic, loop/stuck guard, and rubric probe
-    - [ ] Create `internal/fsm/compaction.go` with eligibility evaluation:
+- [x] Task: Implement compacted view construction in `ToolLoopRunner.buildChatMessages`
+    - [x] Load latest `CompactedTaskState` for `run.ID` in `buildChatMessages`
+    - [x] Pin initial system prompt, prior conversation turns, and the run's original user request message
+    - [x] Render `CompactedTaskState` as a structured context message covering iterations `1..CompactedUpToIter`
+    - [x] Append raw assistant tool-call and tool-result messages only for iterations `> CompactedUpToIter`
+- [x] Task: Implement SelfCompact trigger logic, loop/stuck guard, and rubric probe
+    - [x] Create `internal/fsm/compaction.go` with eligibility evaluation:
       - Check iteration minimum (`MinIterations`), interval since `CompactedUpToIter`, and soft/hard byte thresholds
       - Detect stuck/repeating failing tool calls across consecutive iterations and suppress compaction when stuck
-    - [ ] Implement rubric-gated compaction probe (`probeAndCompact`) and hard byte-limit backstop (`forceCompact`)
-    - [ ] Integrate compaction check at the end of `handleExecuteSteps` before transitioning to the next `StateLLMRequest`
-    - [ ] Record compaction events to `agent_trajectory_events`
-- [ ] Task: Write unit and recovery tests for FSM compaction
-    - [ ] Create `internal/fsm/compaction_test.go` testing:
+    - [x] Implement rubric-gated compaction probe (`probeAndCompact`) and hard byte-limit backstop (`forceCompact`)
+    - [x] Integrate compaction check at the end of `handleExecuteSteps` before transitioning to the next `StateLLMRequest`
+    - [x] Record compaction events to `agent_trajectory_events`
+- [x] Task: Write unit and recovery tests for FSM compaction
+    - [x] Create `internal/fsm/compaction_test.go` testing:
       - Rubric-triggered compaction and structured state rendering
       - Hard byte-threshold backstop compaction
       - Suppression when steps are non-terminal or stuck repeating failing calls
       - Crash recovery resuming a compacted run from `fsm_compactions` + raw tail steps
-- [ ] Task: Step 2 Verification
-    - [ ] Run `go test -race ./internal/fsm/...`
+- [x] Task: Step 2 Verification
+    - [x] Run `go test -race ./internal/fsm/...`
 
 ---
 

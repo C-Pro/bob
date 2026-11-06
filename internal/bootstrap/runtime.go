@@ -184,6 +184,14 @@ func New(cfg *config.Config, opts Options) (*Runtime, error) {
 				MaxLoadedSkills:      cfg.KnowledgeMaxLoadedSkills,
 				MaxLoadedSkillBytes:  cfg.KnowledgeMaxLoadedSkillBytes,
 			}),
+			fsm.WithCompactionConfig(fsm.CompactionConfig{
+				Enabled:            cfg.FSMCompactionEnabled,
+				MinIterations:      cfg.FSMCompactionMinIterations,
+				IntervalIterations: cfg.FSMCompactionIntervalIterations,
+				TailIterations:     cfg.FSMCompactionTailIterations,
+				SoftThresholdBytes: cfg.FSMCompactionSoftThresholdBytes,
+				HardThresholdBytes: cfg.FSMCompactionHardThresholdBytes,
+			}),
 			fsm.WithRunFinalizer(func(ctx context.Context, run *fsm.FSMRun) error {
 				var errs []error
 				if err := sandbox.RemoveRunCache(run.ID); err != nil {

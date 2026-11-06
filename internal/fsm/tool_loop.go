@@ -26,11 +26,13 @@ const (
 
 // ToolLoopRunner executes the simple tool loop finite state machine.
 type ToolLoopRunner struct {
-	mu              sync.RWMutex
-	llmClient       LLMClient
-	stepExecutor    *StepExecutor
-	defaultModel    string
-	toolDefProvider ToolDefinitionProvider
+	mu                sync.RWMutex
+	llmClient         LLMClient
+	stepExecutor      *StepExecutor
+	defaultModel      string
+	toolDefProvider   ToolDefinitionProvider
+	compactionCfg     CompactionConfig
+	compactionDecider CompactionDecider
 }
 
 // NewToolLoopRunner creates a new ToolLoopRunner.
@@ -43,6 +45,20 @@ func NewToolLoopRunner(llmClient LLMClient, stepExecutor *StepExecutor, defaultM
 		stepExecutor: stepExecutor,
 		defaultModel: defaultModel,
 	}
+}
+
+// SetCompactionConfig configures adaptive task trajectory compaction for the runner.
+func (r *ToolLoopRunner) SetCompactionConfig(cfg CompactionConfig) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.compactionCfg = cfg
+}
+
+// SetCompactionDecider configures a custom CompactionDecider for evaluating the SelfCompact rubric.
+func (r *ToolLoopRunner) SetCompactionDecider(d CompactionDecider) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.compactionDecider = d
 }
 
 // SetToolDefinitionProvider configures dynamic tool definition provider for the runner.
@@ -112,7 +128,7 @@ func (r *ToolLoopRunner) Execute(ctx context.Context, run *FSMRun, store *Store,
 			}
 
 		case StateExecuteSteps:
-			waiting, err := r.handleExecuteSteps(ctx, run, store, toolset)
+			waiting, err := r.handleExecuteSteps(ctx, run, store, toolset, model)
 			if err != nil {
 				return err
 			}
@@ -365,7 +381,7 @@ func (r *ToolLoopRunner) handlePrepareSteps(ctx context.Context, run *FSMRun, st
 	return store.UpdateRun(ctx, run)
 }
 
-func (r *ToolLoopRunner) handleExecuteSteps(ctx context.Context, run *FSMRun, store *Store, toolset agentapi.Toolset) (bool, error) {
+func (r *ToolLoopRunner) handleExecuteSteps(ctx context.Context, run *FSMRun, store *Store, toolset agentapi.Toolset, model string) (bool, error) {
 	steps, err := store.ListStepsByIteration(ctx, run.ID, run.Iteration)
 	if err != nil {
 		return false, err
@@ -459,6 +475,16 @@ func (r *ToolLoopRunner) handleExecuteSteps(ctx context.Context, run *FSMRun, st
 
 	for _, s := range stepPtrs {
 		slog.Info("fsm step finished", "tool", s.ToolName, "status", s.Status, "run_id", run.ID)
+	}
+
+	if err := r.maybeCompact(ctx, run, store, model); err != nil {
+		run.Status = RunStatusFailed
+		run.CurrentState = StateFailed
+		run.ErrorText = fmt.Sprintf("compaction persistence failure: %v", err)
+		if updateErr := store.UpdateRun(ctx, run); updateErr != nil {
+			return false, errors.Join(err, updateErr)
+		}
+		return false, fmt.Errorf("compaction persistence failed: %w", err)
 	}
 
 	if run.Iteration >= run.MaxIterations {
@@ -570,8 +596,20 @@ func (r *ToolLoopRunner) buildChatMessages(ctx context.Context, run *FSMRun, sto
 	if err != nil {
 		return nil, fmt.Errorf("failed to list steps for run %s: %w", run.ID, err)
 	}
-	if len(steps) == 0 {
+	latestCompaction, err := store.GetLatestCompaction(ctx, run.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get latest compaction for run %s: %w", run.ID, err)
+	}
+	if len(steps) == 0 && latestCompaction == nil {
 		return messages, nil
+	}
+
+	return reconstructChatMessages(messages, steps, latestCompaction), nil
+}
+
+func reconstructChatMessages(messages []openai.ChatCompletionMessage, steps []FSMStep, latestCompaction *CompactedTaskState) []openai.ChatCompletionMessage {
+	if len(steps) == 0 && latestCompaction == nil {
+		return messages
 	}
 
 	stepsByCallID := make(map[string]FSMStep, len(steps))
@@ -588,26 +626,67 @@ func (r *ToolLoopRunner) buildChatMessages(ctx context.Context, run *FSMRun, sto
 		}
 	}
 
-	reconstructed := make([]openai.ChatCompletionMessage, 0, len(messages)+len(steps))
-	for _, m := range messages {
-		reconstructed = append(reconstructed, m)
-		if m.Role == openai.ChatMessageRoleAssistant && len(m.ToolCalls) > 0 {
-			for _, tc := range m.ToolCalls {
-				if existingToolIDs[tc.ID] {
-					continue
-				}
-				if s, ok := stepsByCallID[tc.ID]; ok {
-					reconstructed = append(reconstructed, openai.ChatCompletionMessage{
-						Role:       openai.ChatMessageRoleTool,
-						Content:    formatToolStepResult(s),
-						ToolCallID: tc.ID,
-					})
-				}
-			}
-		}
+	compactedUpTo := 0
+	if latestCompaction != nil && latestCompaction.CompactedUpToIter > 0 {
+		compactedUpTo = latestCompaction.CompactedUpToIter
 	}
 
-	return reconstructed, nil
+	reconstructed := make([]openai.ChatCompletionMessage, 0, len(messages)+len(steps)+1)
+	compactedInserted := false
+
+	for _, m := range messages {
+		if m.Role == openai.ChatMessageRoleAssistant && len(m.ToolCalls) > 0 {
+			msgIter := 0
+			for _, tc := range m.ToolCalls {
+				if s, ok := stepsByCallID[tc.ID]; ok && s.Iteration > 0 {
+					msgIter = s.Iteration
+					break
+				}
+			}
+
+			// Only assistant tool-call messages belonging to this run's fsm_steps are subject to compaction or step injection.
+			// Prior conversation messages from earlier turns (not in stepsByCallID) remain in the pinned prefix untouched.
+			if msgIter > 0 {
+				if compactedUpTo > 0 && !compactedInserted {
+					reconstructed = append(reconstructed, RenderCompactedStateMessage(latestCompaction))
+					compactedInserted = true
+				}
+
+				if compactedUpTo > 0 && msgIter <= compactedUpTo {
+					continue
+				}
+
+				reconstructed = append(reconstructed, m)
+				for _, tc := range m.ToolCalls {
+					if existingToolIDs[tc.ID] {
+						continue
+					}
+					if s, ok := stepsByCallID[tc.ID]; ok {
+						reconstructed = append(reconstructed, openai.ChatCompletionMessage{
+							Role:       openai.ChatMessageRoleTool,
+							Content:    formatToolStepResult(s),
+							ToolCallID: tc.ID,
+						})
+					}
+				}
+				continue
+			}
+		}
+
+		if compactedUpTo > 0 && m.Role == openai.ChatMessageRoleTool && m.ToolCallID != "" {
+			if s, ok := stepsByCallID[m.ToolCallID]; ok && s.Iteration > 0 && s.Iteration <= compactedUpTo {
+				continue
+			}
+		}
+
+		reconstructed = append(reconstructed, m)
+	}
+
+	if compactedUpTo > 0 && !compactedInserted {
+		reconstructed = append(reconstructed, RenderCompactedStateMessage(latestCompaction))
+	}
+
+	return reconstructed
 }
 
 func (r *ToolLoopRunner) failRunWithContextLimit(ctx context.Context, run *FSMRun, store *Store, size int) error {

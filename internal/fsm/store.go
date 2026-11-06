@@ -856,3 +856,17 @@ func (s *Store) ListCompactions(ctx context.Context, runID string) ([]CompactedT
 
 	return result, nil
 }
+
+// HasCompactionEventForIteration reports whether a compaction outbox event has already been recorded for the given run and iteration.
+func (s *Store) HasCompactionEventForIteration(ctx context.Context, runID string, iteration int) (bool, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT count(*)
+		FROM agent_trajectory_events
+		WHERE run_id = ? AND iteration = ? AND event_type = 'compaction'
+	`, runID, iteration).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("failed to query compaction events for run %s iter %d: %w", runID, iteration, err)
+	}
+	return count > 0, nil
+}
