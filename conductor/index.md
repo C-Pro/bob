@@ -53,7 +53,7 @@
 
 ---
 
-- [~] **Track: User-Validated Skills and Structured Memory**
+- [x] **Track: User-Validated Skills and Structured Memory**
 *Link: [./tracks/user-validated-skills_20260925/](./tracks/user-validated-skills_20260925/)*
 
 ---
@@ -65,3 +65,8 @@
 
 - [x] **Track: Core Agent Engine Decoupling**
 *Link: [./tracks/core-engine-decoupling_20261006/](./tracks/core-engine-decoupling_20261006/)*
+
+---
+
+- [~] **Track: Phase 1 — Context Assembly, Episodic Index, and Adaptive Task Compaction**
+*Link: [./tracks/context-assembly-compaction_20261105/](./tracks/context-assembly-compaction_20261105/)*
