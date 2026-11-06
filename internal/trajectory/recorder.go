@@ -147,6 +147,42 @@ func MakeTurnTerminalEvent(trajID, runID string, gen int, payload TurnTerminalPa
 	}, nil
 }
 
+// MakeCompactionEvent constructs an immutable compaction outbox event.
+func MakeCompactionEvent(trajID, runID string, gen, iteration int, stepID string, payload CompactionEventPayload) (*Event, error) {
+	if gen <= 0 {
+		gen = 1
+	}
+	if len(payload.StateJSON) > 0 && !json.Valid(payload.StateJSON) {
+		return nil, fmt.Errorf("invalid compaction state_json payload")
+	}
+	if stepID == "" {
+		if !payload.ShouldCompact || payload.RubricVerdict == "probed_skip" {
+			stepID = fmt.Sprintf("probe_skip_i%d", iteration)
+		} else if payload.Version > 0 {
+			stepID = fmt.Sprintf("compact_v%d_i%d", payload.Version, iteration)
+		} else {
+			stepID = fmt.Sprintf("probe_i%d", iteration)
+		}
+	}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal compaction payload: %w", err)
+	}
+	return &Event{
+		ID:           newEventID(),
+		TrajectoryID: trajID,
+		RunID:        runID,
+		Generation:   gen,
+		Iteration:    iteration,
+		Phase:        "compaction",
+		StepID:       stepID,
+		Attempt:      1,
+		EventType:    "compaction",
+		Payload:      payloadBytes,
+		CreatedAt:    time.Now().UTC(),
+	}, nil
+}
+
 // ParseExitCode scans tool output text for structured "Exit Code: <int>" lines.
 func ParseExitCode(content string) *int {
 	lines := strings.Split(content, "\n")

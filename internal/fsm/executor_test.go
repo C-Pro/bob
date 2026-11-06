@@ -699,4 +699,3 @@ func TestStepExecutor_TrajectoryEventRecordedAtomicallyWithRawObservation(t *tes
 	require.NotNil(t, loggedStep.ExitCode)
 	assert.Equal(t, 0, *loggedStep.ExitCode)
 }
-

@@ -256,145 +256,145 @@ func (s *SQLiteStore) InsertStaged(ctx context.Context, traj *Trajectory, delay 
 
 func (s *SQLiteStore) insertStagedTx(ctx context.Context, tx *sql.Tx, traj *Trajectory, delay time.Duration) error {
 	// 1. Check if trajectory was pruned (tombstone check)
-		var prunedCount int
-		err := tx.QueryRowContext(ctx, "SELECT count(*) FROM agent_trajectory_pruned WHERE trajectory_id = ?", traj.ID).Scan(&prunedCount)
-		if err != nil {
-			return fmt.Errorf("failed to check prune tombstone: %w", err)
-		}
-		if prunedCount > 0 {
-			// Already pruned; do not resurrect
-			return nil
-		}
+	var prunedCount int
+	err := tx.QueryRowContext(ctx, "SELECT count(*) FROM agent_trajectory_pruned WHERE trajectory_id = ?", traj.ID).Scan(&prunedCount)
+	if err != nil {
+		return fmt.Errorf("failed to check prune tombstone: %w", err)
+	}
+	if prunedCount > 0 {
+		// Already pruned; do not resurrect
+		return nil
+	}
 
-		now := time.Now().UTC()
-		if traj.CreatedAt.IsZero() {
-			traj.CreatedAt = now
-		}
-		if traj.CompletedAt.IsZero() {
-			traj.CompletedAt = now
-		}
-		if traj.Generation <= 0 {
-			traj.Generation = 1
-		}
-		if traj.Revision <= 0 {
-			traj.Revision = 1
-		}
-		if traj.PrivacyLevel == "" {
-			traj.PrivacyLevel = "private"
-		}
-		if traj.ExecutionKind == "" {
-			traj.ExecutionKind = "interactive"
-		}
-		traj.Breakdown.RewardVersion = RewardVersionV1
+	now := time.Now().UTC()
+	if traj.CreatedAt.IsZero() {
+		traj.CreatedAt = now
+	}
+	if traj.CompletedAt.IsZero() {
+		traj.CompletedAt = now
+	}
+	if traj.Generation <= 0 {
+		traj.Generation = 1
+	}
+	if traj.Revision <= 0 {
+		traj.Revision = 1
+	}
+	if traj.PrivacyLevel == "" {
+		traj.PrivacyLevel = "private"
+	}
+	if traj.ExecutionKind == "" {
+		traj.ExecutionKind = "interactive"
+	}
+	traj.Breakdown.RewardVersion = RewardVersionV1
 
-		// 2. Query existing record
-		var existingPayload []byte
-		var existingRevision int
-		var existingExportedRev int
-		var existingGen int
-		var existingStatus string
-		var existingCreatedAt string
+	// 2. Query existing record
+	var existingPayload []byte
+	var existingRevision int
+	var existingExportedRev int
+	var existingGen int
+	var existingStatus string
+	var existingCreatedAt string
 
-		err = tx.QueryRowContext(ctx, `
+	err = tx.QueryRowContext(ctx, `
 			SELECT payload, revision, exported_revision, generation, status, created_at 
 			FROM agent_trajectories 
 			WHERE id = ?
 		`, traj.ID).Scan(&existingPayload, &existingRevision, &existingExportedRev, &existingGen, &existingStatus, &existingCreatedAt)
 
-		if errors.Is(err, sql.ErrNoRows) {
-			// Initial insertion
-			traj.Reward = CalculateReward(traj.Breakdown)
-			traj.Revision = 1
+	if errors.Is(err, sql.ErrNoRows) {
+		// Initial insertion
+		traj.Reward = CalculateReward(traj.Breakdown)
+		traj.Revision = 1
 
-			payloadBytes, err := json.Marshal(traj)
-			if err != nil {
-				return fmt.Errorf("failed to marshal trajectory payload: %w", err)
-			}
+		payloadBytes, err := json.Marshal(traj)
+		if err != nil {
+			return fmt.Errorf("failed to marshal trajectory payload: %w", err)
+		}
 
-			eligibleAt := now.Add(delay).UTC()
+		eligibleAt := now.Add(delay).UTC()
 
-			_, err = tx.ExecContext(ctx, `
+		_, err = tx.ExecContext(ctx, `
 				INSERT INTO agent_trajectories (
 					id, run_id, frontend_id, session_id, scope_id, actor_id, execution_kind,
 					privacy_level, export_approved, generation, payload, r_eval,
 					status, revision, exported_revision, created_at, completed_at, eligible_at
 				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'staged', ?, ?, ?, ?, ?)
 			`,
-				traj.ID,
-				traj.RunID,
-				traj.FrontendID,
-				traj.SessionID,
-				traj.ScopeID,
-				traj.ActorID,
-				traj.ExecutionKind,
-				traj.PrivacyLevel,
-				boolToInt(traj.ExportApproved),
-				traj.Generation,
-				payloadBytes,
-				traj.Reward,
-				traj.Revision,
-				0,
-				formatTime(traj.CreatedAt),
-				formatTime(traj.CompletedAt),
-				formatTime(eligibleAt),
-			)
-			if err != nil {
-				return fmt.Errorf("failed to insert staged trajectory: %w", err)
-			}
-			return nil
-		} else if err != nil {
-			return fmt.Errorf("failed to query existing trajectory: %w", err)
+			traj.ID,
+			traj.RunID,
+			traj.FrontendID,
+			traj.SessionID,
+			traj.ScopeID,
+			traj.ActorID,
+			traj.ExecutionKind,
+			traj.PrivacyLevel,
+			boolToInt(traj.ExportApproved),
+			traj.Generation,
+			payloadBytes,
+			traj.Reward,
+			traj.Revision,
+			0,
+			formatTime(traj.CreatedAt),
+			formatTime(traj.CompletedAt),
+			formatTime(eligibleAt),
+		)
+		if err != nil {
+			return fmt.Errorf("failed to insert staged trajectory: %w", err)
 		}
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("failed to query existing trajectory: %w", err)
+	}
 
-		// Row exists. Check durable execution ordering.
-		if traj.Generation < existingGen {
-			// Stale finalizer arrives after a newer generation: reject as no-op.
-			return nil
-		}
+	// Row exists. Check durable execution ordering.
+	if traj.Generation < existingGen {
+		// Stale finalizer arrives after a newer generation: reject as no-op.
+		return nil
+	}
 
-		// Merge with any persisted user feedback before checking equality
-		var feedbackRating float64
-		var feedbackNote string
+	// Merge with any persisted user feedback before checking equality
+	var feedbackRating float64
+	var feedbackNote string
 
-		row := tx.QueryRowContext(ctx, `
+	row := tx.QueryRowContext(ctx, `
 			SELECT rating, note FROM agent_trajectory_feedback 
 			WHERE trajectory_id = ? 
 			ORDER BY created_at DESC LIMIT 1
 		`, traj.ID)
-		if err := row.Scan(&feedbackRating, &feedbackNote); err == nil {
-			traj.Breakdown.HasUserFeedback = true
-			traj.Breakdown.UserFeedback = feedbackRating
-			traj.Breakdown.FeedbackNote = feedbackNote
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("failed to query trajectory feedback: %w", err)
-		}
+	if err := row.Scan(&feedbackRating, &feedbackNote); err == nil {
+		traj.Breakdown.HasUserFeedback = true
+		traj.Breakdown.UserFeedback = feedbackRating
+		traj.Breakdown.FeedbackNote = feedbackNote
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("failed to query trajectory feedback: %w", err)
+	}
 
-		// Recompute reward with merged feedback
-		traj.Reward = CalculateReward(traj.Breakdown)
+	// Recompute reward with merged feedback
+	traj.Reward = CalculateReward(traj.Breakdown)
 
-		// If same generation, check if substantive fields are unchanged
-		if traj.Generation == existingGen && len(existingPayload) > 0 {
-			var existingTraj Trajectory
-			if err := json.Unmarshal(existingPayload, &existingTraj); err == nil {
-				if trajectoriesSubstantivelyEqual(&existingTraj, traj) {
-					// No substantive changes: no-op
-					return nil
-				}
+	// If same generation, check if substantive fields are unchanged
+	if traj.Generation == existingGen && len(existingPayload) > 0 {
+		var existingTraj Trajectory
+		if err := json.Unmarshal(existingPayload, &existingTraj); err == nil {
+			if trajectoriesSubstantivelyEqual(&existingTraj, traj) {
+				// No substantive changes: no-op
+				return nil
 			}
 		}
+	}
 
-		// Increment revision for changed payload
-		traj.Revision = existingRevision + 1
+	// Increment revision for changed payload
+	traj.Revision = existingRevision + 1
 
-		payloadBytes, err := json.Marshal(traj)
-		if err != nil {
-			return fmt.Errorf("failed to marshal updated trajectory: %w", err)
-		}
+	payloadBytes, err := json.Marshal(traj)
+	if err != nil {
+		return fmt.Errorf("failed to marshal updated trajectory: %w", err)
+	}
 
-		// Re-staging delay begins from re-staging time
-		eligibleAt := now.Add(delay).UTC()
+	// Re-staging delay begins from re-staging time
+	eligibleAt := now.Add(delay).UTC()
 
-		_, err = tx.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, `
 			UPDATE agent_trajectories
 			SET payload = ?,
 			    r_eval = ?,
@@ -407,21 +407,21 @@ func (s *SQLiteStore) insertStagedTx(ctx context.Context, tx *sql.Tx, traj *Traj
 			    export_approved = ?
 			WHERE id = ?
 		`,
-			payloadBytes,
-			traj.Reward,
-			traj.Revision,
-			traj.Generation,
-			formatTime(traj.CompletedAt),
-			formatTime(eligibleAt),
-			traj.PrivacyLevel,
-			boolToInt(traj.ExportApproved),
-			traj.ID,
-		)
-		if err != nil {
-			return fmt.Errorf("failed to update staged trajectory: %w", err)
-		}
+		payloadBytes,
+		traj.Reward,
+		traj.Revision,
+		traj.Generation,
+		formatTime(traj.CompletedAt),
+		formatTime(eligibleAt),
+		traj.PrivacyLevel,
+		boolToInt(traj.ExportApproved),
+		traj.ID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update staged trajectory: %w", err)
+	}
 
-		return nil
+	return nil
 }
 
 // UpdateFeedback records user feedback and re-stages the affected trajectory.

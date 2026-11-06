@@ -196,8 +196,8 @@ func TestToolAuthority_ExplicitEmptyToolsetOverridesLegacyTools(t *testing.T) {
 
 // mockCustomToolset implements agentapi.Toolset for testing.
 type mockCustomToolset struct {
-	defs    []agentapi.ToolDefinition
-	execFn  func(ctx context.Context, call agentapi.ToolCall) (agentapi.ToolResult, error)
+	defs   []agentapi.ToolDefinition
+	execFn func(ctx context.Context, call agentapi.ToolCall) (agentapi.ToolResult, error)
 }
 
 func (m *mockCustomToolset) Definitions(ctx context.Context) ([]agentapi.ToolDefinition, error) {
@@ -218,14 +218,14 @@ func TestToolAuthority_FrontendReadOnlyClassification(t *testing.T) {
 
 	toolA := agentapi.ToolDefinition{
 		Schema: openai.Tool{
-			Type: openai.ToolTypeFunction,
+			Type:     openai.ToolTypeFunction,
 			Function: &openai.FunctionDefinition{Name: "tool_a"},
 		},
 		ReadOnly: true,
 	}
 	toolB := agentapi.ToolDefinition{
 		Schema: openai.Tool{
-			Type: openai.ToolTypeFunction,
+			Type:     openai.ToolTypeFunction,
 			Function: &openai.FunctionDefinition{Name: "tool_b"},
 		},
 		ReadOnly: true,
@@ -323,7 +323,7 @@ func TestToolAuthority_ConcurrentRuns_IsolatedToolsets(t *testing.T) {
 			defs: []agentapi.ToolDefinition{
 				{
 					Schema: openai.Tool{
-						Type: openai.ToolTypeFunction,
+						Type:     openai.ToolTypeFunction,
 						Function: &openai.FunctionDefinition{Name: "fetch_data"},
 					},
 					ReadOnly: true,
@@ -389,7 +389,7 @@ func TestToolAuthority_PreExistingStepUnauthorized(t *testing.T) {
 		defs: []agentapi.ToolDefinition{
 			{
 				Schema: openai.Tool{
-					Type: openai.ToolTypeFunction,
+					Type:     openai.ToolTypeFunction,
 					Function: &openai.FunctionDefinition{Name: "safe_tool"},
 				},
 			},

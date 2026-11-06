@@ -23,74 +23,80 @@ const DefaultMaxAttachmentSizeBytes int64 = 25 * 1024 * 1024
 
 // Config holds runtime configuration settings for the agent.
 type Config struct {
-	BotHandle                      string
-	BesedkaURL                     string
-	BesedkaAPIKey                  string
-	OpenAIAPIKey                   string
-	OpenAIModel                    string
-	OpenAIBaseURL                  string
-	GeminiAPIKey                   string // Deprecated: backward-compatible fallback for OpenAIAPIKey
-	GeminiModel                    string // Deprecated: backward-compatible fallback for OpenAIModel
-	GeminiBaseURL                  string // Deprecated: backward-compatible fallback for OpenAIBaseURL
-	LLMRequestTimeout              time.Duration
-	LLMFirstByteTimeout            time.Duration
-	TownhallMaxParagraphs          int
-	DMMaxParagraphs                int
-	MsgRingBufferSize              int
-	TownhallToolMaxIterations      int
-	DMToolMaxIterations            int
-	FSMRetentionDays               int
-	TavilyAPIKey                   string
-	TavilyBaseURL                  string
-	DataDir                        string
-	EmbeddingModel                 string
-	EmbeddingPrecision             string
-	Secret                         string
-	S3Endpoint                     string
-	S3Region                       string
-	S3Bucket                       string
-	S3AccessKey                    string
-	S3SecretKey                    string
-	S3PathStyle                    bool
-	S3BackupInterval               time.Duration
-	S3BackupKeep                   int
-	S3BackupPrefix                 string
-	SandboxEnabled                 bool
-	SandboxDrivers                 []string
-	SandboxDockerSocket            string
-	SandboxAllowedImages           []string
-	SandboxAllowedNetworkModes     []string
-	SandboxMaxLifetime             time.Duration
-	SandboxDefaultExecTimeout      time.Duration
-	SandboxMaxExecTimeout          time.Duration
-	SandboxCPULimit                float64
-	SandboxMemoryLimitMB           int
-	SandboxTasksMax                int
-	SandboxHostDataDir             string
-	SandboxProxyFwdPath            string
-	SandboxAllowRuntimeBuild       *bool
-	SchedulerMinRunTimeout         time.Duration
-	SchedulerMaxRunTimeout         time.Duration
-	SchedulerMinMaxTurns           int
-	SchedulerMaxMaxTurns           int
-	MaxAttachmentSizeBytes         int64
-	KnowledgeMaxLoadedMemories     int
-	KnowledgeMaxLoadedMemoryBytes  int
-	KnowledgeMaxLoadedSkills       int
-	KnowledgeMaxLoadedSkillBytes   int
-	KnowledgeDefaultDiscoveryLimit int
-	KnowledgeMaxDiscoveryLimit     int
-	KnowledgeReconcileInterval     time.Duration
-	CLIMaxIterations               int
-	SandboxDefaultDriver           string
-	SandboxDockerImage             string
-	SandboxExtraPaths              []string
-	SandboxAutoToolchains          bool
-	TrajectoryEnabled              bool
-	TrajectoryS3Bucket             string
-	TrajectoryS3Prefix             string
-	TrajectoryFlushDelay           time.Duration
-	TrajectoryAllowPrivate         bool
+	BotHandle                       string
+	BesedkaURL                      string
+	BesedkaAPIKey                   string
+	OpenAIAPIKey                    string
+	OpenAIModel                     string
+	OpenAIBaseURL                   string
+	GeminiAPIKey                    string // Deprecated: backward-compatible fallback for OpenAIAPIKey
+	GeminiModel                     string // Deprecated: backward-compatible fallback for OpenAIModel
+	GeminiBaseURL                   string // Deprecated: backward-compatible fallback for OpenAIBaseURL
+	LLMRequestTimeout               time.Duration
+	LLMFirstByteTimeout             time.Duration
+	TownhallMaxParagraphs           int
+	DMMaxParagraphs                 int
+	MsgRingBufferSize               int
+	TownhallToolMaxIterations       int
+	DMToolMaxIterations             int
+	FSMRetentionDays                int
+	TavilyAPIKey                    string
+	TavilyBaseURL                   string
+	DataDir                         string
+	EmbeddingModel                  string
+	EmbeddingPrecision              string
+	Secret                          string
+	S3Endpoint                      string
+	S3Region                        string
+	S3Bucket                        string
+	S3AccessKey                     string
+	S3SecretKey                     string
+	S3PathStyle                     bool
+	S3BackupInterval                time.Duration
+	S3BackupKeep                    int
+	S3BackupPrefix                  string
+	SandboxEnabled                  bool
+	SandboxDrivers                  []string
+	SandboxDockerSocket             string
+	SandboxAllowedImages            []string
+	SandboxAllowedNetworkModes      []string
+	SandboxMaxLifetime              time.Duration
+	SandboxDefaultExecTimeout       time.Duration
+	SandboxMaxExecTimeout           time.Duration
+	SandboxCPULimit                 float64
+	SandboxMemoryLimitMB            int
+	SandboxTasksMax                 int
+	SandboxHostDataDir              string
+	SandboxProxyFwdPath             string
+	SandboxAllowRuntimeBuild        *bool
+	SchedulerMinRunTimeout          time.Duration
+	SchedulerMaxRunTimeout          time.Duration
+	SchedulerMinMaxTurns            int
+	SchedulerMaxMaxTurns            int
+	MaxAttachmentSizeBytes          int64
+	KnowledgeMaxLoadedMemories      int
+	KnowledgeMaxLoadedMemoryBytes   int
+	KnowledgeMaxLoadedSkills        int
+	KnowledgeMaxLoadedSkillBytes    int
+	KnowledgeDefaultDiscoveryLimit  int
+	KnowledgeMaxDiscoveryLimit      int
+	KnowledgeReconcileInterval      time.Duration
+	CLIMaxIterations                int
+	SandboxDefaultDriver            string
+	SandboxDockerImage              string
+	SandboxExtraPaths               []string
+	SandboxAutoToolchains           bool
+	TrajectoryEnabled               bool
+	TrajectoryS3Bucket              string
+	TrajectoryS3Prefix              string
+	TrajectoryFlushDelay            time.Duration
+	TrajectoryAllowPrivate          bool
+	FSMCompactionEnabled            bool
+	FSMCompactionMinIterations      int
+	FSMCompactionIntervalIterations int
+	FSMCompactionTailIterations     int
+	FSMCompactionSoftThresholdBytes int
+	FSMCompactionHardThresholdBytes int
 }
 
 // DefaultSandboxAllowedImages defines standard safe container images.
@@ -116,60 +122,66 @@ func (c *Config) TrajectoryBucket() string {
 // Slices and pointers returned are freshly allocated and isolated.
 func Defaults() *Config {
 	return &Config{
-		BotHandle:                      "@bot",
-		BesedkaURL:                     "http://127.0.0.1:8080",
-		OpenAIModel:                    "gemini-3.8-flash",
-		OpenAIBaseURL:                  "https://generativelanguage.googleapis.com/v1beta/openai/",
-		GeminiModel:                    "gemini-3.8-flash",
-		GeminiBaseURL:                  "https://generativelanguage.googleapis.com/v1beta/openai/",
-		LLMRequestTimeout:              10 * time.Minute,
-		LLMFirstByteTimeout:            1 * time.Minute,
-		TavilyBaseURL:                  "https://api.tavily.com",
-		TownhallMaxParagraphs:          2,
-		DMMaxParagraphs:                10,
-		MsgRingBufferSize:              100,
-		TownhallToolMaxIterations:      10,
-		DMToolMaxIterations:            20,
-		CLIMaxIterations:               100,
-		FSMRetentionDays:               7,
-		DataDir:                        "./data",
-		EmbeddingModel:                 "",
-		EmbeddingPrecision:             "bf16",
-		S3Region:                       "us-east-1",
-		S3BackupInterval:               1 * time.Hour,
-		S3BackupKeep:                   7,
-		S3BackupPrefix:                 "bob_agent/",
-		S3PathStyle:                    true,
-		SandboxEnabled:                 true,
-		SandboxDefaultDriver:           "bwrap",
-		SandboxDrivers:                 []string{"bwrap", "docker"},
-		SandboxDockerSocket:            "/var/run/docker.sock",
-		SandboxDockerImage:             "python:3.12-slim",
-		SandboxAllowedImages:           append([]string(nil), DefaultSandboxAllowedImages...),
-		SandboxAllowedNetworkModes:     append([]string(nil), DefaultSandboxAllowedNetworkModes...),
-		SandboxMaxLifetime:             30 * time.Minute,
-		SandboxDefaultExecTimeout:      1 * time.Minute,
-		SandboxMaxExecTimeout:          10 * time.Minute,
-		SandboxCPULimit:                1.0,
-		SandboxMemoryLimitMB:           512,
-		SandboxTasksMax:                64,
-		SchedulerMinRunTimeout:         1 * time.Minute,
-		SchedulerMaxRunTimeout:         1 * time.Hour,
-		SchedulerMinMaxTurns:           10,
-		SchedulerMaxMaxTurns:           100,
-		MaxAttachmentSizeBytes:         DefaultMaxAttachmentSizeBytes,
-		KnowledgeMaxLoadedMemories:     8,
-		KnowledgeMaxLoadedMemoryBytes:  16384,
-		KnowledgeMaxLoadedSkills:       3,
-		KnowledgeMaxLoadedSkillBytes:   24576,
-		KnowledgeDefaultDiscoveryLimit: 5,
-		KnowledgeMaxDiscoveryLimit:     10,
-		KnowledgeReconcileInterval:     1 * time.Minute,
-		TrajectoryEnabled:              false,
-		TrajectoryS3Bucket:             "",
-		TrajectoryS3Prefix:             "trajectories/",
-		TrajectoryFlushDelay:           15 * time.Minute,
-		TrajectoryAllowPrivate:         false,
+		BotHandle:                       "@bot",
+		BesedkaURL:                      "http://127.0.0.1:8080",
+		OpenAIModel:                     "gemini-3.8-flash",
+		OpenAIBaseURL:                   "https://generativelanguage.googleapis.com/v1beta/openai/",
+		GeminiModel:                     "gemini-3.8-flash",
+		GeminiBaseURL:                   "https://generativelanguage.googleapis.com/v1beta/openai/",
+		LLMRequestTimeout:               10 * time.Minute,
+		LLMFirstByteTimeout:             1 * time.Minute,
+		TavilyBaseURL:                   "https://api.tavily.com",
+		TownhallMaxParagraphs:           2,
+		DMMaxParagraphs:                 10,
+		MsgRingBufferSize:               100,
+		TownhallToolMaxIterations:       10,
+		DMToolMaxIterations:             20,
+		CLIMaxIterations:                100,
+		FSMRetentionDays:                7,
+		DataDir:                         "./data",
+		EmbeddingModel:                  "",
+		EmbeddingPrecision:              "bf16",
+		S3Region:                        "us-east-1",
+		S3BackupInterval:                1 * time.Hour,
+		S3BackupKeep:                    7,
+		S3BackupPrefix:                  "bob_agent/",
+		S3PathStyle:                     true,
+		SandboxEnabled:                  true,
+		SandboxDefaultDriver:            "bwrap",
+		SandboxDrivers:                  []string{"bwrap", "docker"},
+		SandboxDockerSocket:             "/var/run/docker.sock",
+		SandboxDockerImage:              "python:3.12-slim",
+		SandboxAllowedImages:            append([]string(nil), DefaultSandboxAllowedImages...),
+		SandboxAllowedNetworkModes:      append([]string(nil), DefaultSandboxAllowedNetworkModes...),
+		SandboxMaxLifetime:              30 * time.Minute,
+		SandboxDefaultExecTimeout:       1 * time.Minute,
+		SandboxMaxExecTimeout:           10 * time.Minute,
+		SandboxCPULimit:                 1.0,
+		SandboxMemoryLimitMB:            512,
+		SandboxTasksMax:                 64,
+		SchedulerMinRunTimeout:          1 * time.Minute,
+		SchedulerMaxRunTimeout:          1 * time.Hour,
+		SchedulerMinMaxTurns:            10,
+		SchedulerMaxMaxTurns:            100,
+		MaxAttachmentSizeBytes:          DefaultMaxAttachmentSizeBytes,
+		KnowledgeMaxLoadedMemories:      8,
+		KnowledgeMaxLoadedMemoryBytes:   16384,
+		KnowledgeMaxLoadedSkills:        3,
+		KnowledgeMaxLoadedSkillBytes:    24576,
+		KnowledgeDefaultDiscoveryLimit:  5,
+		KnowledgeMaxDiscoveryLimit:      10,
+		KnowledgeReconcileInterval:      1 * time.Minute,
+		TrajectoryEnabled:               false,
+		TrajectoryS3Bucket:              "",
+		TrajectoryS3Prefix:              "trajectories/",
+		TrajectoryFlushDelay:            15 * time.Minute,
+		TrajectoryAllowPrivate:          false,
+		FSMCompactionEnabled:            true,
+		FSMCompactionMinIterations:      3,
+		FSMCompactionIntervalIterations: 3,
+		FSMCompactionTailIterations:     1,
+		FSMCompactionSoftThresholdBytes: 65536,
+		FSMCompactionHardThresholdBytes: 262144,
 	}
 }
 
@@ -361,6 +373,42 @@ func LoadFromEnv() (*Config, error) {
 	}
 	cfg.TrajectoryAllowPrivate = trajAllowPrivate
 
+	fsmCompactionEnabled, err := getEnvBoolOrDefault("FSM_COMPACTION_ENABLED", cfg.FSMCompactionEnabled)
+	if err != nil {
+		return nil, err
+	}
+	cfg.FSMCompactionEnabled = fsmCompactionEnabled
+
+	fsmCompactionMinIter, err := getEnvIntStrict("FSM_COMPACTION_MIN_ITERATIONS", cfg.FSMCompactionMinIterations)
+	if err != nil {
+		return nil, err
+	}
+	cfg.FSMCompactionMinIterations = fsmCompactionMinIter
+
+	fsmCompactionIntervalIter, err := getEnvIntStrict("FSM_COMPACTION_INTERVAL_ITERATIONS", cfg.FSMCompactionIntervalIterations)
+	if err != nil {
+		return nil, err
+	}
+	cfg.FSMCompactionIntervalIterations = fsmCompactionIntervalIter
+
+	fsmCompactionTailIter, err := getEnvIntStrict("FSM_COMPACTION_TAIL_ITERATIONS", cfg.FSMCompactionTailIterations)
+	if err != nil {
+		return nil, err
+	}
+	cfg.FSMCompactionTailIterations = fsmCompactionTailIter
+
+	fsmCompactionSoftBytes, err := getEnvIntStrict("FSM_COMPACTION_SOFT_THRESHOLD_BYTES", cfg.FSMCompactionSoftThresholdBytes)
+	if err != nil {
+		return nil, err
+	}
+	cfg.FSMCompactionSoftThresholdBytes = fsmCompactionSoftBytes
+
+	fsmCompactionHardBytes, err := getEnvIntStrict("FSM_COMPACTION_HARD_THRESHOLD_BYTES", cfg.FSMCompactionHardThresholdBytes)
+	if err != nil {
+		return nil, err
+	}
+	cfg.FSMCompactionHardThresholdBytes = fsmCompactionHardBytes
+
 	cfg.SandboxDrivers = getEnvSliceOrDefault("SANDBOX_DRIVERS", cfg.SandboxDrivers)
 	cfg.SandboxDockerSocket = getEnvOrDefault("SANDBOX_DOCKER_SOCKET", cfg.SandboxDockerSocket)
 	cfg.SandboxAllowedImages = getEnvSliceOrDefault("SANDBOX_ALLOWED_IMAGES", cfg.SandboxAllowedImages)
@@ -536,6 +584,24 @@ func (c *Config) Validate(requireAPIKey bool) error {
 	}
 	if c.KnowledgeReconcileInterval <= 0 {
 		c.KnowledgeReconcileInterval = 1 * time.Minute
+	}
+	if c.FSMCompactionMinIterations <= 0 {
+		c.FSMCompactionMinIterations = 3
+	}
+	if c.FSMCompactionIntervalIterations <= 0 {
+		c.FSMCompactionIntervalIterations = 3
+	}
+	if c.FSMCompactionTailIterations <= 0 {
+		c.FSMCompactionTailIterations = 1
+	}
+	if c.FSMCompactionSoftThresholdBytes <= 0 {
+		c.FSMCompactionSoftThresholdBytes = 65536
+	}
+	if c.FSMCompactionHardThresholdBytes <= 0 {
+		c.FSMCompactionHardThresholdBytes = 262144
+	}
+	if c.FSMCompactionHardThresholdBytes < c.FSMCompactionSoftThresholdBytes {
+		return fmt.Errorf("FSM_COMPACTION_HARD_THRESHOLD_BYTES (%d) cannot be less than FSM_COMPACTION_SOFT_THRESHOLD_BYTES (%d)", c.FSMCompactionHardThresholdBytes, c.FSMCompactionSoftThresholdBytes)
 	}
 	if c.S3Bucket != "" && c.S3Endpoint == "" {
 		return errors.New("S3_BUCKET and S3_ENDPOINT must be set together")

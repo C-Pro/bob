@@ -341,39 +341,39 @@ func TestStore_UpdateFeedback_ScopeAndActorAuthorization(t *testing.T) {
 
 	// 1. Cross-scope attack (different scope): should be rejected
 	reqCrossScope := FeedbackRequest{
-		MessageID:  "msg-cross-scope",
-		FrontendID: "besedka",
-		SessionID:  "chat-1",
-		ScopeID:    "wrong-channel",
-		ActorID:    "alice",
+		MessageID:    "msg-cross-scope",
+		FrontendID:   "besedka",
+		SessionID:    "chat-1",
+		ScopeID:      "wrong-channel",
+		ActorID:      "alice",
 		TrajectoryID: trajID,
-		Rating:     1.0,
+		Rating:       1.0,
 	}
 	_, err := store.UpdateFeedback(ctx, reqCrossScope)
 	assert.ErrorIs(t, err, ErrUnauthorized)
 
 	// 2. Cross-actor unauthorized rating: should be rejected
 	reqCrossActor := FeedbackRequest{
-		MessageID:  "msg-cross-actor",
-		FrontendID: "besedka",
-		SessionID:  "chat-1",
-		ScopeID:    "townhall",
-		ActorID:    "mallory",
+		MessageID:    "msg-cross-actor",
+		FrontendID:   "besedka",
+		SessionID:    "chat-1",
+		ScopeID:      "townhall",
+		ActorID:      "mallory",
 		TrajectoryID: trajID,
-		Rating:     -1.0,
+		Rating:       -1.0,
 	}
 	_, err = store.UpdateFeedback(ctx, reqCrossActor)
 	assert.ErrorIs(t, err, ErrUnauthorized)
 
 	// 3. Valid feedback from alice
 	reqValid := FeedbackRequest{
-		MessageID:  "msg-valid-1",
-		FrontendID: "besedka",
-		SessionID:  "chat-1",
-		ScopeID:    "townhall",
-		ActorID:    "alice",
+		MessageID:    "msg-valid-1",
+		FrontendID:   "besedka",
+		SessionID:    "chat-1",
+		ScopeID:      "townhall",
+		ActorID:      "alice",
 		TrajectoryID: trajID,
-		Rating:     1.0,
+		Rating:       1.0,
 	}
 	res, err := store.UpdateFeedback(ctx, reqValid)
 	require.NoError(t, err)
@@ -419,13 +419,13 @@ func TestStore_MarkExported_FeedbackRaceSequence(t *testing.T) {
 	// Step 2: User submits feedback while exporter is uploading revision 1
 	// This bumps revision to 2 in DB
 	_, err = store.UpdateFeedback(ctx, FeedbackRequest{
-		MessageID:  "msg-race-fb",
-		FrontendID: "besedka",
-		SessionID:  "chat-1",
-		ScopeID:    "townhall",
-		ActorID:    "alice",
+		MessageID:    "msg-race-fb",
+		FrontendID:   "besedka",
+		SessionID:    "chat-1",
+		ScopeID:      "townhall",
+		ActorID:      "alice",
 		TrajectoryID: trajID,
-		Rating:     1.0,
+		Rating:       1.0,
 	})
 	require.NoError(t, err)
 

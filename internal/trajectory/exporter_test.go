@@ -1034,4 +1034,3 @@ func TestExporter_Stop_ConcurrentCallersShareWorkerTimeout(t *testing.T) {
 	assert.ErrorIs(t, err1, context.DeadlineExceeded)
 	assert.ErrorIs(t, err2, context.DeadlineExceeded)
 }
-

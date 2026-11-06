@@ -1,8 +1,10 @@
 package fsm
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -594,4 +596,263 @@ func (s *Store) RecordEvent(ctx context.Context, event *trajectory.Event) error 
 // RecordEventTx logs an outbox event to agent_trajectory_events within an existing transaction.
 func (s *Store) RecordEventTx(ctx context.Context, tx *sql.Tx, event *trajectory.Event) error {
 	return trajectory.RecordEventTx(ctx, tx, event)
+}
+
+// NormalizeCompactionState validates and normalizes a CompactedTaskState prior to persistence or event creation,
+// returning its canonical JSON serialization whose byte length unconditionally matches c.OutputBytes.
+func NormalizeCompactionState(c *CompactedTaskState) ([]byte, error) {
+	if c == nil {
+		return nil, fmt.Errorf("compaction state cannot be nil")
+	}
+	if c.RunID == "" {
+		return nil, fmt.Errorf("compaction run_id cannot be empty")
+	}
+	if c.Version <= 0 {
+		return nil, fmt.Errorf("compaction version must be > 0 (got %d)", c.Version)
+	}
+	if c.ParentVersion < 0 || c.ParentVersion >= c.Version {
+		return nil, fmt.Errorf("compaction parent_version must be in [0, %d) (got %d)", c.Version, c.ParentVersion)
+	}
+	if c.CompactedUpToIter <= 0 {
+		return nil, fmt.Errorf("compaction compacted_up_to_iter must be > 0 (got %d)", c.CompactedUpToIter)
+	}
+	if c.InputBytes < 0 || c.OutputBytes < 0 {
+		return nil, fmt.Errorf("compaction byte counts cannot be negative (input=%d, output=%d)", c.InputBytes, c.OutputBytes)
+	}
+	if c.ID == "" {
+		c.ID = fmt.Sprintf("%s_c_v%d", c.RunID, c.Version)
+	}
+	if c.CreatedAt == 0 {
+		c.CreatedAt = time.Now().Unix()
+	}
+	if c.RubricVerdict == "" {
+		c.RubricVerdict = CompactionVerdictProbedCompact
+	}
+	if c.RubricVerdict != CompactionVerdictProbedCompact && c.RubricVerdict != CompactionVerdictBackstopForced {
+		return nil, fmt.Errorf("invalid persisted compaction rubric_verdict %q", c.RubricVerdict)
+	}
+
+	stateBytes, err := json.Marshal(c)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal compacted task state: %w", err)
+	}
+	c.OutputBytes = len(stateBytes)
+	return stateBytes, nil
+}
+
+// MakeSnapshotCompactionEvent normalizes a CompactedTaskState and builds a matching trajectory compaction event.
+// execIteration is the FSM iteration at which compaction ran (must be >= c.CompactedUpToIter when > 0; defaults to c.CompactedUpToIter when <= 0).
+func MakeSnapshotCompactionEvent(c *CompactedTaskState, trajID string, gen, execIteration int, reason string) (*trajectory.Event, error) {
+	stateBytes, err := NormalizeCompactionState(c)
+	if err != nil {
+		return nil, err
+	}
+	if execIteration <= 0 {
+		execIteration = c.CompactedUpToIter
+	}
+	if execIteration < c.CompactedUpToIter {
+		return nil, fmt.Errorf("compaction execution iteration %d cannot be less than compacted_up_to_iter %d", execIteration, c.CompactedUpToIter)
+	}
+	if trajID == "" {
+		trajID = c.RunID
+	}
+	return trajectory.MakeCompactionEvent(trajID, c.RunID, gen, execIteration, "", trajectory.CompactionEventPayload{
+		Version:           c.Version,
+		ParentVersion:     c.ParentVersion,
+		CompactedUpToIter: c.CompactedUpToIter,
+		ShouldCompact:     true,
+		RubricVerdict:     c.RubricVerdict,
+		Reason:            reason,
+		Model:             c.Model,
+		InputBytes:        c.InputBytes,
+		OutputBytes:       c.OutputBytes,
+		StateJSON:         json.RawMessage(stateBytes),
+	})
+}
+
+// SaveCompaction persists a new versioned CompactedTaskState snapshot for a run.
+func (s *Store) SaveCompaction(ctx context.Context, c *CompactedTaskState) error {
+	return s.SaveCompactionWithEvent(ctx, c, nil)
+}
+
+// SaveCompactionWithEvent persists a new versioned CompactedTaskState snapshot and atomically records a trajectory outbox event.
+func (s *Store) SaveCompactionWithEvent(ctx context.Context, c *CompactedTaskState, event *trajectory.Event) error {
+	stateBytes, err := NormalizeCompactionState(c)
+	if err != nil {
+		return err
+	}
+
+	if event != nil {
+		if event.RunID != c.RunID {
+			return fmt.Errorf("compaction event run_id %q does not match compaction run_id %q", event.RunID, c.RunID)
+		}
+		if event.EventType != "compaction" {
+			return fmt.Errorf("compaction event must have event_type \"compaction\" (got %q)", event.EventType)
+		}
+		if event.Iteration < c.CompactedUpToIter {
+			return fmt.Errorf("compaction event iteration %d cannot be less than compacted_up_to_iter %d", event.Iteration, c.CompactedUpToIter)
+		}
+		var evPayload trajectory.CompactionEventPayload
+		if err := json.Unmarshal(event.Payload, &evPayload); err != nil {
+			return fmt.Errorf("failed to unmarshal compaction event payload: %w", err)
+		}
+		if !evPayload.ShouldCompact ||
+			evPayload.Version != c.Version ||
+			evPayload.ParentVersion != c.ParentVersion ||
+			evPayload.CompactedUpToIter != c.CompactedUpToIter ||
+			evPayload.RubricVerdict != c.RubricVerdict ||
+			evPayload.Model != c.Model ||
+			evPayload.InputBytes != c.InputBytes ||
+			evPayload.OutputBytes != c.OutputBytes ||
+			!bytes.Equal(evPayload.StateJSON, stateBytes) {
+			return fmt.Errorf("compaction event payload metadata or state_json does not match normalized snapshot")
+		}
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction for save compaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var prevVersion, prevIter int
+	err = tx.QueryRowContext(ctx, `
+		SELECT version, compacted_up_to_iter
+		FROM fsm_compactions
+		WHERE run_id = ?
+		ORDER BY version DESC
+		LIMIT 1
+	`, c.RunID).Scan(&prevVersion, &prevIter)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("failed to check existing compaction for run %s: %w", c.RunID, err)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		if c.ParentVersion != 0 {
+			return fmt.Errorf("first compaction for run %s must have parent_version 0 (got %d)", c.RunID, c.ParentVersion)
+		}
+	} else {
+		if c.Version <= prevVersion {
+			return fmt.Errorf("compaction version %d must be > latest version %d", c.Version, prevVersion)
+		}
+		if c.ParentVersion != prevVersion {
+			return fmt.Errorf("compaction parent_version %d must match latest version %d", c.ParentVersion, prevVersion)
+		}
+		if c.CompactedUpToIter <= prevIter {
+			return fmt.Errorf("compaction compacted_up_to_iter %d must advance beyond %d", c.CompactedUpToIter, prevIter)
+		}
+	}
+
+	query := `
+		INSERT INTO fsm_compactions (
+			id, run_id, version, parent_version, compacted_up_to_iter,
+			rubric_verdict, state_json, model, input_bytes, output_bytes, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`
+	_, err = tx.ExecContext(ctx, query,
+		c.ID, c.RunID, c.Version, c.ParentVersion, c.CompactedUpToIter,
+		c.RubricVerdict, string(stateBytes), c.Model, c.InputBytes, c.OutputBytes, c.CreatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to insert fsm_compaction %s: %w", c.ID, err)
+	}
+
+	if event != nil {
+		if err := trajectory.RecordEventTx(ctx, tx, event); err != nil {
+			return fmt.Errorf("failed to record compaction event in tx: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit save compaction transaction: %w", err)
+	}
+
+	return nil
+}
+
+func scanCompaction(scanner rowScanner) (*CompactedTaskState, error) {
+	var id, runID, rubricVerdict, stateJSON, model string
+	var version, parentVersion, compactedUpToIter, inputBytes, outputBytes int
+	var createdAt int64
+
+	err := scanner.Scan(
+		&id, &runID, &version, &parentVersion, &compactedUpToIter,
+		&rubricVerdict, &stateJSON, &model, &inputBytes, &outputBytes, &createdAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var state CompactedTaskState
+	if stateJSON != "" {
+		if err := json.Unmarshal([]byte(stateJSON), &state); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal fsm_compaction %s state_json: %w", id, err)
+		}
+	}
+
+	state.ID = id
+	state.RunID = runID
+	state.Version = version
+	state.ParentVersion = parentVersion
+	state.CompactedUpToIter = compactedUpToIter
+	state.RubricVerdict = rubricVerdict
+	state.Model = model
+	state.InputBytes = inputBytes
+	state.OutputBytes = outputBytes
+	state.CreatedAt = createdAt
+
+	return &state, nil
+}
+
+// GetLatestCompaction returns the highest-version CompactedTaskState for a run, or (nil, nil) if none exists.
+func (s *Store) GetLatestCompaction(ctx context.Context, runID string) (*CompactedTaskState, error) {
+	query := `
+		SELECT id, run_id, version, parent_version, compacted_up_to_iter,
+		       rubric_verdict, state_json, model, input_bytes, output_bytes, created_at
+		FROM fsm_compactions
+		WHERE run_id = ?
+		ORDER BY version DESC
+		LIMIT 1
+	`
+
+	state, err := scanCompaction(s.db.QueryRowContext(ctx, query, runID))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to query latest fsm_compaction for run %s: %w", runID, err)
+	}
+
+	return state, nil
+}
+
+// ListCompactions returns all compaction snapshots for a run ordered by version ASC.
+func (s *Store) ListCompactions(ctx context.Context, runID string) ([]CompactedTaskState, error) {
+	query := `
+		SELECT id, run_id, version, parent_version, compacted_up_to_iter,
+		       rubric_verdict, state_json, model, input_bytes, output_bytes, created_at
+		FROM fsm_compactions
+		WHERE run_id = ?
+		ORDER BY version ASC
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, runID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list fsm_compactions for run %s: %w", runID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var result []CompactedTaskState
+	for rows.Next() {
+		state, err := scanCompaction(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, *state)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating fsm_compactions for run %s: %w", runID, err)
+	}
+
+	return result, nil
 }

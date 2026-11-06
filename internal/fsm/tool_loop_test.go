@@ -1466,9 +1466,3 @@ func TestToolLoop_DynamicToolDefinitionsRefresh(t *testing.T) {
 	assert.Equal(t, int32(1), atomic.LoadInt32(&requestedSandbox))
 	assert.Equal(t, int32(3), atomic.LoadInt32(&turn))
 }
-
-
-
-
-
-

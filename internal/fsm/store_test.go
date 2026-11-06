@@ -3,6 +3,7 @@ package fsm
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"bob/internal/agentapi"
+	"bob/internal/trajectory"
 )
 
 func setupTestDB(t *testing.T) *sql.DB {
@@ -456,4 +458,251 @@ func TestStore_ContextSelectivePersistence(t *testing.T) {
 	assert.False(t, fetched.IsContextDirty())
 }
 
+func TestStore_CompactionCRUD(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
 
+	run := &FSMRun{
+		ID:            "run_compact_1",
+		ChatID:        "chat_1",
+		UserID:        "user_1",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusRunning,
+		CurrentState:  StateExecuteSteps,
+		MaxIterations: 20,
+		ContextJSON:   "[]",
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	// Initially no compactions exist
+	latest, err := store.GetLatestCompaction(ctx, run.ID)
+	require.NoError(t, err)
+	assert.Nil(t, latest)
+
+	list, err := store.ListCompactions(ctx, run.ID)
+	require.NoError(t, err)
+	assert.Empty(t, list)
+
+	// Validation errors
+	require.Error(t, store.SaveCompaction(ctx, nil))
+	require.Error(t, store.SaveCompaction(ctx, &CompactedTaskState{}))
+	require.Error(t, store.SaveCompaction(ctx, &CompactedTaskState{RunID: run.ID, Version: 0}))
+	require.Error(t, store.SaveCompaction(ctx, &CompactedTaskState{RunID: run.ID, Version: 1, ParentVersion: -1, CompactedUpToIter: 3}))
+	require.Error(t, store.SaveCompaction(ctx, &CompactedTaskState{RunID: run.ID, Version: 1, ParentVersion: 1, CompactedUpToIter: 3}))
+	require.Error(t, store.SaveCompaction(ctx, &CompactedTaskState{RunID: run.ID, Version: 1, CompactedUpToIter: 0}))
+	require.Error(t, store.SaveCompaction(ctx, &CompactedTaskState{RunID: run.ID, Version: 1, CompactedUpToIter: 3, InputBytes: -1}))
+	require.Error(t, store.SaveCompaction(ctx, &CompactedTaskState{RunID: run.ID, Version: 1, CompactedUpToIter: 3, RubricVerdict: CompactionVerdictProbedSkip}))
+	require.Error(t, store.SaveCompaction(ctx, &CompactedTaskState{RunID: "non_existent_run", Version: 1, CompactedUpToIter: 3}))
+
+	// First compaction with non-zero parent_version is rejected
+	require.Error(t, store.SaveCompaction(ctx, &CompactedTaskState{
+		RunID:             run.ID,
+		Version:           2,
+		ParentVersion:     1,
+		CompactedUpToIter: 3,
+	}))
+
+	// Save v1 compaction at execution iteration 4 covering iterations 1..3 (retaining iteration 4 as raw tail)
+	c1 := &CompactedTaskState{
+		Version:              1,
+		ParentVersion:        0,
+		RunID:                run.ID,
+		CompactedUpToIter:    3,
+		CompactedStepIDs:     []string{"run_compact_1_i1_s0", "run_compact_1_i2_s0", "run_compact_1_i3_s0"},
+		OriginalObjective:    "Audit codebase and summarize findings",
+		ImmutableConstraints: []string{"Preserve backward compatibility"},
+		VerifiedFindings: []VerifiedFinding{
+			{
+				Summary:       "Schema version is 4",
+				SourceStepIDs: []string{"run_compact_1_i1_s0"},
+			},
+		},
+		CurrentSubgoal:      "Write unit tests",
+		NextIntendedActions: []string{"Run go test"},
+		RubricVerdict:       CompactionVerdictProbedCompact,
+		Model:               "gpt-4o",
+		InputBytes:          16384,
+	}
+	// Execution iteration < CompactedUpToIter is rejected
+	_, err = MakeSnapshotCompactionEvent(c1, run.ID, 1, 2, "Invalid exec iteration")
+	require.Error(t, err)
+
+	ev1, err := MakeSnapshotCompactionEvent(c1, run.ID, 1, 4, "Subtask 1 complete")
+	require.NoError(t, err)
+	require.NoError(t, store.SaveCompactionWithEvent(ctx, c1, ev1))
+	assert.Equal(t, "run_compact_1_c_v1", c1.ID)
+	assert.Greater(t, c1.OutputBytes, 0)
+	assert.Greater(t, c1.CreatedAt, int64(0))
+
+	// Verify stored state_json length exactly matches c1.OutputBytes
+	var storedStateJSON string
+	require.NoError(t, db.QueryRowContext(ctx, "SELECT state_json FROM fsm_compactions WHERE id = ?", c1.ID).Scan(&storedStateJSON))
+	assert.Equal(t, len(storedStateJSON), c1.OutputBytes)
+
+	// Verify event was persisted in agent_trajectory_events at execution iteration 4 while payload records CompactedUpToIter=3
+	var evType, evPhase, evStepID string
+	var evIter int
+	var evPayloadBytes []byte
+	require.NoError(t, db.QueryRowContext(ctx, `
+		SELECT iteration, event_type, phase, step_id, payload
+		FROM agent_trajectory_events
+		WHERE run_id = ? AND generation = 1
+	`, run.ID).Scan(&evIter, &evType, &evPhase, &evStepID, &evPayloadBytes))
+	assert.Equal(t, 4, evIter)
+	assert.Equal(t, "compaction", evType)
+	assert.Equal(t, "compaction", evPhase)
+	assert.Equal(t, "compact_v1_i4", evStepID)
+	var ev1Payload trajectory.CompactionEventPayload
+	require.NoError(t, json.Unmarshal(evPayloadBytes, &ev1Payload))
+	assert.Equal(t, c1.Version, ev1Payload.Version)
+	assert.Equal(t, c1.ParentVersion, ev1Payload.ParentVersion)
+	assert.Equal(t, 3, ev1Payload.CompactedUpToIter)
+	assert.Equal(t, c1.OutputBytes, ev1Payload.OutputBytes)
+	assert.Equal(t, storedStateJSON, string(ev1Payload.StateJSON))
+
+	// Mutating c after MakeSnapshotCompactionEvent (even with identical string length) is rejected and leaves DB unchanged
+	c2Mutated := &CompactedTaskState{
+		Version:           2,
+		ParentVersion:     1,
+		RunID:             run.ID,
+		CompactedUpToIter: 6,
+		CurrentSubgoal:    "Subgoal A",
+		RubricVerdict:     CompactionVerdictProbedCompact,
+		Model:             "gpt-4o",
+		InputBytes:        20000,
+	}
+	ev2Mutated, err := MakeSnapshotCompactionEvent(c2Mutated, run.ID, 1, 7, "Before mutation")
+	require.NoError(t, err)
+	c2Mutated.CurrentSubgoal = "Subgoal B" // same byte length, different StateJSON content
+	require.Error(t, store.SaveCompactionWithEvent(ctx, c2Mutated, ev2Mutated))
+
+	// Atomic rollback test: if trajectory event conflicts on uq_trajectory_events with a different payload,
+	// the new snapshot in fsm_compactions must roll back and leave v1 untouched.
+	c2Rollback := &CompactedTaskState{
+		Version:           2,
+		ParentVersion:     1,
+		RunID:             run.ID,
+		CompactedUpToIter: 4,
+		OriginalObjective: "Rollback test",
+		RubricVerdict:     CompactionVerdictProbedCompact,
+		InputBytes:        20000,
+	}
+	conflictingEv, err := MakeSnapshotCompactionEvent(c2Rollback, run.ID, 1, 4, "Will conflict")
+	require.NoError(t, err)
+	// Force same (run_id, generation, iteration, phase, step_id, attempt, event_type) as ev1 with different payload
+	conflictingEv.Iteration = ev1.Iteration
+	conflictingEv.StepID = ev1.StepID
+	require.Error(t, store.SaveCompactionWithEvent(ctx, c2Rollback, conflictingEv))
+
+	latestAfterRollback, err := store.GetLatestCompaction(ctx, run.ID)
+	require.NoError(t, err)
+	require.NotNil(t, latestAfterRollback)
+	assert.Equal(t, 1, latestAfterRollback.Version)
+
+	// Regressing or non-advancing CompactedUpToIter is rejected
+	require.Error(t, store.SaveCompaction(ctx, &CompactedTaskState{
+		Version:           2,
+		ParentVersion:     1,
+		RunID:             run.ID,
+		CompactedUpToIter: 3,
+	}))
+
+	// Save v2 compaction (forced backstop)
+	c2 := &CompactedTaskState{
+		Version:           2,
+		ParentVersion:     1,
+		RunID:             run.ID,
+		CompactedUpToIter: 6,
+		CompactedStepIDs:  []string{"run_compact_1_i4_s0", "run_compact_1_i5_s0", "run_compact_1_i6_s0"},
+		OriginalObjective: "Audit codebase and summarize findings",
+		VerifiedFindings: []VerifiedFinding{
+			{
+				Summary:       "Schema version is 4",
+				SourceStepIDs: []string{"run_compact_1_i1_s0"},
+			},
+			{
+				Summary:       "All tests pass",
+				SourceStepIDs: []string{"run_compact_1_i6_s0"},
+			},
+		},
+		CurrentSubgoal: "Finalize response",
+		RubricVerdict:  CompactionVerdictBackstopForced,
+		Model:          "gpt-4o",
+		InputBytes:     270000,
+	}
+	require.NoError(t, store.SaveCompaction(ctx, c2))
+
+	// Duplicate (run_id, version) with a different explicit ID must fail UNIQUE(run_id, version)
+	_, err = db.ExecContext(ctx, `
+		INSERT INTO fsm_compactions (
+			id, run_id, version, parent_version, compacted_up_to_iter,
+			rubric_verdict, state_json, model, input_bytes, output_bytes, created_at
+		) VALUES ('distinct_id_for_dup_ver', ?, 2, 1, 6, 'probed_compact', '{}', '', 0, 2, 1700000000)
+	`, run.ID)
+	require.Error(t, err)
+
+	// Second run with same version v1 proves run-scoped isolation in GetLatestCompaction and ListCompactions
+	run2 := &FSMRun{
+		ID:            "run_compact_2",
+		ChatID:        "chat_1",
+		UserID:        "user_1",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusRunning,
+		CurrentState:  StateExecuteSteps,
+		MaxIterations: 20,
+		ContextJSON:   "[]",
+	}
+	require.NoError(t, store.CreateRun(ctx, run2))
+	require.NoError(t, store.SaveCompaction(ctx, &CompactedTaskState{
+		Version:           1,
+		ParentVersion:     0,
+		RunID:             run2.ID,
+		CompactedUpToIter: 4,
+		OriginalObjective: "Second run objective",
+		CurrentSubgoal:    "Second run subgoal",
+	}))
+
+	latestRun2, err := store.GetLatestCompaction(ctx, run2.ID)
+	require.NoError(t, err)
+	require.NotNil(t, latestRun2)
+	assert.Equal(t, 1, latestRun2.Version)
+	assert.Equal(t, 4, latestRun2.CompactedUpToIter)
+	assert.Equal(t, "Second run objective", latestRun2.OriginalObjective)
+
+	listRun2, err := store.ListCompactions(ctx, run2.ID)
+	require.NoError(t, err)
+	require.Len(t, listRun2, 1)
+
+	// GetLatestCompaction for run 1 still returns v2
+	latest, err = store.GetLatestCompaction(ctx, run.ID)
+	require.NoError(t, err)
+	require.NotNil(t, latest)
+	assert.Equal(t, 2, latest.Version)
+	assert.Equal(t, 1, latest.ParentVersion)
+	assert.Equal(t, 6, latest.CompactedUpToIter)
+	assert.Equal(t, CompactionVerdictBackstopForced, latest.RubricVerdict)
+	assert.Len(t, latest.VerifiedFindings, 2)
+
+	// ListCompactions for run 1 returns [v1, v2] in ascending version order
+	list, err = store.ListCompactions(ctx, run.ID)
+	require.NoError(t, err)
+	require.Len(t, list, 2)
+	assert.Equal(t, 1, list[0].Version)
+	assert.Equal(t, 3, list[0].CompactedUpToIter)
+	assert.Equal(t, 2, list[1].Version)
+	assert.Equal(t, 6, list[1].CompactedUpToIter)
+
+	// Cascade delete on run 1 deletion removes run 1's compactions while preserving run 2's compactions
+	_, err = db.ExecContext(ctx, "DELETE FROM fsm_runs WHERE id = ?", run.ID)
+	require.NoError(t, err)
+
+	latestAfterDelete, err := store.GetLatestCompaction(ctx, run.ID)
+	require.NoError(t, err)
+	assert.Nil(t, latestAfterDelete)
+
+	latestRun2AfterDelete, err := store.GetLatestCompaction(ctx, run2.ID)
+	require.NoError(t, err)
+	require.NotNil(t, latestRun2AfterDelete)
+	assert.Equal(t, 1, latestRun2AfterDelete.Version)
+}

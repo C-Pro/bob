@@ -12,10 +12,10 @@ type Event struct {
 	RunID        string          `json:"run_id"`        // FSM Run ID
 	Generation   int             `json:"generation"`    // Durable execution generation
 	Iteration    int             `json:"iteration"`     // FSM loop iteration counter
-	Phase        string          `json:"phase"`         // "start", "loop", "synthesis", "terminal"
+	Phase        string          `json:"phase"`         // "start", "loop", "compaction", "synthesis", "terminal"
 	StepID       string          `json:"step_id"`       // FSM step identifier
 	Attempt      int             `json:"attempt"`       // 1-based retry attempt
-	EventType    string          `json:"event_type"`    // "turn_start", "tool_attempt", "llm_response", "turn_terminal"
+	EventType    string          `json:"event_type"`    // "turn_start", "tool_attempt", "llm_response", "compaction", "turn_terminal"
 	Payload      json.RawMessage `json:"payload"`       // Type-specific event details
 	CreatedAt    time.Time       `json:"created_at"`
 }
@@ -39,15 +39,15 @@ type EvalBreakdown struct {
 	SuccessfulToolCalls int     `json:"successful_tool_calls"` // Tool calls completing without error / exit 0
 	FailedToolCalls     int     `json:"failed_tool_calls"`     // Tool calls returning errors or non-zero exits
 	ToolSuccessRate     float64 `json:"tool_success_rate"`     // [0.0, 1.0] fraction of successful invocations
-	BudgetExhausted     bool    `json:"budget_exhausted"`     // true if iteration or token budget was hit
-	FSMFailed           bool    `json:"fsm_failed"`           // true if FSM terminated with unhandled error
-	TerminationReason   string  `json:"termination_reason"`  // "completed", "budget_exhausted", "fsm_failed", "cancelled", "delivery_failed"
-	HasUserFeedback     bool    `json:"has_user_feedback"`    // true if explicit user feedback was received
-	UserFeedback        float64 `json:"user_feedback"`        // -1.0 (bad), 0.0 (neutral), +1.0 (good)
+	BudgetExhausted     bool    `json:"budget_exhausted"`      // true if iteration or token budget was hit
+	FSMFailed           bool    `json:"fsm_failed"`            // true if FSM terminated with unhandled error
+	TerminationReason   string  `json:"termination_reason"`    // "completed", "budget_exhausted", "fsm_failed", "cancelled", "delivery_failed"
+	HasUserFeedback     bool    `json:"has_user_feedback"`     // true if explicit user feedback was received
+	UserFeedback        float64 `json:"user_feedback"`         // -1.0 (bad), 0.0 (neutral), +1.0 (good)
 	FeedbackNote        string  `json:"feedback_note,omitempty"`
 	ImplicitSignal      float64 `json:"implicit_signal"`               // -1.0 to +1.0 derived from follow-up turns
 	ImplicitProvenance  string  `json:"implicit_provenance,omitempty"` // explanation/source of implicit score
-	RewardVersion       string  `json:"reward_version"`               // e.g. "v1"
+	RewardVersion       string  `json:"reward_version"`                // e.g. "v1"
 }
 
 // Trajectory represents the canonical rollout record for a single logical turn.
@@ -110,4 +110,18 @@ type TurnTerminalPayload struct {
 	Reason     string `json:"reason"` // "completed", "fsm_failed", "cancelled", "budget_exhausted"
 	Failed     bool   `json:"failed"`
 	FinalReply string `json:"final_reply"`
+}
+
+// CompactionEventPayload records a task trajectory compaction probe or snapshot transition.
+type CompactionEventPayload struct {
+	Version           int             `json:"version"`
+	ParentVersion     int             `json:"parent_version"`
+	CompactedUpToIter int             `json:"compacted_up_to_iter"`
+	ShouldCompact     bool            `json:"should_compact"`
+	RubricVerdict     string          `json:"rubric_verdict"` // "probed_compact", "probed_skip", or "backstop_forced"
+	Reason            string          `json:"reason,omitempty"`
+	Model             string          `json:"model,omitempty"`
+	InputBytes        int             `json:"input_bytes"`
+	OutputBytes       int             `json:"output_bytes"`
+	StateJSON         json.RawMessage `json:"state_json,omitempty"`
 }

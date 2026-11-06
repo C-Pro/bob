@@ -207,3 +207,50 @@ func (s FSMStep) ToToolCall() openai.ToolCall {
 		},
 	}
 }
+
+const (
+	// CompactionVerdictProbedCompact indicates that a rubric probe decided to compact the trajectory.
+	CompactionVerdictProbedCompact = "probed_compact"
+	// CompactionVerdictProbedSkip indicates that a rubric probe decided not to compact yet.
+	CompactionVerdictProbedSkip = "probed_skip"
+	// CompactionVerdictBackstopForced indicates that compaction was forced by the hard byte backstop.
+	CompactionVerdictBackstopForced = "backstop_forced"
+)
+
+// VerifiedFinding represents a verified fact or intermediate result distilled from compacted steps.
+type VerifiedFinding struct {
+	Summary       string   `json:"summary"`
+	SourceStepIDs []string `json:"source_step_ids"`
+}
+
+// CompactedTaskState represents a versioned structured task state snapshot for an FSM run.
+type CompactedTaskState struct {
+	ID                   string            `json:"id,omitempty"`
+	Version              int               `json:"version"`
+	ParentVersion        int               `json:"parent_version"`
+	RunID                string            `json:"run_id"`
+	CompactedUpToIter    int               `json:"compacted_up_to_iter"`
+	CompactedStepIDs     []string          `json:"compacted_step_ids"`
+	OriginalObjective    string            `json:"original_objective"`
+	ImmutableConstraints []string          `json:"immutable_constraints,omitempty"`
+	VerifiedFindings     []VerifiedFinding `json:"verified_findings,omitempty"`
+	DecisionsAndRejected []string          `json:"decisions_and_rejected,omitempty"`
+	CurrentSubgoal       string            `json:"current_subgoal"`
+	NextIntendedActions  []string          `json:"next_intended_actions,omitempty"`
+	UnresolvedBlockers   []string          `json:"unresolved_blockers,omitempty"`
+	ProducedArtifacts    []string          `json:"produced_artifacts,omitempty"`
+	ActiveSkillVersions  []string          `json:"active_skill_versions,omitempty"`
+	ActiveMemoryVersions []string          `json:"active_memory_versions,omitempty"`
+	RubricVerdict        string            `json:"rubric_verdict"`
+	Model                string            `json:"model"`
+	InputBytes           int               `json:"-"`
+	OutputBytes          int               `json:"-"`
+	CreatedAt            int64             `json:"created_at"`
+}
+
+// CompactionProbeResult represents the structured decision returned by a SelfCompact rubric probe.
+type CompactionProbeResult struct {
+	ShouldCompact bool                `json:"should_compact"`
+	Reason        string              `json:"reason"`
+	State         *CompactedTaskState `json:"state,omitempty"`
+}
