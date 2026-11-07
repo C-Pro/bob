@@ -57,18 +57,18 @@
 ---
 
 ## Step 4: Episodic Index over Evicted Conversation History (`internal/memory`, `internal/tools`)
-- [ ] Task: Add `memory_episodes` table and episode builder in `internal/memory`
-    - [ ] Create `internal/memory/episode.go` with `Episode` struct (`ID`, `ChatID`, `ChatType`, `ThreadID`, `StartSeq`, `EndSeq`, `StartTime`, `EndTime`, `Participants`, `TopicTags`, `TaskStatus`, `Summary`, `SourceChunkIDs`, `ModelDerived`)
-    - [ ] Initialize `memory_episodes` table and indexes in `Manager.GetDB`
-    - [ ] Generate and persist an `Episode` record alongside raw chunks during `IndexMessages` (extracting participants, sequence/time bounds, topic keywords, and a clearly labeled navigation summary)
-    - [ ] Index episode summaries in CortexDB (`episode:` prefix) while linking back to `source_chunk_ids` and `[start_seq, end_seq]`
-- [ ] Task: Enhance `memory.Manager.Search` and `recall_memory` to support episodic navigation
-    - [ ] Return matching episode navigation entries clearly tagged as `[Model-Derived Episode Summary | seq <start>-<end>]`
-    - [ ] Allow `recall_memory` to fetch raw chunks by sequence range (`start_seq`, `end_seq`) or `chunk_id` so the agent can drill down from an episode summary into exact raw evidence
-- [ ] Task: Write unit tests for Episodic Index
-    - [ ] Create `internal/memory/episode_test.go` verifying episode creation on eviction, hybrid/lexical search, sequence-range raw chunk lookup, and DM/Townhall privacy isolation
-- [ ] Task: Step 4 Verification
-    - [ ] Run `go test -race ./internal/memory/... ./internal/tools/...`
+- [x] Task: Add `memory_episodes` table and episode builder in `internal/memory`
+    - [x] Create `internal/memory/episode.go` with `Episode` struct (`ID`, `ChatID`, `ChatType`, `ThreadID`, `StartSeq`, `EndSeq`, `StartTime`, `EndTime`, `Participants`, `TopicTags`, `TaskStatus`, `Summary`, `SourceChunkIDs`, `ModelDerived`)
+    - [x] Initialize `memory_episodes` table and indexes in `Manager.GetDB`
+    - [x] Generate and persist an `Episode` record alongside raw chunks during `IndexMessages` (extracting participants, sequence/time bounds, topic keywords, and a clearly labeled navigation summary)
+    - [x] Index episode summaries in CortexDB (`episode:` prefix) while linking back to `source_chunk_ids` and `[start_seq, end_seq]`
+- [x] Task: Enhance `memory.Manager.Search` and `recall_memory` to support episodic navigation
+    - [x] Return matching episode navigation entries clearly tagged as `[Model-Derived Episode Summary | seq <start>-<end>]`
+    - [x] Allow `recall_memory` to fetch raw chunks by sequence range (`start_seq`, `end_seq`) or `chunk_id` so the agent can drill down from an episode summary into exact raw evidence
+- [x] Task: Write unit tests for Episodic Index
+    - [x] Create `internal/memory/episode_test.go` verifying episode creation on eviction, hybrid/lexical search, sequence-range raw chunk lookup, and DM/Townhall privacy isolation
+- [x] Task: Step 4 Verification
+    - [x] Run `go test -race ./internal/memory/... ./internal/tools/...`
 
 ---
 

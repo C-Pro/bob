@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -87,6 +88,8 @@ func TestRecallMemoryToolDefinition(t *testing.T) {
 	require.NotNil(t, tool.Function)
 	assert.Equal(t, "recall_memory", tool.Function.Name)
 	assert.Contains(t, tool.Function.Description, "memory")
+	assert.Contains(t, tool.Function.Description, "[Model-Derived Episode Summary | seq <start>-<end>]")
+	assert.Contains(t, tool.Function.Description, "chunk_id")
 
 	paramBytes, err := json.Marshal(tool.Function.Parameters)
 	require.NoError(t, err)
@@ -98,10 +101,12 @@ func TestRecallMemoryToolDefinition(t *testing.T) {
 	props, ok := schema["properties"].(map[string]interface{})
 	require.True(t, ok)
 	assert.Contains(t, props, "query")
+	assert.Contains(t, props, "chunk_id")
+	assert.Contains(t, props, "start_seq")
+	assert.Contains(t, props, "end_seq")
 	assert.Contains(t, props, "limit")
-	required, ok := schema["required"].([]interface{})
-	require.True(t, ok)
-	assert.Contains(t, required, "query")
+	_, hasRequired := schema["required"]
+	assert.False(t, hasRequired, "query should not be strictly required when chunk_id or sequence bounds are provided")
 }
 
 func TestExecuteWebSearchSuccess(t *testing.T) {
@@ -458,6 +463,148 @@ func TestExecuteRecallMemory_InvalidArgs(t *testing.T) {
 
 	_, err = registry.Execute(context.Background(), "recall_memory", `{"query": ""}`)
 	assert.ErrorContains(t, err, "query cannot be empty")
+}
+
+func TestExecuteRecallMemory_EpisodesAndRawChunkDrillDown(t *testing.T) {
+	tempDir := t.TempDir()
+	memMgr := memory.NewManager(&config.Config{DataDir: tempDir, EmbeddingModel: "none"}, nil)
+	defer func() { _ = memMgr.Close() }()
+
+	ctx := context.Background()
+	now := time.Now().Unix()
+
+	require.NoError(t, memMgr.IndexMessages(ctx, "townhall", false, []memory.MessageToStore{
+		{
+			Seq:        42,
+			Timestamp:  now,
+			ChatID:     "townhall",
+			UserID:     "alice",
+			SenderName: "Alice",
+			Role:       "user",
+			Content:    "Deployed envoy canary proxy to region eu-central-1.",
+		},
+		{
+			Seq:        43,
+			Timestamp:  now + 2,
+			ChatID:     "townhall",
+			UserID:     "bob",
+			SenderName: "Bob",
+			Role:       "user",
+			Content:    "Envoy canary rollout completed with zero 5xx errors.",
+		},
+	}))
+
+	registry := NewRegistry(nil, memMgr)
+	thCtx := WithChatSession(ctx, ChatSessionContext{ChatID: "townhall", IsDM: false})
+
+	// 1. Search returns raw chunk labeled as Raw Conversation Chunk with episode_id reference (never mislabeled as Model-Derived Episode Summary)
+	res, err := registry.Execute(thCtx, "recall_memory", `{"query": "envoy"}`)
+	require.NoError(t, err)
+	assert.Contains(t, res, "[Raw Conversation Chunk | chunk_id: chunk_townhall_42_43 | episode_id: ep_townhall_42_43]")
+	assert.NotContains(t, res, "[Model-Derived Episode Summary | seq 42-43]")
+
+	// 1b. Querying episode ID directly returns standalone episode summary with complete mandatory header and pointers
+	epRes, err := registry.Execute(thCtx, "recall_memory", `{"query": "ep_townhall_42_43"}`)
+	require.NoError(t, err)
+	assert.Contains(t, epRes, "[Model-Derived Episode Summary | seq 42-43]")
+	assert.Contains(t, epRes, "Source Chunks: chunk_townhall_42_43")
+	assert.Contains(t, epRes, "Navigation summary only")
+
+	// 2. Drill down into raw chunk by chunk_id without query
+	chunkRes, err := registry.Execute(thCtx, "recall_memory", `{"chunk_id": "chunk_townhall_42_43"}`)
+	require.NoError(t, err)
+	assert.Contains(t, chunkRes, "Deployed envoy canary proxy")
+	assert.Contains(t, chunkRes, "zero 5xx errors")
+
+	// 3. Drill down into raw chunk by start_seq and end_seq
+	seqRes, err := registry.Execute(thCtx, "recall_memory", `{"start_seq": 40, "end_seq": 45}`)
+	require.NoError(t, err)
+	assert.Contains(t, seqRes, "Deployed envoy canary proxy")
+
+	// 4. Verify bounded <= 16 KiB response when multiple large chunks and oversized participant metadata match
+	largePayload := strings.Repeat("envoy proxy configuration line with utf8 🚀\n", 140)
+	oversizedSender := "Alice_" + strings.Repeat("P", 24*1024)
+	for batchIdx := 0; batchIdx < 5; batchIdx++ {
+		seq := int64(200 + batchIdx*10)
+		require.NoError(t, memMgr.IndexMessages(ctx, "townhall", false, []memory.MessageToStore{
+			{
+				Seq:        seq,
+				Timestamp:  now + int64(batchIdx+10),
+				ChatID:     "townhall",
+				UserID:     "alice",
+				SenderName: oversizedSender,
+				Role:       "user",
+				Content:    largePayload,
+			},
+		}))
+	}
+
+	boundedRes, err := registry.Execute(thCtx, "recall_memory", `{"query": "envoy", "limit": 10}`)
+	require.NoError(t, err)
+	assert.LessOrEqual(t, len(boundedRes), MaxRecallMemoryResponseBytes)
+
+	var boundedObj map[string]interface{}
+	require.NoError(t, json.Unmarshal([]byte(boundedRes), &boundedObj))
+	assert.NotEmpty(t, boundedObj["memories"])
+	assert.Contains(t, boundedObj["formatted_results"], "envoy")
+
+	// 5. Verify crowded response with an episode item preserves complete trust label or omits episode
+	crowdedEpRes, err := registry.Execute(thCtx, "recall_memory", `{"query": "ep_townhall_200_200", "limit": 10}`)
+	require.NoError(t, err)
+	assert.LessOrEqual(t, len(crowdedEpRes), MaxRecallMemoryResponseBytes)
+	if strings.Contains(crowdedEpRes, "Model-Derived Episode Summary") {
+		assert.Contains(t, crowdedEpRes, "[Model-Derived Episode Summary | seq 200-200]")
+		assert.Contains(t, crowdedEpRes, "Navigation summary only")
+	}
+
+	// 6. Long query with no matches is also bounded <= 16 KiB
+	hugeQueryArgs, err := json.Marshal(RecallMemoryArgs{Query: "nonexistent_" + strings.Repeat("Q", 24*1024)})
+	require.NoError(t, err)
+	emptyBoundedRes, err := registry.Execute(thCtx, "recall_memory", string(hugeQueryArgs))
+	require.NoError(t, err)
+	assert.LessOrEqual(t, len(emptyBoundedRes), MaxRecallMemoryResponseBytes)
+
+	// 7. Regression: long chunk_id / episode_id (> 64 bytes) under response pressure must preserve exact lookup IDs and drill down cleanly
+	longChatID := "dm_" + strings.Repeat("organization_tenant_workspace_", 3) + "user42"
+	require.Greater(t, len(longChatID), 64)
+	longDMCtx := WithChatSession(ctx, ChatSessionContext{ChatID: longChatID, UserID: "user42", IsDM: true})
+	for i := 0; i < 4; i++ {
+		seq := int64(500 + i*10)
+		require.NoError(t, memMgr.IndexMessages(ctx, longChatID, true, []memory.MessageToStore{
+			{
+				Seq:        seq,
+				Timestamp:  now + int64(100+i),
+				ChatID:     longChatID,
+				UserID:     "user42",
+				SenderName: "User42",
+				Role:       "user",
+				Content:    strings.Repeat("long_pointer_verification_payload ", 160),
+			},
+		}))
+	}
+
+	longRes, err := registry.Execute(longDMCtx, "recall_memory", `{"query": "long_pointer_verification_payload", "limit": 10}`)
+	require.NoError(t, err)
+	assert.LessOrEqual(t, len(longRes), MaxRecallMemoryResponseBytes)
+
+	var longPayload struct {
+		Memories []memory.MemoryItem `json:"memories"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(longRes), &longPayload))
+	require.NotEmpty(t, longPayload.Memories)
+	for _, memItem := range longPayload.Memories {
+		assert.False(t, strings.HasSuffix(memItem.ID, "..."), "item ID must never be truncated")
+		assert.False(t, strings.HasSuffix(memItem.EpisodeID, "..."), "episode ID must never be truncated")
+		for _, srcChunkID := range memItem.SourceChunkIDs {
+			assert.Greater(t, len(srcChunkID), 64)
+			assert.False(t, strings.HasSuffix(srcChunkID, "..."), "source_chunk_id pointer must never be truncated")
+			drillArgs, err := json.Marshal(RecallMemoryArgs{ChunkID: srcChunkID})
+			require.NoError(t, err)
+			drillRes, err := registry.Execute(longDMCtx, "recall_memory", string(drillArgs))
+			require.NoError(t, err)
+			assert.Contains(t, drillRes, "long_pointer_verification_payload")
+		}
+	}
 }
 
 type mockSandboxDriver struct {

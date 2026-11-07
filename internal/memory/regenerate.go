@@ -21,11 +21,12 @@ import (
 
 // RegenerationReport summarizes the result of a vector regeneration pass.
 type RegenerationReport struct {
-	TotalDatabases int      `json:"totalDatabases"`
-	TotalChunks    int      `json:"totalChunks"`
-	Reembedded     int      `json:"reembedded"`
-	Failed         int      `json:"failed"`
-	Errors         []string `json:"errors,omitempty"`
+	TotalDatabases     int      `json:"totalDatabases"`
+	TotalChunks        int      `json:"totalChunks"`
+	Reembedded         int      `json:"reembedded"`
+	ReembeddedEpisodes int      `json:"reembeddedEpisodes,omitempty"`
+	Failed             int      `json:"failed"`
+	Errors             []string `json:"errors,omitempty"`
 }
 
 // EncodeMemoryVector encodes a float32 vector into the 4-byte length prefixed little-endian
@@ -130,12 +131,18 @@ func regenerateDatabaseVectors(ctx context.Context, dbPath string, embedder cort
 		return nil
 	}
 
-	report.TotalChunks += len(records)
-	slog.Info("processing memory chunks for vector regeneration", "db", dbPath, "count", len(records), "batchSize", batchSize)
+	chunkCount := 0
+	for _, r := range records {
+		if strings.HasPrefix(r.id, "chunk_") {
+			chunkCount++
+		}
+	}
+	report.TotalChunks += chunkCount
+	slog.Info("processing memory chunks for vector regeneration", "db", dbPath, "count", len(records), "chunks", chunkCount, "batchSize", batchSize)
 
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		report.Failed += len(records)
+		report.Failed += chunkCount
 		return fmt.Errorf("begin transaction: %w", err)
 	}
 	defer func() {
@@ -144,7 +151,7 @@ func regenerateDatabaseVectors(ctx context.Context, dbPath string, embedder cort
 
 	stmt, err := tx.PrepareContext(ctx, `UPDATE messages SET vector = ? WHERE id = ?`)
 	if err != nil {
-		report.Failed += len(records)
+		report.Failed += chunkCount
 		return fmt.Errorf("prepare update statement: %w", err)
 	}
 	defer func() {
@@ -152,9 +159,10 @@ func regenerateDatabaseVectors(ctx context.Context, dbPath string, embedder cort
 	}()
 
 	dbReembedded := 0
+	dbReembeddedEpisodes := 0
 	for start := 0; start < len(records); start += batchSize {
 		if ctx.Err() != nil {
-			report.Failed += len(records) - dbReembedded
+			report.Failed += chunkCount - dbReembedded
 			return ctx.Err()
 		}
 
@@ -171,7 +179,7 @@ func regenerateDatabaseVectors(ctx context.Context, dbPath string, embedder cort
 
 		vectors, err := embedder.EmbedBatch(ctx, texts)
 		if err != nil {
-			report.Failed += len(records) - dbReembedded
+			report.Failed += chunkCount - dbReembedded
 			errMsg := fmt.Sprintf("%s: EmbedBatch failed at offset %d: %v", filepath.Base(dbPath), start, err)
 			slog.Error("batch embedding generation failed", "error", err, "db", dbPath, "offset", start)
 			report.Errors = append(report.Errors, errMsg)
@@ -179,7 +187,7 @@ func regenerateDatabaseVectors(ctx context.Context, dbPath string, embedder cort
 		}
 
 		if len(vectors) != len(batch) {
-			report.Failed += len(records) - dbReembedded
+			report.Failed += chunkCount - dbReembedded
 			errMsg := fmt.Sprintf("%s: EmbedBatch returned %d vectors for %d texts at offset %d", filepath.Base(dbPath), len(vectors), len(batch), start)
 			slog.Error("inconsistent vector count", "expected", len(batch), "got", len(vectors), "db", dbPath)
 			report.Errors = append(report.Errors, errMsg)
@@ -189,28 +197,33 @@ func regenerateDatabaseVectors(ctx context.Context, dbPath string, embedder cort
 		for i, r := range batch {
 			vecBytes, err := EncodeMemoryVector(vectors[i])
 			if err != nil {
-				report.Failed += len(records) - dbReembedded
+				report.Failed += chunkCount - dbReembedded
 				errMsg := fmt.Sprintf("%s: encode vector for %s: %v", filepath.Base(dbPath), r.id, err)
 				report.Errors = append(report.Errors, errMsg)
 				return fmt.Errorf("encode vector failed: %w", err)
 			}
 
 			if _, err := stmt.ExecContext(ctx, vecBytes, r.id); err != nil {
-				report.Failed += len(records) - dbReembedded
+				report.Failed += chunkCount - dbReembedded
 				errMsg := fmt.Sprintf("%s: update vector for %s: %v", filepath.Base(dbPath), r.id, err)
 				report.Errors = append(report.Errors, errMsg)
 				return fmt.Errorf("update vector failed: %w", err)
 			}
-			dbReembedded++
+			if strings.HasPrefix(r.id, "chunk_") {
+				dbReembedded++
+			} else if strings.HasPrefix(r.id, EpisodeIDPrefix) {
+				dbReembeddedEpisodes++
+			}
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		report.Failed += len(records)
+		report.Failed += chunkCount
 		return fmt.Errorf("commit transaction: %w", err)
 	}
 
 	report.Reembedded += dbReembedded
+	report.ReembeddedEpisodes += dbReembeddedEpisodes
 	return nil
 }
 

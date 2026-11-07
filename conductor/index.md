@@ -70,3 +70,8 @@
 
 - [~] **Track: Phase 1 — Context Assembly, Episodic Index, and Adaptive Task Compaction**
 *Link: [./tracks/context-assembly-compaction_20261105/](./tracks/context-assembly-compaction_20261105/)*
+
+---
+
+- [ ] **Planned Next Track: Lightweight CPU ML Model for Multilingual Episode Tagging, Status Classification, & Local Control-Plane Decisions**
+*Scope: Research and integrate a simple, fast, small CPU-friendly ML model to replace hardcoded English keyword heuristics in `internal/memory/episode.go` (`extractTopicTags`, `inferEpisodeTaskStatus`) and drive local control-plane decisions.*

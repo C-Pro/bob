@@ -96,6 +96,8 @@ func TestPromptMarkdownAndMathGuidelines(t *testing.T) {
 	dmPrompt := RenderDMPrompt(bot, "@bot", user, 5)
 
 	for _, p := range []string{townhallPrompt, dmPrompt} {
+		assert.Contains(t, p, "[Model-Derived Episode Summary | seq <start>-<end>]")
+		assert.Contains(t, p, "chunk_id or start_seq/end_seq")
 		assert.Contains(t, p, "Besedka formatting guidelines:")
 		assert.Contains(t, p, "safe subset of Markdown")
 		assert.Contains(t, p, "GitHub Flavored Markdown tables")
