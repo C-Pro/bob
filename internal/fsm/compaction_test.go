@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"bob/internal/agentapi"
+	"bob/internal/tools"
 	"bob/internal/trajectory"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -1167,4 +1169,307 @@ func TestEvaluateCompactionTrigger_NonTerminalAndPairwiseStuckGuard(t *testing.T
 	mode2, target2 := evaluateCompactionTrigger(cfg, 3, 0, 1000, stepsDiffFailures)
 	assert.Equal(t, compactionTriggerProbeRubric, mode2)
 	assert.Equal(t, 2, target2)
+}
+
+func TestToolLoop_CompactedRunCanRecallOmittedStepViaRecallTaskHistory(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	// Seed another run in the same DB to verify cross-run isolation during recall_task_history
+	otherRun := &FSMRun{
+		ID:           "run_other_isolated",
+		ChatID:       "chat_1",
+		UserID:       "user_1",
+		FSMType:      FSMTypeToolLoop,
+		Status:       RunStatusCompleted,
+		CurrentState: StateCompleted,
+		ContextJSON:  "[]",
+	}
+	require.NoError(t, store.CreateRun(ctx, otherRun))
+	now := time.Now().Unix()
+	require.NoError(t, store.CreateSteps(ctx, []FSMStep{
+		{
+			ID:          "step_other_secret",
+			RunID:       otherRun.ID,
+			Iteration:   1,
+			StepIndex:   0,
+			ToolName:    "inspect_step",
+			ToolCallID:  "call_other_secret",
+			ArgsJSON:    `{}`,
+			ResultJSON:  `{"content":"OTHER_RUN_FORBIDDEN_SECRET"}`,
+			Status:      StepStatusCompleted,
+			CompletedAt: &now,
+		},
+	}))
+
+	var turn int32
+	var sawRecallToolInSchemas atomic.Bool
+	var recalledRawToken atomic.Bool
+
+	llm := &mockLLMClient{
+		handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+			for _, tool := range req.Tools {
+				if tool.Function != nil && tool.Function.Name == "recall_task_history" {
+					sawRecallToolInSchemas.Store(true)
+				}
+			}
+
+			curTurn := atomic.AddInt32(&turn, 1)
+			if curTurn <= 3 {
+				return &openai.ChatCompletionResponse{
+					Choices: []openai.ChatCompletionChoice{
+						{
+							Message: openai.ChatCompletionMessage{
+								Role: openai.ChatMessageRoleAssistant,
+								ToolCalls: []openai.ToolCall{
+									{
+										ID:   fmt.Sprintf("call_hist_%d", curTurn),
+										Type: openai.ToolTypeFunction,
+										Function: openai.FunctionCall{
+											Name:      "inspect_step",
+											Arguments: fmt.Sprintf(`{"step":%d}`, curTurn),
+										},
+									},
+								},
+							},
+						},
+					},
+				}, nil
+			}
+
+			if curTurn == 4 {
+				// Iterations 1..2 have been compacted; raw token from iteration 1 is omitted from active messages.
+				for _, m := range req.Messages {
+					if m.Role == openai.ChatMessageRoleTool {
+						assert.NotContains(t, m.Content, "SECRET_TOKEN_9942_XYZ", "compacted iteration 1 raw output must not be in active tool messages")
+					}
+				}
+				// Call recall_task_history to recover iteration 1's raw output
+				return &openai.ChatCompletionResponse{
+					Choices: []openai.ChatCompletionChoice{
+						{
+							Message: openai.ChatCompletionMessage{
+								Role: openai.ChatMessageRoleAssistant,
+								ToolCalls: []openai.ToolCall{
+									{
+										ID:   "call_recall_iter_1",
+										Type: openai.ToolTypeFunction,
+										Function: openai.FunctionCall{
+											Name:      "recall_task_history",
+											Arguments: `{"iteration":1}`,
+										},
+									},
+								},
+							},
+						},
+					},
+				}, nil
+			}
+
+			// Turn 5: verify recall_task_history returned the exact raw output from iteration 1 and never leaked otherRun
+			for _, m := range req.Messages {
+				if m.Role == openai.ChatMessageRoleTool && m.ToolCallID == "call_recall_iter_1" {
+					assert.NotContains(t, m.Content, "OTHER_RUN_FORBIDDEN_SECRET")
+					if strings.Contains(m.Content, "SECRET_TOKEN_9942_XYZ") {
+						recalledRawToken.Store(true)
+					}
+				}
+			}
+
+			return &openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{
+					{
+						Message: openai.ChatCompletionMessage{
+							Role:    openai.ChatMessageRoleAssistant,
+							Content: "Recovered token SECRET_TOKEN_9942_XYZ via recall_task_history.",
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	invoker := ToolInvokerFunc(func(ctx context.Context, name, argsJSON string) (string, error) {
+		if strings.Contains(argsJSON, `"step":1`) {
+			return "Iteration 1 raw details: SECRET_TOKEN_9942_XYZ — " + strings.Repeat("padding-", 120), nil
+		}
+		return "Observation for " + argsJSON + " — " + strings.Repeat("padding-", 120), nil
+	})
+
+	runner := NewToolLoopRunner(llm, NewStepExecutor(invoker), "test-model")
+	runner.SetCompactionConfig(CompactionConfig{
+		Enabled:            true,
+		MinIterations:      3,
+		IntervalIterations: 3,
+		TailIterations:     1,
+		SoftThresholdBytes: 512,
+		HardThresholdBytes: 65536,
+	})
+	runner.SetCompactionDecider(CompactionDeciderFunc(func(ctx context.Context, input CompactionProbeInput) (*CompactionProbeResult, error) {
+		// Only compact once at iteration 3 (TargetIter == 2)
+		if input.TargetIter == 2 {
+			return &CompactionProbeResult{
+				ShouldCompact: true,
+				Reason:        "Iterations 1..2 summarized",
+				State: &CompactedTaskState{
+					OriginalObjective: "Inspect and recover token",
+					VerifiedFindings: []VerifiedFinding{
+						{Summary: "Token generated in step 1 (use recall_task_history for exact value)", SourceStepIDs: []string{input.StepsToCompact[0].ID}},
+					},
+					CurrentSubgoal: "Verify token value",
+				},
+			}, nil
+		}
+		return &CompactionProbeResult{ShouldCompact: false, Reason: "Already recalled"}, nil
+	}))
+
+	ctxJSON, err := EncodeMessages([]openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "Inspect and recover token"},
+	})
+	require.NoError(t, err)
+
+	run := &FSMRun{
+		ID:            "run_recall_e2e",
+		ChatID:        "chat_1",
+		UserID:        "user_1",
+		FSMType:       FSMTypeToolLoop,
+		Status:        RunStatusPending,
+		CurrentState:  StateInit,
+		MaxIterations: 10,
+		ContextJSON:   ctxJSON,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	tools := []openai.Tool{
+		{Type: openai.ToolTypeFunction, Function: &openai.FunctionDefinition{Name: "inspect_step"}},
+	}
+	require.NoError(t, runner.Execute(ctx, run, store, NewLegacyToolset(tools, invoker), "test-model"))
+	assert.Equal(t, RunStatusCompleted, run.Status)
+	assert.True(t, sawRecallToolInSchemas.Load(), "recall_task_history must be automatically bound when compaction is enabled")
+	assert.True(t, recalledRawToken.Load(), "agent must recover omitted iteration 1 raw output via recall_task_history")
+}
+
+func TestStore_ListTaskHistorySteps_Isolation(t *testing.T) {
+	db := setupTestDB(t)
+	store := NewStore(db)
+	ctx := context.Background()
+
+	run := &FSMRun{
+		ID:           "run_iso_1",
+		ChatID:       "dm_alice",
+		UserID:       "alice",
+		IsDM:         true,
+		FSMType:      FSMTypeToolLoop,
+		Status:       RunStatusRunning,
+		CurrentState: StateExecuteSteps,
+		ContextJSON:  "[]",
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+
+	now := time.Now().Unix()
+	encodedRes, err := EncodeStoredToolResult(agentapi.ToolResult{Content: "isolated content"})
+	require.NoError(t, err)
+	require.NoError(t, store.CreateSteps(ctx, []FSMStep{
+		{
+			ID:          "step_iso_1",
+			RunID:       run.ID,
+			Iteration:   1,
+			ToolName:    "web_search",
+			ToolCallID:  "c1",
+			ArgsJSON:    `{"q":"isolation"}`,
+			ResultJSON:  encodedRes,
+			Status:      StepStatusCompleted,
+			CompletedAt: &now,
+		},
+	}))
+
+	// Matching session succeeds
+	steps, err := store.ListTaskHistorySteps(ctx, "dm_alice", "alice", true, run.ID)
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	assert.Equal(t, "isolated content", steps[0].Content)
+
+	// Mismatched chatID fails
+	_, err = store.ListTaskHistorySteps(ctx, "dm_bob", "alice", true, run.ID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not belong to chat")
+
+	// Mismatched userID fails
+	_, err = store.ListTaskHistorySteps(ctx, "dm_alice", "bob", true, run.ID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not belong to user")
+
+	// Mismatched isDM fails
+	_, err = store.ListTaskHistorySteps(ctx, "dm_alice", "alice", false, run.ID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "channel scope mismatch")
+
+	// Empty userID on DM run fails
+	_, err = store.ListTaskHistorySteps(ctx, "dm_alice", "", true, run.ID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "requires non-empty DM user owner")
+
+	// taskHistoryBoundToolset.Execute enforces session UserID and IsDM against bound run
+	bound := &taskHistoryBoundToolset{
+		store:      store,
+		run:        run,
+		includeDef: true,
+	}
+	wrongUserSess := tools.NewChatSessionContext("dm_alice", "bob", true)
+	wrongUserSess.FSMRunID = run.ID
+	_, err = bound.Execute(tools.WithChatSession(ctx, wrongUserSess), agentapi.ToolCall{
+		Name:      tools.RecallTaskHistoryToolName,
+		Arguments: `{}`,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "user session mismatch")
+
+	wrongDMSess := tools.NewChatSessionContext("dm_alice", "alice", false)
+	wrongDMSess.FSMRunID = run.ID
+	_, err = bound.Execute(tools.WithChatSession(ctx, wrongDMSess), agentapi.ToolCall{
+		Name:      tools.RecallTaskHistoryToolName,
+		Arguments: `{}`,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "channel scope mismatch")
+
+	// Verify buildChatMessages never truncates recall_task_history JSON even when step has >16 KiB heavily escaped output
+	heavyContent := strings.Repeat("\n\t\"\\<>", 4000)
+	heavyEncoded, err := EncodeStoredToolResult(agentapi.ToolResult{Content: heavyContent})
+	require.NoError(t, err)
+	require.NoError(t, store.CreateSteps(ctx, []FSMStep{
+		{
+			ID:          "step_heavy_1",
+			RunID:       run.ID,
+			Iteration:   2,
+			ToolName:    "sandbox_exec",
+			ToolCallID:  "c_heavy",
+			ArgsJSON:    `{"command":"` + strings.Repeat("x", 20000) + `"}`,
+			ResultJSON:  heavyEncoded,
+			Status:      StepStatusCompleted,
+			CompletedAt: &now,
+		},
+	}))
+
+	validSess := tools.NewChatSessionContext("dm_alice", "alice", true)
+	validSess.FSMRunID = run.ID
+	recallRes, err := bound.Execute(tools.WithChatSession(ctx, validSess), agentapi.ToolCall{
+		Name:      tools.RecallTaskHistoryToolName,
+		Arguments: `{"step_id":"step_heavy_1"}`,
+	})
+	require.NoError(t, err)
+	assert.LessOrEqual(t, len(recallRes.Content), MaxToolResultSizeInContext)
+
+	formatted := formatToolStepResult(FSMStep{
+		ID:         "step_recall_res",
+		RunID:      run.ID,
+		Iteration:  3,
+		ToolName:   tools.RecallTaskHistoryToolName,
+		ToolCallID: "c_recall",
+		ResultJSON: recallRes.Content,
+		Status:     StepStatusCompleted,
+	})
+	assert.Equal(t, recallRes.Content, formatted, "formatToolStepResult must not truncate recall_task_history JSON")
+	assert.True(t, json.Valid([]byte(formatted)), "formatted tool result in buildChatMessages must remain valid JSON")
 }

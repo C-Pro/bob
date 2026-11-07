@@ -24,13 +24,19 @@ import (
 )
 
 type mockAttachmentClient struct {
-	mu               sync.Mutex
-	downloadFunc     func(ctx context.Context, fileID string) ([]byte, string, error)
-	uploadFileFunc   func(ctx context.Context, data []byte, filename, mimeType string) (string, error)
-	uploadImageFunc  func(ctx context.Context, data []byte, filename, mimeType string) (string, error)
-	downloadCalls    []string
-	uploadFileCalls  []struct{ Data []byte; Filename, MimeType string }
-	uploadImageCalls []struct{ Data []byte; Filename, MimeType string }
+	mu              sync.Mutex
+	downloadFunc    func(ctx context.Context, fileID string) ([]byte, string, error)
+	uploadFileFunc  func(ctx context.Context, data []byte, filename, mimeType string) (string, error)
+	uploadImageFunc func(ctx context.Context, data []byte, filename, mimeType string) (string, error)
+	downloadCalls   []string
+	uploadFileCalls []struct {
+		Data               []byte
+		Filename, MimeType string
+	}
+	uploadImageCalls []struct {
+		Data               []byte
+		Filename, MimeType string
+	}
 }
 
 func (m *mockAttachmentClient) DownloadAttachment(ctx context.Context, fileID string) ([]byte, string, error) {

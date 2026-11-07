@@ -42,17 +42,17 @@
 ---
 
 ## Step 3: Raw Task History Recovery Tool (`recall_task_history` in `internal/tools`, `internal/fsm`)
-- [ ] Task: Implement `recall_task_history` tool
-    - [ ] Define `RecallTaskHistoryArgs` (`iteration`, `step_id`, `tool_call_id`, `query`, `offset_bytes`, `max_bytes`) and JSON Schema in `internal/tools`
-    - [ ] Query `fsm_steps` strictly scoped to the active `run_id` and session
-    - [ ] Support retrieving full raw tool arguments and outputs (with byte-offset slicing for outputs larger than `MaxToolResultSizeInContext`)
-    - [ ] Classify `recall_task_history` as `ExecutionModeParallel` (read-only)
-    - [ ] Automatically include `recall_task_history` in the bound toolset for FSM runs when compaction is enabled
-- [ ] Task: Write unit and integration tests for `recall_task_history`
-    - [ ] Test retrieving omitted/compacted step results by iteration, `step_id`, and keyword query
-    - [ ] Verify cross-run and cross-chat isolation (cannot query steps belonging to another `run_id` or chat)
-- [ ] Task: Step 3 Verification
-    - [ ] Run `go test -race ./internal/tools/... ./internal/fsm/...`
+- [x] Task: Implement `recall_task_history` tool
+    - [x] Define `RecallTaskHistoryArgs` (`iteration`, `step_id`, `tool_call_id`, `query`, `offset_bytes`, `max_bytes`) and JSON Schema in `internal/tools`
+    - [x] Query `fsm_steps` strictly scoped to the active `run_id` and session
+    - [x] Support retrieving full raw tool arguments and outputs (with byte-offset slicing for outputs larger than `MaxToolResultSizeInContext`)
+    - [x] Classify `recall_task_history` as `ExecutionModeParallel` (read-only)
+    - [x] Automatically include `recall_task_history` in the bound toolset for FSM runs when compaction is enabled
+- [x] Task: Write unit and integration tests for `recall_task_history`
+    - [x] Test retrieving omitted/compacted step results by iteration, `step_id`, and keyword query
+    - [x] Verify cross-run and cross-chat isolation (cannot query steps belonging to another `run_id` or chat)
+- [x] Task: Step 3 Verification
+    - [x] Run `go test -race ./internal/tools/... ./internal/fsm/...`
 
 ---
 

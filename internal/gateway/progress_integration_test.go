@@ -476,4 +476,3 @@ func TestGatewayFSMProgressCard_NoToolsEmitsNoProgress(t *testing.T) {
 	defer mu.Unlock()
 	assert.Equal(t, 0, postedProgressCount, "no progress messages should be posted when 0 tools are called")
 }
-

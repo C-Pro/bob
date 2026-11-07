@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"bob/internal/agentapi"
+	"bob/internal/tools"
 	"bob/internal/trajectory"
 )
 
@@ -869,4 +870,61 @@ func (s *Store) HasCompactionEventForIteration(ctx context.Context, runID string
 		return false, fmt.Errorf("failed to query compaction events for run %s iter %d: %w", runID, iteration, err)
 	}
 	return count > 0, nil
+}
+
+// ListTaskHistorySteps implements tools.TaskHistoryStore by verifying that runID belongs to
+// the specified chat/session and returning all durable FSMSteps for that run.
+func (s *Store) ListTaskHistorySteps(ctx context.Context, chatID, userID string, isDM bool, runID string) ([]tools.TaskHistoryStep, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("fsm store is not initialized")
+	}
+	run, err := s.GetRun(ctx, runID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve run %s: %w", runID, err)
+	}
+	if run.ChatID != chatID {
+		return nil, fmt.Errorf("run %s does not belong to chat %s", runID, chatID)
+	}
+	if run.IsDM != isDM {
+		return nil, fmt.Errorf("run %s channel scope mismatch", runID)
+	}
+	if run.IsDM && (run.UserID == "" || userID == "") {
+		return nil, fmt.Errorf("run %s requires non-empty DM user owner", runID)
+	}
+	if run.UserID != userID {
+		return nil, fmt.Errorf("run %s does not belong to user %s", runID, userID)
+	}
+
+	steps, err := s.ListStepsByRun(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+
+	res := make([]tools.TaskHistoryStep, 0, len(steps))
+	for _, st := range steps {
+		var content string
+		if st.ResultJSON != "" {
+			decoded, decErr := DecodeStoredToolResult(st.ResultJSON)
+			if decErr == nil {
+				content = decoded.Content
+			} else {
+				content = st.ResultJSON
+			}
+		}
+		res = append(res, tools.TaskHistoryStep{
+			ID:          st.ID,
+			RunID:       st.RunID,
+			Iteration:   st.Iteration,
+			StepIndex:   st.StepIndex,
+			ToolName:    st.ToolName,
+			ToolCallID:  st.ToolCallID,
+			ArgsJSON:    st.ArgsJSON,
+			Status:      string(st.Status),
+			Content:     content,
+			ErrorText:   st.ErrorText,
+			StartedAt:   st.StartedAt,
+			CompletedAt: st.CompletedAt,
+		})
+	}
+	return res, nil
 }

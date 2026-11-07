@@ -198,6 +198,9 @@ func (g *Gateway) SetMemoryManager(m *memory.Manager) {
 		if g.toolsRegistry != nil {
 			g.toolsRegistry.SetKnowledgeStoreProvider(g.storeProvider)
 			g.toolsRegistry.SetKnowledgeSearcherProvider(g.storeProvider)
+			if g.cfg.FSMCompactionEnabled {
+				g.toolsRegistry.SetTaskHistoryProvider(g.storeProvider)
+			}
 		}
 		workerCfg := DefaultKnowledgeWorkerConfig()
 		if g.cfg.KnowledgeReconcileInterval > 0 {
@@ -244,6 +247,9 @@ func (g *Gateway) SetStoreProvider(p *MemoryStoreProvider) {
 	if g.toolsRegistry != nil && p != nil {
 		g.toolsRegistry.SetKnowledgeStoreProvider(p)
 		g.toolsRegistry.SetKnowledgeSearcherProvider(p)
+		if g.cfg != nil && g.cfg.FSMCompactionEnabled {
+			g.toolsRegistry.SetTaskHistoryProvider(p)
+		}
 	}
 	var newKW *KnowledgeWorker
 	if p != nil && g.cfg != nil {

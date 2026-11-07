@@ -44,7 +44,7 @@ func (f ToolInvokerFunc) Execute(ctx context.Context, name string, argsJSON stri
 // IsReadOnlyTool reports whether a tool is pure read-only and side-effect free.
 func IsReadOnlyTool(name string) bool {
 	switch strings.TrimSpace(name) {
-	case "web_search", "web_fetch", "recall_memory", "discover_memories", "discover_skills":
+	case "web_search", "web_fetch", "recall_memory", "discover_memories", "discover_skills", "recall_task_history":
 		return true
 	default:
 		return false

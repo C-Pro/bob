@@ -93,6 +93,7 @@ type Registry struct {
 	knowledgeLimits                KnowledgeBudgetLimits
 	knowledgeDefaultDiscoveryLimit int
 	knowledgeMaxDiscoveryLimit     int
+	taskHistoryProvider            TaskHistoryProvider
 	dmAuthorizer                   DMAuthorizer
 	toolDefinitions                []openai.Tool
 	dmToolDefinitions              []openai.Tool
@@ -444,6 +445,15 @@ func (r *Registry) ToolDefinitionsForSession(session ChatSessionContext) []opena
 		if !session.IsScheduled {
 			tools = append(tools, r.knowledgeToolDefs...)
 		}
+		if r.taskHistoryProvider != nil && strings.TrimSpace(session.FSMRunID) != "" {
+			tools = append(tools, RecallTaskHistoryToolDefinition())
+		}
+		return tools
+	}
+	if r.taskHistoryProvider != nil && strings.TrimSpace(session.FSMRunID) != "" {
+		tools := make([]openai.Tool, 0, len(r.toolDefinitions)+1)
+		tools = append(tools, r.toolDefinitions...)
+		tools = append(tools, RecallTaskHistoryToolDefinition())
 		return tools
 	}
 	return r.toolDefinitions
@@ -522,6 +532,8 @@ func (r *Registry) Execute(ctx context.Context, name string, argsJSON string) (s
 		return r.executeDiscoverSkills(ctx, argsJSON)
 	case "load_skill":
 		return r.executeLoadSkill(ctx, argsJSON)
+	case RecallTaskHistoryToolName:
+		return r.executeRecallTaskHistory(ctx, argsJSON)
 	default:
 		return "", fmt.Errorf("unknown tool: %s", name)
 	}

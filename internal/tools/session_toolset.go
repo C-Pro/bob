@@ -12,7 +12,7 @@ import (
 // IsReadOnlyTool reports whether a tool provided by this registry is read-only and side-effect free.
 func IsReadOnlyTool(name string) bool {
 	switch strings.TrimSpace(name) {
-	case "web_search", "web_fetch", "recall_memory", "discover_memories", "discover_skills":
+	case "web_search", "web_fetch", "recall_memory", "discover_memories", "discover_skills", RecallTaskHistoryToolName:
 		return true
 	default:
 		return false
@@ -38,7 +38,15 @@ func (s *SessionToolset) Definitions(ctx context.Context) ([]agentapi.ToolDefini
 	if s.registry == nil {
 		return nil, nil
 	}
-	openaiTools := s.registry.ToolDefinitionsForSession(s.session)
+	callSession := s.session
+	if ctxSess, ok := ChatSessionFromContext(ctx); ok {
+		if ctxSess.ChatID == s.session.ChatID && (s.session.UserID == "" || ctxSess.UserID == s.session.UserID) {
+			if ctxSess.FSMRunID != "" {
+				callSession.FSMRunID = ctxSess.FSMRunID
+			}
+		}
+	}
+	openaiTools := s.registry.ToolDefinitionsForSession(callSession)
 	defs := make([]agentapi.ToolDefinition, 0, len(openaiTools))
 	for _, t := range openaiTools {
 		if t.Function == nil || t.Function.Name == "" {

@@ -149,6 +149,9 @@ func New(cfg *config.Config, opts Options) (*Runtime, error) {
 	toolsRegistry.SetSchedulerStoreProvider(storeProvider)
 	toolsRegistry.SetKnowledgeStoreProvider(storeProvider)
 	toolsRegistry.SetKnowledgeSearcherProvider(storeProvider)
+	if cfg.FSMCompactionEnabled {
+		toolsRegistry.SetTaskHistoryProvider(storeProvider)
+	}
 	toolsRegistry.SetSchedulerLimits(
 		cfg.SchedulerMinRunTimeout,
 		cfg.SchedulerMaxRunTimeout,

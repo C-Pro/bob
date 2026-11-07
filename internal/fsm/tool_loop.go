@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"bob/internal/agentapi"
+	"bob/internal/tools"
 	"bob/internal/trajectory"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -32,6 +33,7 @@ type ToolLoopRunner struct {
 	defaultModel      string
 	toolDefProvider   ToolDefinitionProvider
 	compactionCfg     CompactionConfig
+	compactionCfgSet  bool
 	compactionDecider CompactionDecider
 }
 
@@ -41,9 +43,10 @@ func NewToolLoopRunner(llmClient LLMClient, stepExecutor *StepExecutor, defaultM
 		stepExecutor = NewStepExecutor(nil)
 	}
 	return &ToolLoopRunner{
-		llmClient:    llmClient,
-		stepExecutor: stepExecutor,
-		defaultModel: defaultModel,
+		llmClient:     llmClient,
+		stepExecutor:  stepExecutor,
+		defaultModel:  defaultModel,
+		compactionCfg: DefaultCompactionConfig(),
 	}
 }
 
@@ -52,6 +55,7 @@ func (r *ToolLoopRunner) SetCompactionConfig(cfg CompactionConfig) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.compactionCfg = cfg
+	r.compactionCfgSet = true
 }
 
 // SetCompactionDecider configures a custom CompactionDecider for evaluating the SelfCompact rubric.
@@ -75,11 +79,95 @@ func (r *ToolLoopRunner) HasToolDefinitionProvider() bool {
 	return r.toolDefProvider != nil
 }
 
-func (r *ToolLoopRunner) resolveBinding(ctx context.Context, run *FSMRun, toolset agentapi.Toolset) (*ToolBinding, error) {
+func (r *ToolLoopRunner) resolveBinding(ctx context.Context, run *FSMRun, store *Store, toolset agentapi.Toolset) (*ToolBinding, error) {
 	if toolset != nil {
+		r.mu.RLock()
+		cfg := r.compactionCfg
+		cfgSet := r.compactionCfgSet
+		r.mu.RUnlock()
+
+		if store != nil && run != nil && cfg.Enabled {
+			includeDef := cfgSet
+			if !includeDef {
+				if latest, err := store.GetLatestCompaction(ctx, run.ID); err == nil && latest != nil {
+					includeDef = true
+				}
+			}
+			toolset = &taskHistoryBoundToolset{
+				base:       toolset,
+				store:      store,
+				run:        run,
+				includeDef: includeDef,
+			}
+		}
 		return NewToolBinding(ctx, toolset)
 	}
 	return NewToolBinding(ctx, nil)
+}
+
+type taskHistoryBoundToolset struct {
+	base       agentapi.Toolset
+	store      *Store
+	run        *FSMRun
+	includeDef bool
+}
+
+func (t *taskHistoryBoundToolset) Definitions(ctx context.Context) ([]agentapi.ToolDefinition, error) {
+	if t.base == nil {
+		return nil, nil
+	}
+	defs, err := t.base.Definitions(ctx)
+	if err != nil || len(defs) == 0 {
+		return defs, err
+	}
+	for _, d := range defs {
+		if d.Schema.Function != nil && d.Schema.Function.Name == tools.RecallTaskHistoryToolName {
+			return defs, nil
+		}
+	}
+	if !t.includeDef {
+		return defs, nil
+	}
+	out := make([]agentapi.ToolDefinition, 0, len(defs)+1)
+	out = append(out, defs...)
+	out = append(out, agentapi.ToolDefinition{
+		Schema:   tools.RecallTaskHistoryToolDefinition(),
+		ReadOnly: true,
+	})
+	return out, nil
+}
+
+func (t *taskHistoryBoundToolset) Execute(ctx context.Context, call agentapi.ToolCall) (agentapi.ToolResult, error) {
+	if call.Name == tools.RecallTaskHistoryToolName {
+		if t.store == nil || t.run == nil {
+			return agentapi.ToolResult{}, errors.New("task history store is unavailable")
+		}
+		chatID := t.run.ChatID
+		userID := t.run.UserID
+		isDM := t.run.IsDM
+		if sess, ok := tools.ChatSessionFromContext(ctx); ok {
+			if sess.ChatID != "" && sess.ChatID != chatID {
+				return agentapi.ToolResult{}, fmt.Errorf("chat session mismatch for recall_task_history: %q vs %q", sess.ChatID, chatID)
+			}
+			if sess.FSMRunID != "" && sess.FSMRunID != t.run.ID {
+				return agentapi.ToolResult{}, fmt.Errorf("fsm run mismatch for recall_task_history: %q vs %q", sess.FSMRunID, t.run.ID)
+			}
+			if sess.IsDM != isDM {
+				return agentapi.ToolResult{}, fmt.Errorf("channel scope mismatch for recall_task_history: %t vs %t", sess.IsDM, isDM)
+			}
+			if sess.UserID != userID {
+				return agentapi.ToolResult{}, fmt.Errorf("user session mismatch for recall_task_history: %q vs %q", sess.UserID, userID)
+			}
+			userID = sess.UserID
+			isDM = sess.IsDM
+		}
+		content, err := tools.ExecuteRecallTaskHistoryWithStore(ctx, t.store, chatID, userID, isDM, t.run.ID, call.Arguments)
+		return agentapi.ToolResult{Content: content}, err
+	}
+	if t.base == nil {
+		return agentapi.ToolResult{}, errors.New("base toolset is not configured")
+	}
+	return t.base.Execute(ctx, call)
 }
 
 // Execute drives the state machine for the given FSMRun until it reaches a terminal or suspended state.
@@ -189,7 +277,7 @@ func (r *ToolLoopRunner) handleInit(ctx context.Context, run *FSMRun, store *Sto
 }
 
 func (r *ToolLoopRunner) handleLLMRequest(ctx context.Context, run *FSMRun, store *Store, toolset agentapi.Toolset, model string) error {
-	binding, err := r.resolveBinding(ctx, run, toolset)
+	binding, err := r.resolveBinding(ctx, run, store, toolset)
 	if err != nil {
 		run.Status = RunStatusFailed
 		run.CurrentState = StateFailed
@@ -307,7 +395,7 @@ func (r *ToolLoopRunner) handleLLMRequest(ctx context.Context, run *FSMRun, stor
 }
 
 func (r *ToolLoopRunner) handlePrepareSteps(ctx context.Context, run *FSMRun, store *Store, toolset agentapi.Toolset) error {
-	binding, err := r.resolveBinding(ctx, run, toolset)
+	binding, err := r.resolveBinding(ctx, run, store, toolset)
 	if err != nil {
 		run.Status = RunStatusFailed
 		run.CurrentState = StateFailed
@@ -392,7 +480,7 @@ func (r *ToolLoopRunner) handleExecuteSteps(ctx context.Context, run *FSMRun, st
 		return false, store.UpdateRun(ctx, run)
 	}
 
-	binding, err := r.resolveBinding(ctx, run, toolset)
+	binding, err := r.resolveBinding(ctx, run, store, toolset)
 	if err != nil {
 		run.Status = RunStatusFailed
 		run.CurrentState = StateFailed

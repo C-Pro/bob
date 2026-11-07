@@ -1561,5 +1561,3 @@ func TestGateway_FSMToolLoop_KnowledgeProposalProvenance_Integration(t *testing.
 	assert.Equal(t, int64(42), *memVer.Provenance.SourceMessageSeq)
 	assert.NotEmpty(t, memVer.Provenance.FSMRunID)
 }
-
-
