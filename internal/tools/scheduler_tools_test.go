@@ -493,4 +493,3 @@ func TestScheduleTask_ExpiresAtDaysParsing(t *testing.T) {
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "cannot exceed 30 days")
 }
-

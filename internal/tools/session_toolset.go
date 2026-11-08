@@ -12,7 +12,7 @@ import (
 // IsReadOnlyTool reports whether a tool provided by this registry is read-only and side-effect free.
 func IsReadOnlyTool(name string) bool {
 	switch strings.TrimSpace(name) {
-	case "web_search", "web_fetch", "recall_memory", "discover_memories", "discover_skills":
+	case "web_search", "web_fetch", "recall_memory", "discover_memories", "discover_skills", RecallTaskHistoryToolName:
 		return true
 	default:
 		return false
@@ -33,12 +33,55 @@ func (r *Registry) SessionToolset(session ChatSessionContext) agentapi.Toolset {
 	}
 }
 
+// KnowledgeBudget returns the KnowledgeBudgetTracker bound to this SessionToolset.
+func (s *SessionToolset) KnowledgeBudget() *KnowledgeBudgetTracker {
+	if s == nil {
+		return nil
+	}
+	return s.session.KnowledgeBudget
+}
+
+// ExtractKnowledgeBudget unwraps a Toolset (including AllowlistToolset and CompositeToolset wrappers)
+// to locate an underlying KnowledgeBudgetTracker if present.
+func ExtractKnowledgeBudget(toolset agentapi.Toolset) *KnowledgeBudgetTracker {
+	if toolset == nil {
+		return nil
+	}
+	if st, ok := toolset.(*SessionToolset); ok {
+		return st.KnowledgeBudget()
+	}
+	if prov, ok := toolset.(interface {
+		KnowledgeBudget() *KnowledgeBudgetTracker
+	}); ok {
+		return prov.KnowledgeBudget()
+	}
+	if al, ok := toolset.(*allowlistToolset); ok {
+		return ExtractKnowledgeBudget(al.base)
+	}
+	if comp, ok := toolset.(*compositeToolset); ok {
+		for _, sub := range comp.sets {
+			if b := ExtractKnowledgeBudget(sub); b != nil {
+				return b
+			}
+		}
+	}
+	return nil
+}
+
 // Definitions returns the authorized tool definitions for the bound session.
 func (s *SessionToolset) Definitions(ctx context.Context) ([]agentapi.ToolDefinition, error) {
 	if s.registry == nil {
 		return nil, nil
 	}
-	openaiTools := s.registry.ToolDefinitionsForSession(s.session)
+	callSession := s.session
+	if ctxSess, ok := ChatSessionFromContext(ctx); ok {
+		if ctxSess.ChatID == s.session.ChatID && (s.session.UserID == "" || ctxSess.UserID == s.session.UserID) {
+			if ctxSess.FSMRunID != "" {
+				callSession.FSMRunID = ctxSess.FSMRunID
+			}
+		}
+	}
+	openaiTools := s.registry.ToolDefinitionsForSession(callSession)
 	defs := make([]agentapi.ToolDefinition, 0, len(openaiTools))
 	for _, t := range openaiTools {
 		if t.Function == nil || t.Function.Name == "" {

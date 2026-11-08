@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -399,3 +400,197 @@ func TestNewManager_EmbedderResolution(t *testing.T) {
 	})
 }
 
+func TestSetWatermarkMonotonic(t *testing.T) {
+	manager := NewManager(&config.Config{DataDir: t.TempDir(), EmbeddingModel: "none"}, nil)
+	t.Cleanup(func() { assert.NoError(t, manager.Close()) })
+	ctx := context.Background()
+	for _, chat := range []struct {
+		id   string
+		isDM bool
+	}{{"townhall", false}, {"alice", true}} {
+		t.Run(chat.id, func(t *testing.T) {
+			require.NoError(t, manager.SetWatermark(ctx, chat.id, chat.isDM, 10))
+			db, err := manager.GetDB(ctx, chat.id, chat.isDM)
+			require.NoError(t, err)
+			_, err = db.SQL().ExecContext(ctx, `UPDATE watermark SET updated_at = '2000-01-01 00:00:00' WHERE id = 1`)
+			require.NoError(t, err)
+			var originalTimestamp string
+			require.NoError(t, db.SQL().QueryRowContext(ctx, `SELECT updated_at FROM watermark WHERE id = 1`).Scan(&originalTimestamp))
+
+			require.NoError(t, manager.SetWatermark(ctx, chat.id, chat.isDM, 5))
+			seq, err := manager.GetWatermark(ctx, chat.id, chat.isDM)
+			require.NoError(t, err)
+			assert.Equal(t, int64(10), seq)
+			var timestamp string
+			require.NoError(t, db.SQL().QueryRowContext(ctx, `SELECT updated_at FROM watermark WHERE id = 1`).Scan(&timestamp))
+			assert.Equal(t, originalTimestamp, timestamp)
+
+			require.NoError(t, manager.SetWatermark(ctx, chat.id, chat.isDM, 10))
+			require.NoError(t, db.SQL().QueryRowContext(ctx, `SELECT updated_at FROM watermark WHERE id = 1`).Scan(&timestamp))
+			assert.NotEqual(t, originalTimestamp, timestamp)
+			require.NoError(t, manager.SetWatermark(ctx, chat.id, chat.isDM, 11))
+			seq, err = manager.GetWatermark(ctx, chat.id, chat.isDM)
+			require.NoError(t, err)
+			assert.Equal(t, int64(11), seq)
+		})
+	}
+}
+
+func TestIndexMessagesConcurrentSameChat(t *testing.T) {
+	manager := NewManager(&config.Config{DataDir: t.TempDir(), EmbeddingModel: "none"}, nil)
+	t.Cleanup(func() { assert.NoError(t, manager.Close()) })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	const workers = 12
+	start := make(chan struct{})
+	results := make(chan error, workers)
+	for i := 1; i <= workers; i++ {
+		go func(seq int64) {
+			<-start
+			results <- manager.IndexMessages(ctx, "alice", true, []MessageToStore{{
+				Seq: seq, Timestamp: seq, ChatID: "alice", UserID: "alice", Role: "user",
+				Content: fmt.Sprintf("Concurrent message %d", seq),
+			}})
+		}(int64(i))
+	}
+	close(start)
+	for i := 0; i < workers; i++ {
+		select {
+		case err := <-results:
+			require.NoError(t, err)
+		case <-ctx.Done():
+			t.Fatal("concurrent indexing did not terminate")
+		}
+	}
+	seq, err := manager.GetWatermark(ctx, "alice", true)
+	require.NoError(t, err)
+	assert.Equal(t, int64(workers), seq)
+	db, err := manager.GetDB(ctx, "alice", true)
+	require.NoError(t, err)
+	var chunks int
+	require.NoError(t, db.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM messages WHERE id LIKE 'chunk_%'`).Scan(&chunks))
+	assert.Equal(t, workers, chunks)
+	manager.chatLocksMu.Lock()
+	assert.Empty(t, manager.chatLocks, "unused chat locks must be reclaimed")
+	manager.chatLocksMu.Unlock()
+}
+
+func TestIndexMessagesIndependentChatsRunConcurrently(t *testing.T) {
+	for _, sameID := range []bool{false, true} {
+		t.Run(fmt.Sprintf("same ID different channel=%t", sameID), func(t *testing.T) {
+			entered := make(chan string, 8)
+			release := make(chan struct{})
+			embedder := &mockEmbedder{dim: 3, model: "concurrent-probe", fn: func(text string) []float32 {
+				entered <- text
+				<-release
+				return []float32{0.1, 0.2, 0.3}
+			}}
+			manager := NewManager(&config.Config{DataDir: t.TempDir()}, embedder)
+			t.Cleanup(func() { assert.NoError(t, manager.Close()) })
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			secondID, secondIsDM := "bob", true
+			if sameID {
+				secondID, secondIsDM = "alice", false
+			}
+			_, err := manager.GetDB(ctx, "alice", true)
+			require.NoError(t, err)
+			_, err = manager.GetDB(ctx, secondID, secondIsDM)
+			require.NoError(t, err)
+			results := make(chan error, 2)
+			for _, chat := range []struct {
+				id   string
+				isDM bool
+			}{{"alice", true}, {secondID, secondIsDM}} {
+				go func(id string, isDM bool) {
+					results <- manager.IndexMessages(ctx, id, isDM, []MessageToStore{{Seq: 1, ChatID: id, Content: "Concurrent indexing for " + id}})
+				}(chat.id, chat.isDM)
+			}
+			// Both chats must reach the embedder before either can finish indexing.
+			overlapped := true
+			for i := 0; i < 2; i++ {
+				select {
+				case <-entered:
+				case <-ctx.Done():
+					overlapped = false
+				}
+			}
+			close(release)
+			for i := 0; i < 2; i++ {
+				assert.NoError(t, <-results)
+			}
+			require.True(t, overlapped, "independent chats must index concurrently")
+		})
+	}
+}
+
+func TestChatIndexLockCancellation(t *testing.T) {
+	for _, indexMessages := range []bool{false, true} {
+		t.Run(fmt.Sprintf("through IndexMessages=%t", indexMessages), func(t *testing.T) {
+			manager := NewManager(&config.Config{DataDir: t.TempDir(), EmbeddingModel: "none"}, nil)
+			t.Cleanup(func() { assert.NoError(t, manager.Close()) })
+			release, err := manager.acquireChatLock(context.Background(), "alice", true)
+			require.NoError(t, err)
+			defer release()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			result := make(chan error, 1)
+			go func() {
+				if indexMessages {
+					result <- manager.IndexMessages(ctx, "alice", true, []MessageToStore{{Seq: 1, Content: "waiting message"}})
+					return
+				}
+				unlock, err := manager.acquireChatLock(ctx, "alice", true)
+				if unlock != nil {
+					unlock()
+				}
+				result <- err
+			}()
+			require.Eventually(t, func() bool {
+				manager.chatLocksMu.Lock()
+				defer manager.chatLocksMu.Unlock()
+				return manager.chatLocks[chatLockKey{chatID: "alice", isDM: true}].refs == 2
+			}, time.Second, time.Millisecond, "second operation must be waiting on the held chat lock")
+			cancel()
+			select {
+			case err := <-result:
+				require.ErrorIs(t, err, context.Canceled)
+			case <-time.After(time.Second):
+				t.Fatal("chat lock did not honor cancellation")
+			}
+			manager.chatLocksMu.Lock()
+			assert.Equal(t, 1, manager.chatLocks[chatLockKey{chatID: "alice", isDM: true}].refs)
+			manager.chatLocksMu.Unlock()
+		})
+	}
+}
+
+func TestChatIndexLockRejectsCancelledContext(t *testing.T) {
+	manager := NewManager(&config.Config{DataDir: t.TempDir(), EmbeddingModel: "none"}, nil)
+	t.Cleanup(func() { assert.NoError(t, manager.Close()) })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	release, err := manager.acquireChatLock(ctx, "alice", true)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, release)
+	assert.Empty(t, manager.chatLocks)
+}
+
+func TestIndexMessagesPropagatesWatermarkReadError(t *testing.T) {
+	manager := NewManager(&config.Config{DataDir: t.TempDir(), EmbeddingModel: "none"}, nil)
+	t.Cleanup(func() { assert.NoError(t, manager.Close()) })
+	ctx := context.Background()
+	db, err := manager.GetDB(ctx, "alice", true)
+	require.NoError(t, err)
+	_, err = db.SQL().ExecContext(ctx, `DROP TABLE watermark`)
+	require.NoError(t, err)
+	messages := []MessageToStore{{Seq: 1, ChatID: "alice", Content: "watermark failure regression"}}
+	err = manager.IndexMessages(ctx, "alice", true, messages)
+	require.ErrorContains(t, err, "failed to read watermark")
+	assert.ErrorContains(t, err, "no such table: watermark")
+	require.NoError(t, manager.initWatermarkTable(ctx, db.SQL()))
+	require.NoError(t, manager.IndexMessages(ctx, "alice", true, messages), "failed indexing must release the chat lock")
+	seq, err := manager.GetWatermark(ctx, "alice", true)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), seq)
+}

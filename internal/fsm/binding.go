@@ -181,4 +181,3 @@ func (p *providerToolset) Execute(ctx context.Context, call agentapi.ToolCall) (
 	content, err := p.invoker.Execute(ctx, call.Name, call.Arguments)
 	return agentapi.ToolResult{Content: content}, err
 }
-

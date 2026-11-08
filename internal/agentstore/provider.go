@@ -16,6 +16,7 @@ import (
 	"bob/internal/knowledge"
 	"bob/internal/memory"
 	"bob/internal/scheduler"
+	"bob/internal/tools"
 	"bob/internal/trajectory"
 )
 
@@ -36,10 +37,10 @@ type knowledgeEntry struct {
 
 // MemoryStoreProvider implements fsm.StoreProvider backed by memory.Manager and per-chat SQLite databases.
 type MemoryStoreProvider struct {
-	memMgr            *memory.Manager
-	dataDir           string
-	mu                sync.RWMutex
-	storeEntries      map[string]*storeEntry
+	memMgr               *memory.Manager
+	dataDir              string
+	mu                   sync.RWMutex
+	storeEntries         map[string]*storeEntry
 	knowledgeEntries     map[string]*knowledgeEntry
 	maxDiscoveryLimit    int
 	trajectoryFlushDelay time.Duration
@@ -193,6 +194,11 @@ func (p *MemoryStoreProvider) GetStore(ctx context.Context, chatID string, isDM 
 
 	entry.store = fsm.NewStore(rawDB)
 	return entry.store, nil
+}
+
+// GetTaskHistoryStore implements tools.TaskHistoryProvider backed by the chat's isolated FSM store.
+func (p *MemoryStoreProvider) GetTaskHistoryStore(ctx context.Context, chatID string, isDM bool) (tools.TaskHistoryStore, error) {
+	return p.GetStore(ctx, chatID, isDM)
 }
 
 // GetSchedulerStore retrieves or initializes the isolated scheduler store for the given chat context.

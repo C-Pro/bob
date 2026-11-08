@@ -49,6 +49,16 @@ func FormatProgressStep(toolCall openai.ToolCall) (title, desc string) {
 			desc = "Querying memory"
 		}
 
+	case RecallTaskHistoryToolName:
+		title = "Recall Task History"
+		if sid := parseStringArg(rawArgs, "step_id"); sid != "" {
+			desc = "Inspecting step: " + sid
+		} else if q := parseStringArg(rawArgs, "query"); q != "" {
+			desc = "Searching task history for: " + q
+		} else {
+			desc = "Inspecting earlier task steps"
+		}
+
 	case "sandbox_exec":
 		cmd := parseStringArg(rawArgs, "command")
 		explicitDesc := parseStringArg(rawArgs, "description")

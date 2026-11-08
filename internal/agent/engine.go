@@ -16,8 +16,10 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 
 	"bob/internal/agentapi"
+	"bob/internal/chatcontext"
 	"bob/internal/fsm"
 	"bob/internal/llm"
+	"bob/internal/tools"
 	"bob/internal/trajectory"
 )
 
@@ -219,7 +221,7 @@ func (e *Engine) Run(ctx context.Context, turn agentapi.Turn) (agentapi.Result, 
 		return agentapi.Result{}, fmt.Errorf("frontend %q bind failed: %w", feID, err)
 	}
 
-	// Extract user input and active skills for trajectory recording
+	// Extract user input and active knowledge provenance for trajectory recording
 	var userInput string
 	for i := len(turn.Messages) - 1; i >= 0; i-- {
 		if turn.Messages[i].Role == openai.ChatMessageRoleUser {
@@ -227,12 +229,7 @@ func (e *Engine) Run(ctx context.Context, turn agentapi.Turn) (agentapi.Result, 
 			break
 		}
 	}
-	var activeSkills []string
-	if turn.Run.Metadata != nil {
-		if s, ok := turn.Run.Metadata["active_skills"]; ok && s != "" {
-			activeSkills = strings.Split(s, ",")
-		}
-	}
+	activeSkills, activeMemories, manifestJSON := extractTurnKnowledgeProvenance(ctx, turn.Run.Metadata, bindings.Tools)
 
 	trajStore := e.resolveTrajectoryStore(ctx, turn.Run.Session.SessionID, turn.Run.Session.IsDM)
 	privacy, exportApproved := trajectory.DerivePrivacyLevel(turn.Run.Session.IsDM, userInput, turn.SystemPrompt, activeSkills)
@@ -267,20 +264,35 @@ func (e *Engine) Run(ctx context.Context, turn agentapi.Turn) (agentapi.Result, 
 		}
 	}
 
+	taskState := trajectory.FormatTaskStateWithProvenance(turn.SystemPrompt, manifestJSON, activeMemories, activeSkills)
 	startPayload := trajectory.TurnStartPayload{
-		RunID:          turn.Run.RunID,
-		FrontendID:     feID,
-		SessionID:      turn.Run.Session.SessionID,
-		ScopeID:        turn.Run.Session.ScopeID,
-		ActorID:        turn.Run.Actor.ID,
-		Model:          model,
-		ExecutionKind:  string(turn.Run.Kind),
-		PrivacyLevel:   privacy,
-		ExportApproved: exportApproved,
-		Generation:     1,
-		Input:          userInput,
-		TaskState:      turn.SystemPrompt,
-		ActiveSkills:   activeSkills,
+		RunID:           turn.Run.RunID,
+		FrontendID:      feID,
+		SessionID:       turn.Run.Session.SessionID,
+		ScopeID:         turn.Run.Session.ScopeID,
+		ActorID:         turn.Run.Actor.ID,
+		Model:           model,
+		ExecutionKind:   string(turn.Run.Kind),
+		PrivacyLevel:    privacy,
+		ExportApproved:  exportApproved,
+		Generation:      1,
+		Input:           userInput,
+		TaskState:       taskState,
+		ActiveSkills:    activeSkills,
+		ActiveMemories:  activeMemories,
+		ContextManifest: manifestJSON,
+	}
+
+	buildTerminalPayload := func(gen int, reason string, failed bool, finalReply string) trajectory.TurnTerminalPayload {
+		curSkills, curMemories, _ := extractTurnKnowledgeProvenance(ctx, turn.Run.Metadata, bindings.Tools)
+		return trajectory.TurnTerminalPayload{
+			Generation:     gen,
+			Reason:         reason,
+			Failed:         failed,
+			FinalReply:     finalReply,
+			ActiveSkills:   trajectory.MergeVersionIDs(activeSkills, curSkills),
+			ActiveMemories: trajectory.MergeVersionIDs(activeMemories, curMemories),
+		}
 	}
 
 	if trajStore != nil {
@@ -344,12 +356,7 @@ func (e *Engine) Run(ctx context.Context, turn agentapi.Turn) (agentapi.Result, 
 			}
 			executed = true
 			if trajStore != nil {
-				termPayload := trajectory.TurnTerminalPayload{
-					Generation: 1,
-					Reason:     "completed",
-					Failed:     false,
-					FinalReply: fsmRes.Content,
-				}
+				termPayload := buildTerminalPayload(1, "completed", false, fsmRes.Content)
 				if termEv, evErr := trajectory.MakeTurnTerminalEvent(trajID, turn.Run.RunID, 1, termPayload); evErr == nil {
 					_ = trajStore.RecordEvent(ctx, termEv)
 				}
@@ -359,11 +366,7 @@ func (e *Engine) Run(ctx context.Context, turn agentapi.Turn) (agentapi.Result, 
 			if ctx.Err() != nil {
 				if trajStore != nil {
 					cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
-					termPayload := trajectory.TurnTerminalPayload{
-						Generation: 1,
-						Reason:     "cancelled",
-						Failed:     true,
-					}
+					termPayload := buildTerminalPayload(1, "cancelled", true, "")
 					if termEv, evErr := trajectory.MakeTurnTerminalEvent(trajID, turn.Run.RunID, 1, termPayload); evErr == nil {
 						_ = trajStore.RecordEvent(cleanupCtx, termEv)
 					}
@@ -378,11 +381,7 @@ func (e *Engine) Run(ctx context.Context, turn agentapi.Turn) (agentapi.Result, 
 			if errors.As(err, &storeErr) {
 				slog.Error("fsm tool loop persistence failure, blocking volatile fallback", "session", turn.Run.Session.SessionID, "error", err)
 				if trajStore != nil {
-					termPayload := trajectory.TurnTerminalPayload{
-						Generation: 1,
-						Reason:     "fsm_failed",
-						Failed:     true,
-					}
+					termPayload := buildTerminalPayload(1, "fsm_failed", true, "")
 					if termEv, evErr := trajectory.MakeTurnTerminalEvent(trajID, turn.Run.RunID, 1, termPayload); evErr == nil {
 						_ = trajStore.RecordEvent(ctx, termEv)
 					}
@@ -399,11 +398,7 @@ func (e *Engine) Run(ctx context.Context, turn agentapi.Turn) (agentapi.Result, 
 					if isTimeout {
 						reason = "timeout"
 					}
-					termPayload := trajectory.TurnTerminalPayload{
-						Generation: 1,
-						Reason:     reason,
-						Failed:     true,
-					}
+					termPayload := buildTerminalPayload(1, reason, true, "")
 					if termEv, evErr := trajectory.MakeTurnTerminalEvent(trajID, turn.Run.RunID, 1, termPayload); evErr == nil {
 						_ = trajStore.RecordEvent(ctx, termEv)
 					}
@@ -456,11 +451,7 @@ func (e *Engine) Run(ctx context.Context, turn agentapi.Turn) (agentapi.Result, 
 				reply, err = e.llmClient.GenerateChatResponseWithToolLoop(ctx, llmMsgs, openaiTools, recExecutor, maxIterations)
 				if err != nil {
 					if trajStore != nil {
-						termPayload := trajectory.TurnTerminalPayload{
-							Generation: fallbackGen,
-							Reason:     "volatile_failed",
-							Failed:     true,
-						}
+						termPayload := buildTerminalPayload(fallbackGen, "volatile_failed", true, "")
 						if termEv, evErr := trajectory.MakeTurnTerminalEvent(trajID, turn.Run.RunID, fallbackGen, termPayload); evErr == nil {
 							_ = trajStore.RecordEvent(ctx, termEv)
 						}
@@ -488,12 +479,7 @@ func (e *Engine) Run(ctx context.Context, turn agentapi.Turn) (agentapi.Result, 
 		}
 
 		if trajStore != nil {
-			termPayload := trajectory.TurnTerminalPayload{
-				Generation: fallbackGen,
-				Reason:     "completed",
-				Failed:     false,
-				FinalReply: reply,
-			}
+			termPayload := buildTerminalPayload(fallbackGen, "completed", false, reply)
 			if termEv, evErr := trajectory.MakeTurnTerminalEvent(trajID, turn.Run.RunID, fallbackGen, termPayload); evErr == nil {
 				_ = trajStore.RecordEvent(ctx, termEv)
 			}
@@ -525,12 +511,7 @@ func (e *Engine) Run(ctx context.Context, turn agentapi.Turn) (agentapi.Result, 
 		}
 		if deliverErr := fe.Deliver(deliverCtx, comp); deliverErr != nil {
 			if trajStore != nil {
-				termPayload := trajectory.TurnTerminalPayload{
-					Generation: finalGen,
-					Reason:     "delivery_failed",
-					Failed:     true,
-					FinalReply: result.Content,
-				}
+				termPayload := buildTerminalPayload(finalGen, "delivery_failed", true, result.Content)
 				if termEv, evErr := trajectory.MakeTurnTerminalEvent(trajID, turn.Run.RunID, finalGen, termPayload, "delivery"); evErr == nil {
 					_ = trajStore.RecordEvent(deliverCtx, termEv)
 				}
@@ -544,6 +525,48 @@ func (e *Engine) Run(ctx context.Context, turn agentapi.Turn) (agentapi.Result, 
 	}
 
 	return result, nil
+}
+
+func extractTurnKnowledgeProvenance(
+	ctx context.Context,
+	metadata map[string]string,
+	toolset agentapi.Toolset,
+) (skills []string, memories []string, manifestJSON json.RawMessage) {
+	var metaSkills, metaMemories []string
+	var manifestSkills, manifestMemories []string
+
+	if metadata != nil {
+		if s := strings.TrimSpace(metadata["active_skills"]); s != "" {
+			metaSkills = strings.Split(s, ",")
+		}
+		if m := strings.TrimSpace(metadata["active_memories"]); m != "" {
+			metaMemories = strings.Split(m, ",")
+		}
+		if rawManifest := strings.TrimSpace(metadata["context_manifest"]); rawManifest != "" && json.Valid([]byte(rawManifest)) {
+			manifestJSON = json.RawMessage(rawManifest)
+			var parsed chatcontext.AssemblyManifest
+			if err := json.Unmarshal(manifestJSON, &parsed); err == nil {
+				manifestSkills = parsed.SkillVersions
+				manifestMemories = parsed.MemoryVersions
+			}
+		}
+	}
+
+	var ctxSkills, ctxMemories []string
+	if sess, ok := tools.ChatSessionFromContext(ctx); ok && sess.KnowledgeBudget != nil {
+		ctxSkills = sess.KnowledgeBudget.LoadedSkillVersions()
+		ctxMemories = sess.KnowledgeBudget.LoadedMemoryVersions()
+	}
+
+	var boundSkills, boundMemories []string
+	if budget := tools.ExtractKnowledgeBudget(toolset); budget != nil {
+		boundSkills = budget.LoadedSkillVersions()
+		boundMemories = budget.LoadedMemoryVersions()
+	}
+
+	skills = trajectory.MergeVersionIDs(metaSkills, manifestSkills, ctxSkills, boundSkills)
+	memories = trajectory.MergeVersionIDs(metaMemories, manifestMemories, ctxMemories, boundMemories)
+	return skills, memories, manifestJSON
 }
 
 type recordingExecutor struct {

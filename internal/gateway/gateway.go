@@ -26,6 +26,7 @@ import (
 	"bob/internal/commands"
 	"bob/internal/config"
 	"bob/internal/fsm"
+	"bob/internal/knowledge"
 	"bob/internal/llm"
 	"bob/internal/memory"
 	"bob/internal/models"
@@ -198,6 +199,9 @@ func (g *Gateway) SetMemoryManager(m *memory.Manager) {
 		if g.toolsRegistry != nil {
 			g.toolsRegistry.SetKnowledgeStoreProvider(g.storeProvider)
 			g.toolsRegistry.SetKnowledgeSearcherProvider(g.storeProvider)
+			if g.cfg.FSMCompactionEnabled {
+				g.toolsRegistry.SetTaskHistoryProvider(g.storeProvider)
+			}
 		}
 		workerCfg := DefaultKnowledgeWorkerConfig()
 		if g.cfg.KnowledgeReconcileInterval > 0 {
@@ -244,6 +248,9 @@ func (g *Gateway) SetStoreProvider(p *MemoryStoreProvider) {
 	if g.toolsRegistry != nil && p != nil {
 		g.toolsRegistry.SetKnowledgeStoreProvider(p)
 		g.toolsRegistry.SetKnowledgeSearcherProvider(p)
+		if g.cfg != nil && g.cfg.FSMCompactionEnabled {
+			g.toolsRegistry.SetTaskHistoryProvider(p)
+		}
 	}
 	var newKW *KnowledgeWorker
 	if p != nil && g.cfg != nil {
@@ -483,6 +490,7 @@ func (g *Gateway) Deliver(ctx context.Context, comp agentapi.Completion) error {
 		// suppress generic failure apologies to the chat on crash recovery.
 		return nil
 	}
+	defer g.clearSourceImages(comp.Run)
 
 	g.mu.Lock()
 	botID := g.botUserID
@@ -517,6 +525,7 @@ func (g *Gateway) Deliver(ctx context.Context, comp agentapi.Completion) error {
 		return nil
 	}
 
+	reply = g.finalizeImageReply(ctx, comp.Run, reply)
 	if reply == "" {
 		return nil
 	}
@@ -542,11 +551,10 @@ func (g *Gateway) Deliver(ctx context.Context, comp agentapi.Completion) error {
 		return fmt.Errorf("failed to deliver reply to chat %s: %w", chatID, err)
 	}
 
-	pushContent, pushImages := formattedReply, []chatcontext.ImageAttachment(nil)
+	pushContent := formattedReply
 	if len(outgoingAttachments) > 0 {
-		extraText, images := g.processAttachments(ctx, outgoingAttachments)
+		extraText, _ := g.processAttachments(ctx, outgoingAttachments)
 		pushContent = strings.TrimSpace(formattedReply + extraText)
-		pushImages = images
 	}
 
 	g.contextManager.Push(chatID, chatcontext.Entry{
@@ -554,7 +562,6 @@ func (g *Gateway) Deliver(ctx context.Context, comp agentapi.Completion) error {
 		SenderID:   botID,
 		SenderName: botName,
 		Content:    pushContent,
-		Images:     pushImages,
 		Timestamp:  time.Now().Unix(),
 	})
 
@@ -1619,6 +1626,12 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 }
 
 func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Message, isDM bool, senderName, currentTask string, initialProgressSeq int64) error {
+	sourceRun := agentapi.RunDescriptor{
+		Session:  agentapi.SessionRef{SessionID: msg.ChatID},
+		Actor:    agentapi.Actor{ID: msg.UserID},
+		Metadata: map[string]string{"source_message_seq": strconv.FormatInt(msg.Seq, 10)},
+	}
+	defer g.clearSourceImages(sourceRun)
 	g.mu.Lock()
 	runner := g.runner
 	botID := g.botUserID
@@ -1664,21 +1677,18 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 
 	slog.Info("processing bot message request", "chatID", msg.ChatID, "sender", senderName)
 
-	bufferedMsgs := g.contextManager.GetLLMMessages(msg.ChatID)
-	convMsgs := make([]openai.ChatCompletionMessage, 0, len(bufferedMsgs)+1)
-	convMsgs = append(convMsgs, bufferedMsgs...)
+	// Authoritative verification for knowledge and sandbox capabilities:
+	// A session is granted DM privileges only if it is an authoritative 1-on-1 DM owned by msg.UserID.
+	isAuthorizedDMOwner := isDM && g.VerifyDMOwner(ctx, msg.ChatID, msg.UserID) == nil
 
-	// Defense-in-depth: Ensure message list never ends with an assistant message (e.g. Gemini 400 constraint)
-	if len(convMsgs) > 0 && convMsgs[len(convMsgs)-1].Role == openai.ChatMessageRoleAssistant {
-		continuation := "Please continue."
-		if currentTask != "" {
-			continuation = "Please proceed with: " + currentTask
-		}
-		convMsgs = append(convMsgs, openai.ChatCompletionMessage{
-			Role:    openai.ChatMessageRoleUser,
-			Content: continuation,
-		})
+	continuation := "Please continue."
+	if currentTask != "" {
+		continuation = "Please proceed with: " + currentTask
 	}
+	assemblyInput, assemblyBudgets := g.buildAssemblyInput(ctx, msg, isDM, isAuthorizedDMOwner, systemPrompt, continuation)
+	assembled := g.contextManager.Assemble(msg.ChatID, assemblyInput, assemblyBudgets)
+	systemPrompt = assembled.SystemPrompt
+	convMsgs := assembled.Messages
 
 	if runner != nil {
 		maxIterations := g.cfg.TownhallToolMaxIterations
@@ -1691,6 +1701,9 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 		}
 		if msg.Seq > 0 {
 			metadata["source_message_seq"] = strconv.FormatInt(msg.Seq, 10)
+		}
+		if len(assembled.ManifestJSON) > 0 {
+			metadata["context_manifest"] = string(assembled.ManifestJSON)
 		}
 
 		turn := agentapi.Turn{
@@ -1751,9 +1764,6 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 	} else {
 		budgetLimits = tools.DefaultKnowledgeBudgetLimits()
 	}
-	// Authoritative verification for knowledge and sandbox capabilities:
-	// A session is granted DM privileges only if it is an authoritative 1-on-1 DM owned by msg.UserID.
-	isAuthorizedDMOwner := isDM && g.VerifyDMOwner(ctx, msg.ChatID, msg.UserID) == nil
 
 	sessionCtx := tools.NewChatSessionContext(msg.ChatID, msg.UserID, isAuthorizedDMOwner, budgetLimits)
 	sessionCtx.Notifier = func(chatID, text string) error {
@@ -1885,6 +1895,7 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 		}
 	}
 
+	reply = g.finalizeImageReply(ctx, sourceRun, reply)
 	formattedReply := FormatResponse(reply, isDM, g.cfg.TownhallMaxParagraphs, g.cfg.DMMaxParagraphs)
 
 	var outgoingAttachments []models.Attachment
@@ -1899,11 +1910,10 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 		return fmt.Errorf("failed to send reply to chat %s: %w", msg.ChatID, err)
 	}
 
-	pushContent, pushImages := formattedReply, []chatcontext.ImageAttachment(nil)
+	pushContent := formattedReply
 	if len(outgoingAttachments) > 0 {
-		extraText, images := g.processAttachments(ctx, outgoingAttachments)
+		extraText, _ := g.processAttachments(ctx, outgoingAttachments)
 		pushContent = strings.TrimSpace(formattedReply + extraText)
-		pushImages = images
 	}
 
 	g.contextManager.Push(msg.ChatID, chatcontext.Entry{
@@ -1911,7 +1921,6 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 		SenderID:   botID,
 		SenderName: botUser.GetDisplayName(),
 		Content:    pushContent,
-		Images:     pushImages,
 		Timestamp:  time.Now().Unix(),
 	})
 
@@ -2468,4 +2477,137 @@ func (g *Gateway) VerifyDMOwner(ctx context.Context, chatID, userID string) erro
 	}
 
 	return nil
+}
+
+func (g *Gateway) buildAssemblyInput(ctx context.Context, msg models.Message, isDM, isAuthorizedDMOwner bool, systemPrompt, continuation string) (chatcontext.AssemblyInput, chatcontext.SourceBudgets) {
+	input := chatcontext.AssemblyInput{
+		ChatID:             msg.ChatID,
+		SystemPrompt:       systemPrompt,
+		ContinuationPrompt: continuation,
+	}
+	budgets := chatcontext.DefaultSourceBudgets()
+	if g.cfg != nil {
+		if g.cfg.KnowledgeMaxLoadedMemoryBytes > 0 {
+			budgets.StructuredMemoryBytes = g.cfg.KnowledgeMaxLoadedMemoryBytes
+		}
+		if g.cfg.KnowledgeMaxLoadedSkillBytes > 0 {
+			budgets.ProceduralSkillBytes = g.cfg.KnowledgeMaxLoadedSkillBytes
+		}
+	}
+
+	g.mu.Lock()
+	memMgr := g.memoryManager
+	sp := g.storeProvider
+	g.mu.Unlock()
+
+	var dataDir string
+	if g.cfg != nil {
+		dataDir = g.cfg.DataDir
+	}
+	hasDB := hasPersistedChatDB(memMgr, sp, dataDir, msg.ChatID, isDM)
+
+	if memMgr != nil && hasDB {
+		if eps, err := memMgr.ListEpisodes(ctx, msg.ChatID, isDM); err == nil && len(eps) > 0 {
+			const maxPreloadedEpisodes = 3
+			for i := len(eps) - 1; i >= 0 && len(input.Episodes) < maxPreloadedEpisodes; i-- {
+				ep := eps[i]
+				if isDM && ep.ChatID != "" && ep.ChatID != msg.ChatID {
+					continue
+				}
+				input.Episodes = append(input.Episodes, ep)
+			}
+			// Reverse to chronological order (oldest to newest among the recent slice)
+			for i, j := 0, len(input.Episodes)-1; i < j; i, j = i+1, j-1 {
+				input.Episodes[i], input.Episodes[j] = input.Episodes[j], input.Episodes[i]
+			}
+			// For the newest episode, if it is ongoing or unresolved, also include its latest raw chunk.
+			if len(input.Episodes) > 0 {
+				newestEp := input.Episodes[len(input.Episodes)-1]
+				if (newestEp.TaskStatus == memory.EpisodeStatusOngoing || newestEp.TaskStatus == memory.EpisodeStatusUnresolved) && len(newestEp.SourceChunkIDs) > 0 {
+					lastChunkID := newestEp.SourceChunkIDs[len(newestEp.SourceChunkIDs)-1]
+					if chunks, cErr := memMgr.GetRawChunks(ctx, msg.ChatID, isDM, memory.RawChunkQuery{ChunkID: lastChunkID, Limit: 1}); cErr == nil && len(chunks) > 0 {
+						input.HistoricalItems = append(input.HistoricalItems, chunks...)
+					}
+				}
+			}
+		}
+	}
+
+	if isAuthorizedDMOwner && sp != nil && hasDB {
+		nowUnix := time.Now().UTC().Unix()
+		if fsmStore, err := sp.GetStore(ctx, msg.ChatID, isDM); err == nil && fsmStore != nil {
+			if latestComp, cErr := fsmStore.GetLatestCompactionForChat(ctx, msg.ChatID); cErr == nil && latestComp != nil {
+				if kStore, kErr := sp.GetKnowledgeStore(ctx, msg.ChatID, isDM); kErr == nil && kStore != nil {
+					for _, verID := range latestComp.ActiveMemoryVersions {
+						ver, err := kStore.GetMemoryVersion(ctx, verID)
+						if err != nil || ver == nil {
+							continue
+						}
+						if ver.Status != knowledge.VersionStatusApproved {
+							continue
+						}
+						if ver.ExpiresAt != nil && nowUnix >= *ver.ExpiresAt {
+							continue
+						}
+						if ver.Provenance.ChatID != msg.ChatID || ver.Provenance.UserID != msg.UserID {
+							continue
+						}
+						item, err := kStore.GetItem(ctx, ver.ItemID)
+						if err != nil || item == nil || item.Status != knowledge.ItemStatusActive || item.ActiveVersionID != ver.ID {
+							continue
+						}
+						if item.ChatID != msg.ChatID || item.UserID != msg.UserID {
+							continue
+						}
+						input.Memories = append(input.Memories, *ver)
+					}
+					for _, verID := range latestComp.ActiveSkillVersions {
+						ver, err := kStore.GetSkillVersion(ctx, verID)
+						if err != nil || ver == nil {
+							continue
+						}
+						if ver.Status != knowledge.VersionStatusApproved {
+							continue
+						}
+						if ver.Provenance.ChatID != msg.ChatID || ver.Provenance.UserID != msg.UserID {
+							continue
+						}
+						item, err := kStore.GetItem(ctx, ver.ItemID)
+						if err != nil || item == nil || item.Status != knowledge.ItemStatusActive || item.ActiveVersionID != ver.ID {
+							continue
+						}
+						if item.ChatID != msg.ChatID || item.UserID != msg.UserID {
+							continue
+						}
+						input.Skills = append(input.Skills, *ver)
+					}
+				}
+			}
+		}
+	}
+
+	return input, budgets
+}
+
+func hasPersistedChatDB(memMgr *memory.Manager, sp *MemoryStoreProvider, dataDir, chatID string, isDM bool) bool {
+	if sp != nil {
+		if dbPath := sp.DBPath(chatID, isDM); dbPath != "" {
+			if fi, err := os.Stat(dbPath); err == nil && fi.Size() > 0 {
+				return true
+			}
+		}
+	}
+	if dataDir != "" {
+		name := "townhall.db"
+		if isDM && chatID != "townhall" {
+			name = fmt.Sprintf("dm_%s.db", memory.SanitizeChatID(chatID))
+		}
+		if fi, err := os.Stat(filepath.Join(dataDir, name)); err == nil && fi.Size() > 0 {
+			return true
+		}
+	}
+	if memMgr != nil && len(memMgr.ActiveDBs()) > 0 {
+		return true
+	}
+	return false
 }

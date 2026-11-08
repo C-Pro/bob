@@ -616,4 +616,3 @@ func TestSendProgressMessage(t *testing.T) {
 		require.Error(t, err)
 	})
 }
-

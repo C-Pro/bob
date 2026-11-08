@@ -258,7 +258,6 @@ func (m *mockChildFailingSender) getMessages() []models.ProgressData {
 	return res
 }
 
-
 func TestGatewayProgressObserver_DuplicateEmissionsSuppressed(t *testing.T) {
 	sender := &mockProgressSender{nextSeq: 5}
 	obs := NewGatewayProgressObserver(sender, "chat_dedup", true)

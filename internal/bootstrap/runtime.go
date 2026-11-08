@@ -149,6 +149,9 @@ func New(cfg *config.Config, opts Options) (*Runtime, error) {
 	toolsRegistry.SetSchedulerStoreProvider(storeProvider)
 	toolsRegistry.SetKnowledgeStoreProvider(storeProvider)
 	toolsRegistry.SetKnowledgeSearcherProvider(storeProvider)
+	if cfg.FSMCompactionEnabled {
+		toolsRegistry.SetTaskHistoryProvider(storeProvider)
+	}
 	toolsRegistry.SetSchedulerLimits(
 		cfg.SchedulerMinRunTimeout,
 		cfg.SchedulerMaxRunTimeout,
@@ -183,6 +186,14 @@ func New(cfg *config.Config, opts Options) (*Runtime, error) {
 				MaxLoadedMemoryBytes: cfg.KnowledgeMaxLoadedMemoryBytes,
 				MaxLoadedSkills:      cfg.KnowledgeMaxLoadedSkills,
 				MaxLoadedSkillBytes:  cfg.KnowledgeMaxLoadedSkillBytes,
+			}),
+			fsm.WithCompactionConfig(fsm.CompactionConfig{
+				Enabled:            cfg.FSMCompactionEnabled,
+				MinIterations:      cfg.FSMCompactionMinIterations,
+				IntervalIterations: cfg.FSMCompactionIntervalIterations,
+				TailIterations:     cfg.FSMCompactionTailIterations,
+				SoftThresholdBytes: cfg.FSMCompactionSoftThresholdBytes,
+				HardThresholdBytes: cfg.FSMCompactionHardThresholdBytes,
 			}),
 			fsm.WithRunFinalizer(func(ctx context.Context, run *fsm.FSMRun) error {
 				var errs []error

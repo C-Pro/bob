@@ -10,13 +10,13 @@ import (
 
 const (
 	// SchemaVersion is the current schema version for FSM tables.
-	SchemaVersion = 3
+	SchemaVersion = 4
 	// SchemaDescription describes the current FSM schema.
-	SchemaDescription = "add frontend_id, scope_id, model, execution_kind to fsm_runs"
+	SchemaDescription = "add fsm_compactions table for adaptive task compaction"
 )
 
 // EnsureDBSchema ensures that the namespaced FSM tables and version markers
-// (fsm_schema_version, fsm_runs, fsm_steps) exist and are up to date in the target SQLite database.
+// (fsm_schema_version, fsm_runs, fsm_steps, fsm_compactions) exist and are up to date in the target SQLite database.
 func EnsureDBSchema(ctx context.Context, db *sql.DB) error {
 	if db == nil {
 		return fmt.Errorf("database connection is nil")
@@ -101,6 +101,25 @@ func EnsureDBSchema(ctx context.Context, db *sql.DB) error {
 
 		CREATE INDEX IF NOT EXISTS idx_fsm_steps_run_iter
 			ON fsm_steps(run_id, iteration, step_index);
+
+		CREATE TABLE IF NOT EXISTS fsm_compactions (
+			id TEXT PRIMARY KEY,
+			run_id TEXT NOT NULL,
+			version INTEGER NOT NULL,
+			parent_version INTEGER NOT NULL DEFAULT 0,
+			compacted_up_to_iter INTEGER NOT NULL,
+			rubric_verdict TEXT NOT NULL,
+			state_json TEXT NOT NULL,
+			model TEXT NOT NULL DEFAULT '',
+			input_bytes INTEGER NOT NULL DEFAULT 0,
+			output_bytes INTEGER NOT NULL DEFAULT 0,
+			created_at INTEGER NOT NULL,
+			FOREIGN KEY(run_id) REFERENCES fsm_runs(id) ON DELETE CASCADE,
+			UNIQUE(run_id, version)
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_fsm_compactions_run_ver
+			ON fsm_compactions(run_id, version DESC);
 	`
 	if _, err := db.ExecContext(ctx, schemaSQL); err != nil {
 		return fmt.Errorf("failed to initialize fsm tables: %w", err)

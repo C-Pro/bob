@@ -1,6 +1,7 @@
 package fsm
 
 import (
+	"encoding/json"
 	"testing"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -169,4 +170,48 @@ func TestNewStepFromToolCall(t *testing.T) {
 	}
 	stepNonExec := NewStepFromToolCall("run_1", 2, 6, tcNonExec, ExecutionModeParallel)
 	assert.Equal(t, 30, stepNonExec.TimeoutSeconds)
+}
+
+func TestCompactedTaskStateSerialization(t *testing.T) {
+	probe := CompactionProbeResult{
+		ShouldCompact: true,
+		Reason:        "Subtask 1 finished and verified",
+		State: &CompactedTaskState{
+			Version:              1,
+			ParentVersion:        0,
+			RunID:                "run_123",
+			CompactedUpToIter:    3,
+			CompactedStepIDs:     []string{"run_123_i1_s0", "run_123_i2_s0"},
+			OriginalObjective:    "Investigate database schema and add compactions table",
+			ImmutableConstraints: []string{"Never delete raw fsm_steps"},
+			VerifiedFindings: []VerifiedFinding{
+				{
+					Summary:       "fsm uses fsm_schema_version in per-chat SQLite DB",
+					SourceStepIDs: []string{"run_123_i1_s0"},
+				},
+			},
+			DecisionsAndRejected: []string{"Use fsm_compactions table instead of mutating context_json"},
+			CurrentSubgoal:       "Implement store CRUD for compactions",
+			NextIntendedActions:  []string{"Add SaveCompaction and GetLatestCompaction"},
+			RubricVerdict:        CompactionVerdictProbedCompact,
+			Model:                "gpt-4o",
+			InputBytes:           8192,
+			OutputBytes:          512,
+			CreatedAt:            1700000000,
+		},
+	}
+
+	raw, err := json.Marshal(probe)
+	require.NoError(t, err)
+
+	var decoded CompactionProbeResult
+	require.NoError(t, json.Unmarshal(raw, &decoded))
+	assert.True(t, decoded.ShouldCompact)
+	assert.Equal(t, "Subtask 1 finished and verified", decoded.Reason)
+	require.NotNil(t, decoded.State)
+	assert.Equal(t, 1, decoded.State.Version)
+	assert.Equal(t, "run_123", decoded.State.RunID)
+	assert.Equal(t, 3, decoded.State.CompactedUpToIter)
+	assert.Len(t, decoded.State.VerifiedFindings, 1)
+	assert.Equal(t, "run_123_i1_s0", decoded.State.VerifiedFindings[0].SourceStepIDs[0])
 }

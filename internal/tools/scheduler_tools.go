@@ -107,7 +107,7 @@ var (
 								"description": "Allowed hostnames when network is 'restricted'.",
 							},
 							"mounts": map[string]interface{}{
-								"type":        "array",
+								"type": "array",
 								"items": map[string]interface{}{
 									"type": "object",
 									"properties": map[string]interface{}{

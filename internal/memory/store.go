@@ -33,17 +33,24 @@ func SanitizeChatID(chatID string) string {
 	return cleaned
 }
 
-// MemoryItem represents a retrieved conversation chunk with source and metadata.
+// MemoryItem represents a retrieved conversation chunk or episode summary with source and metadata.
 type MemoryItem struct {
-	ID        string  `json:"id"`
-	Content   string  `json:"content"`
-	Source    string  `json:"source"` // e.g. "[Townhall]" or "[Direct Message]"
-	Score     float64 `json:"score"`
-	StartSeq  int64   `json:"startSeq"`
-	EndSeq    int64   `json:"endSeq"`
-	StartTime int64   `json:"startTime"`
-	EndTime   int64   `json:"endTime"`
-	ChatID    string  `json:"chatId"`
+	ID             string   `json:"id"`
+	Kind           string   `json:"kind,omitempty"`
+	Content        string   `json:"content"`
+	Source         string   `json:"source"` // e.g. "[Townhall]" or "[Direct Message]"
+	Score          float64  `json:"score"`
+	StartSeq       int64    `json:"startSeq"`
+	EndSeq         int64    `json:"endSeq"`
+	StartTime      int64    `json:"startTime"`
+	EndTime        int64    `json:"endTime"`
+	ChatID         string   `json:"chatId"`
+	EpisodeID      string   `json:"episodeId,omitempty"`
+	SourceChunkIDs []string `json:"sourceChunkIds,omitempty"`
+	Participants   []string `json:"participants,omitempty"`
+	TopicTags      []string `json:"topicTags,omitempty"`
+	TaskStatus     string   `json:"taskStatus,omitempty"`
+	ModelDerived   bool     `json:"modelDerived,omitempty"`
 }
 
 // MessageToStore represents an individual message to be included in an indexed chunk.
@@ -59,10 +66,64 @@ type MessageToStore struct {
 
 // Manager manages isolated SQLite sqvect databases per chat and watermark tracking.
 type Manager struct {
-	cfg      *config.Config
-	embedder cortexdb.Embedder
-	dbsMu    sync.RWMutex
-	dbs      map[string]*cortexdb.DB
+	cfg         *config.Config
+	embedder    cortexdb.Embedder
+	dbsMu       sync.RWMutex
+	dbs         map[string]*cortexdb.DB
+	chatLocksMu sync.Mutex
+	chatLocks   map[chatLockKey]*chatIndexLock
+}
+
+type chatLockKey struct {
+	chatID string
+	isDM   bool
+}
+
+type chatIndexLock struct {
+	held chan struct{}
+	refs int
+}
+
+func (m *Manager) acquireChatLock(ctx context.Context, chatID string, isDM bool) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	key := chatLockKey{chatID: chatID, isDM: isDM}
+	m.chatLocksMu.Lock()
+	if m.chatLocks == nil {
+		m.chatLocks = make(map[chatLockKey]*chatIndexLock)
+	}
+	lock := m.chatLocks[key]
+	if lock == nil {
+		lock = &chatIndexLock{held: make(chan struct{}, 1)}
+		m.chatLocks[key] = lock
+	}
+	lock.refs++
+	m.chatLocksMu.Unlock()
+
+	releaseRef := func() {
+		m.chatLocksMu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(m.chatLocks, key)
+		}
+		m.chatLocksMu.Unlock()
+	}
+	select {
+	case lock.held <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-lock.held
+			releaseRef()
+			return nil, err
+		}
+		return func() {
+			<-lock.held
+			releaseRef()
+		}, nil
+	case <-ctx.Done():
+		releaseRef()
+		return nil, ctx.Err()
+	}
 }
 
 func isNilEmbedder(e cortexdb.Embedder) bool {
@@ -189,6 +250,11 @@ func (m *Manager) GetDB(ctx context.Context, chatID string, isDM bool) (*cortexd
 		return nil, fmt.Errorf("failed to init watermark table at %s: %w", path, err)
 	}
 
+	if err := m.initEpisodeTable(ctx, openedDB.SQL()); err != nil {
+		_ = openedDB.Close()
+		return nil, fmt.Errorf("failed to init episode table at %s: %w", path, err)
+	}
+
 	m.dbs[key] = openedDB
 	return openedDB, nil
 }
@@ -232,8 +298,9 @@ func (m *Manager) SetWatermark(ctx context.Context, chatID string, isDM bool, se
 		INSERT INTO watermark (id, last_indexed_seq, updated_at)
 		VALUES (1, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(id) DO UPDATE SET
-			last_indexed_seq = excluded.last_indexed_seq,
-			updated_at = CURRENT_TIMESTAMP
+			last_indexed_seq = MAX(excluded.last_indexed_seq, watermark.last_indexed_seq),
+			updated_at = CASE WHEN excluded.last_indexed_seq >= watermark.last_indexed_seq
+				THEN excluded.updated_at ELSE watermark.updated_at END
 	`, seq)
 	return err
 }
@@ -242,6 +309,12 @@ const maxChunkSize = 33
 
 // IndexMessages stores batches of messages as formatted conversation chunks into the chat's isolated database and updates the watermark.
 func (m *Manager) IndexMessages(ctx context.Context, chatID string, isDM bool, msgs []MessageToStore) error {
+	release, err := m.acquireChatLock(ctx, chatID, isDM)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	if len(msgs) == 0 {
 		return nil
 	}
@@ -252,6 +325,7 @@ func (m *Manager) IndexMessages(ctx context.Context, chatID string, isDM bool, m
 	}
 
 	var maxSeq int64
+	chunkIDs := make([]string, 0, (len(msgs)+maxChunkSize-1)/maxChunkSize)
 
 	// Process messages in chunk batches
 	for i := 0; i < len(msgs); i += maxChunkSize {
@@ -299,7 +373,8 @@ func (m *Manager) IndexMessages(ctx context.Context, chatID string, isDM bool, m
 		}
 
 		formattedContent := sb.String()
-		chunkID := fmt.Sprintf("chunk_%s_%d_%d", SanitizeChatID(chatID), startSeq, endSeq)
+		chunkID := fmt.Sprintf("chunk_%s_%d_%d", uniqueChatIDSlug(chatID), startSeq, endSeq)
+		chunkIDs = append(chunkIDs, chunkID)
 
 		chatType := "townhall"
 		if isDM {
@@ -327,8 +402,18 @@ func (m *Manager) IndexMessages(ctx context.Context, chatID string, isDM bool, m
 		}
 	}
 
+	if len(chunkIDs) > 0 {
+		ep := buildEpisodeFromMessages(chatID, isDM, msgs, chunkIDs)
+		if err := m.saveEpisode(ctx, db, ep); err != nil {
+			return fmt.Errorf("failed to save episode for chat %s: %w", chatID, err)
+		}
+	}
+
 	if maxSeq > 0 {
-		curSeq, _ := m.GetWatermark(ctx, chatID, isDM)
+		curSeq, err := m.GetWatermark(ctx, chatID, isDM)
+		if err != nil {
+			return fmt.Errorf("failed to read watermark for chat %s: %w", chatID, err)
+		}
 		if maxSeq > curSeq {
 			if err := m.SetWatermark(ctx, chatID, isDM, maxSeq); err != nil {
 				slog.Warn("failed to update watermark", "chat_id", chatID, "seq", maxSeq, "error", err)
@@ -359,7 +444,11 @@ func (m *Manager) Search(ctx context.Context, query string, chatID string, isDM 
 		if err != nil {
 			return nil, err
 		}
-		return toMemoryItems(hits, "[Townhall]"), nil
+		items := m.enrichChunksAndMergeEpisodes(ctx, townhallDB, "townhall", "[Townhall]", query, toMemoryItems(hits, "[Townhall]"), limit)
+		if len(items) > limit {
+			items = items[:limit]
+		}
+		return items, nil
 	}
 
 	// DM Context: Search private DM DB + public Townhall DB
@@ -371,19 +460,21 @@ func (m *Manager) Search(ctx context.Context, query string, chatID string, isDM 
 	if err != nil {
 		slog.Warn("search in DM db failed", "chat_id", chatID, "error", err)
 	}
+	dmItems := m.enrichChunksAndMergeEpisodes(ctx, dmDB, chatID, "[Direct Message]", query, toMemoryItems(dmHits, "[Direct Message]"), limit)
 
 	townhallDB, err := m.GetDB(ctx, "townhall", false)
-	var thHits []cortexdb.MemorySearchHit
+	var thItems []MemoryItem
 	if err == nil {
-		thHits, err = m.searchDB(ctx, townhallDB, query, limit)
-		if err != nil {
-			slog.Warn("search in Townhall db for DM context failed", "error", err)
+		thHits, thErr := m.searchDB(ctx, townhallDB, query, limit)
+		if thErr != nil {
+			slog.Warn("search in Townhall db for DM context failed", "error", thErr)
 		}
+		thItems = m.enrichChunksAndMergeEpisodes(ctx, townhallDB, "townhall", "[Townhall]", query, toMemoryItems(thHits, "[Townhall]"), limit)
 	}
 
-	merged := make([]MemoryItem, 0, len(dmHits)+len(thHits))
-	merged = append(merged, toMemoryItems(dmHits, "[Direct Message]")...)
-	merged = append(merged, toMemoryItems(thHits, "[Townhall]")...)
+	merged := make([]MemoryItem, 0, len(dmItems)+len(thItems))
+	merged = append(merged, dmItems...)
+	merged = append(merged, thItems...)
 
 	// Deduplicate by ID and sort by score descending
 	seen := make(map[string]struct{}, len(merged))

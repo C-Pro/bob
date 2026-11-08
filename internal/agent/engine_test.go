@@ -17,6 +17,7 @@ import (
 	"bob/internal/agentapi"
 	"bob/internal/fsm"
 	"bob/internal/llm"
+	"bob/internal/tools"
 	"bob/internal/trajectory"
 )
 
@@ -859,4 +860,76 @@ func TestEngine_TrajectoryRecording_DeliveryFailure_UpdatesReason(t *testing.T) 
 	require.NoError(t, err)
 	assert.Equal(t, "delivery_failed", reason)
 }
+
+func TestEngine_TrajectoryRecording_ProvenanceManifestAndLoadedKnowledge(t *testing.T) {
+	ctx := context.Background()
+	trajStore, _ := setupTestTrajectoryStore(t)
+
+	// Prepare a SessionToolset whose KnowledgeBudgetTracker tracks loaded items during the turn
+	sessionCtx := tools.NewChatSessionContext("chat-prov", "user-1", true, tools.DefaultKnowledgeBudgetLimits())
+	require.NoError(t, sessionCtx.KnowledgeBudget.ChargeMemory("mem_dynamic", "mem_dynamic@2", "Dynamic memory content"))
+	require.NoError(t, sessionCtx.KnowledgeBudget.ChargeSkill("skill_dynamic", "skill_dynamic@3", "Instructions"))
+	sessionToolset := tools.NewRegistry(nil, nil).SessionToolset(sessionCtx)
+
+	fsmEng := &mockFSMEngine{
+		res: &fsm.ToolLoopResult{
+			RunID:   "run_prov_1",
+			Content: "completed with provenance",
+		},
+	}
+	fe := &mockFrontend{
+		bindings: agentapi.Bindings{
+			Tools: sessionToolset,
+		},
+	}
+
+	eng, err := NewEngine(Dependencies{
+		FSMEngine:       fsmEng,
+		TrajectoryStore: trajStore,
+		Frontends: map[string]agentapi.Frontend{
+			"besedka": fe,
+		},
+	})
+	require.NoError(t, err)
+
+	manifestJSON := `{"memory_versions":["mem_assembled@1"],"skill_versions":["skill_assembled@1"],"episode_ids":["ep_chat_1_5"],"chunk_ids":["chunk_6_8"],"ring_buffer":{"min_seq":10,"max_seq":12,"entry_count":3}}`
+	turn := agentapi.Turn{
+		Deliver:      false,
+		SystemPrompt: "You are Bob.",
+		Run: agentapi.RunDescriptor{
+			RunID: "run_prov_1",
+			Session: agentapi.SessionRef{
+				FrontendID: "besedka",
+				SessionID:  "chat-prov",
+				ScopeID:    "chat-prov",
+				IsDM:       false,
+			},
+			Actor: agentapi.Actor{ID: "user-1"},
+			Metadata: map[string]string{
+				"context_manifest": manifestJSON,
+			},
+		},
+		Messages: []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleUser, Content: "Check provenance"},
+		},
+	}
+
+	res, err := eng.Run(ctx, turn)
+	require.NoError(t, err)
+	assert.Equal(t, "completed with provenance", res.Content)
+
+	traj, err := trajStore.Get(ctx, "run_prov_1")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"skill_assembled@1", "skill_dynamic@3"}, traj.ActiveSkills)
+	assert.Equal(t, []string{"mem_assembled@1", "mem_dynamic@2"}, traj.ActiveMemories)
+	assert.Contains(t, traj.TaskState, "You are Bob.")
+	assert.Contains(t, traj.TaskState, "[Provenance Manifest]")
+
+	basePrompt, parsedManifest, parsedMem, parsedSkills := trajectory.ParseTaskStateProvenance(traj.TaskState)
+	assert.Equal(t, "You are Bob.", basePrompt)
+	assert.JSONEq(t, manifestJSON, string(parsedManifest))
+	assert.Equal(t, []string{"mem_assembled@1", "mem_dynamic@2"}, parsedMem)
+	assert.Equal(t, []string{"skill_assembled@1", "skill_dynamic@3"}, parsedSkills)
+}
+
 

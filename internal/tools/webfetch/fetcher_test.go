@@ -131,4 +131,3 @@ func TestFetchHTTPStatusErrors(t *testing.T) {
 		})
 	}
 }
-

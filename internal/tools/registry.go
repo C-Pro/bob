@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"bob/internal/memory"
 	"bob/internal/models"
@@ -93,6 +94,7 @@ type Registry struct {
 	knowledgeLimits                KnowledgeBudgetLimits
 	knowledgeDefaultDiscoveryLimit int
 	knowledgeMaxDiscoveryLimit     int
+	taskHistoryProvider            TaskHistoryProvider
 	dmAuthorizer                   DMAuthorizer
 	toolDefinitions                []openai.Tool
 	dmToolDefinitions              []openai.Tool
@@ -239,14 +241,25 @@ func (r *Registry) initToolDefinitions() {
 		"properties": map[string]interface{}{
 			"query": map[string]interface{}{
 				"type":        "string",
-				"description": "The search query to recall past conversations, topics, facts, or discussions from long-term memory.",
+				"description": "Search query to recall past conversations, topics, facts, episodes, or discussions from long-term memory. Optional when chunk_id, start_seq, or end_seq is provided.",
+			},
+			"chunk_id": map[string]interface{}{
+				"type":        "string",
+				"description": "Optional exact chunk_id (e.g. 'chunk_townhall_1_33') or episode_id (e.g. 'ep_townhall_1_33') to retrieve raw conversation chunks directly.",
+			},
+			"start_seq": map[string]interface{}{
+				"type":        "integer",
+				"description": "Optional starting message sequence number to retrieve raw conversation chunks overlapping [start_seq, end_seq].",
+			},
+			"end_seq": map[string]interface{}{
+				"type":        "integer",
+				"description": "Optional ending message sequence number to retrieve raw conversation chunks overlapping [start_seq, end_seq].",
 			},
 			"limit": map[string]interface{}{
 				"type":        "integer",
 				"description": "Maximum number of memory passages to retrieve (1-10, default 5).",
 			},
 		},
-		"required": []string{"query"},
 	}
 
 	allowedNetworkModes := []string{"none", "restricted"}
@@ -366,7 +379,7 @@ func (r *Registry) initToolDefinitions() {
 			Type: openai.ToolTypeFunction,
 			Function: &openai.FunctionDefinition{
 				Name:        "recall_memory",
-				Description: "Recall relevant past conversation history, discussions, topics, and facts from long-term memory. Use this tool when users ask about previous topics, past conversations, or shared history.",
+				Description: "Recall relevant past conversation history, discussions, topics, and episode navigation summaries from long-term memory. Provide 'query' for search, or 'chunk_id' / 'start_seq' / 'end_seq' to retrieve exact raw chunks. Episode summaries labeled [Model-Derived Episode Summary | seq <start>-<end>] are navigation indexes only; only when a summary is relevant and you need exact details, inspect its raw chunks (skip irrelevant summaries).",
 				Parameters:  recallMemorySchema,
 			},
 		},
@@ -444,6 +457,15 @@ func (r *Registry) ToolDefinitionsForSession(session ChatSessionContext) []opena
 		if !session.IsScheduled {
 			tools = append(tools, r.knowledgeToolDefs...)
 		}
+		if r.taskHistoryProvider != nil && strings.TrimSpace(session.FSMRunID) != "" {
+			tools = append(tools, RecallTaskHistoryToolDefinition())
+		}
+		return tools
+	}
+	if r.taskHistoryProvider != nil && strings.TrimSpace(session.FSMRunID) != "" {
+		tools := make([]openai.Tool, 0, len(r.toolDefinitions)+1)
+		tools = append(tools, r.toolDefinitions...)
+		tools = append(tools, RecallTaskHistoryToolDefinition())
 		return tools
 	}
 	return r.toolDefinitions
@@ -481,8 +503,11 @@ type WebFetchArgs struct {
 
 // RecallMemoryArgs defines arguments for the recall_memory tool.
 type RecallMemoryArgs struct {
-	Query string `json:"query"`
-	Limit int    `json:"limit,omitempty"`
+	Query    string `json:"query"`
+	ChunkID  string `json:"chunk_id,omitempty"`
+	StartSeq *int64 `json:"start_seq,omitempty"`
+	EndSeq   *int64 `json:"end_seq,omitempty"`
+	Limit    int    `json:"limit,omitempty"`
 }
 
 // Execute dispatches a tool execution by function name and arguments JSON.
@@ -522,10 +547,15 @@ func (r *Registry) Execute(ctx context.Context, name string, argsJSON string) (s
 		return r.executeDiscoverSkills(ctx, argsJSON)
 	case "load_skill":
 		return r.executeLoadSkill(ctx, argsJSON)
+	case RecallTaskHistoryToolName:
+		return r.executeRecallTaskHistory(ctx, argsJSON)
 	default:
 		return "", fmt.Errorf("unknown tool: %s", name)
 	}
 }
+
+// MaxRecallMemoryResponseBytes caps the total serialized JSON response of recall_memory to 16 KiB.
+const MaxRecallMemoryResponseBytes = 16 * 1024
 
 func (r *Registry) executeRecallMemory(ctx context.Context, argsJSON string) (string, error) {
 	if r.memoryManager == nil {
@@ -538,13 +568,18 @@ func (r *Registry) executeRecallMemory(ctx context.Context, argsJSON string) (st
 	}
 
 	args.Query = strings.TrimSpace(args.Query)
-	if args.Query == "" {
-		return "", errors.New("query cannot be empty")
+	args.ChunkID = strings.TrimSpace(args.ChunkID)
+	isRawLookup := args.ChunkID != "" || args.StartSeq != nil || args.EndSeq != nil
+	if args.Query == "" && !isRawLookup {
+		return "", errors.New("query cannot be empty (or provide chunk_id, start_seq, or end_seq)")
 	}
 
 	limit := args.Limit
 	if limit <= 0 {
 		limit = 5
+	}
+	if limit > 10 {
+		limit = 10
 	}
 
 	session, _ := ChatSessionFromContext(ctx)
@@ -557,56 +592,334 @@ func (r *Registry) executeRecallMemory(ctx context.Context, argsJSON string) (st
 		isDM = false
 	}
 
-	items, err := r.memoryManager.Search(ctx, args.Query, chatID, isDM, limit)
-	if err != nil {
-		return "", fmt.Errorf("memory search error: %w", err)
+	var (
+		items []memory.MemoryItem
+		err   error
+	)
+
+	if isRawLookup {
+		items, err = r.memoryManager.GetRawChunks(ctx, chatID, isDM, memory.RawChunkQuery{
+			ChunkID:  args.ChunkID,
+			StartSeq: args.StartSeq,
+			EndSeq:   args.EndSeq,
+			Limit:    limit,
+		})
+		if err != nil {
+			return "", fmt.Errorf("memory chunk lookup error: %w", err)
+		}
+		slog.Info("executed recall_memory raw chunk lookup", "chunk_id", args.ChunkID, "start_seq", args.StartSeq, "end_seq", args.EndSeq, "hits", len(items))
+	} else {
+		items, err = r.memoryManager.Search(ctx, args.Query, chatID, isDM, limit)
+		if err != nil {
+			return "", fmt.Errorf("memory search error: %w", err)
+		}
+		slog.Info("executed recall_memory", "query", args.Query, "hits", len(items))
 	}
 
-	slog.Info("executed recall_memory", "query", args.Query, "hits", len(items))
+	items = deduplicateRecallMemoryItems(items)
+
+	return marshalBoundedRecallMemoryResponse(args.Query, args.ChunkID, items)
+}
+
+func deduplicateRecallMemoryItems(items []memory.MemoryItem) []memory.MemoryItem {
+	if len(items) <= 1 {
+		return items
+	}
+	seenIDs := make(map[string]struct{}, len(items))
+	seenEpisodeItems := make(map[string]struct{}, len(items))
+	out := make([]memory.MemoryItem, 0, len(items))
+	for _, it := range items {
+		if _, ok := seenIDs[it.ID]; ok {
+			continue
+		}
+		if it.Kind == "episode" && it.EpisodeID != "" {
+			if _, ok := seenEpisodeItems[it.EpisodeID]; ok {
+				continue
+			}
+			seenEpisodeItems[it.EpisodeID] = struct{}{}
+		}
+		seenIDs[it.ID] = struct{}{}
+		out = append(out, it)
+	}
+	return out
+}
+
+func formatRecallMemoryResults(items []memory.MemoryItem) string {
+	var sb strings.Builder
+	var chunkItems, episodeItems []memory.MemoryItem
+	for _, item := range items {
+		if item.Kind == "episode" {
+			episodeItems = append(episodeItems, item)
+		} else {
+			chunkItems = append(chunkItems, item)
+		}
+	}
+
+	if len(chunkItems) > 0 {
+		sb.WriteString("### Recalled Conversation Chunks:\n")
+		for _, item := range chunkItems {
+			var timeRange string
+			if item.StartTime > 0 && item.EndTime > 0 {
+				startT := time.Unix(item.StartTime, 0).UTC().Format("2006-01-02 15:04:05")
+				endT := time.Unix(item.EndTime, 0).UTC().Format("2006-01-02 15:04:05")
+				timeRange = fmt.Sprintf(" (%s to %s UTC)", startT, endT)
+			} else if item.StartTime > 0 {
+				timeRange = fmt.Sprintf(" (%s UTC)", time.Unix(item.StartTime, 0).UTC().Format("2006-01-02 15:04:05"))
+			}
+
+			seqRange := fmt.Sprintf("seq %d-%d", item.StartSeq, item.EndSeq)
+			if item.StartSeq == item.EndSeq {
+				seqRange = fmt.Sprintf("seq %d", item.StartSeq)
+			}
+
+			fmt.Fprintf(&sb, "\n--- %s [%s]%s ---\n", item.Source, seqRange, timeRange)
+			if item.EpisodeID != "" {
+				fmt.Fprintf(&sb, "[Raw Conversation Chunk | chunk_id: %s | episode_id: %s]\n", item.ID, item.EpisodeID)
+			} else {
+				fmt.Fprintf(&sb, "[Raw Conversation Chunk | chunk_id: %s]\n", item.ID)
+			}
+			fmt.Fprintf(&sb, "%s\n", strings.TrimSpace(item.Content))
+		}
+	}
+
+	if len(episodeItems) > 0 {
+		if sb.Len() > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString("### Matching Episode Navigation Summaries:\n")
+		for _, item := range episodeItems {
+			fmt.Fprintf(&sb, "\n--- %s [seq %d-%d] ---\n%s\n", item.Source, item.StartSeq, item.EndSeq, strings.TrimSpace(item.Content))
+		}
+	}
+
+	return strings.TrimSpace(sb.String())
+}
+
+func sanitizeBoundedMemoryItemMetadata(it memory.MemoryItem, maxSliceItems, maxElemBytes int) (memory.MemoryItem, bool) {
+	// Never truncate lookup identifiers (ID, EpisodeID, ChatID, SourceChunkIDs) with "...";
+	// if identifier pointers alone are pathologically large, drop the item rather than emitting broken pointers.
+	idBytes := len(it.ID) + len(it.EpisodeID) + len(it.ChatID)
+	for _, cid := range it.SourceChunkIDs {
+		idBytes += len(cid)
+	}
+	if idBytes > 2048 {
+		return memory.MemoryItem{}, false
+	}
+	if len(it.SourceChunkIDs) > 0 {
+		copiedChunks := make([]string, len(it.SourceChunkIDs))
+		copy(copiedChunks, it.SourceChunkIDs)
+		it.SourceChunkIDs = copiedChunks
+	}
+	it.Source = truncateUTF8String(it.Source, 64)
+	it.TaskStatus = truncateUTF8String(it.TaskStatus, 64)
+	it.Participants = boundStringElements(it.Participants, maxSliceItems, maxElemBytes)
+	it.TopicTags = boundStringElements(it.TopicTags, maxSliceItems, maxElemBytes)
+	return it, true
+}
+
+func boundStringElements(in []string, maxItems, maxElemBytes int) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	n := len(in)
+	if n > maxItems {
+		n = maxItems
+	}
+	out := make([]string, n)
+	for i := 0; i < n; i++ {
+		out[i] = truncateUTF8String(in[i], maxElemBytes)
+	}
+	return out
+}
+
+func formatBoundedEpisodeContent(item memory.MemoryItem, maxBytes int) (string, bool) {
+	header := fmt.Sprintf("[Model-Derived Episode Summary | seq %d-%d]", item.StartSeq, item.EndSeq)
+	chunksLine := ""
+	if len(item.SourceChunkIDs) > 0 {
+		chunksLine = fmt.Sprintf("Source Chunks: %s\n", strings.Join(item.SourceChunkIDs, ", "))
+	}
+	note := "(Note: Navigation summary only — if this episode is relevant and you need exact details, inspect its raw chunks via recall_memory with start_seq/end_seq or chunk_id.)"
+	mandatoryBytes := len(header) + 1 + len(chunksLine) + len(note)
+	if maxBytes < mandatoryBytes {
+		return "", false
+	}
+
+	if len(item.Content) <= maxBytes && strings.HasPrefix(item.Content, header) {
+		return item.Content, true
+	}
+
+	remaining := maxBytes - mandatoryBytes
+	var b strings.Builder
+	b.WriteString(header)
+	b.WriteString("\n")
+	b.WriteString(chunksLine)
+	if remaining > 16 {
+		body := strings.TrimSpace(item.Content)
+		if strings.HasPrefix(body, header) {
+			body = strings.TrimSpace(strings.TrimPrefix(body, header))
+		}
+		if idx := strings.Index(body, "(Note: Navigation summary only"); idx >= 0 {
+			body = strings.TrimSpace(body[:idx])
+		}
+		if body != "" {
+			b.WriteString(truncateUTF8String(body, remaining-1))
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString(note)
+	return b.String(), true
+}
+
+func marshalBoundedRecallMemoryResponse(query, chunkID string, items []memory.MemoryItem) (string, error) {
+	boundedQuery := truncateUTF8String(query, 256)
+	boundedChunkID := truncateUTF8String(chunkID, 512)
 
 	if len(items) == 0 {
 		payload := map[string]interface{}{
-			"query":    args.Query,
+			"query":    boundedQuery,
 			"count":    0,
 			"memories": []interface{}{},
 			"message":  "No relevant memories found in long-term memory for the given query.",
 		}
-		respBytes, _ := json.Marshal(payload)
+		if boundedChunkID != "" {
+			payload["chunk_id"] = boundedChunkID
+		}
+		respBytes, err := json.Marshal(payload)
+		if err != nil {
+			return "", fmt.Errorf("failed to format memory response: %w", err)
+		}
 		return string(respBytes), nil
 	}
 
-	var sb strings.Builder
-	sb.WriteString("### Recalled Conversation Chunks:\n")
-	for _, item := range items {
-		var timeRange string
-		if item.StartTime > 0 && item.EndTime > 0 {
-			startT := time.Unix(item.StartTime, 0).UTC().Format("2006-01-02 15:04:05")
-			endT := time.Unix(item.EndTime, 0).UTC().Format("2006-01-02 15:04:05")
-			timeRange = fmt.Sprintf(" (%s to %s UTC)", startT, endT)
-		} else if item.StartTime > 0 {
-			timeRange = fmt.Sprintf(" (%s UTC)", time.Unix(item.StartTime, 0).UTC().Format("2006-01-02 15:04:05"))
+	// Sanitize display metadata on all items upfront while preserving exact lookup identifiers
+	sanitized := make([]memory.MemoryItem, 0, len(items))
+	for _, it := range items {
+		if cleaned, ok := sanitizeBoundedMemoryItemMetadata(it, 8, 64); ok {
+			sanitized = append(sanitized, cleaned)
 		}
-
-		seqRange := fmt.Sprintf("seq %d-%d", item.StartSeq, item.EndSeq)
-		if item.StartSeq == item.EndSeq {
-			seqRange = fmt.Sprintf("seq %d", item.StartSeq)
-		}
-
-		fmt.Fprintf(&sb, "\n--- %s [%s]%s ---\n%s\n", item.Source, seqRange, timeRange, strings.TrimSpace(item.Content))
 	}
 
-	payload := map[string]interface{}{
-		"query":             args.Query,
-		"count":             len(items),
-		"memories":          items,
-		"formatted_results": strings.TrimSpace(sb.String()),
+	if len(sanitized) == 0 {
+		fallback := map[string]interface{}{
+			"query":     boundedQuery,
+			"count":     0,
+			"memories":  []interface{}{},
+			"truncated": true,
+			"message":   "Memory results exceeded the 16 KiB response budget; retry with a narrower query, chunk_id, or start_seq/end_seq.",
+		}
+		respBytes, _ := json.Marshal(fallback)
+		return string(respBytes), nil
 	}
 
-	respBytes, err := json.Marshal(payload)
+	buildPayload := func(cur []memory.MemoryItem) ([]byte, error) {
+		payload := map[string]interface{}{
+			"query":             boundedQuery,
+			"count":             len(cur),
+			"memories":          cur,
+			"formatted_results": formatRecallMemoryResults(cur),
+		}
+		if boundedChunkID != "" {
+			payload["chunk_id"] = boundedChunkID
+		}
+		return json.Marshal(payload)
+	}
+
+	respBytes, err := buildPayload(sanitized)
 	if err != nil {
 		return "", fmt.Errorf("failed to format memory response: %w", err)
 	}
+	if len(respBytes) <= MaxRecallMemoryResponseBytes {
+		return string(respBytes), nil
+	}
+
+	// Iteratively shrink item contents (preserving raw chunks ahead of episode summaries, and dropping episodes if their mandatory header cannot fit)
+	perItemBudget := (MaxRecallMemoryResponseBytes / (len(sanitized) * 2)) - 256
+	if perItemBudget < 256 {
+		perItemBudget = 256
+	}
+
+	var working []memory.MemoryItem
+	for attempt := 0; attempt < 6; attempt++ {
+		working = make([]memory.MemoryItem, 0, len(sanitized))
+		for _, orig := range sanitized {
+			it, ok := sanitizeBoundedMemoryItemMetadata(orig, 4, 48)
+			if !ok {
+				continue
+			}
+			if it.Kind == "episode" {
+				epBudget := perItemBudget
+				if epBudget > 512 {
+					epBudget = 512
+				}
+				formattedEp, ok := formatBoundedEpisodeContent(it, epBudget)
+				if !ok {
+					// Omit the episode rather than truncating its mandatory trust header
+					continue
+				}
+				it.Content = formattedEp
+			} else {
+				it.Content = truncateUTF8String(it.Content, perItemBudget)
+			}
+			working = append(working, it)
+		}
+
+		respBytes, err = buildPayload(working)
+		if err != nil {
+			return "", fmt.Errorf("failed to format memory response: %w", err)
+		}
+		if len(respBytes) <= MaxRecallMemoryResponseBytes {
+			return string(respBytes), nil
+		}
+		perItemBudget /= 2
+		if perItemBudget < 64 {
+			perItemBudget = 64
+		}
+	}
+
+	// Drop trailing items (dropping episode items before raw chunk items) until <= 16 KiB
+	for len(working) > 1 && len(respBytes) > MaxRecallMemoryResponseBytes {
+		droppedEp := false
+		for i := len(working) - 1; i >= 0; i-- {
+			if working[i].Kind == "episode" {
+				working = append(working[:i], working[i+1:]...)
+				droppedEp = true
+				break
+			}
+		}
+		if !droppedEp {
+			working = working[:len(working)-1]
+		}
+		respBytes, err = buildPayload(working)
+		if err != nil {
+			return "", fmt.Errorf("failed to format memory response: %w", err)
+		}
+	}
+
+	if len(respBytes) > MaxRecallMemoryResponseBytes {
+		fallback := map[string]interface{}{
+			"query":     boundedQuery,
+			"count":     0,
+			"memories":  []interface{}{},
+			"truncated": true,
+			"message":   "Memory results exceeded the 16 KiB response budget; retry with a narrower query, chunk_id, or start_seq/end_seq.",
+		}
+		respBytes, _ = json.Marshal(fallback)
+	}
 	return string(respBytes), nil
+}
+
+func truncateUTF8String(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "..."
 }
 
 func (r *Registry) executeWebSearch(ctx context.Context, argsJSON string) (string, error) {

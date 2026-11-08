@@ -80,6 +80,62 @@ func TestRecorder_EventConstructors(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "turn_terminal", termEv.EventType)
 	assert.Equal(t, "terminal", termEv.Phase)
+
+	// Compaction event
+	compPayload := CompactionEventPayload{
+		Version:           1,
+		ParentVersion:     0,
+		CompactedUpToIter: 3,
+		ShouldCompact:     true,
+		RubricVerdict:     "probed_compact",
+		Reason:            "Subtask completed and verified",
+		Model:             "gpt-4o",
+		InputBytes:        12000,
+		OutputBytes:       850,
+		StateJSON:         json.RawMessage(`{"version":1,"current_subgoal":"finish report"}`),
+	}
+	compEv, err := MakeCompactionEvent("traj-1", "run-1", 0, 3, "", compPayload)
+	require.NoError(t, err)
+	assert.Equal(t, "compaction", compEv.EventType)
+	assert.Equal(t, "compaction", compEv.Phase)
+	assert.Equal(t, 1, compEv.Generation)
+	assert.Equal(t, "compact_v1_i3", compEv.StepID)
+	assert.Equal(t, 3, compEv.Iteration)
+	var decodedComp CompactionEventPayload
+	require.NoError(t, json.Unmarshal(compEv.Payload, &decodedComp))
+	assert.Equal(t, 1, decodedComp.Version)
+	assert.True(t, decodedComp.ShouldCompact)
+	assert.Equal(t, "probed_compact", decodedComp.RubricVerdict)
+	assert.Equal(t, "Subtask completed and verified", decodedComp.Reason)
+
+	// Probe skip event has distinct default StepID
+	skipEv, err := MakeCompactionEvent("traj-1", "run-1", 1, 3, "", CompactionEventPayload{
+		ParentVersion: 0,
+		ShouldCompact: false,
+		RubricVerdict: "probed_skip",
+		Reason:        "Verification still in progress",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "probe_skip_i3", skipEv.StepID)
+	assert.NotEqual(t, compEv.StepID, skipEv.StepID)
+
+	// Explicit StepID is preserved
+	explicitEv, err := MakeCompactionEvent("traj-1", "run-1", 2, 4, "custom_step_id", CompactionEventPayload{
+		ShouldCompact: false,
+		RubricVerdict: "probed_skip",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "custom_step_id", explicitEv.StepID)
+	assert.Equal(t, 2, explicitEv.Generation)
+
+	// Invalid StateJSON is rejected
+	_, err = MakeCompactionEvent("traj-1", "run-1", 1, 3, "", CompactionEventPayload{
+		Version:       1,
+		ShouldCompact: true,
+		RubricVerdict: "probed_compact",
+		StateJSON:     json.RawMessage(`{invalid json`),
+	})
+	require.Error(t, err)
 }
 
 func TestRecorder_ParseExitCode(t *testing.T) {

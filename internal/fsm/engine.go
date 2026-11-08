@@ -179,6 +179,20 @@ func WithRunFinalizer(fn RunFinalizer) EngineOption {
 	}
 }
 
+// WithCompactionConfig configures adaptive task trajectory compaction for the engine's ToolLoopRunner.
+func WithCompactionConfig(cfg CompactionConfig) EngineOption {
+	return func(e *Engine) {
+		e.compactionCfg = cfg
+	}
+}
+
+// WithCompactionDecider configures a custom CompactionDecider for evaluating the SelfCompact rubric.
+func WithCompactionDecider(d CompactionDecider) EngineOption {
+	return func(e *Engine) {
+		e.compactionDecider = d
+	}
+}
+
 // Engine coordinates durable FSM workflow executions, state dispatching, delayed transitions, and crash recovery.
 type Engine struct {
 	storeProvider           StoreProvider
@@ -193,6 +207,8 @@ type Engine struct {
 	maxRecoveryConcurrency  int
 	knowledgeLimits         tools.KnowledgeBudgetLimits
 	runFinalizer            RunFinalizer
+	compactionCfg           CompactionConfig
+	compactionDecider       CompactionDecider
 
 	frontendsMu sync.RWMutex
 	frontends   map[string]agentapi.Frontend
@@ -253,6 +269,10 @@ func NewEngine(storeProvider StoreProvider, llmClient LLMClient, invoker ToolInv
 	runner := NewToolLoopRunner(llmClient, e.stepExecutor, e.defaultModel)
 	if e.toolDefProvider != nil {
 		runner.SetToolDefinitionProvider(e.toolDefProvider)
+	}
+	runner.SetCompactionConfig(e.compactionCfg)
+	if e.compactionDecider != nil {
+		runner.SetCompactionDecider(e.compactionDecider)
 	}
 	e.RegisterRunner(FSMTypeToolLoop, runner)
 

@@ -570,4 +570,3 @@ func (g *Gateway) SendProgressMessage(ctx context.Context, chatID string, progre
 
 	return res.Seq, nil
 }
-

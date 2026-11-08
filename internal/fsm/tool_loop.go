@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"bob/internal/agentapi"
+	"bob/internal/tools"
 	"bob/internal/trajectory"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -26,11 +27,14 @@ const (
 
 // ToolLoopRunner executes the simple tool loop finite state machine.
 type ToolLoopRunner struct {
-	mu              sync.RWMutex
-	llmClient       LLMClient
-	stepExecutor    *StepExecutor
-	defaultModel    string
-	toolDefProvider ToolDefinitionProvider
+	mu                sync.RWMutex
+	llmClient         LLMClient
+	stepExecutor      *StepExecutor
+	defaultModel      string
+	toolDefProvider   ToolDefinitionProvider
+	compactionCfg     CompactionConfig
+	compactionCfgSet  bool
+	compactionDecider CompactionDecider
 }
 
 // NewToolLoopRunner creates a new ToolLoopRunner.
@@ -39,10 +43,26 @@ func NewToolLoopRunner(llmClient LLMClient, stepExecutor *StepExecutor, defaultM
 		stepExecutor = NewStepExecutor(nil)
 	}
 	return &ToolLoopRunner{
-		llmClient:    llmClient,
-		stepExecutor: stepExecutor,
-		defaultModel: defaultModel,
+		llmClient:     llmClient,
+		stepExecutor:  stepExecutor,
+		defaultModel:  defaultModel,
+		compactionCfg: DefaultCompactionConfig(),
 	}
+}
+
+// SetCompactionConfig configures adaptive task trajectory compaction for the runner.
+func (r *ToolLoopRunner) SetCompactionConfig(cfg CompactionConfig) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.compactionCfg = cfg
+	r.compactionCfgSet = true
+}
+
+// SetCompactionDecider configures a custom CompactionDecider for evaluating the SelfCompact rubric.
+func (r *ToolLoopRunner) SetCompactionDecider(d CompactionDecider) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.compactionDecider = d
 }
 
 // SetToolDefinitionProvider configures dynamic tool definition provider for the runner.
@@ -59,11 +79,95 @@ func (r *ToolLoopRunner) HasToolDefinitionProvider() bool {
 	return r.toolDefProvider != nil
 }
 
-func (r *ToolLoopRunner) resolveBinding(ctx context.Context, run *FSMRun, toolset agentapi.Toolset) (*ToolBinding, error) {
+func (r *ToolLoopRunner) resolveBinding(ctx context.Context, run *FSMRun, store *Store, toolset agentapi.Toolset) (*ToolBinding, error) {
 	if toolset != nil {
+		r.mu.RLock()
+		cfg := r.compactionCfg
+		cfgSet := r.compactionCfgSet
+		r.mu.RUnlock()
+
+		if store != nil && run != nil && cfg.Enabled {
+			includeDef := cfgSet
+			if !includeDef {
+				if latest, err := store.GetLatestCompaction(ctx, run.ID); err == nil && latest != nil {
+					includeDef = true
+				}
+			}
+			toolset = &taskHistoryBoundToolset{
+				base:       toolset,
+				store:      store,
+				run:        run,
+				includeDef: includeDef,
+			}
+		}
 		return NewToolBinding(ctx, toolset)
 	}
 	return NewToolBinding(ctx, nil)
+}
+
+type taskHistoryBoundToolset struct {
+	base       agentapi.Toolset
+	store      *Store
+	run        *FSMRun
+	includeDef bool
+}
+
+func (t *taskHistoryBoundToolset) Definitions(ctx context.Context) ([]agentapi.ToolDefinition, error) {
+	if t.base == nil {
+		return nil, nil
+	}
+	defs, err := t.base.Definitions(ctx)
+	if err != nil || len(defs) == 0 {
+		return defs, err
+	}
+	for _, d := range defs {
+		if d.Schema.Function != nil && d.Schema.Function.Name == tools.RecallTaskHistoryToolName {
+			return defs, nil
+		}
+	}
+	if !t.includeDef {
+		return defs, nil
+	}
+	out := make([]agentapi.ToolDefinition, 0, len(defs)+1)
+	out = append(out, defs...)
+	out = append(out, agentapi.ToolDefinition{
+		Schema:   tools.RecallTaskHistoryToolDefinition(),
+		ReadOnly: true,
+	})
+	return out, nil
+}
+
+func (t *taskHistoryBoundToolset) Execute(ctx context.Context, call agentapi.ToolCall) (agentapi.ToolResult, error) {
+	if call.Name == tools.RecallTaskHistoryToolName {
+		if t.store == nil || t.run == nil {
+			return agentapi.ToolResult{}, errors.New("task history store is unavailable")
+		}
+		chatID := t.run.ChatID
+		userID := t.run.UserID
+		isDM := t.run.IsDM
+		if sess, ok := tools.ChatSessionFromContext(ctx); ok {
+			if sess.ChatID != "" && sess.ChatID != chatID {
+				return agentapi.ToolResult{}, fmt.Errorf("chat session mismatch for recall_task_history: %q vs %q", sess.ChatID, chatID)
+			}
+			if sess.FSMRunID != "" && sess.FSMRunID != t.run.ID {
+				return agentapi.ToolResult{}, fmt.Errorf("fsm run mismatch for recall_task_history: %q vs %q", sess.FSMRunID, t.run.ID)
+			}
+			if sess.IsDM != isDM {
+				return agentapi.ToolResult{}, fmt.Errorf("channel scope mismatch for recall_task_history: %t vs %t", sess.IsDM, isDM)
+			}
+			if sess.UserID != userID {
+				return agentapi.ToolResult{}, fmt.Errorf("user session mismatch for recall_task_history: %q vs %q", sess.UserID, userID)
+			}
+			userID = sess.UserID
+			isDM = sess.IsDM
+		}
+		content, err := tools.ExecuteRecallTaskHistoryWithStore(ctx, t.store, chatID, userID, isDM, t.run.ID, call.Arguments)
+		return agentapi.ToolResult{Content: content}, err
+	}
+	if t.base == nil {
+		return agentapi.ToolResult{}, errors.New("base toolset is not configured")
+	}
+	return t.base.Execute(ctx, call)
 }
 
 // Execute drives the state machine for the given FSMRun until it reaches a terminal or suspended state.
@@ -112,7 +216,7 @@ func (r *ToolLoopRunner) Execute(ctx context.Context, run *FSMRun, store *Store,
 			}
 
 		case StateExecuteSteps:
-			waiting, err := r.handleExecuteSteps(ctx, run, store, toolset)
+			waiting, err := r.handleExecuteSteps(ctx, run, store, toolset, model)
 			if err != nil {
 				return err
 			}
@@ -173,7 +277,7 @@ func (r *ToolLoopRunner) handleInit(ctx context.Context, run *FSMRun, store *Sto
 }
 
 func (r *ToolLoopRunner) handleLLMRequest(ctx context.Context, run *FSMRun, store *Store, toolset agentapi.Toolset, model string) error {
-	binding, err := r.resolveBinding(ctx, run, toolset)
+	binding, err := r.resolveBinding(ctx, run, store, toolset)
 	if err != nil {
 		run.Status = RunStatusFailed
 		run.CurrentState = StateFailed
@@ -291,7 +395,7 @@ func (r *ToolLoopRunner) handleLLMRequest(ctx context.Context, run *FSMRun, stor
 }
 
 func (r *ToolLoopRunner) handlePrepareSteps(ctx context.Context, run *FSMRun, store *Store, toolset agentapi.Toolset) error {
-	binding, err := r.resolveBinding(ctx, run, toolset)
+	binding, err := r.resolveBinding(ctx, run, store, toolset)
 	if err != nil {
 		run.Status = RunStatusFailed
 		run.CurrentState = StateFailed
@@ -365,7 +469,7 @@ func (r *ToolLoopRunner) handlePrepareSteps(ctx context.Context, run *FSMRun, st
 	return store.UpdateRun(ctx, run)
 }
 
-func (r *ToolLoopRunner) handleExecuteSteps(ctx context.Context, run *FSMRun, store *Store, toolset agentapi.Toolset) (bool, error) {
+func (r *ToolLoopRunner) handleExecuteSteps(ctx context.Context, run *FSMRun, store *Store, toolset agentapi.Toolset, model string) (bool, error) {
 	steps, err := store.ListStepsByIteration(ctx, run.ID, run.Iteration)
 	if err != nil {
 		return false, err
@@ -376,7 +480,7 @@ func (r *ToolLoopRunner) handleExecuteSteps(ctx context.Context, run *FSMRun, st
 		return false, store.UpdateRun(ctx, run)
 	}
 
-	binding, err := r.resolveBinding(ctx, run, toolset)
+	binding, err := r.resolveBinding(ctx, run, store, toolset)
 	if err != nil {
 		run.Status = RunStatusFailed
 		run.CurrentState = StateFailed
@@ -459,6 +563,16 @@ func (r *ToolLoopRunner) handleExecuteSteps(ctx context.Context, run *FSMRun, st
 
 	for _, s := range stepPtrs {
 		slog.Info("fsm step finished", "tool", s.ToolName, "status", s.Status, "run_id", run.ID)
+	}
+
+	if err := r.maybeCompact(ctx, run, store, model); err != nil {
+		run.Status = RunStatusFailed
+		run.CurrentState = StateFailed
+		run.ErrorText = fmt.Sprintf("compaction persistence failure: %v", err)
+		if updateErr := store.UpdateRun(ctx, run); updateErr != nil {
+			return false, errors.Join(err, updateErr)
+		}
+		return false, fmt.Errorf("compaction persistence failed: %w", err)
 	}
 
 	if run.Iteration >= run.MaxIterations {
@@ -552,7 +666,8 @@ func formatToolStepResult(s FSMStep) string {
 		content = fmt.Sprintf(`{"status": %q, "result": ""}`, s.Status)
 	}
 	if len(content) > MaxToolResultSizeInContext {
-		content = content[:MaxToolResultSizeInContext] + "\n[tool output truncated in context]"
+		const suffix = "\n[tool output truncated in context]"
+		content = truncateUTF8Bytes(content, MaxToolResultSizeInContext-len(suffix)) + suffix
 	}
 	return content
 }
@@ -570,10 +685,14 @@ func (r *ToolLoopRunner) buildChatMessages(ctx context.Context, run *FSMRun, sto
 	if err != nil {
 		return nil, fmt.Errorf("failed to list steps for run %s: %w", run.ID, err)
 	}
-	if len(steps) == 0 {
-		return messages, nil
+	latestCompaction, err := store.GetLatestCompaction(ctx, run.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get latest compaction for run %s: %w", run.ID, err)
 	}
+	return reconstructChatMessages(messages, steps, latestCompaction), nil
+}
 
+func reconstructChatMessages(messages []openai.ChatCompletionMessage, steps []FSMStep, latestCompaction *CompactedTaskState) []openai.ChatCompletionMessage {
 	stepsByCallID := make(map[string]FSMStep, len(steps))
 	for _, s := range steps {
 		if s.ToolCallID != "" {
@@ -581,33 +700,79 @@ func (r *ToolLoopRunner) buildChatMessages(ctx context.Context, run *FSMRun, sto
 		}
 	}
 
-	existingToolIDs := make(map[string]bool)
+	toolResponses := make(map[string]openai.ChatCompletionMessage)
 	for _, m := range messages {
 		if m.Role == openai.ChatMessageRoleTool && m.ToolCallID != "" {
-			existingToolIDs[m.ToolCallID] = true
-		}
-	}
-
-	reconstructed := make([]openai.ChatCompletionMessage, 0, len(messages)+len(steps))
-	for _, m := range messages {
-		reconstructed = append(reconstructed, m)
-		if m.Role == openai.ChatMessageRoleAssistant && len(m.ToolCalls) > 0 {
-			for _, tc := range m.ToolCalls {
-				if existingToolIDs[tc.ID] {
-					continue
-				}
-				if s, ok := stepsByCallID[tc.ID]; ok {
-					reconstructed = append(reconstructed, openai.ChatCompletionMessage{
-						Role:       openai.ChatMessageRoleTool,
-						Content:    formatToolStepResult(s),
-						ToolCallID: tc.ID,
-					})
-				}
+			if _, exists := toolResponses[m.ToolCallID]; !exists {
+				toolResponses[m.ToolCallID] = m
 			}
 		}
 	}
 
-	return reconstructed, nil
+	compactedUpTo := 0
+	if latestCompaction != nil && latestCompaction.CompactedUpToIter > 0 {
+		compactedUpTo = latestCompaction.CompactedUpToIter
+	}
+
+	reconstructed := make([]openai.ChatCompletionMessage, 0, len(messages)+len(steps)+1)
+	compactedInserted := false
+
+	for _, m := range messages {
+		// Tool responses are emitted only with their parent assistant message.
+		if m.Role == openai.ChatMessageRoleTool {
+			continue
+		}
+		if m.Role != openai.ChatMessageRoleAssistant || len(m.ToolCalls) == 0 {
+			reconstructed = append(reconstructed, m)
+			continue
+		}
+
+		belongsToRun := false
+		allCompacted := compactedUpTo > 0
+		for _, tc := range m.ToolCalls {
+			s, ok := stepsByCallID[tc.ID]
+			if ok && s.Iteration > 0 {
+				belongsToRun = true
+			} else {
+				// Unknown iterations keep the whole group, including prior-turn exchanges.
+				allCompacted = false
+			}
+			if s.Iteration > compactedUpTo {
+				allCompacted = false
+			}
+		}
+
+		if belongsToRun && compactedUpTo > 0 && !compactedInserted {
+			reconstructed = append(reconstructed, RenderCompactedStateMessage(latestCompaction))
+			compactedInserted = true
+		}
+		if allCompacted {
+			continue
+		}
+
+		reconstructed = append(reconstructed, m)
+		for _, tc := range m.ToolCalls {
+			response, ok := toolResponses[tc.ID]
+			if !ok {
+				response = openai.ChatCompletionMessage{
+					Role:       openai.ChatMessageRoleTool,
+					ToolCallID: tc.ID,
+					Content:    `{"error":"Tool response unavailable in recovered history; execution outcome is unknown."}`,
+				}
+				if s, exists := stepsByCallID[tc.ID]; exists {
+					response.Content = formatToolStepResult(s)
+				}
+			}
+			reconstructed = append(reconstructed, response)
+			delete(toolResponses, tc.ID)
+		}
+	}
+
+	if compactedUpTo > 0 && !compactedInserted {
+		reconstructed = append(reconstructed, RenderCompactedStateMessage(latestCompaction))
+	}
+
+	return reconstructed
 }
 
 func (r *ToolLoopRunner) failRunWithContextLimit(ctx context.Context, run *FSMRun, store *Store, size int) error {

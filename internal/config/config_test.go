@@ -72,6 +72,12 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	_ = os.Unsetenv("TRAJECTORY_S3_PREFIX")
 	_ = os.Unsetenv("TRAJECTORY_FLUSH_DELAY")
 	_ = os.Unsetenv("TRAJECTORY_ALLOW_PRIVATE")
+	_ = os.Unsetenv("FSM_COMPACTION_ENABLED")
+	_ = os.Unsetenv("FSM_COMPACTION_MIN_ITERATIONS")
+	_ = os.Unsetenv("FSM_COMPACTION_INTERVAL_ITERATIONS")
+	_ = os.Unsetenv("FSM_COMPACTION_TAIL_ITERATIONS")
+	_ = os.Unsetenv("FSM_COMPACTION_SOFT_THRESHOLD_BYTES")
+	_ = os.Unsetenv("FSM_COMPACTION_HARD_THRESHOLD_BYTES")
 
 	cfg, err := LoadFromEnv()
 	require.NoError(t, err)
@@ -127,6 +133,12 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	assert.Equal(t, "trajectories/", cfg.TrajectoryS3Prefix)
 	assert.Equal(t, 15*time.Minute, cfg.TrajectoryFlushDelay)
 	assert.False(t, cfg.TrajectoryAllowPrivate)
+	assert.True(t, cfg.FSMCompactionEnabled)
+	assert.Equal(t, 3, cfg.FSMCompactionMinIterations)
+	assert.Equal(t, 3, cfg.FSMCompactionIntervalIterations)
+	assert.Equal(t, 1, cfg.FSMCompactionTailIterations)
+	assert.Equal(t, 65536, cfg.FSMCompactionSoftThresholdBytes)
+	assert.Equal(t, 262144, cfg.FSMCompactionHardThresholdBytes)
 }
 
 func TestLoadFromEnvStandardOpenAI(t *testing.T) {
@@ -873,5 +885,57 @@ func TestValidateBesedka(t *testing.T) {
 		cfg := validCfg()
 		cfg.TownhallMaxParagraphs = 0
 		assert.ErrorContains(t, cfg.ValidateBesedka(), "invalid TOWNHALL_MAX_PARAGRAPHS: 0")
+	})
+}
+
+func TestFSMCompactionConfig(t *testing.T) {
+	t.Run("custom values from env", func(t *testing.T) {
+		t.Setenv("FSM_COMPACTION_ENABLED", "false")
+		t.Setenv("FSM_COMPACTION_MIN_ITERATIONS", "5")
+		t.Setenv("FSM_COMPACTION_INTERVAL_ITERATIONS", "4")
+		t.Setenv("FSM_COMPACTION_TAIL_ITERATIONS", "2")
+		t.Setenv("FSM_COMPACTION_SOFT_THRESHOLD_BYTES", "32768")
+		t.Setenv("FSM_COMPACTION_HARD_THRESHOLD_BYTES", "131072")
+
+		cfg, err := LoadFromEnv()
+		require.NoError(t, err)
+		assert.False(t, cfg.FSMCompactionEnabled)
+		assert.Equal(t, 5, cfg.FSMCompactionMinIterations)
+		assert.Equal(t, 4, cfg.FSMCompactionIntervalIterations)
+		assert.Equal(t, 2, cfg.FSMCompactionTailIterations)
+		assert.Equal(t, 32768, cfg.FSMCompactionSoftThresholdBytes)
+		assert.Equal(t, 131072, cfg.FSMCompactionHardThresholdBytes)
+		require.NoError(t, cfg.Validate(false))
+	})
+
+	t.Run("invalid boolean for FSM_COMPACTION_ENABLED", func(t *testing.T) {
+		t.Setenv("FSM_COMPACTION_ENABLED", "maybe")
+		_, err := LoadFromEnv()
+		assert.ErrorContains(t, err, "invalid boolean value")
+	})
+
+	t.Run("invalid integer for FSM_COMPACTION_MIN_ITERATIONS", func(t *testing.T) {
+		t.Setenv("FSM_COMPACTION_MIN_ITERATIONS", "0")
+		_, err := LoadFromEnv()
+		assert.ErrorContains(t, err, "invalid integer for FSM_COMPACTION_MIN_ITERATIONS")
+	})
+
+	t.Run("validate enforces hard threshold >= soft threshold and defaults zero values", func(t *testing.T) {
+		cfg := Defaults()
+		cfg.FSMCompactionMinIterations = 0
+		cfg.FSMCompactionIntervalIterations = 0
+		cfg.FSMCompactionTailIterations = 0
+		cfg.FSMCompactionSoftThresholdBytes = 0
+		cfg.FSMCompactionHardThresholdBytes = 0
+		require.NoError(t, cfg.Validate(false))
+		assert.Equal(t, 3, cfg.FSMCompactionMinIterations)
+		assert.Equal(t, 3, cfg.FSMCompactionIntervalIterations)
+		assert.Equal(t, 1, cfg.FSMCompactionTailIterations)
+		assert.Equal(t, 65536, cfg.FSMCompactionSoftThresholdBytes)
+		assert.Equal(t, 262144, cfg.FSMCompactionHardThresholdBytes)
+
+		cfg.FSMCompactionSoftThresholdBytes = 100000
+		cfg.FSMCompactionHardThresholdBytes = 50000
+		assert.ErrorContains(t, cfg.Validate(false), "FSM_COMPACTION_HARD_THRESHOLD_BYTES (50000) cannot be less than FSM_COMPACTION_SOFT_THRESHOLD_BYTES (100000)")
 	})
 }

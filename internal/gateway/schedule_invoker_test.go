@@ -249,10 +249,10 @@ func TestScheduleInvoker_Execute_WithPreApprovedSandbox(t *testing.T) {
 	})
 
 	invoker := NewScheduleInvoker(InvokerConfig{
-		FSM:        mockFSM,
-		Tools:      toolsRegistry,
-		Sandbox:    sandboxMgr,
-		Model:      "test-model",
+		FSM:     mockFSM,
+		Tools:   toolsRegistry,
+		Sandbox: sandboxMgr,
+		Model:   "test-model",
 		SchedulerStoreProv: func(ctx context.Context, chatID string, isDM bool) (*scheduler.Store, error) {
 			return st, nil
 		},
@@ -289,15 +289,15 @@ func TestScheduleInvoker_Execute_TamperedGrant(t *testing.T) {
 
 	now := time.Now().Unix()
 	sched := &scheduler.Schedule{
-		ID:           "sched_tampered",
-		ChatID:       "dm_user1",
-		UserID:       "user1",
-		Name:         "tampered_task",
-		Instruction:  "Do something",
-		Status:       scheduler.ScheduleStatusActive,
-		NextRunAt:    now,
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		ID:          "sched_tampered",
+		ChatID:      "dm_user1",
+		UserID:      "user1",
+		Name:        "tampered_task",
+		Instruction: "Do something",
+		Status:      scheduler.ScheduleStatusActive,
+		NextRunAt:   now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	}
 
 	// Tampered grant: params_hash does not match JSON
@@ -333,15 +333,15 @@ func TestScheduleInvoker_Execute_ExpiredGrant(t *testing.T) {
 	past := time.Now().Unix() - 100
 
 	sched := &scheduler.Schedule{
-		ID:           "sched_expired",
-		ChatID:       "dm_user1",
-		UserID:       "user1",
-		Name:         "expired_task",
-		Instruction:  "Do something",
-		Status:       scheduler.ScheduleStatusActive,
-		NextRunAt:    past,
-		CreatedAt:    past,
-		UpdatedAt:    past,
+		ID:          "sched_expired",
+		ChatID:      "dm_user1",
+		UserID:      "user1",
+		Name:        "expired_task",
+		Instruction: "Do something",
+		Status:      scheduler.ScheduleStatusActive,
+		NextRunAt:   past,
+		CreatedAt:   past,
+		UpdatedAt:   past,
 	}
 
 	grant := &scheduler.ScheduleGrant{
@@ -386,15 +386,15 @@ func TestScheduleInvoker_Execute_TownhallSandboxForbidden(t *testing.T) {
 	now := time.Now().Unix()
 
 	sched := &scheduler.Schedule{
-		ID:           "sched_townhall_sbx",
-		ChatID:       "townhall",
-		UserID:       "user1",
-		Name:         "townhall_sandbox",
-		Instruction:  "Do something",
-		Status:       scheduler.ScheduleStatusActive,
-		NextRunAt:    now,
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		ID:          "sched_townhall_sbx",
+		ChatID:      "townhall",
+		UserID:      "user1",
+		Name:        "townhall_sandbox",
+		Instruction: "Do something",
+		Status:      scheduler.ScheduleStatusActive,
+		NextRunAt:   now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	}
 
 	grant := &scheduler.ScheduleGrant{
