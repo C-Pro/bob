@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -168,4 +169,59 @@ func TestSanitizeRunKey_NoCollision(t *testing.T) {
 	assert.NotEqual(t, k1, k2)
 	assert.Equal(t, "a_run", k1)
 	assert.Equal(t, "b_run", k2)
+}
+
+func TestCacheRootDir_FallbackWhenHomeUnwritable(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	origXDG := os.Getenv("XDG_CACHE_HOME")
+	defer func() {
+		_ = os.Setenv("HOME", origHome)
+		_ = os.Setenv("XDG_CACHE_HOME", origXDG)
+		SetCacheRootOverride("")
+	}()
+
+	_ = os.Setenv("HOME", "/nonexistent_root_dir/unwritable_home")
+	_ = os.Setenv("XDG_CACHE_HOME", "/nonexistent_root_dir/unwritable_xdg")
+	SetCacheRootOverride("")
+
+	rootDir := CacheRootDir()
+	assert.NotEmpty(t, rootDir)
+	assert.NotContains(t, rootDir, "/nonexistent_root_dir")
+
+	runID := "test_fallback_run"
+	cacheDir, err := AcquireRunCacheDir(runID, RunCacheMetadata{RunID: runID})
+	require.NoError(t, err)
+	defer func() { _ = RemoveRunCache(runID) }()
+
+	assert.DirExists(t, cacheDir)
+	assert.DirExists(t, filepath.Join(cacheDir, "go"))
+}
+
+func TestCacheRootDir_DataDirPreferredOverTemp(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	origXDG := os.Getenv("XDG_CACHE_HOME")
+	defer func() {
+		_ = os.Setenv("HOME", origHome)
+		_ = os.Setenv("XDG_CACHE_HOME", origXDG)
+		SetCacheRootOverride("")
+	}()
+
+	_ = os.Setenv("HOME", "/nonexistent_root_dir/unwritable_home")
+	_ = os.Setenv("XDG_CACHE_HOME", "/nonexistent_root_dir/unwritable_xdg")
+	SetCacheRootOverride("")
+
+	tempDataDir := t.TempDir()
+	SetCacheRootDataDir(tempDataDir)
+
+	rootDir := CacheRootDir()
+	expectedPrefix := filepath.Clean(filepath.Join(tempDataDir, "cache", "sandboxes"))
+	assert.Equal(t, expectedPrefix, rootDir)
+
+	runID := "test_datadir_run"
+	cacheDir, err := AcquireRunCacheDir(runID, RunCacheMetadata{RunID: runID, DataDir: tempDataDir})
+	require.NoError(t, err)
+	defer func() { _ = RemoveRunCache(runID) }()
+
+	assert.True(t, strings.HasPrefix(cacheDir, expectedPrefix))
+	assert.DirExists(t, cacheDir)
 }

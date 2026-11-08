@@ -3,10 +3,11 @@ FROM golang:1.27-alpine AS builder
 
 WORKDIR /app
 
-# Create a non-root user and data directory
-RUN adduser -D -u 10001 -g '' appuser && \
-    mkdir -p /data && \
-    chown -R appuser:appuser /data
+# Create a non-root user, home, temp, and data directories
+RUN adduser -D -u 10001 -g '' -h /home/appuser appuser && \
+    mkdir -p /data /home/appuser /tmp && \
+    chmod 1777 /tmp && \
+    chown -R appuser:appuser /data /home/appuser
 
 # Copy source code (includes vendor directory)
 COPY . .
@@ -29,6 +30,12 @@ COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 
 # Copy the user from the builder stage
 COPY --from=builder /etc/passwd /etc/passwd
+
+# Copy user home directory
+COPY --from=builder --chown=appuser:appuser /home/appuser /home/appuser
+
+# Copy /tmp directory with world-writable permissions
+COPY --from=builder /tmp /tmp
 
 # Copy data directory owned by appuser
 COPY --from=builder --chown=appuser:appuser /data /data

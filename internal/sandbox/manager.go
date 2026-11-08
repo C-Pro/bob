@@ -64,6 +64,10 @@ type Manager struct {
 
 // NewManager creates a new Sandbox Manager and registers configured drivers.
 func NewManager(cfg Config, drivers []Driver) *Manager {
+	if cfg.DataDir != "" {
+		SetCacheRootDataDir(cfg.DataDir)
+	}
+
 	driverMap := make(map[DriverType]Driver)
 	for _, d := range drivers {
 		driverMap[d.Type()] = d
