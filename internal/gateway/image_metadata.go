@@ -18,8 +18,9 @@ import (
 )
 
 var attachmentMarkerPattern = regexp.MustCompile(`\[Attachment: (.*?) \(id: ([^,\n]*), type: ([^),\n]*)(?:, description: ("(?:\\.|[^"\\])*"))?\)\]`)
-var descriptionFencePattern = regexp.MustCompile("(?s)```(?:json)?[ \\t]*\\r?\\n?(.*?)```")
-var descriptionObjectPattern = regexp.MustCompile(`^\{\s*"descriptions"\s*:`)
+var descriptionFencePattern = regexp.MustCompile("(?s)^\\s*```(?:json)?[ \\t]*\\r?\\n?(.*?)```")
+var descriptionObjectPattern = regexp.MustCompile(`^\s*\{\s*"descriptions"\s*:`)
+var malformedDescriptionFencePattern = regexp.MustCompile("^\\s*```(?:json)?\\s*\\{\\s*\"descriptions\"\\s*:")
 
 func descriptionKey(s string) string {
 	return strings.ToLower(strings.TrimSpace(s))
@@ -61,54 +62,35 @@ func parseImageDescriptions(text string) (map[string]string, bool) {
 
 func extractAndStripImageDescriptions(text string) (string, map[string]string) {
 	descriptions := make(map[string]string)
-	merge := func(found map[string]string) {
-		for key, description := range found {
-			descriptions[key] = description
-		}
-	}
-	text = descriptionFencePattern.ReplaceAllStringFunc(text, func(block string) string {
-		match := descriptionFencePattern.FindStringSubmatch(block)
-		if found, ok := parseImageDescriptions(strings.TrimSpace(match[1])); ok {
-			merge(found)
-			return ""
-		}
-		if strings.Contains(match[1], `"descriptions"`) {
-			return ""
-		}
-		return block
-	})
-	for offset := 0; offset < len(text); {
-		next := strings.IndexByte(text[offset:], '{')
-		if next < 0 {
-			break
-		}
-		start := offset + next
-		decoder := json.NewDecoder(strings.NewReader(text[start:]))
-		var raw json.RawMessage
-		err := decoder.Decode(&raw)
-		isMetadata := descriptionObjectPattern.MatchString(text[start:])
-		if err != nil && !isMetadata {
-			offset = start + 1
-			continue
-		}
-		end := start + int(decoder.InputOffset())
-		found, ok := parseImageDescriptions(string(raw))
-		if err != nil {
-			end = start + imageMetadataObjectEnd(text[start:])
-		}
-		if ok || isMetadata {
-			merge(found)
-			prefix := strings.TrimRight(text[:start], " \t")
-			if strings.HasSuffix(prefix, "json") && (len(prefix) == 4 || strings.ContainsAny(prefix[len(prefix)-5:len(prefix)-4], " \t\r\n")) {
-				start = len(prefix) - 4
+	if match := descriptionFencePattern.FindStringSubmatchIndex(text); match != nil {
+		found, ok := parseImageDescriptions(strings.TrimSpace(text[match[2]:match[3]]))
+		if ok || malformedDescriptionFencePattern.MatchString(text) {
+			if ok {
+				descriptions = found
 			}
-			text = text[:start] + text[end:]
-			offset = start
-		} else {
-			offset = end
+			return strings.TrimLeft(text[match[1]:], " \t\r\n\f"), descriptions
 		}
+		return text, descriptions
 	}
-	return strings.TrimSpace(text), descriptions
+	if !descriptionObjectPattern.MatchString(text) {
+		return text, descriptions
+	}
+
+	decoder := json.NewDecoder(strings.NewReader(text))
+	var raw json.RawMessage
+	if err := decoder.Decode(&raw); err == nil {
+		if found, ok := parseImageDescriptions(string(raw)); ok {
+			descriptions = found
+		}
+		return strings.TrimLeft(text[int(decoder.InputOffset()):], " \t\r\n\f"), descriptions
+	}
+
+	start := strings.IndexByte(text, '{')
+	if end := imageMetadataObjectEnd(text[start:]); end > 0 {
+		return strings.TrimLeft(text[start+end:], " \t\r\n\f"), descriptions
+	}
+	// Without a complete boundary, preserving the text avoids consuming the answer.
+	return text, descriptions
 }
 
 func imageMetadataObjectEnd(text string) int {
@@ -138,7 +120,7 @@ func imageMetadataObjectEnd(text string) int {
 			}
 		}
 	}
-	return len(text)
+	return 0
 }
 
 func enrichAttachmentText(content string, descriptions map[string]string) string {
@@ -242,11 +224,11 @@ func (g *Gateway) clearSourceImages(run agentapi.RunDescriptor) {
 }
 
 func (g *Gateway) finalizeImageReply(ctx context.Context, run agentapi.RunDescriptor, reply string) string {
-	clean, descriptions := extractAndStripImageDescriptions(reply)
 	entry, ok := g.sourceImageEntry(run)
-	if !ok {
-		return clean
+	if !ok || len(entry.Images) == 0 {
+		return reply
 	}
+	clean, descriptions := extractAndStripImageDescriptions(reply)
 	var missing []models.Attachment
 	for _, match := range attachmentMarkerPattern.FindAllStringSubmatch(entry.Content, -1) {
 		if match[4] != "" {

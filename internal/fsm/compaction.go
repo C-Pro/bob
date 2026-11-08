@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"bob/internal/trajectory"
 
@@ -369,7 +370,7 @@ func summarizeStepForState(s FSMStep) string {
 	}
 	snippet = strings.Join(strings.Fields(snippet), " ")
 	if len(snippet) > 240 {
-		snippet = snippet[:240] + "..."
+		snippet = truncateUTF8Bytes(snippet, 240-3) + "..."
 	}
 	if snippet == "" {
 		return fmt.Sprintf("Iter %d %s (%s)", s.Iteration, s.ToolName, s.Status)
@@ -497,7 +498,7 @@ func (d *llmCompactionDecider) DecideCompaction(ctx context.Context, input Compa
 	fmt.Fprintf(&b, "Candidate Compaction Boundary: Iterations 1..%d (Current Run Iteration: %d)\n", input.TargetIter, input.Run.Iteration)
 	goal := input.OriginalUserGoal
 	if len(goal) > 2048 {
-		goal = goal[:2048] + "...[truncated]"
+		goal = truncateUTF8Bytes(goal, 2048-15) + "...[truncated]"
 	}
 	fmt.Fprintf(&b, "Original Objective: %s\n\n", goal)
 
@@ -505,7 +506,7 @@ func (d *llmCompactionDecider) DecideCompaction(ctx context.Context, input Compa
 		prevJSON, _ := json.Marshal(input.PreviousState)
 		prevStr := string(prevJSON)
 		if len(prevStr) > maxProbePrevStateBytes {
-			prevStr = prevStr[:maxProbePrevStateBytes] + "...[truncated]"
+			prevStr = truncateUTF8Bytes(prevStr, maxProbePrevStateBytes-15) + "...[truncated]"
 		}
 		fmt.Fprintf(&b, "Previous Compacted State (v%d, up to iter %d):\n%s\n\n", input.PreviousState.Version, input.PreviousState.CompactedUpToIter, prevStr)
 	}
@@ -514,7 +515,7 @@ func (d *llmCompactionDecider) DecideCompaction(ctx context.Context, input Compa
 	for _, s := range input.StepsToCompact {
 		args := strings.TrimSpace(s.ArgsJSON)
 		if len(args) > maxProbeStepArgsBytes {
-			args = args[:maxProbeStepArgsBytes] + "...[truncated for probe]"
+			args = truncateUTF8Bytes(args, maxProbeStepArgsBytes-23) + "...[truncated for probe]"
 		}
 		decoded, _ := DecodeStoredToolResult(s.ResultJSON)
 		obs := strings.TrimSpace(decoded.Content)
@@ -522,7 +523,7 @@ func (d *llmCompactionDecider) DecideCompaction(ctx context.Context, input Compa
 			obs = s.ErrorText
 		}
 		if len(obs) > maxProbeStepOutputBytes {
-			obs = obs[:maxProbeStepOutputBytes] + "...[truncated for probe]"
+			obs = truncateUTF8Bytes(obs, maxProbeStepOutputBytes-23) + "...[truncated for probe]"
 		}
 		fmt.Fprintf(&b, "- StepID=%s Iter=%d Tool=%s Status=%s Args=%s\n  Output: %s\n", s.ID, s.Iteration, s.ToolName, s.Status, args, obs)
 		if b.Len() >= maxProbePromptBytes {
@@ -540,7 +541,7 @@ func (d *llmCompactionDecider) DecideCompaction(ctx context.Context, input Compa
 
 	userPrompt := b.String()
 	if len(userPrompt) > maxProbePromptBytes {
-		userPrompt = userPrompt[:maxProbePromptBytes] + "\n...[truncated]"
+		userPrompt = truncateUTF8Bytes(userPrompt, maxProbePromptBytes-16) + "\n...[truncated]"
 	}
 
 	req := openai.ChatCompletionRequest{
@@ -832,4 +833,18 @@ func (r *ToolLoopRunner) maybeCompact(ctx context.Context, run *FSMRun, store *S
 		"output_bytes", state.OutputBytes,
 	)
 	return nil
+}
+
+func truncateUTF8Bytes(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }

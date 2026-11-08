@@ -527,3 +527,102 @@ func TestRecallTaskHistory_StepOffsetPaginationOver25Steps(t *testing.T) {
 	assert.Equal(t, "step_many_00", seenIDs[0])
 	assert.Equal(t, "step_many_24", seenIDs[24])
 }
+
+func TestSliceTaskHistoryOutputPaginationProgress(t *testing.T) {
+	for _, raw := range []string{"Я", "😀", "─", "Привет😀┌─┐ world 🚀", string([]byte{0xff, 0xfe}) + "😀"} {
+		for budget := 1; budget <= 5; budget++ {
+			t.Run(fmt.Sprintf("%q/budget=%d", raw, budget), func(t *testing.T) {
+				var reconstructed strings.Builder
+				offset := 0
+				for pages := 0; ; pages++ {
+					require.Less(t, pages, len(raw)+1, "pagination must terminate")
+					chunk, actualOffset, returned, more, next := sliceTaskHistoryOutput(raw, offset, budget)
+					require.Equal(t, offset, actualOffset)
+					require.Equal(t, len(chunk), returned)
+					require.Positive(t, returned)
+					if utf8.ValidString(raw) {
+						assert.True(t, utf8.ValidString(chunk))
+					}
+					reconstructed.WriteString(chunk)
+					if !more {
+						assert.Nil(t, next)
+						assert.Equal(t, len(raw), offset+returned)
+						break
+					}
+					require.NotNil(t, next)
+					require.Greater(t, *next, offset)
+					require.Equal(t, offset+returned, *next)
+					offset = *next
+				}
+				assert.Equal(t, raw, reconstructed.String())
+			})
+		}
+	}
+}
+
+func TestSliceTaskHistoryOutputBudgetAndEOF(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		raw            string
+		offset, budget int
+		want           string
+		wantOffset     int
+	}{
+		{name: "zero budget", raw: "Я😀", budget: 0},
+		{name: "negative budget", raw: "Я😀", budget: -1},
+		{name: "zero budget with adjusted offset", raw: "Я😀", offset: 1, budget: 0},
+		{name: "EOF", raw: "😀", offset: 4, budget: 1, wantOffset: 4},
+		{name: "past EOF", raw: "😀", offset: 5, budget: 1, wantOffset: 5},
+		{name: "empty", budget: 1},
+		{name: "overflow budget", raw: "x😀", offset: 1, budget: int(^uint(0) >> 1), want: "😀", wantOffset: 1},
+		{name: "offset inside rune", raw: "x😀", offset: 3, budget: 1, want: "😀", wantOffset: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			chunk, offset, returned, more, next := sliceTaskHistoryOutput(tc.raw, tc.offset, tc.budget)
+			assert.Equal(t, tc.want, chunk)
+			assert.Equal(t, tc.wantOffset, offset)
+			assert.Equal(t, len(tc.want), returned)
+			assert.False(t, more)
+			assert.Nil(t, next)
+		})
+	}
+}
+
+type isolationErrorTaskHistoryStore struct {
+	err error
+}
+
+func (s *isolationErrorTaskHistoryStore) ListTaskHistorySteps(_ context.Context, _, _ string, _ bool, _ string) ([]TaskHistoryStep, error) {
+	return nil, s.err
+}
+
+func TestExecuteRecallTaskHistoryWithStoreRejectsRunIDArgument(t *testing.T) {
+	store := &isolationErrorTaskHistoryStore{err: errors.New("store must not be queried")}
+	output, err := ExecuteRecallTaskHistoryWithStore(
+		context.Background(), store, "dm_alice", "alice", true, "current_run",
+		`{"run_id": "other_run_123"}`,
+	)
+	require.ErrorContains(t, err, `unknown field "run_id"`)
+	assert.Empty(t, output)
+	assert.NotContains(t, err.Error(), store.err.Error())
+}
+
+func TestExecuteRecallTaskHistoryWithStorePropagatesIsolationError(t *testing.T) {
+	for _, message := range []string{
+		"run does not belong to chat",
+		"run does not belong to user",
+		"run channel scope mismatch",
+	} {
+		t.Run(message, func(t *testing.T) {
+			isolationErr := errors.New(message)
+			store := &isolationErrorTaskHistoryStore{err: isolationErr}
+			output, err := ExecuteRecallTaskHistoryWithStore(
+				context.Background(), store, "dm_alice", "alice", true, "current_run", `{}`,
+			)
+			require.ErrorIs(t, err, isolationErr)
+			assert.ErrorContains(t, err, "failed to query task history")
+			assert.ErrorContains(t, err, message)
+			assert.Empty(t, output)
+		})
+	}
+}

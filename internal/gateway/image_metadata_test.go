@@ -28,27 +28,57 @@ import (
 
 func TestExtractAndStripImageDescriptions(t *testing.T) {
 	payload := `{"descriptions":[{"filename":"Photo.PNG","file_id":"IMG-123","description":"A cat with {curly} markings."}]}`
+	wantDescriptions := map[string]string{"photo.png": "A cat with {curly} markings.", "img-123": "A cat with {curly} markings."}
+	fenced := "```json\n" + payload + "\n```"
+	laterCode := "```json\n{\"descriptions\":[{\"description\":\"example code\"}]}\n```"
 	for _, tc := range []struct {
 		name, text, clean string
 		want              map[string]string
 	}{
-		{name: "fenced", text: "A cat.\n\n```json\n" + payload + "\n```", clean: "A cat.", want: map[string]string{"photo.png": "A cat with {curly} markings.", "img-123": "A cat with {curly} markings."}},
-		{name: "unfenced", text: "A cat.\n" + payload, clean: "A cat.", want: map[string]string{"photo.png": "A cat with {curly} markings.", "img-123": "A cat with {curly} markings."}},
-		{name: "prefix", text: "A cat.\njson " + payload, clean: "A cat.", want: map[string]string{"photo.png": "A cat with {curly} markings.", "img-123": "A cat with {curly} markings."}},
-		{name: "only metadata", text: "json " + payload, want: map[string]string{"photo.png": "A cat with {curly} markings.", "img-123": "A cat with {curly} markings."}},
-		{name: "no json", text: " Just a cat. ", clean: "Just a cat.", want: map[string]string{}},
-		{name: "unrelated json", text: "```json\n{\"answer\":42}\n```", clean: "```json\n{\"answer\":42}\n```", want: map[string]string{}},
-		{name: "malformed fenced metadata", text: "A cat.\n```json\n{\"descriptions\":[oops]}\n```", clean: "A cat.", want: map[string]string{}},
-		{name: "malformed raw metadata", text: "A cat.\njson {\"descriptions\":[oops]}", clean: "A cat.", want: map[string]string{}},
-		{name: "incomplete raw metadata", text: "A cat.\n{\"descriptions\":[", clean: "A cat.", want: map[string]string{}},
+		{name: "leading fenced", text: fenced + "\nA cat.", clean: "A cat.", want: wantDescriptions},
+		{name: "leading unfenced", text: payload + "\nA cat.", clean: "A cat.", want: wantDescriptions},
+		{name: "only metadata", text: fenced, want: wantDescriptions},
+		{name: "whitespace and CRLF fence", text: " \t\r\n```json\r\n" + payload + "\r\n```\r\nA cat.", clean: "A cat.", want: wantDescriptions},
+		{name: "whitespace and CRLF raw", text: " \t\r\n" + payload + "\r\nA cat.", clean: "A cat.", want: wantDescriptions},
+		{name: "unlabelled leading fence", text: "\n```\n" + payload + "\n```\nA cat.", clean: "A cat.", want: wantDescriptions},
+		{name: "later code preserved verbatim", text: fenced + "\nA cat.\n" + laterCode + "\n ", clean: "A cat.\n" + laterCode + "\n ", want: wantDescriptions},
+		{name: "later raw preserved", text: payload + "\nAnswer\n" + payload, clean: "Answer\n" + payload, want: wantDescriptions},
+		{name: "malformed closed fence", text: "```json\n{\"descriptions\":[oops]}\n```\nA cat.\n" + laterCode, clean: "A cat.\n" + laterCode},
+		{name: "malformed closed fence with unfinished object", text: "```json\n{\"descriptions\":[\n```\nA cat.", clean: "A cat."},
+		{name: "malformed balanced raw", text: "{\"descriptions\":[oops]}\nA cat.", clean: "A cat."},
 		{name: "numeric ID", text: `{"descriptions":[{"fileID":123,"description":" Cat "}]}`, want: map[string]string{"123": "Cat"}},
-		{name: "empty descriptions", text: `{"descriptions":[{"filename":"photo.png","description":" "}]}`, want: map[string]string{}},
-		{name: "multiple blocks", text: payload + "\nAnswer\n" + payload, clean: "Answer", want: map[string]string{"photo.png": "A cat with {curly} markings.", "img-123": "A cat with {curly} markings."}},
+		{name: "empty descriptions", text: `{"descriptions":[{"filename":"photo.png","description":" "}]}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			clean, descriptions := extractAndStripImageDescriptions(tc.text)
 			assert.Equal(t, tc.clean, clean)
-			assert.Equal(t, tc.want, descriptions)
+			if tc.want == nil {
+				assert.Empty(t, descriptions)
+			} else {
+				assert.Equal(t, tc.want, descriptions)
+			}
+		})
+	}
+
+	for _, text := range []string{
+		" Just a cat. ",
+		"A cat.\n" + fenced,
+		"A cat.\n" + payload,
+		"A cat.\njson " + payload,
+		"json " + payload,
+		"```json\n{\"answer\":42}\n```",
+		"```json\n{\"example\":\"descriptions\"}\n```\nAnswer",
+		"```json\n{\"example\":\"descriptions\",\n```\nAnswer",
+		"A cat.\n```json\n{\"descriptions\":[oops]}\n```",
+		"A cat.\n{\"descriptions\":[",
+		"```json\n{\"descriptions\":[\n\nThe actual answer is a cat.",
+		"{\"descriptions\":[\n\nThe actual answer is a cat.",
+		"```json\n" + payload + "\nAnswer without closing fence.",
+	} {
+		t.Run("preserve/"+text, func(t *testing.T) {
+			clean, descriptions := extractAndStripImageDescriptions(text)
+			assert.Equal(t, text, clean)
+			assert.Empty(t, descriptions)
 		})
 	}
 }
@@ -145,9 +175,9 @@ func TestGateway_DeliverImageDescriptions(t *testing.T) {
 		name, reply string
 		fallback    bool
 	}{
-		{name: "in turn", reply: "A cat.\n```json\n{\"descriptions\":[{\"filename\":\"photo.png\",\"description\":\"A cat on a mat\"}]}\n```"},
+		{name: "in turn", reply: "```json\n{\"descriptions\":[{\"filename\":\"photo.png\",\"description\":\"A cat on a mat\"}]}\n```\nA cat."},
 		{name: "fallback", reply: "A cat.", fallback: true},
-		{name: "malformed", reply: "A cat.\n```json\n{\"descriptions\":[oops]}\n```", fallback: true},
+		{name: "malformed", reply: "```json\n{\"descriptions\":[oops]}\n```\nA cat.", fallback: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -271,7 +301,7 @@ func TestGateway_FinalizeImageReplyPartialAndFailedFallback(t *testing.T) {
 				e.Content += "\n[Attachment: dog.png (id: img-456, type: image/png)]"
 				return true
 			})
-			clean := gw.finalizeImageReply(context.Background(), imageTestRun(), "Pets.\n"+`{"descriptions":[{"filename":"photo.png","description":"A cat"}]}`)
+			clean := gw.finalizeImageReply(context.Background(), imageTestRun(), `{"descriptions":[{"filename":"photo.png","description":"A cat"}]}`+"\nPets.")
 			assert.Equal(t, "Pets.", clean)
 			entry := gw.contextManager.GetOrCreate("townhall").Entries()[0]
 			assert.Nil(t, entry.Images)
@@ -285,4 +315,39 @@ func TestGateway_FinalizeImageReplyPartialAndFailedFallback(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGatewayFinalizeImageReplyPreservesNonImageTurns(t *testing.T) {
+	for _, source := range []string{"missing", "text only", "attachment marker without image"} {
+		t.Run(source, func(t *testing.T) {
+			gw := NewGateway(&config.Config{DataDir: t.TempDir()}, nil)
+			defer gw.Stop()
+			if source != "missing" {
+				content := "Show code containing descriptions"
+				if source == "attachment marker without image" {
+					content += "\n[Attachment: photo.png (id: img-123, type: image/png)]"
+				}
+				gw.contextManager.Push("townhall", chatcontext.Entry{Role: "user", SenderID: "alice", Seq: 1, Content: content})
+			}
+			for _, reply := range []string{
+				" \r\n```json\r\n{\"descriptions\":[{\"filename\":\"example.png\",\"description\":\"example\"}]}\r\n```\r\nAnswer. ",
+				"Answer:\n```json\n{\"descriptions\":[oops]}\n```\n",
+				`{"descriptions":[{"filename":"example.png","description":"example"}]}`,
+			} {
+				assert.Equal(t, reply, gw.finalizeImageReply(context.Background(), imageTestRun(), reply))
+			}
+		})
+	}
+}
+
+func TestGatewayFinalizeImageReplyPreservesLaterCode(t *testing.T) {
+	gw := NewGateway(&config.Config{DataDir: t.TempDir()}, nil)
+	defer gw.Stop()
+	pushImageTestEntry(gw)
+	body := "A cat.\n\n```json\n{\"descriptions\":[{\"description\":\"keep this example\"}]}\n```\n"
+	reply := " \r\n```json\r\n{\"descriptions\":[{\"filename\":\"photo.png\",\"description\":\"A cat on a mat\"}]}\r\n```\r\n" + body
+	assert.Equal(t, body, gw.finalizeImageReply(context.Background(), imageTestRun(), reply))
+	entry := gw.contextManager.GetOrCreate("townhall").Entries()[0]
+	assert.Contains(t, entry.Content, `description: "A cat on a mat"`)
+	assert.Nil(t, entry.Images)
 }

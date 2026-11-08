@@ -666,7 +666,8 @@ func formatToolStepResult(s FSMStep) string {
 		content = fmt.Sprintf(`{"status": %q, "result": ""}`, s.Status)
 	}
 	if len(content) > MaxToolResultSizeInContext {
-		content = content[:MaxToolResultSizeInContext] + "\n[tool output truncated in context]"
+		const suffix = "\n[tool output truncated in context]"
+		content = truncateUTF8Bytes(content, MaxToolResultSizeInContext-len(suffix)) + suffix
 	}
 	return content
 }
@@ -688,18 +689,10 @@ func (r *ToolLoopRunner) buildChatMessages(ctx context.Context, run *FSMRun, sto
 	if err != nil {
 		return nil, fmt.Errorf("failed to get latest compaction for run %s: %w", run.ID, err)
 	}
-	if len(steps) == 0 && latestCompaction == nil {
-		return messages, nil
-	}
-
 	return reconstructChatMessages(messages, steps, latestCompaction), nil
 }
 
 func reconstructChatMessages(messages []openai.ChatCompletionMessage, steps []FSMStep, latestCompaction *CompactedTaskState) []openai.ChatCompletionMessage {
-	if len(steps) == 0 && latestCompaction == nil {
-		return messages
-	}
-
 	stepsByCallID := make(map[string]FSMStep, len(steps))
 	for _, s := range steps {
 		if s.ToolCallID != "" {
@@ -707,10 +700,12 @@ func reconstructChatMessages(messages []openai.ChatCompletionMessage, steps []FS
 		}
 	}
 
-	existingToolIDs := make(map[string]bool)
+	toolResponses := make(map[string]openai.ChatCompletionMessage)
 	for _, m := range messages {
 		if m.Role == openai.ChatMessageRoleTool && m.ToolCallID != "" {
-			existingToolIDs[m.ToolCallID] = true
+			if _, exists := toolResponses[m.ToolCallID]; !exists {
+				toolResponses[m.ToolCallID] = m
+			}
 		}
 	}
 
@@ -723,51 +718,54 @@ func reconstructChatMessages(messages []openai.ChatCompletionMessage, steps []FS
 	compactedInserted := false
 
 	for _, m := range messages {
-		if m.Role == openai.ChatMessageRoleAssistant && len(m.ToolCalls) > 0 {
-			msgIter := 0
-			for _, tc := range m.ToolCalls {
-				if s, ok := stepsByCallID[tc.ID]; ok && s.Iteration > 0 {
-					msgIter = s.Iteration
-					break
-				}
+		// Tool responses are emitted only with their parent assistant message.
+		if m.Role == openai.ChatMessageRoleTool {
+			continue
+		}
+		if m.Role != openai.ChatMessageRoleAssistant || len(m.ToolCalls) == 0 {
+			reconstructed = append(reconstructed, m)
+			continue
+		}
+
+		belongsToRun := false
+		allCompacted := compactedUpTo > 0
+		for _, tc := range m.ToolCalls {
+			s, ok := stepsByCallID[tc.ID]
+			if ok && s.Iteration > 0 {
+				belongsToRun = true
+			} else {
+				// Unknown iterations keep the whole group, including prior-turn exchanges.
+				allCompacted = false
 			}
-
-			// Only assistant tool-call messages belonging to this run's fsm_steps are subject to compaction or step injection.
-			// Prior conversation messages from earlier turns (not in stepsByCallID) remain in the pinned prefix untouched.
-			if msgIter > 0 {
-				if compactedUpTo > 0 && !compactedInserted {
-					reconstructed = append(reconstructed, RenderCompactedStateMessage(latestCompaction))
-					compactedInserted = true
-				}
-
-				if compactedUpTo > 0 && msgIter <= compactedUpTo {
-					continue
-				}
-
-				reconstructed = append(reconstructed, m)
-				for _, tc := range m.ToolCalls {
-					if existingToolIDs[tc.ID] {
-						continue
-					}
-					if s, ok := stepsByCallID[tc.ID]; ok {
-						reconstructed = append(reconstructed, openai.ChatCompletionMessage{
-							Role:       openai.ChatMessageRoleTool,
-							Content:    formatToolStepResult(s),
-							ToolCallID: tc.ID,
-						})
-					}
-				}
-				continue
+			if s.Iteration > compactedUpTo {
+				allCompacted = false
 			}
 		}
 
-		if compactedUpTo > 0 && m.Role == openai.ChatMessageRoleTool && m.ToolCallID != "" {
-			if s, ok := stepsByCallID[m.ToolCallID]; ok && s.Iteration > 0 && s.Iteration <= compactedUpTo {
-				continue
-			}
+		if belongsToRun && compactedUpTo > 0 && !compactedInserted {
+			reconstructed = append(reconstructed, RenderCompactedStateMessage(latestCompaction))
+			compactedInserted = true
+		}
+		if allCompacted {
+			continue
 		}
 
 		reconstructed = append(reconstructed, m)
+		for _, tc := range m.ToolCalls {
+			response, ok := toolResponses[tc.ID]
+			if !ok {
+				response = openai.ChatCompletionMessage{
+					Role:       openai.ChatMessageRoleTool,
+					ToolCallID: tc.ID,
+					Content:    `{"error":"Tool response unavailable in recovered history; execution outcome is unknown."}`,
+				}
+				if s, exists := stepsByCallID[tc.ID]; exists {
+					response.Content = formatToolStepResult(s)
+				}
+			}
+			reconstructed = append(reconstructed, response)
+			delete(toolResponses, tc.ID)
+		}
 	}
 
 	if compactedUpTo > 0 && !compactedInserted {

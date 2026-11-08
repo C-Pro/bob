@@ -494,14 +494,15 @@ func sliceTaskHistoryOutput(raw string, offsetBytes, maxBytes int) (slice string
 	}
 
 	if maxBytes <= 0 {
-		next := start
-		return "", start, 0, true, &next
+		return "", start, 0, false, nil
 	}
 
-	end := start + maxBytes
+	end := total
+	if maxBytes <= total-start {
+		end = start + maxBytes
+	}
 	if end >= total {
-		end = total
-		return raw[start:end], start, end - start, false, nil
+		return raw[start:total], start, total - start, false, nil
 	}
 
 	// Back up end if it falls in the middle of a multi-byte UTF-8 rune.
@@ -509,16 +510,18 @@ func sliceTaskHistoryOutput(raw string, offsetBytes, maxBytes int) (slice string
 		end--
 	}
 	if end == start {
-		// Budget is smaller than the single UTF-8 rune at start; do not split a valid multi-byte rune.
+		// A positive budget must advance past at least one complete rune.
 		r, rSize := utf8.DecodeRuneInString(raw[start:])
-		if r == utf8.RuneError && rSize == 1 {
+		if r == utf8.RuneError && rSize <= 1 {
 			end = start + 1
 		} else {
-			next := start
-			return "", start, 0, true, &next
+			end = start + rSize
 		}
 	}
 
+	if end >= total {
+		return raw[start:total], start, total - start, false, nil
+	}
 	next := end
 	return raw[start:end], start, end - start, true, &next
 }

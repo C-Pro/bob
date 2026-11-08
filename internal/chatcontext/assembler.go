@@ -20,7 +20,7 @@ const (
 	DefaultProceduralSkillBudgetBytes   = 24 * 1024  // 24 KiB
 	DefaultHistoricalContextBudgetBytes = 16 * 1024  // 16 KiB
 	DefaultRecentTurnsBudgetBytes       = 128 * 1024 // 128 KiB
-	EstimatedImageBytes                 = 1024       // Approximately 256 tokens, independent of encoded image size.
+	EstimatedImageBytes                 = 4096       // Approximately 1024 tokens, independent of encoded image size.
 )
 
 // SourceBudgets defines per-source byte budgets enforced during context assembly.

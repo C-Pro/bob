@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"bob/internal/agentapi"
 	"bob/internal/tools"
@@ -1529,4 +1530,239 @@ func TestStore_ListTaskHistorySteps_Isolation(t *testing.T) {
 	})
 	assert.Equal(t, recallRes.Content, formatted, "formatToolStepResult must not truncate recall_task_history JSON")
 	assert.True(t, json.Valid([]byte(formatted)), "formatted tool result in buildChatMessages must remain valid JSON")
+}
+
+func TestTruncateUTF8Bytes(t *testing.T) {
+	for _, input := range []string{"", "ASCII", "Привет", "😀🚀", "┌─┐│└┘", "aЯ😀─z"} {
+		t.Run(input, func(t *testing.T) {
+			for budget := -1; budget <= len(input)+1; budget++ {
+				got := truncateUTF8Bytes(input, budget)
+				assert.True(t, utf8.ValidString(got), "budget %d", budget)
+				assert.True(t, strings.HasPrefix(input, got))
+				if budget <= 0 {
+					assert.Empty(t, got)
+				} else {
+					assert.LessOrEqual(t, len(got), budget)
+					if len(got) < len(input) {
+						_, size := utf8.DecodeRuneInString(input[len(got):])
+						assert.Greater(t, len(got)+size, budget, "must retain every complete rune that fits")
+					} else {
+						assert.Equal(t, input, got)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestFormatToolStepResultUTF8Truncation(t *testing.T) {
+	const suffix = "\n[tool output truncated in context]"
+	for _, unit := range []string{"Я", "😀", "─"} {
+		t.Run(unit, func(t *testing.T) {
+			for _, size := range []int{MaxToolResultSizeInContext - 1, MaxToolResultSizeInContext, MaxToolResultSizeInContext + 20} {
+				content := strings.Repeat("x", size-2*len(unit)) + unit + unit
+				encoded, err := EncodeStoredToolResult(agentapi.ToolResult{Content: content})
+				require.NoError(t, err)
+				got := formatToolStepResult(FSMStep{ResultJSON: encoded})
+				assert.True(t, utf8.ValidString(got))
+				assert.LessOrEqual(t, len(got), MaxToolResultSizeInContext)
+				if size <= MaxToolResultSizeInContext {
+					assert.Equal(t, content, got)
+				} else {
+					assert.True(t, strings.HasSuffix(got, suffix))
+					assert.True(t, strings.HasPrefix(content, strings.TrimSuffix(got, suffix)))
+				}
+			}
+			// Force the byte cutoff into the middle of a rune.
+			content := strings.Repeat("x", MaxToolResultSizeInContext-len(suffix)-1) + strings.Repeat(unit, 30)
+			got := formatToolStepResult(FSMStep{ResultJSON: content})
+			assert.True(t, utf8.ValidString(got))
+			assert.LessOrEqual(t, len(got), MaxToolResultSizeInContext)
+			assert.True(t, strings.HasSuffix(got, suffix))
+		})
+	}
+}
+
+func TestStoreTaskHistoryIsolationThroughRecall(t *testing.T) {
+	store := NewStore(setupTestDB(t))
+	ctx := context.Background()
+	for _, run := range []*FSMRun{
+		{ID: "alice_run", ChatID: "dm_alice", UserID: "alice", IsDM: true},
+		{ID: "foreign_run", ChatID: "dm_bob", UserID: "bob", IsDM: true},
+		{ID: "public_run", ChatID: "townhall", UserID: "alice", IsDM: false},
+	} {
+		run.FSMType = FSMTypeToolLoop
+		run.Status = RunStatusRunning
+		run.CurrentState = StateExecuteSteps
+		run.ContextJSON = "[]"
+		require.NoError(t, store.CreateRun(ctx, run))
+	}
+	encoded, err := EncodeStoredToolResult(agentapi.ToolResult{Content: "FOREIGN_RUN_SECRET"})
+	require.NoError(t, err)
+	require.NoError(t, store.CreateSteps(ctx, []FSMStep{{
+		ID: "foreign_step", RunID: "foreign_run", Iteration: 1,
+		ToolName: "web_search", ToolCallID: "foreign_call", ArgsJSON: `{}`,
+		ResultJSON: encoded, Status: StepStatusCompleted,
+	}}))
+
+	for _, tc := range []struct {
+		name, chatID, userID, runID, args, wantError string
+		isDM                                         bool
+	}{
+		{name: "wrong chat", chatID: "dm_alice", userID: "bob", isDM: true, runID: "foreign_run", args: `{}`, wantError: "does not belong to chat"},
+		{name: "wrong user", chatID: "dm_bob", userID: "alice", isDM: true, runID: "foreign_run", args: `{}`, wantError: "does not belong to user"},
+		{name: "DM as public", chatID: "dm_alice", userID: "alice", runID: "alice_run", args: `{}`, wantError: "channel scope mismatch"},
+		{name: "public as DM", chatID: "townhall", userID: "alice", isDM: true, runID: "public_run", args: `{}`, wantError: "channel scope mismatch"},
+		{name: "missing DM owner", chatID: "dm_alice", isDM: true, runID: "alice_run", args: `{}`, wantError: "requires non-empty DM user owner"},
+		{name: "foreign run in arguments", chatID: "dm_alice", userID: "alice", isDM: true, runID: "alice_run", args: `{"run_id":"foreign_run"}`, wantError: `unknown field "run_id"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			output, err := tools.ExecuteRecallTaskHistoryWithStore(ctx, store, tc.chatID, tc.userID, tc.isDM, tc.runID, tc.args)
+			require.ErrorContains(t, err, tc.wantError)
+			assert.Empty(t, output)
+		})
+	}
+
+	output, err := tools.ExecuteRecallTaskHistoryWithStore(ctx, store, "dm_alice", "alice", true, "alice_run", `{"step_id":"foreign_step"}`)
+	require.NoError(t, err)
+	assert.Contains(t, output, `"matched_count":0`)
+	assert.NotContains(t, output, "FOREIGN_RUN_SECRET")
+
+	output, err = tools.ExecuteRecallTaskHistoryWithStore(ctx, store, "dm_bob", "bob", true, "foreign_run", `{"step_id":"foreign_step"}`)
+	require.NoError(t, err)
+	assert.Contains(t, output, "FOREIGN_RUN_SECRET")
+}
+
+func TestReconstructChatMessagesAtomicToolGroups(t *testing.T) {
+	assistant := func(ids ...string) openai.ChatCompletionMessage {
+		m := openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant}
+		for _, id := range ids {
+			m.ToolCalls = append(m.ToolCalls, openai.ToolCall{
+				ID: id, Type: openai.ToolTypeFunction,
+				Function: openai.FunctionCall{Name: "read_file", Arguments: `{}`},
+			})
+		}
+		return m
+	}
+	tool := func(id, content string) openai.ChatCompletionMessage {
+		return openai.ChatCompletionMessage{Role: openai.ChatMessageRoleTool, ToolCallID: id, Content: content}
+	}
+	system := openai.ChatCompletionMessage{Role: openai.ChatMessageRoleSystem, Content: "system instructions"}
+	user := openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: "current objective"}
+	answer := openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant, Content: "regular answer"}
+	compaction := &CompactedTaskState{Version: 1, CompactedUpToIter: 2, OriginalObjective: user.Content}
+	summary := RenderCompactedStateMessage(compaction)
+	oldStep := FSMStep{ToolCallID: "old", Iteration: 1, ResultJSON: "stored old result"}
+	newStep := FSMStep{ToolCallID: "new", Iteration: 3, ResultJSON: "stored new result"}
+
+	for _, tc := range []struct {
+		name       string
+		messages   []openai.ChatCompletionMessage
+		steps      []FSMStep
+		compaction *CompactedTaskState
+		want       []openai.ChatCompletionMessage
+	}{
+		{
+			name:     "parallel existing and recovered responses in call order",
+			messages: []openai.ChatCompletionMessage{system, user, assistant("old", "new"), tool("new", "existing new result"), answer},
+			steps:    []FSMStep{oldStep, newStep},
+			want:     []openai.ChatCompletionMessage{system, user, assistant("old", "new"), tool("old", oldStep.ResultJSON), tool("new", "existing new result"), answer},
+		},
+		{
+			name:     "responses reordered and duplicates consumed",
+			messages: []openai.ChatCompletionMessage{user, assistant("old", "new"), tool("new", "first new result"), answer, tool("old", "existing old result"), tool("new", "duplicate")},
+			steps:    []FSMStep{oldStep, newStep},
+			want:     []openai.ChatCompletionMessage{user, assistant("old", "new"), tool("old", "existing old result"), tool("new", "first new result"), answer},
+		},
+		{
+			name:     "mixed iterations retain all responses when compacted call is first",
+			messages: []openai.ChatCompletionMessage{user, assistant("old", "new"), tool("old", "existing old result"), answer},
+			steps:    []FSMStep{oldStep, newStep}, compaction: compaction,
+			want: []openai.ChatCompletionMessage{user, summary, assistant("old", "new"), tool("old", "existing old result"), tool("new", newStep.ResultJSON), answer},
+		},
+		{
+			name:     "mixed iterations retain all responses when retained call is first",
+			messages: []openai.ChatCompletionMessage{user, assistant("new", "old"), tool("old", "existing old result"), answer},
+			steps:    []FSMStep{oldStep, newStep}, compaction: compaction,
+			want: []openai.ChatCompletionMessage{user, summary, assistant("new", "old"), tool("new", newStep.ResultJSON), tool("old", "existing old result"), answer},
+		},
+		{
+			name:     "all compacted calls and their responses removed together",
+			messages: []openai.ChatCompletionMessage{system, user, assistant("old", "boundary"), tool("boundary", "boundary result"), tool("old", "old result"), answer, assistant("new")},
+			steps:    []FSMStep{oldStep, {ToolCallID: "boundary", Iteration: 2}, newStep}, compaction: compaction,
+			want: []openai.ChatCompletionMessage{system, user, summary, answer, assistant("new"), tool("new", newStep.ResultJSON)},
+		},
+		{
+			name:     "unknown iteration conservatively retains group",
+			messages: []openai.ChatCompletionMessage{user, assistant("old", "unknown"), tool("unknown", "prior result"), answer},
+			steps:    []FSMStep{oldStep}, compaction: compaction,
+			want: []openai.ChatCompletionMessage{user, summary, assistant("old", "unknown"), tool("old", oldStep.ResultJSON), tool("unknown", "prior result"), answer},
+		},
+		{
+			name:     "zero iteration conservatively retains group",
+			messages: []openai.ChatCompletionMessage{user, assistant("old", "unknown"), tool("unknown", "prior result")},
+			steps:    []FSMStep{oldStep, {ToolCallID: "unknown"}}, compaction: compaction,
+			want: []openai.ChatCompletionMessage{user, summary, assistant("old", "unknown"), tool("old", oldStep.ResultJSON), tool("unknown", "prior result")},
+		},
+		{
+			name:     "prior exchange remains before compaction summary",
+			messages: []openai.ChatCompletionMessage{system, assistant("prior"), tool("prior", "prior result"), user, assistant("old"), answer},
+			steps:    []FSMStep{oldStep}, compaction: compaction,
+			want: []openai.ChatCompletionMessage{system, assistant("prior"), tool("prior", "prior result"), user, summary, answer},
+		},
+		{
+			name:     "orphans discarded even without steps or compaction",
+			messages: []openai.ChatCompletionMessage{system, tool("orphan", "secret"), user, answer, tool("orphan", "duplicate secret")},
+			want:     []openai.ChatCompletionMessage{system, user, answer},
+		},
+		{
+			name:     "orphan with stored step is discarded",
+			messages: []openai.ChatCompletionMessage{user, tool("new", "orphan result"), answer},
+			steps:    []FSMStep{newStep}, compaction: compaction,
+			want: []openai.ChatCompletionMessage{user, answer, summary},
+		},
+		{
+			name:     "missing response gets explicit recovery error",
+			messages: []openai.ChatCompletionMessage{user, assistant("missing"), answer},
+			want:     []openai.ChatCompletionMessage{user, assistant("missing"), tool("missing", `{"error":"Tool response unavailable in recovered history; execution outcome is unknown."}`), answer},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before, err := EncodeMessages(tc.messages)
+			require.NoError(t, err)
+			got := reconstructChatMessages(tc.messages, tc.steps, tc.compaction)
+			assert.Equal(t, tc.want, got)
+			after, err := EncodeMessages(tc.messages)
+			require.NoError(t, err)
+			assert.Equal(t, before, after, "reconstruction must not mutate stored context")
+			assert.Equal(t, got, reconstructChatMessages(got, tc.steps, nil), "repaired groups must remain stable")
+		})
+	}
+}
+
+func TestBuildChatMessagesRepairsToolGroupsWithoutSteps(t *testing.T) {
+	store := NewStore(setupTestDB(t))
+	ctx := context.Background()
+	messages := []openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: "objective"},
+		{Role: openai.ChatMessageRoleTool, ToolCallID: "orphan", Content: "orphan response"},
+		{Role: openai.ChatMessageRoleAssistant, ToolCalls: []openai.ToolCall{{ID: "missing", Type: openai.ToolTypeFunction, Function: openai.FunctionCall{Name: "read_file", Arguments: `{}`}}}},
+	}
+	encoded, err := EncodeMessages(messages)
+	require.NoError(t, err)
+	run := &FSMRun{
+		ID: "run_missing_steps", ChatID: "townhall", FSMType: FSMTypeToolLoop,
+		Status: RunStatusRunning, CurrentState: StateLLMRequest, ContextJSON: encoded,
+	}
+	require.NoError(t, store.CreateRun(ctx, run))
+	runner := NewToolLoopRunner(nil, nil, "test-model")
+	got, err := runner.buildChatMessages(ctx, run, store)
+	require.NoError(t, err)
+	require.Len(t, got, 3)
+	assert.Equal(t, messages[0], got[0])
+	assert.Equal(t, messages[2], got[1])
+	assert.Equal(t, openai.ChatMessageRoleTool, got[2].Role)
+	assert.Equal(t, "missing", got[2].ToolCallID)
+	assert.True(t, json.Valid([]byte(got[2].Content)))
+	assert.Contains(t, got[2].Content, "execution outcome is unknown")
 }

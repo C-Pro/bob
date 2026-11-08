@@ -83,6 +83,8 @@ func TestAssembler_HistoricalImagesStrippedWithoutMutatingBuffer(t *testing.T) {
 }
 
 func TestEntryFormattedBytes_EstimatesImages(t *testing.T) {
+	assert.Equal(t, 4096, EstimatedImageBytes)
+	assert.Equal(t, 1024, estimateTokens(EstimatedImageBytes))
 	for _, encodedBytes := range []int{8, 60 * 1024} {
 		t.Run(fmt.Sprintf("encoded_bytes_%d", encodedBytes), func(t *testing.T) {
 			entry := Entry{
@@ -118,6 +120,7 @@ func TestTruncateEntryToFit_PreservesImagesAndMetadata(t *testing.T) {
 		{name: "text truncated", budget: EstimatedImageBytes + len("Alice: ") + 5, content: "ЖЖ", senderName: "Alice", keepImages: true},
 		{name: "prefix exceeds remaining budget", budget: EstimatedImageBytes + 3, content: "Ж", keepImages: true},
 		{name: "image alone fits", budget: EstimatedImageBytes, keepImages: true},
+		{name: "one byte below image estimate", budget: EstimatedImageBytes - 1, content: entry.Content, senderName: "Alice"},
 		{name: "image exceeds entire budget", budget: len("Alice: ") + 5, content: "ЖЖ", senderName: "Alice"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -443,4 +446,50 @@ func TestManager_Assemble(t *testing.T) {
 	assert.Equal(t, "Please continue.", res.Messages[2].Content)
 	assert.Equal(t, int64(1), res.Manifest.RingBuffer.MinSeq)
 	assert.Equal(t, int64(2), res.Manifest.RingBuffer.MaxSeq)
+}
+
+func TestAssemblerActiveImageBudgetBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		images, budget int
+		keepImages     bool
+	}{
+		{name: "single image below estimate", images: 1, budget: 4095},
+		{name: "single image exact estimate", images: 1, budget: 4096, keepImages: true},
+		{name: "multiple images below total estimate", images: 2, budget: 8191},
+		{name: "multiple images exact total estimate", images: 2, budget: 8192, keepImages: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entry := Entry{Role: openai.ChatMessageRoleUser, SenderName: "Alice", Content: "Describe images", Seq: 2}
+			for i := 0; i < tc.images; i++ {
+				entry.Images = append(entry.Images, ImageAttachment{URL: fmt.Sprintf("https://images.test/%d.png", i)})
+			}
+			manager := NewManager(10)
+			manager.Push("chat-images", Entry{Role: openai.ChatMessageRoleAssistant, Content: "Previous answer", Seq: 1})
+			manager.Push("chat-images", entry)
+			result := manager.Assemble("chat-images", AssemblyInput{}, SourceBudgets{RecentTurnsBytes: tc.budget})
+			require.Len(t, result.Messages, 1)
+			message := result.Messages[0]
+			assert.Equal(t, openai.ChatMessageRoleUser, message.Role)
+			if tc.keepImages {
+				require.Len(t, message.MultiContent, tc.images)
+				for i, part := range message.MultiContent {
+					assert.Equal(t, openai.ChatMessagePartTypeImageURL, part.Type)
+					require.NotNil(t, part.ImageURL)
+					assert.Equal(t, entry.Images[i].URL, part.ImageURL.URL)
+				}
+				assert.Empty(t, message.Content)
+				assert.Equal(t, tc.images*4096, result.Manifest.Usage.RecentTurns.Bytes)
+			} else {
+				assert.Empty(t, message.MultiContent)
+				assert.Equal(t, "Alice: Describe images", message.Content)
+				assert.Equal(t, len(message.Content), result.Manifest.Usage.RecentTurns.Bytes)
+			}
+			assert.LessOrEqual(t, result.Manifest.Usage.RecentTurns.Bytes, tc.budget)
+			assert.Equal(t, estimateTokens(result.Manifest.Usage.RecentTurns.Bytes), result.Manifest.Usage.RecentTurns.EstimatedTokens)
+			assert.True(t, result.Manifest.Usage.RecentTurns.Truncated)
+			assert.Equal(t, 1, result.Manifest.RingBuffer.DroppedCount)
+			assert.Equal(t, entry, manager.GetOrCreate("chat-images").Entries()[1], "assembly must preserve original attachments")
+		})
+	}
 }

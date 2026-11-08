@@ -66,10 +66,64 @@ type MessageToStore struct {
 
 // Manager manages isolated SQLite sqvect databases per chat and watermark tracking.
 type Manager struct {
-	cfg      *config.Config
-	embedder cortexdb.Embedder
-	dbsMu    sync.RWMutex
-	dbs      map[string]*cortexdb.DB
+	cfg         *config.Config
+	embedder    cortexdb.Embedder
+	dbsMu       sync.RWMutex
+	dbs         map[string]*cortexdb.DB
+	chatLocksMu sync.Mutex
+	chatLocks   map[chatLockKey]*chatIndexLock
+}
+
+type chatLockKey struct {
+	chatID string
+	isDM   bool
+}
+
+type chatIndexLock struct {
+	held chan struct{}
+	refs int
+}
+
+func (m *Manager) acquireChatLock(ctx context.Context, chatID string, isDM bool) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	key := chatLockKey{chatID: chatID, isDM: isDM}
+	m.chatLocksMu.Lock()
+	if m.chatLocks == nil {
+		m.chatLocks = make(map[chatLockKey]*chatIndexLock)
+	}
+	lock := m.chatLocks[key]
+	if lock == nil {
+		lock = &chatIndexLock{held: make(chan struct{}, 1)}
+		m.chatLocks[key] = lock
+	}
+	lock.refs++
+	m.chatLocksMu.Unlock()
+
+	releaseRef := func() {
+		m.chatLocksMu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(m.chatLocks, key)
+		}
+		m.chatLocksMu.Unlock()
+	}
+	select {
+	case lock.held <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-lock.held
+			releaseRef()
+			return nil, err
+		}
+		return func() {
+			<-lock.held
+			releaseRef()
+		}, nil
+	case <-ctx.Done():
+		releaseRef()
+		return nil, ctx.Err()
+	}
 }
 
 func isNilEmbedder(e cortexdb.Embedder) bool {
@@ -244,8 +298,9 @@ func (m *Manager) SetWatermark(ctx context.Context, chatID string, isDM bool, se
 		INSERT INTO watermark (id, last_indexed_seq, updated_at)
 		VALUES (1, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(id) DO UPDATE SET
-			last_indexed_seq = excluded.last_indexed_seq,
-			updated_at = CURRENT_TIMESTAMP
+			last_indexed_seq = MAX(excluded.last_indexed_seq, watermark.last_indexed_seq),
+			updated_at = CASE WHEN excluded.last_indexed_seq >= watermark.last_indexed_seq
+				THEN excluded.updated_at ELSE watermark.updated_at END
 	`, seq)
 	return err
 }
@@ -254,6 +309,12 @@ const maxChunkSize = 33
 
 // IndexMessages stores batches of messages as formatted conversation chunks into the chat's isolated database and updates the watermark.
 func (m *Manager) IndexMessages(ctx context.Context, chatID string, isDM bool, msgs []MessageToStore) error {
+	release, err := m.acquireChatLock(ctx, chatID, isDM)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	if len(msgs) == 0 {
 		return nil
 	}
@@ -349,7 +410,10 @@ func (m *Manager) IndexMessages(ctx context.Context, chatID string, isDM bool, m
 	}
 
 	if maxSeq > 0 {
-		curSeq, _ := m.GetWatermark(ctx, chatID, isDM)
+		curSeq, err := m.GetWatermark(ctx, chatID, isDM)
+		if err != nil {
+			return fmt.Errorf("failed to read watermark for chat %s: %w", chatID, err)
+		}
 		if maxSeq > curSeq {
 			if err := m.SetWatermark(ctx, chatID, isDM, maxSeq); err != nil {
 				slog.Warn("failed to update watermark", "chat_id", chatID, "seq", maxSeq, "error", err)
