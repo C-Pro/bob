@@ -515,7 +515,15 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req openai.ChatComple
 			}
 		}
 
-		resp, err := c.apiClient.CreateChatCompletion(ctx, req)
+		reqCtx := ctx
+		var cancel context.CancelFunc
+		if c.requestTimeout > 0 {
+			reqCtx, cancel = context.WithTimeout(ctx, c.requestTimeout)
+		}
+		resp, err := c.apiClient.CreateChatCompletion(reqCtx, req)
+		if cancel != nil {
+			cancel()
+		}
 		if err == nil {
 			if len(resp.Choices) == 0 {
 				return nil, errors.New("no completion choices returned by API")

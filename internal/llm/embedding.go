@@ -41,7 +41,15 @@ func (c *Client) CreateEmbeddings(ctx context.Context, texts []string, model str
 			}
 		}
 
-		resp, err := c.apiClient.CreateEmbeddings(ctx, req)
+		reqCtx := ctx
+		var cancel context.CancelFunc
+		if c.requestTimeout > 0 {
+			reqCtx, cancel = context.WithTimeout(ctx, c.requestTimeout)
+		}
+		resp, err := c.apiClient.CreateEmbeddings(reqCtx, req)
+		if cancel != nil {
+			cancel()
+		}
 		if err == nil {
 			if len(resp.Data) == 0 {
 				return nil, errors.New("no embeddings returned by API")

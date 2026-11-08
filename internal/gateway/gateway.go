@@ -1414,8 +1414,9 @@ func (g *Gateway) WarmupContext(ctx context.Context) error {
 
 // ProcessMessage handles a single incoming message from Besedka.
 func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
-	defer cancel()
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	if msg.ChatID == "" {
 		msg.ChatID = "townhall"
