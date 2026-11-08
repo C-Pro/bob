@@ -607,7 +607,7 @@ func (r *Registry) executeRecallMemory(ctx context.Context, argsJSON string) (st
 		if err != nil {
 			return "", fmt.Errorf("memory chunk lookup error: %w", err)
 		}
-		slog.Info("executed recall_memory raw chunk lookup", "chunk_id", args.ChunkID, "hits", len(items))
+		slog.Info("executed recall_memory raw chunk lookup", "chunk_id", args.ChunkID, "start_seq", args.StartSeq, "end_seq", args.EndSeq, "hits", len(items))
 	} else {
 		items, err = r.memoryManager.Search(ctx, args.Query, chatID, isDM, limit)
 		if err != nil {

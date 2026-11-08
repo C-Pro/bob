@@ -490,6 +490,7 @@ func (g *Gateway) Deliver(ctx context.Context, comp agentapi.Completion) error {
 		// suppress generic failure apologies to the chat on crash recovery.
 		return nil
 	}
+	defer g.clearSourceImages(comp.Run)
 
 	g.mu.Lock()
 	botID := g.botUserID
@@ -524,6 +525,7 @@ func (g *Gateway) Deliver(ctx context.Context, comp agentapi.Completion) error {
 		return nil
 	}
 
+	reply = g.finalizeImageReply(ctx, comp.Run, reply)
 	if reply == "" {
 		return nil
 	}
@@ -549,11 +551,10 @@ func (g *Gateway) Deliver(ctx context.Context, comp agentapi.Completion) error {
 		return fmt.Errorf("failed to deliver reply to chat %s: %w", chatID, err)
 	}
 
-	pushContent, pushImages := formattedReply, []chatcontext.ImageAttachment(nil)
+	pushContent := formattedReply
 	if len(outgoingAttachments) > 0 {
-		extraText, images := g.processAttachments(ctx, outgoingAttachments)
+		extraText, _ := g.processAttachments(ctx, outgoingAttachments)
 		pushContent = strings.TrimSpace(formattedReply + extraText)
-		pushImages = images
 	}
 
 	g.contextManager.Push(chatID, chatcontext.Entry{
@@ -561,7 +562,6 @@ func (g *Gateway) Deliver(ctx context.Context, comp agentapi.Completion) error {
 		SenderID:   botID,
 		SenderName: botName,
 		Content:    pushContent,
-		Images:     pushImages,
 		Timestamp:  time.Now().Unix(),
 	})
 
@@ -1626,6 +1626,12 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 }
 
 func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Message, isDM bool, senderName, currentTask string, initialProgressSeq int64) error {
+	sourceRun := agentapi.RunDescriptor{
+		Session:  agentapi.SessionRef{SessionID: msg.ChatID},
+		Actor:    agentapi.Actor{ID: msg.UserID},
+		Metadata: map[string]string{"source_message_seq": strconv.FormatInt(msg.Seq, 10)},
+	}
+	defer g.clearSourceImages(sourceRun)
 	g.mu.Lock()
 	runner := g.runner
 	botID := g.botUserID
@@ -1889,6 +1895,7 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 		}
 	}
 
+	reply = g.finalizeImageReply(ctx, sourceRun, reply)
 	formattedReply := FormatResponse(reply, isDM, g.cfg.TownhallMaxParagraphs, g.cfg.DMMaxParagraphs)
 
 	var outgoingAttachments []models.Attachment
@@ -1903,11 +1910,10 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 		return fmt.Errorf("failed to send reply to chat %s: %w", msg.ChatID, err)
 	}
 
-	pushContent, pushImages := formattedReply, []chatcontext.ImageAttachment(nil)
+	pushContent := formattedReply
 	if len(outgoingAttachments) > 0 {
-		extraText, images := g.processAttachments(ctx, outgoingAttachments)
+		extraText, _ := g.processAttachments(ctx, outgoingAttachments)
 		pushContent = strings.TrimSpace(formattedReply + extraText)
-		pushImages = images
 	}
 
 	g.contextManager.Push(msg.ChatID, chatcontext.Entry{
@@ -1915,7 +1921,6 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 		SenderID:   botID,
 		SenderName: botUser.GetDisplayName(),
 		Content:    pushContent,
-		Images:     pushImages,
 		Timestamp:  time.Now().Unix(),
 	})
 

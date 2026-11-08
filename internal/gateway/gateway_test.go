@@ -1262,6 +1262,14 @@ func TestProcessMessage_ImageAttachment(t *testing.T) {
 	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req openai.ChatCompletionRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.ResponseFormat != nil {
+			_ = json.NewEncoder(w).Encode(openai.ChatCompletionResponse{
+				Choices: []openai.ChatCompletionChoice{{Message: openai.ChatCompletionMessage{
+					Content: `{"descriptions":[{"filename":"photo.png","description":"An image."}]}`,
+				}}},
+			})
+			return
+		}
 
 		// Check the user message
 		for _, msg := range req.Messages {
@@ -1384,8 +1392,8 @@ func TestProcessMessage_ImageAttachment(t *testing.T) {
 	// Verify ring buffer entry
 	entries := gw.contextManager.GetOrCreate("townhall").Entries()
 	require.Len(t, entries, 2) // user + assistant
-	assert.Len(t, entries[0].Images, 1)
-	assert.Equal(t, "data:image/jpeg;base64,"+fakeImageB64, entries[0].Images[0].URL)
+	assert.Nil(t, entries[0].Images)
+	assert.Contains(t, entries[0].Content, `description: "An image."`)
 
 	gw.Stop()
 }
@@ -1633,15 +1641,18 @@ func TestGateway_EvictionToMemoryIndexing(t *testing.T) {
 
 	// Allow async indexing goroutine to complete
 	var hits []memory.MemoryItem
+	var wm int64
 	require.Eventually(t, func() bool {
 		var err error
 		hits, err = gw.MemoryManager().Search(ctx, "secret", "townhall", false, 5)
-		return err == nil && len(hits) > 0
+		if err != nil || len(hits) == 0 {
+			return false
+		}
+		wm, err = gw.MemoryManager().GetWatermark(ctx, "townhall", false)
+		return err == nil && wm == int64(10)
 	}, 45*time.Second, 150*time.Millisecond)
 
 	// Verify watermark was updated
-	wm, err := gw.MemoryManager().GetWatermark(ctx, "townhall", false)
-	require.NoError(t, err)
 	assert.Equal(t, int64(10), wm)
 
 	// Verify message content in memory store
@@ -3598,4 +3609,3 @@ func TestGateway_MultiSourceAssembly_OwnershipValidationAndFreshRestart(t *testi
 		assert.Equal(t, chatID, input.ChatID)
 	})
 }
-

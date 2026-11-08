@@ -1,9 +1,11 @@
 package fsm
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +20,61 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestCompactionProbeCompletionBudgetAndDiagnostics(t *testing.T) {
+	previousLogger := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+	for _, tc := range []struct {
+		name         string
+		content      string
+		finishReason openai.FinishReason
+		wantError    bool
+	}{
+		{name: "complete JSON", content: `{"should_compact":false,"reason":"No compaction needed"}`, finishReason: openai.FinishReasonStop},
+		{name: "length finish with valid JSON", content: `{"should_compact":false}`, finishReason: openai.FinishReasonLength},
+		{name: "truncated JSON", content: `{"should_compact":tru`, finishReason: openai.FinishReasonLength, wantError: true},
+		{name: "malformed JSON", content: "invalid JSON", finishReason: openai.FinishReasonStop, wantError: true},
+		{name: "bounded preview", content: strings.Repeat("x", 2000) + "END_OF_RAW", finishReason: openai.FinishReasonLength, wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+			decider := &llmCompactionDecider{client: &mockLLMClient{
+				handler: func(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+					assert.Equal(t, 8192, req.MaxCompletionTokens)
+					assert.Equal(t, "probe-model", req.Model)
+					return &openai.ChatCompletionResponse{Choices: []openai.ChatCompletionChoice{{
+						FinishReason: tc.finishReason,
+						Message:      openai.ChatCompletionMessage{Role: "assistant", Content: tc.content},
+					}}}, nil
+				},
+			}}
+			result, err := decider.DecideCompaction(context.Background(), CompactionProbeInput{
+				Run: &FSMRun{ID: "probe-test", Iteration: 3}, Model: "probe-model", TargetIter: 2,
+			})
+			if tc.wantError {
+				require.Error(t, err)
+				assert.Nil(t, result)
+				assert.ErrorContains(t, err, "finish_reason="+string(tc.finishReason))
+				assert.ErrorContains(t, err, "raw_preview=")
+				assert.NotContains(t, err.Error(), "END_OF_RAW")
+				var syntaxError *json.SyntaxError
+				assert.ErrorAs(t, err, &syntaxError)
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, result)
+				assert.False(t, result.ShouldCompact)
+			}
+			if tc.finishReason == openai.FinishReasonLength {
+				assert.Contains(t, logs.String(), "level=WARN")
+				assert.Contains(t, logs.String(), "compaction probe output was truncated")
+				assert.Contains(t, logs.String(), "finish_reason=length")
+			} else {
+				assert.Empty(t, logs.String())
+			}
+		})
+	}
+}
 
 func TestToolLoop_RubricTriggeredCompactionAndViewConstruction(t *testing.T) {
 	db := setupTestDB(t)

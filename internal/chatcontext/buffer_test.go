@@ -11,6 +11,49 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestRingBuffer_UpdateLast(t *testing.T) {
+	rb := NewRingBuffer(10)
+	assert.False(t, rb.UpdateLast(func(e *Entry) bool { return true }))
+	rb.Push(Entry{Role: "user", Content: "Older", Seq: 1})
+	rb.Push(Entry{Role: "user", Content: "Newest", Seq: 2, Images: []ImageAttachment{{URL: "image"}}})
+	rb.Push(Entry{Role: "assistant", Content: "Reply", Seq: 3})
+	var visited []int64
+	require.True(t, rb.UpdateLast(func(e *Entry) bool {
+		visited = append(visited, e.Seq)
+		if e.Role != "user" {
+			return false
+		}
+		e.Content = "Enriched"
+		e.Images = nil
+		return true
+	}))
+	assert.Equal(t, []int64{3, 2}, visited)
+	entries := rb.Entries()
+	assert.Equal(t, "Older", entries[0].Content)
+	assert.Equal(t, "Enriched", entries[1].Content)
+	assert.Nil(t, entries[1].Images)
+	assert.Equal(t, "Reply", entries[2].Content)
+	assert.False(t, rb.UpdateLast(func(e *Entry) bool { return e.Seq == 99 }))
+
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Go(func() {
+			for range 100 {
+				rb.UpdateLast(func(e *Entry) bool {
+					if e.Role != "user" {
+						return false
+					}
+					e.Timestamp++
+					return true
+				})
+				rb.Entries()
+			}
+		})
+	}
+	wg.Wait()
+	assert.Equal(t, int64(1000), rb.Entries()[1].Timestamp)
+}
+
 func TestRingBuffer_PushAndEviction(t *testing.T) {
 	rb := NewRingBuffer(3)
 	assert.Equal(t, 3, rb.Capacity())

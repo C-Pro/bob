@@ -2,6 +2,7 @@ package chatcontext
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +15,130 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestAssembler_LargeImagesRetainEarlierConversation(t *testing.T) {
+	entries := make([]Entry, 0, 11)
+	for i := 1; i <= 10; i++ {
+		entries = append(entries, Entry{
+			Role: openai.ChatMessageRoleUser, Content: fmt.Sprintf("Earlier message %d", i), Seq: int64(i),
+		})
+	}
+	imageURL := "data:image/jpeg;base64," + strings.Repeat("A", 60*1024)
+	entries = append(entries, Entry{
+		Role: openai.ChatMessageRoleUser, SenderName: "Alice", Content: "Describe these images", Seq: 11,
+		Images: []ImageAttachment{{URL: imageURL}, {URL: imageURL}, {URL: imageURL}},
+	})
+
+	res := NewAssembler().Assemble(AssemblyInput{RecentEntries: entries})
+
+	require.Len(t, res.Messages, 11)
+	for i := 0; i < 10; i++ {
+		assert.Equal(t, entries[i].Content, res.Messages[i].Content)
+	}
+	require.Len(t, res.Messages[10].MultiContent, 4)
+	assert.Equal(t, "Alice: Describe these images", res.Messages[10].MultiContent[0].Text)
+	for _, part := range res.Messages[10].MultiContent[1:] {
+		require.NotNil(t, part.ImageURL)
+		assert.Equal(t, imageURL, part.ImageURL.URL)
+	}
+	assert.Equal(t, 0, res.Manifest.RingBuffer.DroppedCount)
+	assert.False(t, res.Manifest.Usage.RecentTurns.Truncated)
+	expectedBytes := 3 * EstimatedImageBytes
+	for _, entry := range entries {
+		expectedBytes += len(entry.Content)
+	}
+	expectedBytes += len("Alice: ")
+	assert.Equal(t, expectedBytes, res.Manifest.Usage.RecentTurns.Bytes)
+}
+
+func TestAssembler_HistoricalImagesStrippedWithoutMutatingBuffer(t *testing.T) {
+	mgr := NewManager(10)
+	image := ImageAttachment{URL: "data:image/jpeg;base64," + strings.Repeat("A", 60*1024)}
+	first := Entry{Role: openai.ChatMessageRoleUser, Content: "First image", Images: []ImageAttachment{image}, Seq: 1}
+	mgr.Push("chat-images", first)
+	res := mgr.Assemble("chat-images", AssemblyInput{})
+	require.Len(t, res.Messages, 1)
+	require.Len(t, res.Messages[0].MultiContent, 2)
+
+	mgr.Push("chat-images", Entry{Role: openai.ChatMessageRoleAssistant, Content: "Description", Seq: 2})
+	res = mgr.Assemble("chat-images", AssemblyInput{})
+	require.Len(t, res.Messages, 3)
+	assert.Empty(t, res.Messages[0].MultiContent)
+	assert.Equal(t, first.Content, res.Messages[0].Content)
+
+	latest := Entry{Role: openai.ChatMessageRoleUser, Content: "Next image", Images: []ImageAttachment{image}, Seq: 3}
+	mgr.Push("chat-images", latest)
+	res = mgr.Assemble("chat-images", AssemblyInput{}, SourceBudgets{
+		RecentTurnsBytes: len(first.Content) + len("Description") + len(latest.Content) + EstimatedImageBytes,
+	})
+	require.Len(t, res.Messages, 3)
+	assert.Equal(t, 0, res.Manifest.RingBuffer.DroppedCount)
+	assert.Empty(t, res.Messages[0].MultiContent)
+	assert.Equal(t, first.Content, res.Messages[0].Content)
+	require.Len(t, res.Messages[2].MultiContent, 2)
+	assert.Equal(t, image.URL, res.Messages[2].MultiContent[1].ImageURL.URL)
+	buffered := mgr.GetOrCreate("chat-images").Entries()
+	assert.Equal(t, first, buffered[0])
+	assert.Equal(t, latest, buffered[2])
+}
+
+func TestEntryFormattedBytes_EstimatesImages(t *testing.T) {
+	for _, encodedBytes := range []int{8, 60 * 1024} {
+		t.Run(fmt.Sprintf("encoded_bytes_%d", encodedBytes), func(t *testing.T) {
+			entry := Entry{
+				SenderName: "Alice", Content: "Images",
+				Images: []ImageAttachment{
+					{URL: "data:image/jpeg;base64," + strings.Repeat("A", encodedBytes)},
+					{URL: "data:image/jpeg;base64," + strings.Repeat("B", encodedBytes)},
+				},
+			}
+			assert.Equal(t, len("Alice: Images")+2*EstimatedImageBytes, entryFormattedBytes(entry))
+			entry.Content = ""
+			entry.SenderName = ""
+			assert.Equal(t, 2*EstimatedImageBytes, entryFormattedBytes(entry))
+			entry.Role = openai.ChatMessageRoleAssistant
+			assert.Zero(t, entryFormattedBytes(entry))
+		})
+	}
+}
+
+func TestTruncateEntryToFit_PreservesImagesAndMetadata(t *testing.T) {
+	entry := Entry{
+		Role: openai.ChatMessageRoleUser, SenderName: "Alice", SenderID: "user-1",
+		Content: strings.Repeat("Ж", 50), Seq: 42, Timestamp: 1700000000,
+		Images: []ImageAttachment{{URL: "data:image/jpeg;base64," + strings.Repeat("A", 60*1024)}},
+	}
+	for _, tc := range []struct {
+		name       string
+		budget     int
+		content    string
+		senderName string
+		keepImages bool
+	}{
+		{name: "text truncated", budget: EstimatedImageBytes + len("Alice: ") + 5, content: "ЖЖ", senderName: "Alice", keepImages: true},
+		{name: "prefix exceeds remaining budget", budget: EstimatedImageBytes + 3, content: "Ж", keepImages: true},
+		{name: "image alone fits", budget: EstimatedImageBytes, keepImages: true},
+		{name: "image exceeds entire budget", budget: len("Alice: ") + 5, content: "ЖЖ", senderName: "Alice"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := truncateEntryToFit(entry, tc.budget)
+			expected := entry
+			expected.Content = tc.content
+			expected.SenderName = tc.senderName
+			if !tc.keepImages {
+				expected.Images = nil
+			}
+			assert.Equal(t, expected, got)
+			assert.True(t, utf8.ValidString(got.Content))
+			assert.LessOrEqual(t, entryFormattedBytes(got), tc.budget)
+			res := NewAssembler(SourceBudgets{RecentTurnsBytes: tc.budget}).Assemble(AssemblyInput{RecentEntries: []Entry{entry}})
+			require.Len(t, res.Messages, 1)
+			assert.Equal(t, entryToLLMMessage(expected), res.Messages[0])
+			assert.True(t, res.Manifest.Usage.RecentTurns.Truncated)
+			assert.Equal(t, entryFormattedBytes(expected), res.Manifest.Usage.RecentTurns.Bytes)
+		})
+	}
+}
 
 func TestAssembler_MultiSourceAssemblyAndManifest(t *testing.T) {
 	assembler := NewAssembler(DefaultSourceBudgets())

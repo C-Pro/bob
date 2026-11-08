@@ -78,6 +78,7 @@ func TestRenderDMPromptWithSandbox(t *testing.T) {
 	assert.Contains(t, prompt, "Alice")
 	assert.Contains(t, prompt, "sandbox_request")
 	assert.Contains(t, prompt, "sandbox_exec")
+	assert.Contains(t, prompt, "sandbox_download_attachment")
 	assert.Contains(t, prompt, "sandbox_destroy")
 	assert.Contains(t, prompt, "/workspace")
 	assert.NotContains(t, prompt, "active sandbox")
@@ -106,3 +107,23 @@ func TestPromptMarkdownAndMathGuidelines(t *testing.T) {
 	}
 }
 
+func TestPromptsImageDescriptionsAndScopedRecall(t *testing.T) {
+	bot := models.User{DisplayName: "Bob"}
+	user := models.User{DisplayName: "Alice"}
+	for name, rendered := range map[string]string{
+		"townhall": RenderTownhallPrompt(bot, "@bot", 2),
+		"dm":       RenderDMPrompt(bot, "@bot", user, 5),
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.Contains(t, rendered, "image attachments")
+			assert.Contains(t, rendered, "at the beginning of your response")
+			assert.Contains(t, rendered, "```json\n{\"descriptions\": [{\"filename\":")
+			assert.Contains(t, rendered, `"description":`)
+			assert.Contains(t, rendered, "Then proceed with your response or necessary tool calls.")
+			assert.Contains(t, rendered, "durable facts not present in your immediate context")
+			assert.Contains(t, rendered, "search memory with recall_memory before concluding that information was never discussed")
+			assert.Contains(t, rendered, "Do NOT call recall_memory for attachments, files, code, or context already referenced in your active conversation turns.")
+			assert.NotContains(t, rendered, "ALWAYS search your memory")
+		})
+	}
+}

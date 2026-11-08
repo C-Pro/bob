@@ -19,7 +19,7 @@ const (
 	maxProbeStepOutputBytes = 1024
 	maxProbePrevStateBytes  = 8192
 	maxProbePromptBytes     = 32768
-	maxProbeCompletionToks  = 2048
+	maxProbeCompletionToks  = 8192
 	maxCompactedStateBytes  = 32768
 )
 
@@ -565,6 +565,10 @@ func (d *llmCompactionDecider) DecideCompaction(ctx context.Context, input Compa
 	if len(resp.Choices) == 0 {
 		return nil, fmt.Errorf("compaction probe returned empty choices")
 	}
+	finishReason := resp.Choices[0].FinishReason
+	if finishReason == openai.FinishReasonLength {
+		slog.Warn("compaction probe output was truncated", "finish_reason", finishReason, "max_completion_tokens", maxProbeCompletionToks)
+	}
 
 	raw := strings.TrimSpace(resp.Choices[0].Message.Content)
 	if len(raw) > maxCompactedStateBytes*2 {
@@ -574,7 +578,7 @@ func (d *llmCompactionDecider) DecideCompaction(ctx context.Context, input Compa
 
 	var result CompactionProbeResult
 	if err := json.Unmarshal([]byte(raw), &result); err != nil {
-		return nil, fmt.Errorf("failed to parse compaction probe JSON: %w", err)
+		return nil, fmt.Errorf("failed to parse compaction probe JSON (finish_reason=%s, raw_preview=%.512q): %w", finishReason, raw, err)
 	}
 	return &result, nil
 }

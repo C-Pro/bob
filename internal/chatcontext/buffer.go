@@ -89,6 +89,19 @@ func (rb *RingBuffer) Entries() []Entry {
 	return res
 }
 
+// UpdateLast visits entries newest first, stopping when fn updates an entry and returns true.
+// The callback runs under the buffer lock and must not call other buffer methods.
+func (rb *RingBuffer) UpdateLast(fn func(e *Entry) bool) bool {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	for i := len(rb.entries) - 1; i >= 0; i-- {
+		if fn(&rb.entries[i]) {
+			return true
+		}
+	}
+	return false
+}
+
 // Len returns the current number of entries in the buffer.
 func (rb *RingBuffer) Len() int {
 	rb.mu.RLock()

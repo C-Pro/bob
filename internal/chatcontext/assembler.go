@@ -20,6 +20,7 @@ const (
 	DefaultProceduralSkillBudgetBytes   = 24 * 1024  // 24 KiB
 	DefaultHistoricalContextBudgetBytes = 16 * 1024  // 16 KiB
 	DefaultRecentTurnsBudgetBytes       = 128 * 1024 // 128 KiB
+	EstimatedImageBytes                 = 1024       // Approximately 256 tokens, independent of encoded image size.
 )
 
 // SourceBudgets defines per-source byte budgets enforced during context assembly.
@@ -538,6 +539,9 @@ func selectRecentEntriesWithinBudget(entries []Entry, budgetBytes int) (retained
 	var reversed []Entry
 	for i := len(entries) - 1; i >= 0; i-- {
 		e := entries[i]
+		if i != len(entries)-1 {
+			e.Images = nil
+		}
 		cost := entryFormattedBytes(e)
 		if len(reversed) == 0 && cost > budgetBytes {
 			// Ensure the latest turn is always retained by truncating its text content to fit budgetBytes.
@@ -570,7 +574,7 @@ func entryFormattedBytes(e Entry) int {
 		for _, part := range msg.MultiContent {
 			total += len(part.Text)
 			if part.ImageURL != nil {
-				total += len(part.ImageURL.URL)
+				total += EstimatedImageBytes
 			}
 		}
 		return total
@@ -588,12 +592,19 @@ func truncateEntryToFit(e Entry, budgetBytes int) Entry {
 	if role == openai.ChatMessageRoleUser && senderName != "" && senderName != e.SenderID {
 		prefixLen = len(senderName) + 2 // "<SenderName>: "
 	}
-	avail := budgetBytes - prefixLen
+	imageBytes := 0
+	if role == openai.ChatMessageRoleUser {
+		imageBytes = len(e.Images) * EstimatedImageBytes
+	}
+	if imageBytes > budgetBytes {
+		e.Images = nil
+		imageBytes = 0
+	}
+	avail := budgetBytes - imageBytes - prefixLen
 	if avail < 0 {
 		e.SenderName = ""
-		avail = budgetBytes
+		avail = budgetBytes - imageBytes
 	}
-	e.Images = nil
 	e.Content = truncateUTF8Bytes(e.Content, avail)
 	return e
 }
