@@ -29,6 +29,8 @@ type RunCacheMetadata struct {
 
 var (
 	cacheRootOverride string
+	cacheRootDataDir  string
+	resolvedCacheRoot string
 	cacheRootMu       sync.RWMutex
 
 	activeLocksMu sync.Mutex
@@ -114,27 +116,115 @@ func SetCacheRootOverride(dir string) {
 	cacheRootMu.Lock()
 	defer cacheRootMu.Unlock()
 	cacheRootOverride = dir
+	resolvedCacheRoot = ""
+	if dir == "" {
+		cacheRootDataDir = ""
+	}
+}
+
+// SetCacheRootDataDir configures a data directory candidate to use for sandbox run caches.
+func SetCacheRootDataDir(dir string) {
+	clean := strings.TrimSpace(dir)
+	if clean == "" {
+		return
+	}
+	cacheRootMu.Lock()
+	defer cacheRootMu.Unlock()
+	if cacheRootDataDir != clean {
+		cacheRootDataDir = clean
+		resolvedCacheRoot = ""
+	}
+}
+
+func testWritableDir(dir string) bool {
+	clean := strings.TrimSpace(dir)
+	if clean == "" {
+		return false
+	}
+	if err := os.MkdirAll(clean, 0o700); err != nil {
+		return false
+	}
+	f, err := os.CreateTemp(clean, ".probe-*")
+	if err != nil {
+		return false
+	}
+	_ = f.Close()
+	_ = os.Remove(f.Name())
+	return true
 }
 
 // CacheRootDir returns the base root directory where per-run sandbox caches are stored.
 func CacheRootDir() string {
 	cacheRootMu.RLock()
-	override := cacheRootOverride
+	if cacheRootOverride != "" {
+		res := cacheRootOverride
+		cacheRootMu.RUnlock()
+		return res
+	}
+	if resolvedCacheRoot != "" {
+		res := resolvedCacheRoot
+		cacheRootMu.RUnlock()
+		return res
+	}
 	cacheRootMu.RUnlock()
-	if override != "" {
-		return override
+
+	cacheRootMu.Lock()
+	defer cacheRootMu.Unlock()
+
+	if cacheRootOverride != "" {
+		return cacheRootOverride
+	}
+	if resolvedCacheRoot != "" {
+		return resolvedCacheRoot
 	}
 
-	cacheDir, err := os.UserCacheDir()
-	if err != nil || strings.TrimSpace(cacheDir) == "" {
-		home := os.Getenv("HOME")
-		if home != "" {
-			cacheDir = filepath.Join(home, ".cache")
-		} else {
-			cacheDir = "./data/cache"
+	candidates := make([]string, 0, 8)
+
+	// 1. Standard user cache directory
+	if userCache, err := os.UserCacheDir(); err == nil && strings.TrimSpace(userCache) != "" {
+		candidates = append(candidates, filepath.Join(userCache, "bob", "sandboxes"))
+	}
+	if xdg := os.Getenv("XDG_CACHE_HOME"); strings.TrimSpace(xdg) != "" {
+		candidates = append(candidates, filepath.Join(xdg, "bob", "sandboxes"))
+	}
+	if home := os.Getenv("HOME"); strings.TrimSpace(home) != "" {
+		candidates = append(candidates, filepath.Join(home, ".cache", "bob", "sandboxes"))
+	}
+
+	// 2. Data directory candidates
+	if cacheRootDataDir != "" {
+		candidates = append(candidates, filepath.Join(cacheRootDataDir, "cache", "sandboxes"))
+	}
+	candidates = append(candidates,
+		filepath.Join(".", "data", "cache", "sandboxes"),
+		filepath.Join("/data", "cache", "sandboxes"),
+	)
+
+	// 3. System temp directory
+	candidates = append(candidates,
+		filepath.Join(os.TempDir(), ".cache", "bob", "sandboxes"),
+		filepath.Join(os.TempDir(), "bob", "sandboxes"),
+	)
+
+	// 4. Working directory fallback
+	candidates = append(candidates, filepath.Join(".", ".cache", "bob", "sandboxes"))
+
+	seen := make(map[string]struct{}, len(candidates))
+	for _, cand := range candidates {
+		cand = filepath.Clean(cand)
+		if _, exists := seen[cand]; exists {
+			continue
+		}
+		seen[cand] = struct{}{}
+		if testWritableDir(cand) {
+			resolvedCacheRoot = cand
+			return cand
 		}
 	}
-	return filepath.Join(cacheDir, "bob", "sandboxes")
+
+	fallback := filepath.Join(os.TempDir(), "bob", "sandboxes")
+	resolvedCacheRoot = fallback
+	return fallback
 }
 
 // SanitizeRunKey prevents path traversal when using runID in filenames.
@@ -158,7 +248,12 @@ func AcquireRunCacheDir(runID string, meta RunCacheMetadata) (string, error) {
 		return "", fmt.Errorf("invalid run ID %q", runID)
 	}
 
-	baseDir := filepath.Join(CacheRootDir(), cleanID)
+	if meta.DataDir != "" {
+		SetCacheRootDataDir(meta.DataDir)
+	}
+
+	rootDir := CacheRootDir()
+	baseDir := filepath.Join(rootDir, cleanID)
 	cacheDir := filepath.Join(baseDir, "cache")
 
 	// Ensure cache subdirectories exist
@@ -172,6 +267,33 @@ func AcquireRunCacheDir(runID string, meta RunCacheMetadata) (string, error) {
 	}
 	for _, dir := range subdirs {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
+			slog.Warn("failed to create cache directory in root, falling back to temp dir", "root", rootDir, "error", err)
+			cacheRootMu.Lock()
+			resolvedCacheRoot = ""
+			cacheRootMu.Unlock()
+
+			fallbackRoot := filepath.Join(os.TempDir(), ".cache", "bob", "sandboxes")
+			if testWritableDir(fallbackRoot) {
+				cacheRootMu.Lock()
+				resolvedCacheRoot = fallbackRoot
+				cacheRootMu.Unlock()
+				baseDir = filepath.Join(fallbackRoot, cleanID)
+				cacheDir = filepath.Join(baseDir, "cache")
+				fallbackSubdirs := []string{
+					cacheDir,
+					filepath.Join(cacheDir, "go"),
+					filepath.Join(cacheDir, "go-build"),
+					filepath.Join(cacheDir, "golangci-lint"),
+					filepath.Join(cacheDir, "npm"),
+					filepath.Join(cacheDir, "pip"),
+				}
+				for _, fbDir := range fallbackSubdirs {
+					if fbErr := os.MkdirAll(fbDir, 0o700); fbErr != nil {
+						return "", fmt.Errorf("failed to create cache directory %s after fallback: %w", fbDir, fbErr)
+					}
+				}
+				break
+			}
 			return "", fmt.Errorf("failed to create cache directory %s: %w", dir, err)
 		}
 	}
