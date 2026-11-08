@@ -870,3 +870,58 @@ func TestExecuteSandboxRequest_NotifierError(t *testing.T) {
 	}`)
 	assert.NoError(t, err, "subsequent request must succeed after rollback")
 }
+
+func TestSandboxToolDefinitions_Descriptions(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &config.Config{
+		DataDir:                    tempDir,
+		SandboxEnabled:             true,
+		SandboxDrivers:             []string{"bwrap"},
+		SandboxAllowedNetworkModes: []string{"none", "restricted"},
+		SandboxDefaultExecTimeout:  1 * time.Minute,
+		SandboxMaxExecTimeout:      10 * time.Minute,
+	}
+	mockDriver := &mockSandboxDriver{available: true}
+	sandboxMgr := sandbox.NewManager(cfg.SandboxConfig(), []sandbox.Driver{mockDriver})
+	defer func() { _ = sandboxMgr.Close() }()
+
+	reg := NewRegistry(nil, nil, sandboxMgr)
+	tools := reg.ToolDefinitionsForSession(ChatSessionContext{IsDM: true, UserID: "user1"})
+
+	var sbxRequest, sbxDestroy *openai.Tool
+	for i := range tools {
+		if tools[i].Function.Name == "sandbox_request" {
+			sbxRequest = &tools[i]
+		}
+		if tools[i].Function.Name == "sandbox_destroy" {
+			sbxDestroy = &tools[i]
+		}
+	}
+
+	require.NotNil(t, sbxRequest)
+	require.NotNil(t, sbxDestroy)
+
+	// Verify sandbox_request description uses milder, task-based wording
+	assert.Contains(t, sbxRequest.Function.Description, "appropriate permissions and allowed domains, keeping them minimal")
+	assert.NotContains(t, sbxRequest.Function.Description, "least privilege")
+	assert.NotContains(t, sbxRequest.Function.Description, "network: full")
+	assert.NotContains(t, sbxRequest.Function.Description, "network:full")
+
+	// Verify parameter schema descriptions
+	paramsMap, ok := sbxRequest.Function.Parameters.(map[string]interface{})
+	require.True(t, ok)
+	props, ok := paramsMap["properties"].(map[string]interface{})
+	require.True(t, ok)
+
+	netProp, ok := props["network"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Contains(t, netProp["description"], "Request minimal permissions needed to achieve the task.")
+	assert.NotContains(t, netProp["description"], "least privilege")
+
+	domProp, ok := props["domains"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Contains(t, domProp["description"], "If internet access for dependencies or APIs is required, provide the specific domains needed.")
+
+	// Verify sandbox_destroy description includes reconfiguration guidance
+	assert.Contains(t, sbxDestroy.Function.Description, "permissions/domains need to be reconfigured with sandbox_request")
+}

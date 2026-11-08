@@ -278,7 +278,7 @@ func (r *Registry) initToolDefinitions() {
 			networkDescriptions = append(networkDescriptions, "'full' (unrestricted internet access)")
 		}
 	}
-	networkDesc := "Network access level. Permitted modes on this server: " + strings.Join(networkDescriptions, ", ") + ". Apply least privilege."
+	networkDesc := "Network access level. Permitted modes on this server: " + strings.Join(networkDescriptions, ", ") + ". Request minimal permissions needed to achieve the task."
 
 	sandboxRequestSchema := map[string]interface{}{
 		"type": "object",
@@ -302,7 +302,7 @@ func (r *Registry) initToolDefinitions() {
 				"items": map[string]interface{}{
 					"type": "string",
 				},
-				"description": "List of domains to allow when network is 'restricted' (e.g. ['pypi.org', 'files.pythonhosted.org']).",
+				"description": "List of domains to allow when network is 'restricted' (e.g. ['pypi.org', 'files.pythonhosted.org']). If internet access for dependencies or APIs is required, provide the specific domains needed.",
 			},
 			"mounts": map[string]interface{}{
 				"type": "array",
@@ -391,7 +391,7 @@ func (r *Registry) initToolDefinitions() {
 			Type: openai.ToolTypeFunction,
 			Function: &openai.FunctionDefinition{
 				Name:        "sandbox_request",
-				Description: "Request creation of a secure isolated execution sandbox. You MUST apply the principle of least privilege, requesting only the minimal permissions required for the task. The human user must explicitly approve your request before the sandbox is created. Available only in 1-on-1 direct messages.",
+				Description: "Request creation of a secure isolated execution sandbox. Consider what you need to achieve the task and request appropriate permissions and allowed domains, keeping them minimal for the task. The human user must explicitly approve your request before the sandbox is created. Available only in 1-on-1 direct messages.",
 				Parameters:  sandboxRequestSchema,
 			},
 		},
@@ -407,7 +407,7 @@ func (r *Registry) initToolDefinitions() {
 			Type: openai.ToolTypeFunction,
 			Function: &openai.FunctionDefinition{
 				Name:        "sandbox_destroy",
-				Description: "Explicitly terminate and tear down your active sandbox when you have finished your tasks or before requesting a different sandbox environment, freeing system resources.",
+				Description: "Explicitly terminate and tear down your active sandbox when finished or when permissions/domains need to be reconfigured with sandbox_request, freeing system resources.",
 				Parameters:  sandboxDestroySchema,
 			},
 		},

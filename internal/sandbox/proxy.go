@@ -479,7 +479,7 @@ func (p *FilteringProxy) resolveAndValidate(ctx context.Context, host string) (n
 	// 3. If in Restricted mode, verify host or IP is explicitly permitted in AllowedHosts whitelist (default-deny)
 	if p.policy.Mode == NetworkRestricted {
 		if len(p.policy.AllowedHosts) == 0 {
-			return nil, fmt.Errorf("restricted network policy requires at least one allowed domain; host %q blocked by default-deny", cleanHost)
+			return nil, fmt.Errorf("restricted network policy has an empty domain allowlist; host %q is blocked by default-deny. Consider destroying this sandbox (sandbox_destroy) and requesting a new one with the necessary allowed domains", cleanHost)
 		}
 		allowed := false
 		for _, allowedHost := range p.policy.AllowedHosts {
@@ -499,7 +499,7 @@ func (p *FilteringProxy) resolveAndValidate(ctx context.Context, host string) (n
 			}
 		}
 		if !allowed {
-			return nil, fmt.Errorf("host %q is not in allowed domains whitelist", cleanHost)
+			return nil, fmt.Errorf("host %q is not in the sandbox domain allowlist. Consider destroying this sandbox (sandbox_destroy) and requesting a new one with the necessary allowed domains", cleanHost)
 		}
 	}
 
