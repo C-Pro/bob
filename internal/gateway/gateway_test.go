@@ -16,6 +16,7 @@ import (
 	"bob/internal/chatcontext"
 	"bob/internal/config"
 	"bob/internal/fsm"
+	"bob/internal/knowledge"
 	"bob/internal/llm"
 	"bob/internal/memory"
 	"bob/internal/models"
@@ -3260,3 +3261,341 @@ func TestGateway_Frontend_BindAndDeliver(t *testing.T) {
 	assert.Equal(t, "chat-1", runner.turnCalls[0].Run.Session.SessionID)
 	runner.mu.Unlock()
 }
+
+func TestGateway_MultiSourceAssemblyInGenerateReply(t *testing.T) {
+	ctx := context.Background()
+	tempDir := t.TempDir()
+
+	cfg := &config.Config{
+		BotHandle:             "@bot",
+		DataDir:               tempDir,
+		EmbeddingModel:        "none",
+		MsgRingBufferSize:     10,
+		DMMaxParagraphs:       3,
+		DMToolMaxIterations:   10,
+		TownhallMaxParagraphs: 2,
+	}
+
+	gw := NewGateway(cfg, nil)
+	memMgr := memory.NewManager(cfg, nil)
+	defer func() { _ = memMgr.Close() }()
+	gw.SetMemoryManager(memMgr)
+
+	gw.mu.Lock()
+	gw.botUserID = "bot-1"
+	gw.botUser = models.User{ID: "bot-1", UserName: "bot"}
+	gw.mu.Unlock()
+
+	chatID := "dm_bot-1_user-1"
+	gw.chatCache.Set(models.Chat{
+		ID:           chatID,
+		Type:         "dm",
+		TargetUserID: "user-1",
+		UserIDs:      []string{"bot-1", "user-1"},
+	})
+
+	// 1. Index an evicted ongoing episode in memoryManager (seq 1..2)
+	require.NoError(t, memMgr.IndexMessages(ctx, chatID, true, []memory.MessageToStore{
+		{Seq: 1, Timestamp: 1000, ChatID: chatID, UserID: "user-1", SenderName: "Alice", Role: "user", Content: "Can you help me migrate staging DB?"},
+		{Seq: 2, Timestamp: 1010, ChatID: chatID, UserID: "bot-1", SenderName: "Bob", Role: "assistant", Content: "Working on the migration plan."},
+	}))
+
+	// 2. Create and approve a structured memory and a procedural skill in knowledge.Store
+	kStore, err := gw.StoreProvider().GetKnowledgeStore(ctx, chatID, true)
+	require.NoError(t, err)
+	seq := int64(2)
+	_, memVer, err := kStore.ProposeMemory(ctx, &knowledge.KnowledgeItem{
+		ChatID: chatID,
+		UserID: "user-1",
+	}, &knowledge.MemoryVersion{
+		Type:       knowledge.MemoryTypeFact,
+		Content:    "Staging DB uses PostgreSQL 16.",
+		Confidence: 1.0,
+		Provenance: knowledge.Provenance{ChatID: chatID, UserID: "user-1", SourceMessageSeq: &seq, FSMRunID: "run_prev"},
+	})
+	require.NoError(t, err)
+	require.NoError(t, kStore.ApproveVersion(ctx, memVer.ID, "user-1"))
+
+	_, skillVer, err := kStore.ProposeSkill(ctx, &knowledge.KnowledgeItem{
+		ChatID: chatID,
+		UserID: "user-1",
+	}, &knowledge.SkillVersion{
+		Name:                 "db-migration",
+		Description:          "Run safe DB migrations",
+		InstructionsMarkdown: "Always back up schema before applying migrations.",
+		Provenance:           knowledge.Provenance{ChatID: chatID, UserID: "user-1", SourceMessageSeq: &seq, FSMRunID: "run_prev"},
+	})
+	require.NoError(t, err)
+	require.NoError(t, kStore.ApproveVersion(ctx, skillVer.ID, "user-1"))
+
+	// 3. Persist a CompactedTaskState on fsmStore referencing the active memory and skill versions
+	fsmStore, err := gw.StoreProvider().GetStore(ctx, chatID, true)
+	require.NoError(t, err)
+	require.NoError(t, fsmStore.CreateRun(ctx, &fsm.FSMRun{
+		ID:            "run_prev",
+		ChatID:        chatID,
+		UserID:        "user-1",
+		IsDM:          true,
+		FSMType:       fsm.FSMTypeToolLoop,
+		Status:        fsm.RunStatusCompleted,
+		CurrentState:  fsm.StateCompleted,
+		MaxIterations: 10,
+	}))
+	require.NoError(t, fsmStore.SaveCompaction(ctx, &fsm.CompactedTaskState{
+		RunID:                "run_prev",
+		Version:              1,
+		ParentVersion:        0,
+		CompactedUpToIter:    2,
+		OriginalObjective:    "Migrate staging DB",
+		CurrentSubgoal:       "Verify schema backup",
+		ActiveMemoryVersions: []string{memVer.ID},
+		ActiveSkillVersions:  []string{skillVer.ID},
+		RubricVerdict:        fsm.CompactionVerdictProbedCompact,
+	}))
+
+	// 4. Push recent ring-buffer turn (seq 10)
+	gw.contextManager.Push(chatID, chatcontext.Entry{
+		Role:       openai.ChatMessageRoleUser,
+		SenderID:   "user-1",
+		SenderName: "Alice",
+		Content:    "Let's resume the migration.",
+		Timestamp:  2000,
+		Seq:        10,
+	})
+
+	runner := &mockTurnRunner{
+		result: agentapi.Result{
+			RunID:   "run-assembled",
+			Content: "Resuming migration with all 5 context sources.",
+		},
+	}
+	gw.SetRunner(runner)
+
+	msg := models.Message{
+		Seq:       10,
+		ChatID:    chatID,
+		UserID:    "user-1",
+		Content:   "Let's resume the migration.",
+		Timestamp: 2000,
+	}
+	require.NoError(t, gw.generateAndSendAgentReply(ctx, msg, true, "Alice", "", 0))
+
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	require.Len(t, runner.turnCalls, 1)
+	turn := runner.turnCalls[0]
+
+	// Verify assembled SystemPrompt includes all 4 system-prompt sources
+	assert.Contains(t, turn.SystemPrompt, "[Approved Structured Memories]")
+	assert.Contains(t, turn.SystemPrompt, "Staging DB uses PostgreSQL 16.")
+	assert.Contains(t, turn.SystemPrompt, "[Approved Procedural Skills]")
+	assert.Contains(t, turn.SystemPrompt, "Always back up schema before applying migrations.")
+	assert.Contains(t, turn.SystemPrompt, "[Episodic & Historical Context]")
+	assert.Contains(t, turn.SystemPrompt, "[Model-Derived Episode Summary | seq 1-2]")
+	assert.Contains(t, turn.SystemPrompt, "[Raw Conversation Chunk")
+
+	// Verify context_manifest metadata contains all 5 sources
+	manifestRaw := turn.Run.Metadata["context_manifest"]
+	require.NotEmpty(t, manifestRaw)
+	var manifest chatcontext.AssemblyManifest
+	require.NoError(t, json.Unmarshal([]byte(manifestRaw), &manifest))
+	assert.Equal(t, []string{memVer.ID}, manifest.MemoryVersions)
+	assert.Equal(t, []string{skillVer.ID}, manifest.SkillVersions)
+	assert.NotEmpty(t, manifest.EpisodeIDs)
+	assert.NotEmpty(t, manifest.ChunkIDs)
+	assert.Equal(t, int64(10), manifest.RingBuffer.MinSeq)
+	assert.Equal(t, int64(10), manifest.RingBuffer.MaxSeq)
+}
+
+func TestGateway_MultiSourceAssembly_OwnershipValidationAndFreshRestart(t *testing.T) {
+	ctx := context.Background()
+	tempDir := t.TempDir()
+
+	cfg := &config.Config{
+		BotHandle:             "@bot",
+		DataDir:               tempDir,
+		EmbeddingModel:        "none",
+		MsgRingBufferSize:     10,
+		DMMaxParagraphs:       3,
+		DMToolMaxIterations:   10,
+		TownhallMaxParagraphs: 2,
+	}
+
+	// 1. Pre-populate data using an initial gateway and memory manager
+	initGw := NewGateway(cfg, nil)
+	initMemMgr := memory.NewManager(cfg, nil)
+	initGw.SetMemoryManager(initMemMgr)
+
+	chatID := "dm_bot-1_user-1"
+	initGw.mu.Lock()
+	initGw.botUserID = "bot-1"
+	initGw.botUser = models.User{ID: "bot-1", UserName: "bot"}
+	initGw.mu.Unlock()
+
+	initGw.chatCache.Set(models.Chat{
+		ID:           chatID,
+		Type:         "dm",
+		TargetUserID: "user-1",
+		UserIDs:      []string{"bot-1", "user-1"},
+	})
+
+	// Pre-index episode in chat
+	require.NoError(t, initMemMgr.IndexMessages(ctx, chatID, true, []memory.MessageToStore{
+		{Seq: 1, Timestamp: 1000, ChatID: chatID, UserID: "user-1", SenderName: "Alice", Role: "user", Content: "Restart and ownership test message"},
+		{Seq: 2, Timestamp: 1010, ChatID: chatID, UserID: "bot-1", SenderName: "Bob", Role: "assistant", Content: "Acknowledged"},
+	}))
+
+	kStore, err := initGw.StoreProvider().GetKnowledgeStore(ctx, chatID, true)
+	require.NoError(t, err)
+	seq := int64(2)
+
+	// Legitimate memory owned by user-1
+	_, legitMem, err := kStore.ProposeMemory(ctx, &knowledge.KnowledgeItem{
+		ChatID: chatID,
+		UserID: "user-1",
+	}, &knowledge.MemoryVersion{
+		Type:       knowledge.MemoryTypeFact,
+		Content:    "Legitimate memory owned by user-1",
+		Confidence: 1.0,
+		Provenance: knowledge.Provenance{ChatID: chatID, UserID: "user-1", SourceMessageSeq: &seq, FSMRunID: "run_prev"},
+	})
+	require.NoError(t, err)
+	require.NoError(t, kStore.ApproveVersion(ctx, legitMem.ID, "user-1"))
+
+	// Foreign-owned memory (user-attacker) in the same chat database
+	_, foreignMem, err := kStore.ProposeMemory(ctx, &knowledge.KnowledgeItem{
+		ChatID: chatID,
+		UserID: "user-attacker",
+	}, &knowledge.MemoryVersion{
+		Type:       knowledge.MemoryTypeFact,
+		Content:    "Foreign injected memory",
+		Confidence: 1.0,
+		Provenance: knowledge.Provenance{ChatID: chatID, UserID: "user-attacker", SourceMessageSeq: &seq, FSMRunID: "run_prev"},
+	})
+	require.NoError(t, err)
+	require.NoError(t, kStore.ApproveVersion(ctx, foreignMem.ID, "user-attacker"))
+
+	// Memory with mismatched provenance (item belongs to user-1, but version provenance belongs to user-attacker)
+	_, mismatchedMem, err := kStore.ProposeMemory(ctx, &knowledge.KnowledgeItem{
+		ChatID: chatID,
+		UserID: "user-1",
+	}, &knowledge.MemoryVersion{
+		Type:       knowledge.MemoryTypeFact,
+		Content:    "Mismatched provenance memory",
+		Confidence: 1.0,
+		Provenance: knowledge.Provenance{ChatID: chatID, UserID: "user-1", SourceMessageSeq: &seq, FSMRunID: "run_prev"},
+	})
+	require.NoError(t, err)
+	require.NoError(t, kStore.ApproveVersion(ctx, mismatchedMem.ID, "user-1"))
+	_, err = kStore.DB().ExecContext(ctx, "UPDATE memory_versions SET user_id = 'user-attacker' WHERE id = ?", mismatchedMem.ID)
+	require.NoError(t, err)
+
+	// Foreign-owned skill
+	_, foreignSkill, err := kStore.ProposeSkill(ctx, &knowledge.KnowledgeItem{
+		ChatID: chatID,
+		UserID: "user-attacker",
+	}, &knowledge.SkillVersion{
+		Name:                 "foreign-skill",
+		Description:          "Attacker skill",
+		InstructionsMarkdown: "Attacker instructions",
+		Provenance:           knowledge.Provenance{ChatID: chatID, UserID: "user-attacker", SourceMessageSeq: &seq, FSMRunID: "run_prev"},
+	})
+	require.NoError(t, err)
+	require.NoError(t, kStore.ApproveVersion(ctx, foreignSkill.ID, "user-attacker"))
+
+	// Persist compaction referencing legit, foreign, and mismatched items
+	fsmStore, err := initGw.StoreProvider().GetStore(ctx, chatID, true)
+	require.NoError(t, err)
+	require.NoError(t, fsmStore.CreateRun(ctx, &fsm.FSMRun{
+		ID:            "run_prev",
+		ChatID:        chatID,
+		UserID:        "user-1",
+		IsDM:          true,
+		FSMType:       fsm.FSMTypeToolLoop,
+		Status:        fsm.RunStatusCompleted,
+		CurrentState:  fsm.StateCompleted,
+		MaxIterations: 10,
+	}))
+	require.NoError(t, fsmStore.SaveCompaction(ctx, &fsm.CompactedTaskState{
+		RunID:                "run_prev",
+		Version:              1,
+		ParentVersion:        0,
+		CompactedUpToIter:    2,
+		OriginalObjective:    "Testing ownership",
+		CurrentSubgoal:       "Validate preloading",
+		ActiveMemoryVersions: []string{legitMem.ID, foreignMem.ID, mismatchedMem.ID},
+		ActiveSkillVersions:  []string{foreignSkill.ID},
+		RubricVerdict:        fsm.CompactionVerdictProbedCompact,
+	}))
+
+	// Close initial memory manager simulating process restart
+	_ = initMemMgr.Close()
+
+	// 2. Start a fresh Gateway with a brand new memory manager (zero active in-memory DBs initially)
+	freshGw := NewGateway(cfg, nil)
+	freshMemMgr := memory.NewManager(cfg, nil)
+	defer func() { _ = freshMemMgr.Close() }()
+	freshGw.SetMemoryManager(freshMemMgr)
+
+	// Ensure ActiveDBs is initially empty
+	require.Empty(t, freshMemMgr.ActiveDBs())
+
+	freshGw.mu.Lock()
+	freshGw.botUserID = "bot-1"
+	freshGw.botUser = models.User{ID: "bot-1", UserName: "bot"}
+	freshGw.mu.Unlock()
+
+	freshGw.chatCache.Set(models.Chat{
+		ID:           chatID,
+		Type:         "dm",
+		TargetUserID: "user-1",
+		UserIDs:      []string{"bot-1", "user-1"},
+	})
+
+	runner := &mockTurnRunner{
+		result: agentapi.Result{
+			RunID:   "run-fresh",
+			Content: "Fresh run reply",
+		},
+	}
+	freshGw.SetRunner(runner)
+
+	msg := models.Message{
+		Seq:       10,
+		ChatID:    chatID,
+		UserID:    "user-1",
+		Content:   "Proceed with fresh turn",
+		Timestamp: 3000,
+	}
+	require.NoError(t, freshGw.generateAndSendAgentReply(ctx, msg, true, "Alice", "", 0))
+
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	require.Len(t, runner.turnCalls, 1)
+	turn := runner.turnCalls[0]
+
+	// Must contain the legitimate memory loaded from disk despite fresh restart
+	assert.Contains(t, turn.SystemPrompt, "Legitimate memory owned by user-1")
+	// Must NOT contain foreign or mismatched memories
+	assert.NotContains(t, turn.SystemPrompt, "Foreign injected memory")
+	assert.NotContains(t, turn.SystemPrompt, "Mismatched provenance memory")
+	// Must NOT contain foreign skill
+	assert.NotContains(t, turn.SystemPrompt, "foreign-skill")
+
+	// Verify manifest
+	manifestRaw := turn.Run.Metadata["context_manifest"]
+	require.NotEmpty(t, manifestRaw)
+	var manifest chatcontext.AssemblyManifest
+	require.NoError(t, json.Unmarshal([]byte(manifestRaw), &manifest))
+	assert.Equal(t, []string{legitMem.ID}, manifest.MemoryVersions)
+	assert.Empty(t, manifest.SkillVersions)
+
+	// 3. Verify nil MemoryManager does not panic
+	noMemGw := NewGateway(cfg, nil)
+	noMemGw.SetMemoryManager(nil)
+	assert.NotPanics(t, func() {
+		input, _ := noMemGw.buildAssemblyInput(ctx, msg, true, true, "prompt", "continuation")
+		assert.Equal(t, chatID, input.ChatID)
+	})
+}
+

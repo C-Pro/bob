@@ -33,6 +33,41 @@ func (r *Registry) SessionToolset(session ChatSessionContext) agentapi.Toolset {
 	}
 }
 
+// KnowledgeBudget returns the KnowledgeBudgetTracker bound to this SessionToolset.
+func (s *SessionToolset) KnowledgeBudget() *KnowledgeBudgetTracker {
+	if s == nil {
+		return nil
+	}
+	return s.session.KnowledgeBudget
+}
+
+// ExtractKnowledgeBudget unwraps a Toolset (including AllowlistToolset and CompositeToolset wrappers)
+// to locate an underlying KnowledgeBudgetTracker if present.
+func ExtractKnowledgeBudget(toolset agentapi.Toolset) *KnowledgeBudgetTracker {
+	if toolset == nil {
+		return nil
+	}
+	if st, ok := toolset.(*SessionToolset); ok {
+		return st.KnowledgeBudget()
+	}
+	if prov, ok := toolset.(interface {
+		KnowledgeBudget() *KnowledgeBudgetTracker
+	}); ok {
+		return prov.KnowledgeBudget()
+	}
+	if al, ok := toolset.(*allowlistToolset); ok {
+		return ExtractKnowledgeBudget(al.base)
+	}
+	if comp, ok := toolset.(*compositeToolset); ok {
+		for _, sub := range comp.sets {
+			if b := ExtractKnowledgeBudget(sub); b != nil {
+				return b
+			}
+		}
+	}
+	return nil
+}
+
 // Definitions returns the authorized tool definitions for the bound session.
 func (s *SessionToolset) Definitions(ctx context.Context) ([]agentapi.ToolDefinition, error) {
 	if s.registry == nil {

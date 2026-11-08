@@ -263,6 +263,11 @@ func BuildTrajectoryProjection(start TurnStartPayload, terminal TurnTerminalPayl
 		output = terminal.FinalReply
 	}
 
+	stepSkills, stepMemories := ExtractStepKnowledgeVersions(steps)
+	activeSkills := MergeVersionIDs(start.ActiveSkills, stepSkills, terminal.ActiveSkills)
+	activeMemories := MergeVersionIDs(start.ActiveMemories, stepMemories, terminal.ActiveMemories)
+	taskState := FormatTaskStateWithProvenance(start.TaskState, start.ContextManifest, activeMemories, activeSkills)
+
 	return &Trajectory{
 		ID:             start.RunID,
 		RunID:          start.RunID,
@@ -278,12 +283,222 @@ func BuildTrajectoryProjection(start TurnStartPayload, terminal TurnTerminalPayl
 		CreatedAt:      now,
 		CompletedAt:    now,
 		UserInput:      start.Input,
-		TaskState:      start.TaskState,
-		ActiveSkills:   start.ActiveSkills,
+		TaskState:      taskState,
+		ActiveSkills:   activeSkills,
+		ActiveMemories: activeMemories,
 		Steps:          steps,
 		FinalOutput:    output,
 		Reward:         rEval,
 		Breakdown:      breakdown,
 		Revision:       1,
 	}
+}
+
+// MergeVersionIDs deduplicates and trims version identifiers while preserving first-seen order.
+func MergeVersionIDs(lists ...[]string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, list := range lists {
+		for _, v := range list {
+			trimmed := strings.TrimSpace(v)
+			if trimmed == "" || seen[trimmed] {
+				continue
+			}
+			seen[trimmed] = true
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+const (
+	// ProvenanceManifestHeader marks the start of the structured provenance block embedded in Trajectory.TaskState.
+	ProvenanceManifestHeader = "[Provenance Manifest]"
+	// ProvenanceManifestFooter marks the end of the structured provenance block embedded in Trajectory.TaskState.
+	ProvenanceManifestFooter = "[/Provenance Manifest]"
+)
+
+// isValidKnowledgeVersionID verifies that verID is a resolved version identifier "<item>@<rev>"
+// matching the expected prefix ("skill_" or "mem_") and a positive integer revision.
+func isValidKnowledgeVersionID(verID, expectedPrefix string) bool {
+	if !strings.HasPrefix(verID, expectedPrefix) {
+		return false
+	}
+	atIdx := strings.LastIndex(verID, "@")
+	if atIdx <= len(expectedPrefix) || atIdx >= len(verID)-1 {
+		return false
+	}
+	rev, err := strconv.Atoi(verID[atIdx+1:])
+	return err == nil && rev >= 1
+}
+
+// ExtractStepKnowledgeVersions inspects completed tool steps and extracts loaded skill version IDs
+// ("skill_<id>@<rev>") and memory version IDs ("mem_<id>@<rev>") from load_skill and load_memory invocations.
+// Only steps with a successful observation containing a resolved version_id and no error field are recorded.
+func ExtractStepKnowledgeVersions(steps []Step) (skills []string, memories []string) {
+	seenSkills := make(map[string]bool)
+	seenMemories := make(map[string]bool)
+
+	for _, s := range steps {
+		if s.ExitCode != nil && *s.ExitCode != 0 {
+			continue
+		}
+		action := strings.TrimSpace(s.Action)
+		if action != "load_skill" && action != "load_memory" {
+			continue
+		}
+
+		var obsPayload struct {
+			VersionID string `json:"version_id"`
+			Error     any    `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(s.Observation), &obsPayload); err != nil || obsPayload.Error != nil {
+			continue
+		}
+		verID := strings.TrimSpace(obsPayload.VersionID)
+		if verID == "" {
+			continue
+		}
+
+		switch action {
+		case "load_skill":
+			if isValidKnowledgeVersionID(verID, "skill_") && !seenSkills[verID] {
+				seenSkills[verID] = true
+				skills = append(skills, verID)
+			}
+		case "load_memory":
+			if isValidKnowledgeVersionID(verID, "mem_") && !seenMemories[verID] {
+				seenMemories[verID] = true
+				memories = append(memories, verID)
+			}
+		}
+	}
+	return skills, memories
+}
+
+// ParseTaskStateProvenance separates a TaskState string into its base system prompt and any embedded
+// provenance fields (active_memories, active_skills, context_manifest) from a validated trailing
+// [Provenance Manifest] ... [/Provenance Manifest] block. If no valid trailing provenance block is
+// present, taskState is returned unchanged as basePrompt.
+func ParseTaskStateProvenance(taskState string) (basePrompt string, manifestJSON json.RawMessage, memories, skills []string) {
+	trimmedRight := strings.TrimRight(taskState, " \t\r\n")
+	if !strings.HasSuffix(trimmedRight, ProvenanceManifestFooter) {
+		return taskState, nil, nil, nil
+	}
+
+	withoutFooter := trimmedRight[:len(trimmedRight)-len(ProvenanceManifestFooter)]
+	idx := strings.LastIndex(withoutFooter, ProvenanceManifestHeader)
+	if idx < 0 {
+		return taskState, nil, nil, nil
+	}
+	if idx > 0 && withoutFooter[idx-1] != '\n' {
+		return taskState, nil, nil, nil
+	}
+
+	block := withoutFooter[idx+len(ProvenanceManifestHeader):]
+	var parsedMemories, parsedSkills []string
+	var parsedManifest json.RawMessage
+	hasField := false
+
+	for _, line := range strings.Split(block, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(trimmed, "active_memories:"):
+			raw := strings.TrimSpace(strings.TrimPrefix(trimmed, "active_memories:"))
+			if raw == "" {
+				return taskState, nil, nil, nil
+			}
+			parsedMemories = MergeVersionIDs(parsedMemories, strings.Split(raw, ","))
+			hasField = true
+		case strings.HasPrefix(trimmed, "active_skills:"):
+			raw := strings.TrimSpace(strings.TrimPrefix(trimmed, "active_skills:"))
+			if raw == "" {
+				return taskState, nil, nil, nil
+			}
+			parsedSkills = MergeVersionIDs(parsedSkills, strings.Split(raw, ","))
+			hasField = true
+		case strings.HasPrefix(trimmed, "context_manifest:"):
+			raw := strings.TrimSpace(strings.TrimPrefix(trimmed, "context_manifest:"))
+			if raw == "" || !json.Valid([]byte(raw)) {
+				return taskState, nil, nil, nil
+			}
+			parsedManifest = json.RawMessage(raw)
+			hasField = true
+		default:
+			// Unrecognized line inside candidate provenance block -> treat entire taskState as literal prompt text.
+			return taskState, nil, nil, nil
+		}
+	}
+
+	if !hasField {
+		return taskState, nil, nil, nil
+	}
+
+	prefix := withoutFooter[:idx]
+	switch {
+	case strings.HasSuffix(prefix, "\r\n\r\n"):
+		basePrompt = prefix[:len(prefix)-4]
+	case strings.HasSuffix(prefix, "\n\n"):
+		basePrompt = prefix[:len(prefix)-2]
+	case strings.HasSuffix(prefix, "\r\n"):
+		basePrompt = prefix[:len(prefix)-2]
+	case strings.HasSuffix(prefix, "\n"):
+		basePrompt = prefix[:len(prefix)-1]
+	default:
+		basePrompt = prefix
+	}
+	return basePrompt, parsedManifest, parsedMemories, parsedSkills
+}
+
+// FormatTaskStateWithProvenance combines the base system prompt with a deterministic
+// [Provenance Manifest] ... [/Provenance Manifest] trailing block whenever active memories,
+// active skills, or an assembly manifest are present.
+// If none are present, baseTaskState is returned unchanged.
+func FormatTaskStateWithProvenance(baseTaskState string, manifestJSON json.RawMessage, activeMemories, activeSkills []string) string {
+	cleanBase, existingManifest, existingMem, existingSkills := ParseTaskStateProvenance(baseTaskState)
+	mergedMemories := MergeVersionIDs(existingMem, activeMemories)
+	mergedSkills := MergeVersionIDs(existingSkills, activeSkills)
+
+	effectiveManifest := manifestJSON
+	if len(effectiveManifest) == 0 {
+		effectiveManifest = existingManifest
+	}
+	if len(effectiveManifest) > 0 && !json.Valid(effectiveManifest) {
+		effectiveManifest = nil
+	}
+
+	if len(mergedMemories) == 0 && len(mergedSkills) == 0 && len(effectiveManifest) == 0 {
+		return cleanBase
+	}
+
+	var sb strings.Builder
+	if cleanBase != "" {
+		sb.WriteString(cleanBase)
+		sb.WriteString("\n\n")
+	}
+	sb.WriteString(ProvenanceManifestHeader)
+	if len(mergedMemories) > 0 {
+		sb.WriteString("\nactive_memories: ")
+		sb.WriteString(strings.Join(mergedMemories, ", "))
+	}
+	if len(mergedSkills) > 0 {
+		sb.WriteString("\nactive_skills: ")
+		sb.WriteString(strings.Join(mergedSkills, ", "))
+	}
+	if len(effectiveManifest) > 0 {
+		var compact json.RawMessage
+		if b, err := json.Marshal(effectiveManifest); err == nil {
+			compact = b
+		} else {
+			compact = effectiveManifest
+		}
+		sb.WriteString("\ncontext_manifest: ")
+		sb.Write(compact)
+	}
+	sb.WriteString("\n")
+	sb.WriteString(ProvenanceManifestFooter)
+	return sb.String()
 }

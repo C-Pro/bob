@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"bob/internal/agentapi"
@@ -823,6 +824,30 @@ func (s *Store) GetLatestCompaction(ctx context.Context, runID string) (*Compact
 		return nil, fmt.Errorf("failed to query latest fsm_compaction for run %s: %w", runID, err)
 	}
 
+	return state, nil
+}
+
+// GetLatestCompactionForChat returns the most recent CompactedTaskState across runs in chatID, or (nil, nil) if none exists.
+func (s *Store) GetLatestCompactionForChat(ctx context.Context, chatID string) (*CompactedTaskState, error) {
+	if s == nil || s.db == nil || strings.TrimSpace(chatID) == "" {
+		return nil, nil
+	}
+	query := `
+		SELECT c.id, c.run_id, c.version, c.parent_version, c.compacted_up_to_iter,
+		       c.rubric_verdict, c.state_json, c.model, c.input_bytes, c.output_bytes, c.created_at
+		FROM fsm_compactions c
+		INNER JOIN fsm_runs r ON r.id = c.run_id
+		WHERE r.chat_id = ?
+		ORDER BY c.created_at DESC, c.version DESC
+		LIMIT 1
+	`
+	state, err := scanCompaction(s.db.QueryRowContext(ctx, query, chatID))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to query latest fsm_compaction for chat %s: %w", chatID, err)
+	}
 	return state, nil
 }
 

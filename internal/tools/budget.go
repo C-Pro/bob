@@ -3,6 +3,7 @@ package tools
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -423,4 +424,42 @@ func (t *KnowledgeBudgetTracker) Stats() (memCount, memBytes, skillCount, skillB
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.loadedMemoriesCount, t.loadedMemoriesBytes, t.loadedSkillsCount, t.loadedSkillsBytes
+}
+
+// LoadedMemoryVersions returns a deterministically sorted slice of version IDs (e.g. "mem_<id>@<rev>")
+// for all memories currently loaded in the tracker.
+func (t *KnowledgeBudgetTracker) LoadedMemoryVersions() []string {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var versions []string
+	for _, item := range t.loadedItems {
+		if item.Kind == "memory" && strings.TrimSpace(item.VersionID) != "" {
+			versions = append(versions, strings.TrimSpace(item.VersionID))
+		}
+	}
+	sort.Strings(versions)
+	return versions
+}
+
+// LoadedSkillVersions returns a deterministically sorted slice of version IDs (e.g. "skill_<id>@<rev>")
+// for all skills currently loaded in the tracker.
+func (t *KnowledgeBudgetTracker) LoadedSkillVersions() []string {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var versions []string
+	for _, item := range t.loadedItems {
+		if item.Kind == "skill" && strings.TrimSpace(item.VersionID) != "" {
+			versions = append(versions, strings.TrimSpace(item.VersionID))
+		}
+	}
+	sort.Strings(versions)
+	return versions
 }

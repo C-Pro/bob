@@ -68,6 +68,7 @@ type Trajectory struct {
 	UserInput      string        `json:"x"`               // x: raw stripped user input
 	TaskState      string        `json:"phi_task"`        // \Phi_{task}: active memory/task context
 	ActiveSkills   []string      `json:"active_skills,omitempty"`
+	ActiveMemories []string      `json:"active_memories,omitempty"`
 	Steps          []Step        `json:"steps"` // (z, a, o) sequence
 	FinalOutput    string        `json:"y"`     // y: final assistant response
 	Reward         float64       `json:"r_eval"`
@@ -89,27 +90,31 @@ type FeedbackRequest struct {
 
 // TurnStartPayload contains initial session and task context recorded at turn start.
 type TurnStartPayload struct {
-	RunID          string   `json:"run_id"`
-	FrontendID     string   `json:"frontend_id"`
-	SessionID      string   `json:"session_id"`
-	ScopeID        string   `json:"scope_id"`
-	ActorID        string   `json:"actor_id"`
-	Model          string   `json:"model"`
-	ExecutionKind  string   `json:"execution_kind"`
-	PrivacyLevel   string   `json:"privacy_level"`
-	ExportApproved bool     `json:"export_approved"`
-	Generation     int      `json:"generation"`
-	Input          string   `json:"input"`
-	TaskState      string   `json:"task_state"`
-	ActiveSkills   []string `json:"active_skills,omitempty"`
+	RunID           string          `json:"run_id"`
+	FrontendID      string          `json:"frontend_id"`
+	SessionID       string          `json:"session_id"`
+	ScopeID         string          `json:"scope_id"`
+	ActorID         string          `json:"actor_id"`
+	Model           string          `json:"model"`
+	ExecutionKind   string          `json:"execution_kind"`
+	PrivacyLevel    string          `json:"privacy_level"`
+	ExportApproved  bool            `json:"export_approved"`
+	Generation      int             `json:"generation"`
+	Input           string          `json:"input"`
+	TaskState       string          `json:"task_state"`
+	ActiveSkills    []string        `json:"active_skills,omitempty"`
+	ActiveMemories  []string        `json:"active_memories,omitempty"`
+	ContextManifest json.RawMessage `json:"context_manifest,omitempty"`
 }
 
 // TurnTerminalPayload records the final outcome when a turn finishes.
 type TurnTerminalPayload struct {
-	Generation int    `json:"generation"`
-	Reason     string `json:"reason"` // "completed", "fsm_failed", "cancelled", "budget_exhausted"
-	Failed     bool   `json:"failed"`
-	FinalReply string `json:"final_reply"`
+	Generation     int      `json:"generation"`
+	Reason         string   `json:"reason"` // "completed", "fsm_failed", "cancelled", "budget_exhausted"
+	Failed         bool     `json:"failed"`
+	FinalReply     string   `json:"final_reply"`
+	ActiveSkills   []string `json:"active_skills,omitempty"`
+	ActiveMemories []string `json:"active_memories,omitempty"`
 }
 
 // CompactionEventPayload records a task trajectory compaction probe or snapshot transition.

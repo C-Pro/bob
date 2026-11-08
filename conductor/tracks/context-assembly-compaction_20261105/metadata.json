@@ -1,8 +1,8 @@
 {
   "track_id": "context-assembly-compaction_20261105",
   "type": "feature",
-  "status": "in_progress",
+  "status": "completed",
   "created_at": "2026-11-05T21:35:00Z",
-  "updated_at": "2026-11-05T21:35:00Z",
+  "updated_at": "2026-11-07T13:43:00Z",
   "description": "Phase 1 Context Assembly, Episodic Index, and Adaptive Task Compaction (SelfCompact rubric-gated compaction in internal/fsm, recall_task_history tool, episodic history navigation, and provenance-tracked multi-source context builder)."
 }

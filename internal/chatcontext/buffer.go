@@ -108,6 +108,55 @@ func (rb *RingBuffer) Clear() {
 	rb.entries = make([]Entry, 0, rb.capacity)
 }
 
+// entryToLLMMessage converts a single chatcontext Entry into an openai.ChatCompletionMessage.
+func entryToLLMMessage(e Entry) openai.ChatCompletionMessage {
+	role := e.Role
+	switch role {
+	case "", "user":
+		role = openai.ChatMessageRoleUser
+	case "assistant":
+		role = openai.ChatMessageRoleAssistant
+	case "system":
+		role = openai.ChatMessageRoleSystem
+	}
+
+	var content string
+	senderName := strings.TrimSpace(e.SenderName)
+	if role == openai.ChatMessageRoleUser && senderName != "" && senderName != e.SenderID {
+		content = fmt.Sprintf("%s: %s", senderName, e.Content)
+	} else {
+		content = e.Content
+	}
+
+	if len(e.Images) > 0 && role == openai.ChatMessageRoleUser {
+		parts := make([]openai.ChatMessagePart, 0, 1+len(e.Images))
+		if content != "" {
+			parts = append(parts, openai.ChatMessagePart{
+				Type: openai.ChatMessagePartTypeText,
+				Text: content,
+			})
+		}
+		for _, img := range e.Images {
+			parts = append(parts, openai.ChatMessagePart{
+				Type: openai.ChatMessagePartTypeImageURL,
+				ImageURL: &openai.ChatMessageImageURL{
+					URL:    img.URL,
+					Detail: openai.ImageURLDetailAuto,
+				},
+			})
+		}
+		return openai.ChatCompletionMessage{
+			Role:         role,
+			MultiContent: parts,
+		}
+	}
+
+	return openai.ChatCompletionMessage{
+		Role:    role,
+		Content: content,
+	}
+}
+
 // ToLLMMessages converts the buffered entries into openai.ChatCompletionMessage objects.
 // User messages are formatted with "<SenderName>: <Content>" if SenderName is present.
 func (rb *RingBuffer) ToLLMMessages() []openai.ChatCompletionMessage {
@@ -116,51 +165,7 @@ func (rb *RingBuffer) ToLLMMessages() []openai.ChatCompletionMessage {
 
 	msgs := make([]openai.ChatCompletionMessage, 0, len(rb.entries))
 	for _, e := range rb.entries {
-		role := e.Role
-		switch role {
-		case "", "user":
-			role = openai.ChatMessageRoleUser
-		case "assistant":
-			role = openai.ChatMessageRoleAssistant
-		case "system":
-			role = openai.ChatMessageRoleSystem
-		}
-
-		var content string
-		senderName := strings.TrimSpace(e.SenderName)
-		if role == openai.ChatMessageRoleUser && senderName != "" && senderName != e.SenderID {
-			content = fmt.Sprintf("%s: %s", senderName, e.Content)
-		} else {
-			content = e.Content
-		}
-
-		if len(e.Images) > 0 && role == openai.ChatMessageRoleUser {
-			parts := make([]openai.ChatMessagePart, 0, 1+len(e.Images))
-			if content != "" {
-				parts = append(parts, openai.ChatMessagePart{
-					Type: openai.ChatMessagePartTypeText,
-					Text: content,
-				})
-			}
-			for _, img := range e.Images {
-				parts = append(parts, openai.ChatMessagePart{
-					Type: openai.ChatMessagePartTypeImageURL,
-					ImageURL: &openai.ChatMessageImageURL{
-						URL:    img.URL,
-						Detail: openai.ImageURLDetailAuto,
-					},
-				})
-			}
-			msgs = append(msgs, openai.ChatCompletionMessage{
-				Role:         role,
-				MultiContent: parts,
-			})
-		} else {
-			msgs = append(msgs, openai.ChatCompletionMessage{
-				Role:    role,
-				Content: content,
-			})
-		}
+		msgs = append(msgs, entryToLLMMessage(e))
 	}
 	return msgs
 }

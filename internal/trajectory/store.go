@@ -854,6 +854,8 @@ func (s *SQLiteStore) ReconcileTerminalRuns(ctx context.Context) error {
 			var startTime time.Time
 			var terminalTime time.Time
 			var stepsByGen = make(map[int][]Step)
+			var compSkillsByGen = make(map[int][]string)
+			var compMemoriesByGen = make(map[int][]string)
 			var latestOutput string
 
 			for evRows.Next() {
@@ -881,6 +883,22 @@ func (s *SQLiteStore) ReconcileTerminalRuns(ctx context.Context) error {
 					var step Step
 					if err := json.Unmarshal(payloadBytes, &step); err == nil {
 						stepsByGen[gen] = append(stepsByGen[gen], step)
+					}
+				case "compaction":
+					var cp CompactionEventPayload
+					if err := json.Unmarshal(payloadBytes, &cp); err == nil && len(cp.StateJSON) > 0 {
+						var state struct {
+							ActiveSkillVersions  []string `json:"active_skill_versions"`
+							ActiveMemoryVersions []string `json:"active_memory_versions"`
+							ActiveSkills         []string `json:"active_skills"`
+							ActiveMemories       []string `json:"active_memories"`
+						}
+						if err := json.Unmarshal(cp.StateJSON, &state); err == nil {
+							compSkillsByGen[gen] = append(compSkillsByGen[gen], state.ActiveSkillVersions...)
+							compSkillsByGen[gen] = append(compSkillsByGen[gen], state.ActiveSkills...)
+							compMemoriesByGen[gen] = append(compMemoriesByGen[gen], state.ActiveMemoryVersions...)
+							compMemoriesByGen[gen] = append(compMemoriesByGen[gen], state.ActiveMemories...)
+						}
 					}
 				case "llm_response":
 					var respPayload struct {
@@ -939,6 +957,16 @@ func (s *SQLiteStore) ReconcileTerminalRuns(ctx context.Context) error {
 				breakdown.ToolSuccessRate = float64(succCount) / float64(len(steps))
 			}
 
+			stepSkills, stepMemories := ExtractStepKnowledgeVersions(steps)
+			_, existingManifest, parsedMem, parsedSkills := ParseTaskStateProvenance(startPayload.TaskState)
+			activeSkills := MergeVersionIDs(parsedSkills, startPayload.ActiveSkills, compSkillsByGen[terminalGen], stepSkills, terminalPayload.ActiveSkills)
+			activeMemories := MergeVersionIDs(parsedMem, startPayload.ActiveMemories, compMemoriesByGen[terminalGen], stepMemories, terminalPayload.ActiveMemories)
+			manifestJSON := startPayload.ContextManifest
+			if len(manifestJSON) == 0 {
+				manifestJSON = existingManifest
+			}
+			taskState := FormatTaskStateWithProvenance(startPayload.TaskState, manifestJSON, activeMemories, activeSkills)
+
 			reconciled := &Trajectory{
 				ID:             trajID,
 				RunID:          startPayload.RunID,
@@ -954,8 +982,9 @@ func (s *SQLiteStore) ReconcileTerminalRuns(ctx context.Context) error {
 				CreatedAt:      startTime,
 				CompletedAt:    terminalTime,
 				UserInput:      startPayload.Input,
-				TaskState:      startPayload.TaskState,
-				ActiveSkills:   startPayload.ActiveSkills,
+				TaskState:      taskState,
+				ActiveSkills:   activeSkills,
+				ActiveMemories: activeMemories,
 				Steps:          steps,
 				FinalOutput:    latestOutput,
 				Reward:         CalculateReward(breakdown),
@@ -1046,6 +1075,14 @@ func trajectoriesSubstantivelyEqual(a, b *Trajectory) bool {
 	}
 	for i := range a.ActiveSkills {
 		if a.ActiveSkills[i] != b.ActiveSkills[i] {
+			return false
+		}
+	}
+	if len(a.ActiveMemories) != len(b.ActiveMemories) {
+		return false
+	}
+	for i := range a.ActiveMemories {
+		if a.ActiveMemories[i] != b.ActiveMemories[i] {
 			return false
 		}
 	}

@@ -68,7 +68,7 @@
 
 ---
 
-- [~] **Track: Phase 1 — Context Assembly, Episodic Index, and Adaptive Task Compaction**
+- [x] **Track: Phase 1 — Context Assembly, Episodic Index, and Adaptive Task Compaction**
 *Link: [./tracks/context-assembly-compaction_20261105/](./tracks/context-assembly-compaction_20261105/)*
 
 ---

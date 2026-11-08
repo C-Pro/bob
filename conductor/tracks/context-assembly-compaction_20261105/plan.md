@@ -73,20 +73,20 @@
 ---
 
 ## Step 5: Multi-Source Context Assembler & Trajectory Provenance (`internal/chatcontext`, `internal/agent`, `internal/trajectory`)
-- [ ] Task: Implement Multi-Source Context Assembler
-    - [ ] Create `internal/chatcontext/assembler.go` with `Assembler`, `AssemblyInput`, `SourceBudgets`, and `AssemblyManifest`
-    - [ ] Enforce per-source byte budgets across:
+- [x] Task: Implement Multi-Source Context Assembler
+    - [x] Create `internal/chatcontext/assembler.go` with `Assembler`, `AssemblyInput`, `SourceBudgets`, and `AssemblyManifest`
+    - [x] Enforce per-source byte budgets across:
       1. Pinned system prompt
       2. Approved structured memories (`internal/knowledge`)
       3. Approved procedural skills (`internal/knowledge`)
       4. Episodic/historical passages (`internal/memory`)
       5. Recent conversation ring buffer (`internal/chatcontext`)
-    - [ ] Deduplicate overlapping historical chunks whose `[start_seq, end_seq]` overlaps with entries currently in the ring buffer
-- [ ] Task: Wire Provenance Manifest into `internal/agent` and `internal/trajectory`
-    - [ ] Record loaded skill version IDs (`skill_<id>@<rev>`) and memory version IDs (`mem_<id>@<rev>`) from `KnowledgeBudgetTracker` and `AssemblyManifest` into `Trajectory.ActiveSkills` and `Trajectory.TaskState` ($\Phi_{\text{task}}$)
-    - [ ] Ensure `ReconcileTerminalRuns` in `internal/trajectory/store.go` captures skills and memories loaded dynamically via `load_skill` / `load_memory` during the turn
-- [ ] Task: Write unit and integration tests for Context Assembly & Provenance
-    - [ ] Create `internal/chatcontext/assembler_test.go` testing budget enforcement, sequence overlap deduplication, and manifest generation
-    - [ ] Test end-to-end trajectory provenance recording in `internal/agent/engine_test.go` and `internal/trajectory/store_test.go`
-- [ ] Task: Step 5 Verification & Full Quality Check
-    - [ ] Run `make check` (`lint-go`, `test-go` with `-race`, `semgrep`, `osv-scanner`) and verify 0 errors
+    - [x] Deduplicate overlapping historical chunks whose `[start_seq, end_seq]` overlaps with entries currently in the ring buffer
+- [x] Task: Wire Provenance Manifest into `internal/agent` and `internal/trajectory`
+    - [x] Record loaded skill version IDs (`skill_<id>@<rev>`) and memory version IDs (`mem_<id>@<rev>`) from `KnowledgeBudgetTracker` and `AssemblyManifest` into `Trajectory.ActiveSkills` and `Trajectory.TaskState` ($\Phi_{\text{task}}$)
+    - [x] Ensure `ReconcileTerminalRuns` in `internal/trajectory/store.go` captures skills and memories loaded dynamically via `load_skill` / `load_memory` during the turn
+- [x] Task: Write unit and integration tests for Context Assembly & Provenance
+    - [x] Create `internal/chatcontext/assembler_test.go` testing budget enforcement, sequence overlap deduplication, and manifest generation
+    - [x] Test end-to-end trajectory provenance recording in `internal/agent/engine_test.go` and `internal/trajectory/store_test.go`
+- [x] Task: Step 5 Verification & Full Quality Check
+    - [x] Run `make check` (`lint-go`, `test-go` with `-race`, `semgrep`, `osv-scanner`) and verify 0 errors

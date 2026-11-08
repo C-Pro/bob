@@ -1003,3 +1003,236 @@ func TestParseTime(t *testing.T) {
 		})
 	}
 }
+
+func TestStore_ReconcileTerminalRuns_ProvenanceFromStartStepsCompactionAndTerminal(t *testing.T) {
+	_, store := setupTestDB(t)
+	ctx := context.Background()
+
+	trajID := uuid.NewString()
+	runID := "run-provenance-test"
+	now := time.Now().UTC()
+
+	manifestJSON := json.RawMessage(`{"memory_versions":["mem_init@1"],"skill_versions":["skill_init@1"],"ring_buffer":{"min_seq":10,"max_seq":15,"entry_count":6}}`)
+	startPayload, err := json.Marshal(TurnStartPayload{
+		RunID:           runID,
+		FrontendID:      "besedka",
+		SessionID:       "chat-prov",
+		ScopeID:         "townhall",
+		ActorID:         "user-prov",
+		Model:           "gemini-2.5-flash",
+		ExecutionKind:   "interactive",
+		PrivacyLevel:    "public",
+		ExportApproved:  true,
+		Generation:      1,
+		Input:           "Deploy with provenance",
+		TaskState:       "Base system prompt",
+		ActiveSkills:    []string{"skill_init@1"},
+		ActiveMemories:  []string{"mem_init@1"},
+		ContextManifest: manifestJSON,
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.RecordEvent(ctx, &Event{
+		TrajectoryID: trajID,
+		RunID:        runID,
+		Generation:   1,
+		Iteration:    0,
+		Phase:        "start",
+		EventType:    "turn_start",
+		Payload:      startPayload,
+		CreatedAt:    now,
+	}))
+
+	// Successful load_skill tool_attempt
+	exitZero := 0
+	exitOne := 1
+	stepSkillOK, err := json.Marshal(Step{
+		Index:       0,
+		Action:      "load_skill",
+		ActionArgs:  json.RawMessage(`{"id":"skill_dyn@2"}`),
+		Observation: `{"item_id":"skill_dyn","version_id":"skill_dyn@2","revision":2}`,
+		ExitCode:    &exitZero,
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.RecordEvent(ctx, &Event{
+		TrajectoryID: trajID,
+		RunID:        runID,
+		Generation:   1,
+		Iteration:    1,
+		Phase:        "tool",
+		StepID:       "step-0",
+		EventType:    "tool_attempt",
+		Payload:      stepSkillOK,
+		CreatedAt:    now.Add(100 * time.Millisecond),
+	}))
+
+	// Failed load_skill tool_attempt (must NOT be recorded in ActiveSkills)
+	stepSkillFail, err := json.Marshal(Step{
+		Index:       1,
+		Action:      "load_skill",
+		ActionArgs:  json.RawMessage(`{"id":"skill_failed@9"}`),
+		Observation: `{"error":"budget exceeded"}`,
+		ExitCode:    &exitOne,
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.RecordEvent(ctx, &Event{
+		TrajectoryID: trajID,
+		RunID:        runID,
+		Generation:   1,
+		Iteration:    1,
+		Phase:        "tool",
+		StepID:       "step-1",
+		EventType:    "tool_attempt",
+		Payload:      stepSkillFail,
+		CreatedAt:    now.Add(200 * time.Millisecond),
+	}))
+
+	// Successful load_memory tool_attempt
+	stepMemOK, err := json.Marshal(Step{
+		Index:       2,
+		Action:      "load_memory",
+		ActionArgs:  json.RawMessage(`{"id":"mem_dyn@3"}`),
+		Observation: `{"item_id":"mem_dyn","version_id":"mem_dyn@3","revision":3}`,
+		ExitCode:    &exitZero,
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.RecordEvent(ctx, &Event{
+		TrajectoryID: trajID,
+		RunID:        runID,
+		Generation:   1,
+		Iteration:    2,
+		Phase:        "tool",
+		StepID:       "step-2",
+		EventType:    "tool_attempt",
+		Payload:      stepMemOK,
+		CreatedAt:    now.Add(300 * time.Millisecond),
+	}))
+
+	// JSON error observation with nil ExitCode and ActionArgs fallback candidate (must NOT be recorded)
+	stepSkillJSONErr, err := json.Marshal(Step{
+		Index:       3,
+		Action:      "load_skill",
+		ActionArgs:  json.RawMessage(`{"skill_id":"skill_json_err@1"}`),
+		Observation: `{"error":"skill not approved"}`,
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.RecordEvent(ctx, &Event{
+		TrajectoryID: trajID,
+		RunID:        runID,
+		Generation:   1,
+		Iteration:    2,
+		Phase:        "tool",
+		StepID:       "step-3",
+		EventType:    "tool_attempt",
+		Payload:      stepSkillJSONErr,
+		CreatedAt:    now.Add(320 * time.Millisecond),
+	}))
+
+	// Unversioned item_id / ActionArgs without resolved version_id (must NOT be recorded)
+	stepMemUnversioned, err := json.Marshal(Step{
+		Index:       4,
+		Action:      "load_memory",
+		ActionArgs:  json.RawMessage(`{"memory_id":"mem_unversioned"}`),
+		Observation: `{"item_id":"mem_unversioned"}`,
+		ExitCode:    &exitZero,
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.RecordEvent(ctx, &Event{
+		TrajectoryID: trajID,
+		RunID:        runID,
+		Generation:   1,
+		Iteration:    2,
+		Phase:        "tool",
+		StepID:       "step-4",
+		EventType:    "tool_attempt",
+		Payload:      stepMemUnversioned,
+		CreatedAt:    now.Add(340 * time.Millisecond),
+	}))
+
+	// Compaction event carrying active_skill_versions and active_memory_versions in StateJSON
+	compPayload, err := json.Marshal(CompactionEventPayload{
+		Version:           1,
+		ParentVersion:     0,
+		CompactedUpToIter: 2,
+		RubricVerdict:     "probed_compact",
+		StateJSON:         json.RawMessage(`{"active_skill_versions":["skill_comp@4"],"active_memory_versions":["mem_comp@2"]}`),
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.RecordEvent(ctx, &Event{
+		TrajectoryID: trajID,
+		RunID:        runID,
+		Generation:   1,
+		Iteration:    2,
+		Phase:        "compaction",
+		EventType:    "compaction",
+		Payload:      compPayload,
+		CreatedAt:    now.Add(400 * time.Millisecond),
+	}))
+
+	// Terminal event
+	termPayload, err := json.Marshal(TurnTerminalPayload{
+		Generation:     1,
+		Reason:         "completed",
+		Failed:         false,
+		FinalReply:     "Deployment complete",
+		ActiveSkills:   []string{"skill_term@5"},
+		ActiveMemories: []string{"mem_term@4"},
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.RecordEvent(ctx, &Event{
+		TrajectoryID: trajID,
+		RunID:        runID,
+		Generation:   1,
+		Iteration:    3,
+		Phase:        "terminal",
+		EventType:    "turn_terminal",
+		Payload:      termPayload,
+		CreatedAt:    now.Add(500 * time.Millisecond),
+	}))
+
+	require.NoError(t, store.ReconcileTerminalRuns(ctx))
+
+	traj, err := store.Get(ctx, trajID)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"skill_init@1", "skill_comp@4", "skill_dyn@2", "skill_term@5"}, traj.ActiveSkills)
+	assert.Equal(t, []string{"mem_init@1", "mem_comp@2", "mem_dyn@3", "mem_term@4"}, traj.ActiveMemories)
+	assert.Contains(t, traj.TaskState, "Base system prompt")
+	assert.Contains(t, traj.TaskState, "[Provenance Manifest]")
+
+	basePrompt, parsedManifest, parsedMemories, parsedSkills := ParseTaskStateProvenance(traj.TaskState)
+	assert.Equal(t, "Base system prompt", basePrompt)
+	assert.JSONEq(t, string(manifestJSON), string(parsedManifest))
+	assert.Equal(t, traj.ActiveMemories, parsedMemories)
+	assert.Equal(t, traj.ActiveSkills, parsedSkills)
+}
+
+func TestTaskStateProvenance_LiteralMarkerInBasePromptRoundTrip(t *testing.T) {
+	literalPrompt := "You are an assistant.\n\n[Provenance Manifest]\nThis is literal documentation explaining how [Provenance Manifest] works in prompts.\nDo not truncate this text!"
+
+	// 1. Without any provenance fields, ParseTaskStateProvenance must leave literalPrompt untouched.
+	base, manifest, mems, skills := ParseTaskStateProvenance(literalPrompt)
+	assert.Equal(t, literalPrompt, base)
+	assert.Nil(t, manifest)
+	assert.Empty(t, mems)
+	assert.Empty(t, skills)
+
+	// 2. Formatting with real provenance and parsing back must preserve literalPrompt byte-for-byte.
+	manifestJSON := json.RawMessage(`{"memory_versions":["mem_1@1"]}`)
+	formatted := FormatTaskStateWithProvenance(literalPrompt, manifestJSON, []string{"mem_1@1"}, []string{"skill_1@2"})
+	assert.Contains(t, formatted, literalPrompt)
+
+	roundTripBase, roundTripManifest, roundTripMems, roundTripSkills := ParseTaskStateProvenance(formatted)
+	assert.Equal(t, literalPrompt, roundTripBase)
+	assert.JSONEq(t, string(manifestJSON), string(roundTripManifest))
+	assert.Equal(t, []string{"mem_1@1"}, roundTripMems)
+	assert.Equal(t, []string{"skill_1@2"}, roundTripSkills)
+
+	// 3. Re-formatting an already formatted string updates provenance in place without duplicating blocks.
+	reformatted := FormatTaskStateWithProvenance(formatted, nil, []string{"mem_2@3"}, []string{"skill_2@1"})
+	base2, manifest2, mems2, skills2 := ParseTaskStateProvenance(reformatted)
+	assert.Equal(t, literalPrompt, base2)
+	assert.JSONEq(t, string(manifestJSON), string(manifest2))
+	assert.Equal(t, []string{"mem_1@1", "mem_2@3"}, mems2)
+	assert.Equal(t, []string{"skill_1@2", "skill_2@1"}, skills2)
+}
+
+
