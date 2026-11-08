@@ -78,6 +78,69 @@ func TestFilteringProxyHTTP(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
 }
 
+func TestFilteringProxyRestrictedAllowlistDeniedResponse(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		allowedHosts []string
+		wantMessage  string
+	}{
+		{
+			name:        "empty allowlist",
+			wantMessage: "restricted network policy has an empty domain allowlist; host \"93.184.216.34\" is blocked by default-deny",
+		},
+		{
+			name:         "domain not allowed",
+			allowedHosts: []string{"allowed.example.com"},
+			wantMessage:  "host \"93.184.216.34\" is not in the sandbox domain allowlist",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			proxy := &FilteringProxy{policy: NetworkPolicy{
+				Mode:         NetworkRestricted,
+				AllowedHosts: tc.allowedHosts,
+			}}
+			recorder := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "http://93.184.216.34/package", nil)
+			req.RemoteAddr = "127.0.0.1:12345"
+
+			// Test HTTP GET
+			proxy.handleRequest(recorder, req)
+			assert.Equal(t, http.StatusForbidden, recorder.Code)
+			assert.Contains(t, recorder.Body.String(), tc.wantMessage)
+			assert.Contains(t, recorder.Body.String(), "destroying this sandbox (sandbox_destroy)")
+			assert.Contains(t, recorder.Body.String(), "requesting a new one with the necessary allowed domains")
+
+			// Test CONNECT request
+			recorderConnect := httptest.NewRecorder()
+			reqConnect := httptest.NewRequest(http.MethodConnect, "/", nil)
+			reqConnect.URL.Host = "93.184.216.34:443"
+			reqConnect.Host = "93.184.216.34:443"
+			reqConnect.RemoteAddr = "127.0.0.1:12345"
+			proxy.handleRequest(recorderConnect, reqConnect)
+			assert.Equal(t, http.StatusForbidden, recorderConnect.Code)
+			assert.Contains(t, recorderConnect.Body.String(), tc.wantMessage)
+			assert.Contains(t, recorderConnect.Body.String(), "destroying this sandbox (sandbox_destroy)")
+			assert.Contains(t, recorderConnect.Body.String(), "requesting a new one with the necessary allowed domains")
+		})
+	}
+
+	t.Run("explicitly blocked host does not suggest requesting allowed domains", func(t *testing.T) {
+		proxy := &FilteringProxy{policy: NetworkPolicy{
+			Mode:         NetworkRestricted,
+			AllowedHosts: []string{"forbidden.com"},
+			BlockedHosts: []string{"forbidden.com"},
+		}}
+		recorder := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "http://forbidden.com/test", nil)
+		req.RemoteAddr = "127.0.0.1:12345"
+
+		proxy.handleRequest(recorder, req)
+		assert.Equal(t, http.StatusForbidden, recorder.Code)
+		assert.Contains(t, recorder.Body.String(), "is blacklisted")
+		assert.NotContains(t, recorder.Body.String(), "sandbox_destroy")
+	})
+}
+
 func TestFilteringProxyConnect(t *testing.T) {
 	// Create a dummy backend TCP echo server
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

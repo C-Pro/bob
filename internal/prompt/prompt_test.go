@@ -55,6 +55,13 @@ func TestRenderDMPrompt(t *testing.T) {
 	assert.Contains(t, prompt, "propose_memory")
 	assert.Contains(t, prompt, "propose_skill")
 	assert.Contains(t, prompt, "explicit user request")
+	assert.Contains(t, prompt, "request sandbox permissions (including allowed domains) accordingly")
+	assert.Contains(t, prompt, "request the minimal permissions that will let you reach your goal")
+	assert.Contains(t, prompt, "Tunnel connection failed: 403 Forbidden")
+	assert.Contains(t, prompt, "call sandbox_destroy, then sandbox_request with the necessary domains and other task permissions")
+	assert.NotContains(t, prompt, "network: full")
+	assert.NotContains(t, prompt, "network:full")
+	assert.NotContains(t, prompt, "\"network\": \"full\"")
 
 	// Fallback user display name should fall back to username or "the user", never expose raw UUID user-99
 	userWithUsername := models.User{ID: "user-99", UserName: "alice99"}

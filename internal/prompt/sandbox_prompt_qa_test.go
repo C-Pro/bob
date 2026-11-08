@@ -31,6 +31,11 @@ func TestRenderDMPromptWithSandbox_EdgeCases(t *testing.T) {
 		assert.Contains(t, basePrompt, "sandbox_exec")
 		assert.Contains(t, basePrompt, "sandbox_destroy")
 		assert.Contains(t, basePrompt, "/workspace")
+		assert.Contains(t, basePrompt, "Tunnel connection failed: 403 Forbidden")
+		assert.Contains(t, basePrompt, "sandbox_request with the necessary domains")
+		assert.NotContains(t, basePrompt, "network: full")
+		assert.NotContains(t, basePrompt, "network:full")
+		assert.NotContains(t, basePrompt, "\"network\": \"full\"")
 		assert.NotContains(t, basePrompt, "active sandbox")
 		assert.NotContains(t, basePrompt, "unconditional destruction")
 

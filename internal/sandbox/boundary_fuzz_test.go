@@ -286,7 +286,7 @@ func TestFilteringProxy_RestrictedEmptyDomains(t *testing.T) {
 		},
 	}
 	_, errStrict := proxyStrict.resolveAndValidate(context.Background(), "93.184.216.34")
-	assert.ErrorContains(t, errStrict, "is not in allowed domains whitelist")
+	assert.ErrorContains(t, errStrict, "is not in the sandbox domain allowlist")
 }
 
 // TestFilteringProxy_LANClientIPAuthorization verifies that non-loopback client IPs
