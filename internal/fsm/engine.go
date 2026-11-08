@@ -193,6 +193,13 @@ func WithCompactionDecider(d CompactionDecider) EngineOption {
 	}
 }
 
+// WithLoopGuardConfig configures loop guard settings for the engine.
+func WithLoopGuardConfig(cfg LoopGuardConfig) EngineOption {
+	return func(e *Engine) {
+		e.loopGuardCfg = cfg
+	}
+}
+
 // Engine coordinates durable FSM workflow executions, state dispatching, delayed transitions, and crash recovery.
 type Engine struct {
 	storeProvider           StoreProvider
@@ -209,6 +216,7 @@ type Engine struct {
 	runFinalizer            RunFinalizer
 	compactionCfg           CompactionConfig
 	compactionDecider       CompactionDecider
+	loopGuardCfg            LoopGuardConfig
 
 	frontendsMu sync.RWMutex
 	frontends   map[string]agentapi.Frontend
@@ -239,6 +247,7 @@ func NewEngine(storeProvider StoreProvider, llmClient LLMClient, invoker ToolInv
 		recoveryStalenessCutoff: 15 * time.Minute,
 		maxRecoveryConcurrency:  4,
 		knowledgeLimits:         tools.DefaultKnowledgeBudgetLimits(),
+		loopGuardCfg:            DefaultLoopGuardConfig(),
 		frontends:               make(map[string]agentapi.Frontend),
 		runners:                 make(map[FSMType]Runner),
 		running:                 make(map[string]context.CancelFunc),
@@ -274,6 +283,7 @@ func NewEngine(storeProvider StoreProvider, llmClient LLMClient, invoker ToolInv
 	if e.compactionDecider != nil {
 		runner.SetCompactionDecider(e.compactionDecider)
 	}
+	runner.SetLoopGuardConfig(e.loopGuardCfg)
 	e.RegisterRunner(FSMTypeToolLoop, runner)
 
 	return e

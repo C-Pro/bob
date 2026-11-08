@@ -2,9 +2,11 @@ package fsm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,6 +37,7 @@ type ToolLoopRunner struct {
 	compactionCfg     CompactionConfig
 	compactionCfgSet  bool
 	compactionDecider CompactionDecider
+	loopGuardCfg      LoopGuardConfig
 }
 
 // NewToolLoopRunner creates a new ToolLoopRunner.
@@ -47,7 +50,15 @@ func NewToolLoopRunner(llmClient LLMClient, stepExecutor *StepExecutor, defaultM
 		stepExecutor:  stepExecutor,
 		defaultModel:  defaultModel,
 		compactionCfg: DefaultCompactionConfig(),
+		loopGuardCfg:  DefaultLoopGuardConfig(),
 	}
+}
+
+// SetLoopGuardConfig configures loop guard settings for the runner.
+func (r *ToolLoopRunner) SetLoopGuardConfig(cfg LoopGuardConfig) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.loopGuardCfg = cfg
 }
 
 // SetCompactionConfig configures adaptive task trajectory compaction for the runner.
@@ -442,10 +453,51 @@ func (r *ToolLoopRunner) handlePrepareSteps(ctx context.Context, run *FSMRun, st
 		}
 	}
 
+	r.mu.RLock()
+	lgCfg := r.loopGuardCfg
+	r.mu.RUnlock()
+
+	historySteps, err := store.ListStepsByRun(ctx, run.ID)
+	if err != nil {
+		return fmt.Errorf("failed to list steps for loop guard: %w", err)
+	}
+
+	verdict := DetectLoop(historySteps, lastMsg.ToolCalls, lgCfg)
+	if verdict.Action == LoopActionForceSynthesis {
+		slog.Warn("loop guard detected stuck loop; forcing synthesis", "run_id", run.ID, "reason", verdict.Reason)
+		run.CurrentState = StateSynthesis
+		run.ErrorText = fmt.Sprintf("stuck loop detected: %s", verdict.Reason)
+		return store.UpdateRun(ctx, run)
+	}
+
 	steps := make([]FSMStep, len(lastMsg.ToolCalls))
 	stepPtrs := make([]*FSMStep, len(lastMsg.ToolCalls))
 	for i, tc := range lastMsg.ToolCalls {
 		steps[i] = NewStepFromToolCall(run.ID, run.Iteration, i, tc, ExecutionModeSequential)
+		if verdict.Action == LoopActionIntercept {
+			if notice, ok := verdict.NoticeByCall[i]; ok {
+				now := time.Now().Unix()
+				resEnv, _ := EncodeStoredToolResult(agentapi.ToolResult{Content: notice})
+				steps[i].Status = StepStatusCompleted
+				steps[i].ResultJSON = resEnv
+				steps[i].ErrorText = LoopGuardBlockedErrorText
+				steps[i].StartedAt = &now
+				steps[i].CompletedAt = &now
+				zero := 0
+				trajStep := trajectory.Step{
+					Index:       steps[i].StepIndex,
+					Iteration:   steps[i].Iteration,
+					Attempt:     1,
+					Action:      steps[i].ToolName,
+					ActionArgs:  json.RawMessage(steps[i].ArgsJSON),
+					Observation: notice,
+					ExitCode:    &zero,
+				}
+				if ev, evErr := trajectory.MakeToolAttemptEvent(run.ID, run.ID, 1, run.Iteration, "loop", steps[i].ID, 1, trajStep); evErr == nil {
+					_ = store.RecordEvent(ctx, ev)
+				}
+			}
+		}
 		stepPtrs[i] = &steps[i]
 	}
 
@@ -589,9 +641,14 @@ func (r *ToolLoopRunner) handleSynthesis(ctx context.Context, run *FSMRun, store
 		return err
 	}
 
+	synthPrompt := SynthesisPrompt
+	if strings.Contains(run.ErrorText, "stuck loop detected") {
+		synthPrompt = "A repetitive tool execution loop was detected. " + SynthesisPrompt
+	}
+
 	messages = append(messages, openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleUser,
-		Content: SynthesisPrompt,
+		Content: synthPrompt,
 	})
 
 	req := openai.ChatCompletionRequest{
@@ -636,7 +693,7 @@ func (r *ToolLoopRunner) handleSynthesis(ctx context.Context, run *FSMRun, store
 	}
 	baseMessages = append(baseMessages, openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleUser,
-		Content: SynthesisPrompt,
+		Content: synthPrompt,
 	}, finalMsg)
 
 	encoded, err := EncodeMessages(baseMessages)

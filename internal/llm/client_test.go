@@ -582,6 +582,39 @@ func TestCreateChatCompletion_RequestTimeoutFailsImmediately(t *testing.T) {
 	assert.Equal(t, int32(1), atomic.LoadInt32(&attempts), "request timeout must not be retried")
 }
 
+func TestCreateChatCompletion_PerRequestTimeoutDoesNotAccumulateAcrossCalls(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(60 * time.Millisecond)
+		resp := openai.ChatCompletionResponse{
+			Choices: []openai.ChatCompletionChoice{
+				{Message: openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant, Content: "ok"}},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		OpenAIAPIKey:      "test-key",
+		OpenAIModel:       "gpt-4o-mini",
+		OpenAIBaseURL:     server.URL,
+		LLMRequestTimeout: 100 * time.Millisecond,
+	}
+
+	client := NewClient(cfg, nil)
+	parentCtx := context.Background()
+
+	// Call 1 takes 60ms (< 100ms timeout) -> succeeds
+	resp1, err1 := client.CreateChatCompletion(parentCtx, openai.ChatCompletionRequest{})
+	require.NoError(t, err1)
+	assert.Equal(t, "ok", resp1.Choices[0].Message.Content)
+
+	// Call 2 also takes 60ms (cumulative 120ms > 100ms) -> must still succeed because timeout is per-request
+	resp2, err2 := client.CreateChatCompletion(parentCtx, openai.ChatCompletionRequest{})
+	require.NoError(t, err2)
+	assert.Equal(t, "ok", resp2.Choices[0].Message.Content)
+}
+
 func TestCreateChatCompletion_FirstByteTimeoutRetriedOnce(t *testing.T) {
 	var attempts int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

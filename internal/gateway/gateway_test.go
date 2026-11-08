@@ -3183,13 +3183,49 @@ type mockTurnRunner struct {
 	turnCalls []agentapi.Turn
 	result    agentapi.Result
 	err       error
+	runFn     func(ctx context.Context, turn agentapi.Turn) (agentapi.Result, error)
 }
 
 func (m *mockTurnRunner) Run(ctx context.Context, turn agentapi.Turn) (agentapi.Result, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.turnCalls = append(m.turnCalls, turn)
+	if m.runFn != nil {
+		return m.runFn(ctx, turn)
+	}
 	return m.result, m.err
+}
+
+func TestProcessMessage_PreservesCallerContextWithout10mCap(t *testing.T) {
+	cfg := &config.Config{
+		BotHandle:             "@bot",
+		TownhallMaxParagraphs: 2,
+		DMMaxParagraphs:       5,
+		MsgRingBufferSize:     10,
+		DataDir:               t.TempDir(),
+	}
+	gw := NewGateway(cfg, nil)
+	defer gw.Stop()
+
+	var receivedCtx context.Context
+	runner := &mockTurnRunner{
+		runFn: func(ctx context.Context, turn agentapi.Turn) (agentapi.Result, error) {
+			receivedCtx = ctx
+			return agentapi.Result{Content: "reply"}, nil
+		},
+	}
+	gw.SetRunner(runner)
+
+	err := gw.ProcessMessage(context.Background(), models.Message{
+		ChatID:  "townhall",
+		UserID:  "u1",
+		Content: "@bot hello",
+	})
+	require.NoError(t, err)
+
+	require.NotNil(t, receivedCtx)
+	_, hasDeadline := receivedCtx.Deadline()
+	assert.False(t, hasDeadline, "ProcessMessage must not impose an artificial 10m timeout on the whole tool loop")
 }
 
 func TestGateway_Frontend_BindAndDeliver(t *testing.T) {
