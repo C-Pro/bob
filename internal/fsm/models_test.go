@@ -215,3 +215,52 @@ func TestCompactedTaskStateSerialization(t *testing.T) {
 	assert.Len(t, decoded.State.VerifiedFindings, 1)
 	assert.Equal(t, "run_123_i1_s0", decoded.State.VerifiedFindings[0].SourceStepIDs[0])
 }
+
+func TestCompactedTaskStateFlexibleStringSlices(t *testing.T) {
+	// Test that CompactedTaskState can unmarshal string fields when the LLM produces single strings
+	// instead of JSON arrays for slice fields.
+	rawJSON := `{
+		"should_compact": true,
+		"reason": "checkpoint reached",
+		"state": {
+			"version": 1,
+			"original_objective": "Test objective",
+			"immutable_constraints": "Single constraint string",
+			"decisions_and_rejected": "Single decision",
+			"current_subgoal": "Subgoal 1",
+			"next_intended_actions": "Single next action",
+			"unresolved_blockers": "Single blocker string",
+			"produced_artifacts": "Single artifact",
+			"active_skill_versions": "v1.0",
+			"active_memory_versions": "m1.0"
+		}
+	}`
+
+	var probe CompactionProbeResult
+	err := json.Unmarshal([]byte(rawJSON), &probe)
+	require.NoError(t, err)
+	require.NotNil(t, probe.State)
+	assert.Equal(t, []string{"Single constraint string"}, probe.State.ImmutableConstraints)
+	assert.Equal(t, []string{"Single decision"}, probe.State.DecisionsAndRejected)
+	assert.Equal(t, []string{"Single next action"}, probe.State.NextIntendedActions)
+	assert.Equal(t, []string{"Single blocker string"}, probe.State.UnresolvedBlockers)
+	assert.Equal(t, []string{"Single artifact"}, probe.State.ProducedArtifacts)
+	assert.Equal(t, []string{"v1.0"}, probe.State.ActiveSkillVersions)
+	assert.Equal(t, []string{"m1.0"}, probe.State.ActiveMemoryVersions)
+
+	// Test with null and empty string fields
+	emptyJSON := `{
+		"should_compact": false,
+		"reason": "not yet",
+		"state": {
+			"unresolved_blockers": "",
+			"next_intended_actions": null
+		}
+	}`
+	var emptyProbe CompactionProbeResult
+	err = json.Unmarshal([]byte(emptyJSON), &emptyProbe)
+	require.NoError(t, err)
+	require.NotNil(t, emptyProbe.State)
+	assert.Nil(t, emptyProbe.State.UnresolvedBlockers)
+	assert.Nil(t, emptyProbe.State.NextIntendedActions)
+}

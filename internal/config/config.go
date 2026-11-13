@@ -178,7 +178,7 @@ func Defaults() *Config {
 		TrajectoryAllowPrivate:          false,
 		FSMCompactionEnabled:            true,
 		FSMCompactionMinIterations:      3,
-		FSMCompactionIntervalIterations: 3,
+		FSMCompactionIntervalIterations: 10,
 		FSMCompactionTailIterations:     1,
 		FSMCompactionSoftThresholdBytes: 65536,
 		FSMCompactionHardThresholdBytes: 262144,
@@ -589,7 +589,7 @@ func (c *Config) Validate(requireAPIKey bool) error {
 		c.FSMCompactionMinIterations = 3
 	}
 	if c.FSMCompactionIntervalIterations <= 0 {
-		c.FSMCompactionIntervalIterations = 3
+		c.FSMCompactionIntervalIterations = 10
 	}
 	if c.FSMCompactionTailIterations <= 0 {
 		c.FSMCompactionTailIterations = 1

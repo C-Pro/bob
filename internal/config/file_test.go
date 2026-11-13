@@ -162,6 +162,14 @@ sandbox:
   cpu_limit: 2.0
   memory_limit_mb: 1024
   tasks_max: 2048
+
+fsm:
+  compaction_enabled: true
+  compaction_min_iterations: 5
+  compaction_interval_iterations: 8
+  compaction_tail_iterations: 2
+  compaction_soft_threshold_bytes: 32768
+  compaction_hard_threshold_bytes: 131072
 `
 
 	require.NoError(t, os.WriteFile(cfgFile, []byte(content), 0600))
@@ -212,6 +220,14 @@ sandbox:
 	assert.Equal(t, 2.0, cfg.SandboxCPULimit)
 	assert.Equal(t, 1024, cfg.SandboxMemoryLimitMB)
 	assert.Equal(t, 2048, cfg.SandboxTasksMax)
+
+	// FSM / Compaction
+	assert.True(t, cfg.FSMCompactionEnabled)
+	assert.Equal(t, 5, cfg.FSMCompactionMinIterations)
+	assert.Equal(t, 8, cfg.FSMCompactionIntervalIterations)
+	assert.Equal(t, 2, cfg.FSMCompactionTailIterations)
+	assert.Equal(t, 32768, cfg.FSMCompactionSoftThresholdBytes)
+	assert.Equal(t, 131072, cfg.FSMCompactionHardThresholdBytes)
 
 	// Passes ValidateCLI
 	assert.NoError(t, cfg.ValidateCLI())

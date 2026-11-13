@@ -1,8 +1,10 @@
 package fsm
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"bob/internal/agentapi"
 
@@ -246,6 +248,54 @@ type CompactedTaskState struct {
 	InputBytes           int               `json:"-"`
 	OutputBytes          int               `json:"-"`
 	CreatedAt            int64             `json:"created_at"`
+}
+
+// UnmarshalJSON implements custom unmarshaling for CompactedTaskState to gracefully accept
+// string fields from LLMs that return a single string where an array of strings was requested.
+func (s *CompactedTaskState) UnmarshalJSON(data []byte) error {
+	type rawState CompactedTaskState
+	type flexibleState struct {
+		rawState
+		ImmutableConstraints json.RawMessage `json:"immutable_constraints,omitempty"`
+		DecisionsAndRejected json.RawMessage `json:"decisions_and_rejected,omitempty"`
+		NextIntendedActions  json.RawMessage `json:"next_intended_actions,omitempty"`
+		UnresolvedBlockers   json.RawMessage `json:"unresolved_blockers,omitempty"`
+		ProducedArtifacts    json.RawMessage `json:"produced_artifacts,omitempty"`
+		ActiveSkillVersions  json.RawMessage `json:"active_skill_versions,omitempty"`
+		ActiveMemoryVersions json.RawMessage `json:"active_memory_versions,omitempty"`
+	}
+	var f flexibleState
+	if err := json.Unmarshal(data, &f); err != nil {
+		return err
+	}
+	*s = CompactedTaskState(f.rawState)
+	s.ImmutableConstraints = parseFlexibleStringSlice(f.ImmutableConstraints)
+	s.DecisionsAndRejected = parseFlexibleStringSlice(f.DecisionsAndRejected)
+	s.NextIntendedActions = parseFlexibleStringSlice(f.NextIntendedActions)
+	s.UnresolvedBlockers = parseFlexibleStringSlice(f.UnresolvedBlockers)
+	s.ProducedArtifacts = parseFlexibleStringSlice(f.ProducedArtifacts)
+	s.ActiveSkillVersions = parseFlexibleStringSlice(f.ActiveSkillVersions)
+	s.ActiveMemoryVersions = parseFlexibleStringSlice(f.ActiveMemoryVersions)
+	return nil
+}
+
+func parseFlexibleStringSlice(raw json.RawMessage) []string {
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return nil
+	}
+	var list []string
+	if err := json.Unmarshal(raw, &list); err == nil {
+		return list
+	}
+	var single string
+	if err := json.Unmarshal(raw, &single); err == nil {
+		single = strings.TrimSpace(single)
+		if single == "" {
+			return nil
+		}
+		return []string{single}
+	}
+	return nil
 }
 
 // CompactionProbeResult represents the structured decision returned by a SelfCompact rubric probe.

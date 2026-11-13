@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1089,4 +1090,90 @@ func TestStore_AtomicIndexDeletionQueues_RollbackOnQueueFailure(t *testing.T) {
 	_, err = rawDB.Exec("DROP TRIGGER fail_pending_insert")
 	require.NoError(t, err)
 	require.NoError(t, store.DisableSkill(ctx, skillItem.ID, "user_rollback"))
+}
+
+func TestStore_ActiveCounts(t *testing.T) {
+	ctx := context.Background()
+	store, db := setupTestStore(t)
+	defer func() { _ = db.Close() }()
+
+	chatID := "test_counts_chat"
+
+	// 1. Initially empty
+	counts, err := store.ActiveCounts(ctx, chatID)
+	require.NoError(t, err)
+	assert.Equal(t, 0, counts.MemoryCount)
+	assert.Equal(t, 0, counts.SkillCount)
+
+	// 2. Propose memory (pending, not active yet)
+	_, ver, err := store.ProposeMemory(ctx, &KnowledgeItem{
+		ChatID: chatID,
+		UserID: "user1",
+		Kind:   KindMemory,
+	}, &MemoryVersion{
+		Type:       MemoryTypeFact,
+		Content:    "active fact",
+		Confidence: 1.0,
+	})
+	require.NoError(t, err)
+
+	counts, err = store.ActiveCounts(ctx, chatID)
+	require.NoError(t, err)
+	assert.Equal(t, 0, counts.MemoryCount, "pending memory should not count as active")
+
+	// 3. Approve memory -> active
+	require.NoError(t, store.ApproveVersion(ctx, ver.ID, "user1"))
+	counts, err = store.ActiveCounts(ctx, chatID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, counts.MemoryCount)
+	assert.Equal(t, 0, counts.SkillCount)
+
+	// 4. Propose and approve skill
+	_, sVer, err := store.ProposeSkill(ctx, &KnowledgeItem{
+		ChatID: chatID,
+		UserID: "user1",
+		Kind:   KindSkill,
+	}, &SkillVersion{
+		Name:                 "test_skill",
+		Description:          "A skill",
+		Triggers:             []string{"run"},
+		Tags:                 []string{"test"},
+		InstructionsMarkdown: "steps",
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ApproveVersion(ctx, sVer.ID, "user1"))
+
+	counts, err = store.ActiveCounts(ctx, chatID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, counts.MemoryCount)
+	assert.Equal(t, 1, counts.SkillCount)
+
+	// 5. Expired memory is excluded
+	ttl := 1
+	_, expVer, err := store.ProposeMemory(ctx, &KnowledgeItem{
+		ChatID: chatID,
+		UserID: "user1",
+		Kind:   KindMemory,
+	}, &MemoryVersion{
+		Type:       MemoryTypeFact,
+		Content:    "expired fact",
+		Confidence: 1.0,
+		TTLDays:    &ttl,
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ApproveVersion(ctx, expVer.ID, "user1"))
+
+	// Manually set expiration in the past
+	_, err = db.ExecContext(ctx, "UPDATE memory_versions SET expires_at = ? WHERE id = ?", time.Now().Add(-1*time.Hour).Unix(), expVer.ID)
+	require.NoError(t, err)
+
+	counts, err = store.ActiveCounts(ctx, chatID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, counts.MemoryCount, "expired memory must be excluded")
+	assert.Equal(t, 1, counts.SkillCount)
+
+	counts, err = store.ActiveCounts(ctx, chatID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, counts.MemoryCount, "expired memory must be excluded")
+	assert.Equal(t, 1, counts.SkillCount)
 }

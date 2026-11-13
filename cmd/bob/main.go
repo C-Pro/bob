@@ -258,6 +258,9 @@ func runWithFactory(args []string, stdin io.Reader, stdout, stderr io.Writer, fa
 	if visited["max-iterations"] {
 		cfg.CLIMaxIterations = maxIterVal
 	}
+	if timeoutVal > cfg.SandboxMaxLifetime {
+		cfg.SandboxMaxLifetime = timeoutVal
+	}
 
 	effectiveDriver := cfg.SandboxDefaultDriver
 	if effectiveDriver == "" {

@@ -16,13 +16,20 @@ type CLISandboxInfo struct {
 	Network           string
 }
 
+// CLIKnowledgeInfo holds counts of stored knowledge items for prompt rendering.
+type CLIKnowledgeInfo struct {
+	MemoryCount int
+	SkillCount  int
+}
+
 // CLIPromptContext specifies the environment and available capabilities for the CLI runner.
 type CLIPromptContext struct {
-	Now     time.Time
-	TZ      string
-	OS      string
-	Tools   []agentapi.ToolDefinition
-	Sandbox *CLISandboxInfo
+	Now       time.Time
+	TZ        string
+	OS        string
+	Tools     []agentapi.ToolDefinition
+	Sandbox   *CLISandboxInfo
+	Knowledge *CLIKnowledgeInfo
 }
 
 // RenderCLI renders the system prompt for the CLI runner.
@@ -96,6 +103,17 @@ func RenderCLI(ctx CLIPromptContext) string {
 	} else {
 		b.WriteString("Local Filesystem:\n")
 		b.WriteString("You do NOT have access to local files on the user's filesystem. There are no tools available to read, write, or inspect local files or directories.\n")
+	}
+
+	// Knowledge Base
+	if ctx.Knowledge != nil {
+		b.WriteString("\nKnowledge Base:\n")
+		if ctx.Knowledge.MemoryCount == 0 && ctx.Knowledge.SkillCount == 0 {
+			b.WriteString("Currently empty (0 memories, 0 skills stored). Do not attempt to query or load memories or skills.\n")
+		} else {
+			fmt.Fprintf(&b, "Available: %d memories, %d skills stored. Use discover_memories or discover_skills to query when relevant.\n",
+				ctx.Knowledge.MemoryCount, ctx.Knowledge.SkillCount)
+		}
 	}
 
 	return strings.TrimSpace(b.String())

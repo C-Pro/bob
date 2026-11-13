@@ -414,6 +414,39 @@ func TestRun_MaxIterationsFlagAndConfig(t *testing.T) {
 	assert.Equal(t, 42, recordedMaxIter)
 }
 
+func TestRun_TimeoutExtendsSandboxLifetime(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{
+				{"message": map[string]any{"content": "done"}},
+			},
+		})
+	}))
+	defer server.Close()
+
+	cfgPath := writeValidConfigFile(t, server.URL)
+
+	var recordedMaxLifetime time.Duration
+	factory := func(cfg *config.Config, opts bootstrap.Options) (*bootstrap.Runtime, error) {
+		recordedMaxLifetime = cfg.SandboxMaxLifetime
+		return bootstrap.New(cfg, opts)
+	}
+
+	var stdout, stderr bytes.Buffer
+	// Without --timeout, defaults to 1h which extends the 30m default to 1h
+	code := runWithFactory([]string{"-p", "hello", "--config", cfgPath}, nil, &stdout, &stderr, factory)
+	assert.Equal(t, 0, code)
+	assert.Equal(t, 1*time.Hour, recordedMaxLifetime)
+
+	// With explicit --timeout 2h, extends to 2h
+	stdout.Reset()
+	stderr.Reset()
+	code = runWithFactory([]string{"-p", "hello", "--config", cfgPath, "--timeout", "2h"}, nil, &stdout, &stderr, factory)
+	assert.Equal(t, 0, code)
+	assert.Equal(t, 2*time.Hour, recordedMaxLifetime)
+}
+
 type mockDriverTest struct {
 	available bool
 }

@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	compactionProbeTimeout  = 30 * time.Second
+	compactionProbeTimeout  = 5 * time.Minute
 	maxProbeStepArgsBytes   = 512
 	maxProbeStepOutputBytes = 1024
 	maxProbePrevStateBytes  = 8192
@@ -586,15 +586,26 @@ func (d *llmCompactionDecider) DecideCompaction(ctx context.Context, input Compa
 
 func stripMarkdownJSONFence(s string) string {
 	trimmed := strings.TrimSpace(s)
-	if strings.HasPrefix(trimmed, "```") {
-		if nl := strings.IndexByte(trimmed, '\n'); nl != -1 {
-			trimmed = trimmed[nl+1:]
+	// If it contains a code fence anywhere (e.g. after a preamble), extract within the fence.
+	if start := strings.Index(trimmed, "```"); start != -1 {
+		rest := trimmed[start+3:]
+		if nl := strings.IndexByte(rest, '\n'); nl != -1 {
+			rest = rest[nl+1:]
 		}
-		if end := strings.LastIndex(trimmed, "```"); end != -1 {
-			trimmed = trimmed[:end]
+		if end := strings.LastIndex(rest, "```"); end != -1 {
+			rest = rest[:end]
+		}
+		return strings.TrimSpace(rest)
+	}
+	// If it contains a raw JSON object with leading or trailing prose, extract the outer braces.
+	if !strings.HasPrefix(trimmed, "{") {
+		if start := strings.IndexByte(trimmed, '{'); start != -1 {
+			if end := strings.LastIndexByte(trimmed, '}'); end != -1 && end > start {
+				return strings.TrimSpace(trimmed[start : end+1])
+			}
 		}
 	}
-	return strings.TrimSpace(trimmed)
+	return trimmed
 }
 
 func recordProbeSkipEvent(ctx context.Context, store *Store, runID string, iteration, prevVersion, prevCompactedIter int, model string, activeBytes int, reason string) error {
