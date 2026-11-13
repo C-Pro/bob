@@ -18,3 +18,5 @@ bob_agent
 bin/
 /bob-proxy-fwd
 internal/sandbox/embedded/*.gz
+__pycache__/
+eval/harness/repos/

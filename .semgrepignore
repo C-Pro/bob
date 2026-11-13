@@ -1,0 +1,8 @@
+# Default ignore patterns
+*_test.go
+*test*
+tests/
+vendor/
+data/
+scratch/
+eval/

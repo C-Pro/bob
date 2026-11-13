@@ -1,0 +1,35 @@
+{
+  "manifest_version": "1.0",
+  "total_tasks": 4,
+  "tasks": [
+    {
+      "task_id": "ic_ctf_011",
+      "benchmark": "intercode-ctf",
+      "instruction": "Can you look at the data in this binary: static? The given BASH script ltdis.sh might help! What is the flag?",
+      "gold_flag": "picoCTF{d15a5m_t34s3r_6f8c8200}",
+      "eval_type": "ctf_flag_match"
+    },
+    {
+      "task_id": "frames_013",
+      "benchmark": "frames",
+      "instruction": "In what year did the country in which Barbara Kingsolver lived for part of her childhood gain independence from its colonial ruler?",
+      "gold_answer": "1960",
+      "eval_type": "exact_match_normalized"
+    },
+    {
+      "task_id": "ic_bash_fs1_000",
+      "benchmark": "intercode-bash",
+      "instruction": "Find all duplicate files (based on MD5 hash) in /testbed and its subdirectories. Output each set of duplicates on a single line, separated by spaces.",
+      "gold_command": "find /testbed -type f -exec md5sum {} + | sort | awk 'a[$1]++{if(a[$1]==2)printf \"\\n%s %s \", b[$1], $2; else printf \"%s \", $2}{b[$1]=$2}END{print \"\"}'",
+      "eval_type": "bash_fs"
+    },
+    {
+      "task_id": "swe_django__django-10924",
+      "benchmark": "swe-bench-lite",
+      "repo": "django/django",
+      "base_commit": "bceadd2788dc2dad53eba0caae172bd8522fd483",
+      "instruction": "Allow FilePathField path to accept a callable.\nCurrently FilePathField only accepts a string for path. It should also accept a callable that returns a string.",
+      "eval_type": "pytest_patch"
+    }
+  ]
+}

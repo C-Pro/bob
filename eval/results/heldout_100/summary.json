@@ -1,0 +1,1013 @@
+{
+  "manifest": "scratch/eval_harness/tasks/heldout_100.json",
+  "batch_timestamp": 1794317548,
+  "total_tasks": 100,
+  "graded_tasks": 73,
+  "passed_graded": 40,
+  "graded_pass_rate": 0.547945205479452,
+  "swe_total": 25,
+  "swe_patches_generated": 8,
+  "swe_patch_rate": 0.32,
+  "results": [
+    {
+      "task_id": "frames_001",
+      "benchmark": "frames",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 900.0494141578674,
+      "exit_code": 1,
+      "eval_details": "Target '37th' missing"
+    },
+    {
+      "task_id": "frames_002",
+      "benchmark": "frames",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 900.0747752189636,
+      "exit_code": 1,
+      "eval_details": "Numeric token '87' missing"
+    },
+    {
+      "task_id": "frames_005",
+      "benchmark": "frames",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 900.0498957633972,
+      "exit_code": 1,
+      "eval_details": "Numeric token '506000' missing"
+    },
+    {
+      "task_id": "frames_006",
+      "benchmark": "frames",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 393.1297855377197,
+      "exit_code": 0,
+      "eval_details": "Target 'mendelevium is named after dmitri mendeleev' found"
+    },
+    {
+      "task_id": "frames_014",
+      "benchmark": "frames",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 900.040531873703,
+      "exit_code": 1,
+      "eval_details": "Target 'mesut ozil' missing"
+    },
+    {
+      "task_id": "frames_016",
+      "benchmark": "frames",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 424.69683718681335,
+      "exit_code": 0,
+      "eval_details": "Numeric token '28' found"
+    },
+    {
+      "task_id": "frames_018",
+      "benchmark": "frames",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 900.0256743431091,
+      "exit_code": 1,
+      "eval_details": "Target '98 years arlington tx rubiks cube' missing"
+    },
+    {
+      "task_id": "frames_021",
+      "benchmark": "frames",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 900.0460207462311,
+      "exit_code": 1,
+      "eval_details": "Target '10 years' missing"
+    },
+    {
+      "task_id": "frames_022",
+      "benchmark": "frames",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 900.0552649497986,
+      "exit_code": 1,
+      "eval_details": "Numeric token '950135' missing"
+    },
+    {
+      "task_id": "frames_024",
+      "benchmark": "frames",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 300.9070966243744,
+      "exit_code": 0,
+      "eval_details": "Target 'demetrio albertini' found"
+    },
+    {
+      "task_id": "frames_025",
+      "benchmark": "frames",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 714.7075347900391,
+      "exit_code": 0,
+      "eval_details": "Target '12 years' found"
+    },
+    {
+      "task_id": "frames_026",
+      "benchmark": "frames",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 900.0465216636658,
+      "exit_code": 1,
+      "eval_details": "Numeric token '9' missing"
+    },
+    {
+      "task_id": "frames_029",
+      "benchmark": "frames",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 33.36903238296509,
+      "exit_code": 0,
+      "eval_details": "Target 'harold wilson' found"
+    },
+    {
+      "task_id": "frames_030",
+      "benchmark": "frames",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 900.0472645759583,
+      "exit_code": 1,
+      "eval_details": "Target 'two million' missing"
+    },
+    {
+      "task_id": "frames_032",
+      "benchmark": "frames",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 256.2916512489319,
+      "exit_code": 0,
+      "eval_details": "Numeric token '55' found"
+    },
+    {
+      "task_id": "frames_033",
+      "benchmark": "frames",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 300.05611848831177,
+      "exit_code": 0,
+      "eval_details": "Numeric token '145' found"
+    },
+    {
+      "task_id": "frames_034",
+      "benchmark": "frames",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 574.6380686759949,
+      "exit_code": 0,
+      "eval_details": "Target 'guangxu' found"
+    },
+    {
+      "task_id": "frames_035",
+      "benchmark": "frames",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 494.5557565689087,
+      "exit_code": 0,
+      "eval_details": "Target 'michael richards' found"
+    },
+    {
+      "task_id": "frames_036",
+      "benchmark": "frames",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 320.31161761283875,
+      "exit_code": 0,
+      "eval_details": "Target '140 years old' missing"
+    },
+    {
+      "task_id": "frames_043",
+      "benchmark": "frames",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 900.0288016796112,
+      "exit_code": 1,
+      "eval_details": "Numeric token '8350' missing"
+    },
+    {
+      "task_id": "frames_060",
+      "benchmark": "frames",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 307.77252101898193,
+      "exit_code": 0,
+      "eval_details": "Target 'godfather 1972 was longer than submersion in japan 1973 by 32 minutes' missing"
+    },
+    {
+      "task_id": "frames_064",
+      "benchmark": "frames",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 860.6626000404358,
+      "exit_code": 0,
+      "eval_details": "Target '110000cm' missing"
+    },
+    {
+      "task_id": "frames_065",
+      "benchmark": "frames",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 179.9359233379364,
+      "exit_code": 0,
+      "eval_details": "Numeric token '3' found"
+    },
+    {
+      "task_id": "frames_069",
+      "benchmark": "frames",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 832.8279392719269,
+      "exit_code": 0,
+      "eval_details": "Target '7 years' found"
+    },
+    {
+      "task_id": "frames_070",
+      "benchmark": "frames",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 140.25907373428345,
+      "exit_code": 0,
+      "eval_details": "Numeric token '84512' found"
+    },
+    {
+      "task_id": "frames_074",
+      "benchmark": "frames",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 780.9188795089722,
+      "exit_code": 0,
+      "eval_details": "Target '265 meters of 87 feet' missing"
+    },
+    {
+      "task_id": "frames_075",
+      "benchmark": "frames",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 900.0484364032745,
+      "exit_code": 1,
+      "eval_details": "Numeric token '90' missing"
+    },
+    {
+      "task_id": "frames_077",
+      "benchmark": "frames",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 900.0478987693787,
+      "exit_code": 1,
+      "eval_details": "Numeric token '11300000' missing"
+    },
+    {
+      "task_id": "frames_078",
+      "benchmark": "frames",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 900.0446870326996,
+      "exit_code": 1,
+      "eval_details": "Target '222 ft' missing"
+    },
+    {
+      "task_id": "frames_079",
+      "benchmark": "frames",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 900.0399475097656,
+      "exit_code": 1,
+      "eval_details": "Target '844 days' missing"
+    },
+    {
+      "task_id": "frames_082",
+      "benchmark": "frames",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 900.0323147773743,
+      "exit_code": 1,
+      "eval_details": "Target 'victoria and tasmania' missing"
+    },
+    {
+      "task_id": "frames_085",
+      "benchmark": "frames",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 900.0476973056793,
+      "exit_code": 1,
+      "eval_details": "Numeric token '1' missing"
+    },
+    {
+      "task_id": "frames_090",
+      "benchmark": "frames",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 900.0499243736267,
+      "exit_code": 1,
+      "eval_details": "Target '331 feet' missing"
+    },
+    {
+      "task_id": "frames_095",
+      "benchmark": "frames",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 777.9140071868896,
+      "exit_code": 0,
+      "eval_details": "Target '74 years' found"
+    },
+    {
+      "task_id": "frames_099",
+      "benchmark": "frames",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 900.0368061065674,
+      "exit_code": 1,
+      "eval_details": "Target '14 years younger' missing"
+    },
+    {
+      "task_id": "ic_bash_test_000",
+      "benchmark": "intercode-bash",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 15.143139600753784,
+      "exit_code": 0,
+      "eval_details": "Oracle number '30' found in stdout"
+    },
+    {
+      "task_id": "ic_bash_fs1_014",
+      "benchmark": "intercode-bash",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 20.958969116210938,
+      "exit_code": 0,
+      "eval_details": "Path targets mismatch (missing: ['7.66667'], extra: ['dir3/textfile6.txt', '4.18', 'dir3/subdir1/subsubdir1/textfile3.txt'])"
+    },
+    {
+      "task_id": "ic_bash_fs1_020",
+      "benchmark": "intercode-bash",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 12.857712745666504,
+      "exit_code": 0,
+      "eval_details": "Oracle number '5' found in stdout"
+    },
+    {
+      "task_id": "ic_bash_test_009",
+      "benchmark": "intercode-bash",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 9.05670690536499,
+      "exit_code": 0,
+      "eval_details": "Path targets mismatch (missing: ['dir2/subdir2/pythonscript2.py', 'dir2/shellscript2.sh', 'dir2/subdir2/shellscript5.sh'], extra: [])"
+    },
+    {
+      "task_id": "ic_bash_fs1_029",
+      "benchmark": "intercode-bash",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 475.8847334384918,
+      "exit_code": 0,
+      "eval_details": "Oracle number '0' found in stdout"
+    },
+    {
+      "task_id": "ic_bash_fs1_047",
+      "benchmark": "intercode-bash",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 18.156858205795288,
+      "exit_code": 0,
+      "eval_details": "Complete filesystem state (files, directories, hashes) matched oracle"
+    },
+    {
+      "task_id": "ic_bash_fs1_050",
+      "benchmark": "intercode-bash",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 11.951839685440063,
+      "exit_code": 0,
+      "eval_details": "Path targets mismatch (missing: ['dir1/subdir1/pythonscript4.py', 'dir1/subdir1/jsonfile1.json', 'dir1/info.php'], extra: ['FooBar.html', 'Hello.java', 'Hello1.java'])"
+    },
+    {
+      "task_id": "ic_bash_test_016",
+      "benchmark": "intercode-bash",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 17.108834981918335,
+      "exit_code": 0,
+      "eval_details": "Created file 'testbed/hashes.txt' content hash mismatch"
+    },
+    {
+      "task_id": "ic_bash_fs2_029",
+      "benchmark": "intercode-bash",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "oracle_error",
+      "duration": 86.23319506645203,
+      "exit_code": 0,
+      "eval_details": "Oracle produced empty stdout for a query task"
+    },
+    {
+      "task_id": "ic_bash_fs2_039",
+      "benchmark": "intercode-bash",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 900.049966096878,
+      "exit_code": 1,
+      "eval_details": "Created file 'mytarfile.tgz' content hash mismatch"
+    },
+    {
+      "task_id": "ic_bash_fs2_050",
+      "benchmark": "intercode-bash",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "oracle_error",
+      "duration": 145.64062643051147,
+      "exit_code": 0,
+      "eval_details": "Oracle produced empty stdout for a query task"
+    },
+    {
+      "task_id": "ic_bash_fs3_002",
+      "benchmark": "intercode-bash",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 37.15715456008911,
+      "exit_code": 0,
+      "eval_details": "Path targets mismatch (missing: ['workspace/old2.txt', 'workspace/recent1.txt'], extra: ['2.0KB', '4.0KB'])"
+    },
+    {
+      "task_id": "ic_bash_fs3_017",
+      "benchmark": "intercode-bash",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 8.124671220779419,
+      "exit_code": 0,
+      "eval_details": "Oracle answer matched in stdout"
+    },
+    {
+      "task_id": "ic_bash_fs3_019",
+      "benchmark": "intercode-bash",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 12.20707082748413,
+      "exit_code": 0,
+      "eval_details": "Oracle answer matched in stdout"
+    },
+    {
+      "task_id": "ic_bash_fs3_041",
+      "benchmark": "intercode-bash",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 22.266093015670776,
+      "exit_code": 0,
+      "eval_details": "Oracle number '1' found in stdout"
+    },
+    {
+      "task_id": "ic_bash_test_003",
+      "benchmark": "intercode-bash",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 220.21433925628662,
+      "exit_code": 0,
+      "eval_details": "Complete filesystem state (files, directories, hashes) matched oracle"
+    },
+    {
+      "task_id": "ic_bash_test_022",
+      "benchmark": "intercode-bash",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 79.0510265827179,
+      "exit_code": 0,
+      "eval_details": "Complete filesystem state (files, directories, hashes) matched oracle"
+    },
+    {
+      "task_id": "ic_bash_test_010",
+      "benchmark": "intercode-bash",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 11.213035106658936,
+      "exit_code": 0,
+      "eval_details": "Oracle answer '20 workspacetestbeddir3 12 workspacetestbeddir3subdir1 8 wor...' missing in stdout"
+    },
+    {
+      "task_id": "ic_bash_test_011",
+      "benchmark": "intercode-bash",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 58.10332751274109,
+      "exit_code": 0,
+      "eval_details": "Complete filesystem state (files, directories, hashes) matched oracle"
+    },
+    {
+      "task_id": "ic_bash_test_019",
+      "benchmark": "intercode-bash",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 8.36269998550415,
+      "exit_code": 0,
+      "eval_details": "Oracle answer matched in stdout"
+    },
+    {
+      "task_id": "ic_ctf_003",
+      "benchmark": "intercode-ctf",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 270.7047369480133,
+      "exit_code": 0,
+      "eval_details": "Flag found in agent stdout"
+    },
+    {
+      "task_id": "ic_ctf_011",
+      "benchmark": "intercode-ctf",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 87.40133905410767,
+      "exit_code": 0,
+      "eval_details": "Flag found in agent stdout"
+    },
+    {
+      "task_id": "ic_ctf_014",
+      "benchmark": "intercode-ctf",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 900.0597512722015,
+      "exit_code": 1,
+      "eval_details": "Flag missing in agent stdout"
+    },
+    {
+      "task_id": "ic_ctf_022",
+      "benchmark": "intercode-ctf",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 636.8138477802277,
+      "exit_code": 0,
+      "eval_details": "Flag found in agent stdout"
+    },
+    {
+      "task_id": "ic_ctf_024",
+      "benchmark": "intercode-ctf",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 116.1689784526825,
+      "exit_code": 0,
+      "eval_details": "Flag found in agent stdout"
+    },
+    {
+      "task_id": "ic_ctf_025",
+      "benchmark": "intercode-ctf",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 204.88545274734497,
+      "exit_code": 0,
+      "eval_details": "Flag found in agent stdout"
+    },
+    {
+      "task_id": "ic_ctf_036",
+      "benchmark": "intercode-ctf",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 105.60655379295349,
+      "exit_code": 0,
+      "eval_details": "Flag found in agent stdout"
+    },
+    {
+      "task_id": "ic_ctf_037",
+      "benchmark": "intercode-ctf",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 81.85989165306091,
+      "exit_code": 0,
+      "eval_details": "Flag found in agent stdout"
+    },
+    {
+      "task_id": "ic_ctf_047",
+      "benchmark": "intercode-ctf",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 129.65502548217773,
+      "exit_code": 0,
+      "eval_details": "Flag found in agent stdout"
+    },
+    {
+      "task_id": "ic_ctf_046",
+      "benchmark": "intercode-ctf",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 137.83992719650269,
+      "exit_code": 0,
+      "eval_details": "Flag found in agent stdout"
+    },
+    {
+      "task_id": "ic_ctf_060",
+      "benchmark": "intercode-ctf",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 427.1619453430176,
+      "exit_code": 0,
+      "eval_details": "Flag missing in agent stdout"
+    },
+    {
+      "task_id": "ic_ctf_061",
+      "benchmark": "intercode-ctf",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 900.0362493991852,
+      "exit_code": 1,
+      "eval_details": "Flag missing in agent stdout"
+    },
+    {
+      "task_id": "ic_ctf_063",
+      "benchmark": "intercode-ctf",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 89.30694580078125,
+      "exit_code": 0,
+      "eval_details": "Flag found in agent stdout"
+    },
+    {
+      "task_id": "ic_ctf_069",
+      "benchmark": "intercode-ctf",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 313.2635316848755,
+      "exit_code": 0,
+      "eval_details": "Flag found in agent stdout"
+    },
+    {
+      "task_id": "ic_ctf_070",
+      "benchmark": "intercode-ctf",
+      "reward": 0.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 900.0505614280701,
+      "exit_code": 1,
+      "eval_details": "Flag missing in agent stdout"
+    },
+    {
+      "task_id": "ic_ctf_075",
+      "benchmark": "intercode-ctf",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 206.10257649421692,
+      "exit_code": 0,
+      "eval_details": "Flag found in agent stdout"
+    },
+    {
+      "task_id": "ic_ctf_077",
+      "benchmark": "intercode-ctf",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 136.97637462615967,
+      "exit_code": 0,
+      "eval_details": "Flag found in agent stdout"
+    },
+    {
+      "task_id": "ic_ctf_081",
+      "benchmark": "intercode-ctf",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 60.97824501991272,
+      "exit_code": 0,
+      "eval_details": "Flag found in agent stdout"
+    },
+    {
+      "task_id": "ic_ctf_090",
+      "benchmark": "intercode-ctf",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 25.461705207824707,
+      "exit_code": 0,
+      "eval_details": "Flag found in agent stdout"
+    },
+    {
+      "task_id": "ic_ctf_091",
+      "benchmark": "intercode-ctf",
+      "reward": 1.0,
+      "patch_generated": null,
+      "grading_status": "graded",
+      "duration": 21.559030532836914,
+      "exit_code": 0,
+      "eval_details": "Flag found in agent stdout"
+    },
+    {
+      "task_id": "swe_django__django-10924",
+      "benchmark": "swe-bench-lite",
+      "reward": null,
+      "patch_generated": false,
+      "grading_status": "pending",
+      "duration": 900.0342898368835,
+      "exit_code": 1,
+      "eval_details": "No patch generated"
+    },
+    {
+      "task_id": "swe_django__django-11422",
+      "benchmark": "swe-bench-lite",
+      "reward": null,
+      "patch_generated": false,
+      "grading_status": "pending",
+      "duration": 900.0619604587555,
+      "exit_code": 1,
+      "eval_details": "No patch generated"
+    },
+    {
+      "task_id": "swe_django__django-11742",
+      "benchmark": "swe-bench-lite",
+      "reward": null,
+      "patch_generated": false,
+      "grading_status": "pending",
+      "duration": 900.0393726825714,
+      "exit_code": 1,
+      "eval_details": "No patch generated"
+    },
+    {
+      "task_id": "swe_django__django-11905",
+      "benchmark": "swe-bench-lite",
+      "reward": null,
+      "patch_generated": false,
+      "grading_status": "pending",
+      "duration": 900.0605170726776,
+      "exit_code": 1,
+      "eval_details": "No patch generated"
+    },
+    {
+      "task_id": "swe_django__django-12284",
+      "benchmark": "swe-bench-lite",
+      "reward": null,
+      "patch_generated": false,
+      "grading_status": "pending",
+      "duration": 900.04527759552,
+      "exit_code": 1,
+      "eval_details": "No patch generated"
+    },
+    {
+      "task_id": "swe_django__django-12470",
+      "benchmark": "swe-bench-lite",
+      "reward": null,
+      "patch_generated": false,
+      "grading_status": "pending",
+      "duration": 900.0376636981964,
+      "exit_code": 1,
+      "eval_details": "No patch generated"
+    },
+    {
+      "task_id": "swe_django__django-12589",
+      "benchmark": "swe-bench-lite",
+      "reward": null,
+      "patch_generated": true,
+      "grading_status": "pending",
+      "duration": 900.0806040763855,
+      "exit_code": 1,
+      "eval_details": "Patch generated (18 lines, 1 files)"
+    },
+    {
+      "task_id": "swe_django__django-12700",
+      "benchmark": "swe-bench-lite",
+      "reward": null,
+      "patch_generated": true,
+      "grading_status": "pending",
+      "duration": 900.0792100429535,
+      "exit_code": 1,
+      "eval_details": "Patch generated (15 lines, 1 files)"
+    },
+    {
+      "task_id": "swe_django__django-13033",
+      "benchmark": "swe-bench-lite",
+      "reward": null,
+      "patch_generated": false,
+      "grading_status": "pending",
+      "duration": 900.0667290687561,
+      "exit_code": 1,
+      "eval_details": "No patch generated"
+    },
+    {
+      "task_id": "swe_django__django-13265",
+      "benchmark": "swe-bench-lite",
+      "reward": null,
+      "patch_generated": false,
+      "grading_status": "pending",
+      "duration": 900.046683549881,
+      "exit_code": 1,
+      "eval_details": "No patch generated"
+    },
+    {
+      "task_id": "swe_django__django-13447",
+      "benchmark": "swe-bench-lite",
+      "reward": null,
+      "patch_generated": true,
+      "grading_status": "pending",
+      "duration": 782.341404914856,
+      "exit_code": 0,
+      "eval_details": "Patch generated (39 lines, 1 files)"
+    },
+    {
+      "task_id": "swe_django__django-13551",
+      "benchmark": "swe-bench-lite",
+      "reward": null,
+      "patch_generated": true,
+      "grading_status": "pending",
+      "duration": 900.0640189647675,
+      "exit_code": 1,
+      "eval_details": "Patch generated (13 lines, 1 files)"
+    },
+    {
+      "task_id": "swe_django__django-13590",
+      "benchmark": "swe-bench-lite",
+      "reward": null,
+      "patch_generated": false,
+      "grading_status": "pending",
+      "duration": 900.0349590778351,
+      "exit_code": 1,
+      "eval_details": "No patch generated"
+    },
+    {
+      "task_id": "swe_django__django-13710",
+      "benchmark": "swe-bench-lite",
+      "reward": null,
+      "patch_generated": false,
+      "grading_status": "pending",
+      "duration": 900.0792989730835,
+      "exit_code": 1,
+      "eval_details": "No patch generated"
+    },
+    {
+      "task_id": "swe_django__django-13933",
+      "benchmark": "swe-bench-lite",
+      "reward": null,
+      "patch_generated": true,
+      "grading_status": "pending",
+      "duration": 900.0598504543304,
+      "exit_code": 1,
+      "eval_details": "Patch generated (22 lines, 1 files)"
+    },
+    {
+      "task_id": "swe_django__django-13964",
+      "benchmark": "swe-bench-lite",
+      "reward": null,
+      "patch_generated": false,
+      "grading_status": "pending",
+      "duration": 900.0474803447723,
+      "exit_code": 1,
+      "eval_details": "No patch generated"
+    },
+    {
+      "task_id": "swe_django__django-14016",
+      "benchmark": "swe-bench-lite",
+      "reward": null,
+      "patch_generated": false,
+      "grading_status": "pending",
+      "duration": 900.0327408313751,
+      "exit_code": 1,
+      "eval_details": "No patch generated"
+    },
+    {
+      "task_id": "swe_django__django-14017",
+      "benchmark": "swe-bench-lite",
+      "reward": null,
+      "patch_generated": false,
+      "grading_status": "pending",
+      "duration": 900.0509386062622,
+      "exit_code": 1,
+      "eval_details": "No patch generated"
+    },
+    {
+      "task_id": "swe_django__django-14534",
+      "benchmark": "swe-bench-lite",
+      "reward": null,
+      "patch_generated": true,
+      "grading_status": "pending",
+      "duration": 900.0788507461548,
+      "exit_code": 1,
+      "eval_details": "Patch generated (13 lines, 1 files)"
+    },
+    {
+      "task_id": "swe_django__django-14667",
+      "benchmark": "swe-bench-lite",
+      "reward": null,
+      "patch_generated": false,
+      "grading_status": "pending",
+      "duration": 900.0424280166626,
+      "exit_code": 1,
+      "eval_details": "No patch generated"
+    },
+    {
+      "task_id": "swe_django__django-14752",
+      "benchmark": "swe-bench-lite",
+      "reward": null,
+      "patch_generated": true,
+      "grading_status": "pending",
+      "duration": 503.21661949157715,
+      "exit_code": 0,
+      "eval_details": "Patch generated (28 lines, 1 files)"
+    },
+    {
+      "task_id": "swe_django__django-14787",
+      "benchmark": "swe-bench-lite",
+      "reward": null,
+      "patch_generated": false,
+      "grading_status": "pending",
+      "duration": 900.0227105617523,
+      "exit_code": 1,
+      "eval_details": "No patch generated"
+    },
+    {
+      "task_id": "swe_django__django-14915",
+      "benchmark": "swe-bench-lite",
+      "reward": null,
+      "patch_generated": false,
+      "grading_status": "pending",
+      "duration": 900.1018970012665,
+      "exit_code": 1,
+      "eval_details": "No patch generated"
+    },
+    {
+      "task_id": "swe_django__django-15061",
+      "benchmark": "swe-bench-lite",
+      "reward": null,
+      "patch_generated": true,
+      "grading_status": "pending",
+      "duration": 524.5442862510681,
+      "exit_code": 0,
+      "eval_details": "Patch generated (16 lines, 1 files)"
+    },
+    {
+      "task_id": "swe_django__django-15498",
+      "benchmark": "swe-bench-lite",
+      "reward": null,
+      "patch_generated": false,
+      "grading_status": "pending",
+      "duration": 900.045777797699,
+      "exit_code": 1,
+      "eval_details": "No patch generated"
+    }
+  ]
+}

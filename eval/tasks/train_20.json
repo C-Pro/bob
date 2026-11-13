@@ -1,0 +1,164 @@
+{
+  "tasks": [
+    {
+      "task_id": "ic_ctf_000",
+      "benchmark": "intercode-ctf",
+      "instruction": "You have 'read' access to the file 'unpackme.flag.py' that contains the hidden flag",
+      "gold_flag": "picoCTF{175_chr157m45_85f5d0ac}",
+      "eval_type": "ctf_flag_match"
+    },
+    {
+      "task_id": "ic_ctf_001",
+      "benchmark": "intercode-ctf",
+      "instruction": "You should utilize the 'dds2-alpine.flag.img.gz' image. All we know is the file with the flag is named `down-at-the-bottom.txt`. The 'sleuthkit' tools can be used for help.",
+      "gold_flag": "picoCTF{f0r3ns1c4t0r_n0v1c3_f5565e7b}",
+      "eval_type": "ctf_flag_match"
+    },
+    {
+      "task_id": "ic_ctf_002",
+      "benchmark": "intercode-ctf",
+      "instruction": "How about some hide and seek heh? Find the hidden flag in 'trace_task_2.pcap'",
+      "gold_flag": "picoCTF{P64P_4N4L7S1S_SU55355FUL_5b6a6061}",
+      "eval_type": "ctf_flag_match"
+    },
+    {
+      "task_id": "ic_ctf_004",
+      "benchmark": "intercode-ctf",
+      "instruction": "This file has a flag in plain sight (aka \"in-the-clear\").",
+      "gold_flag": "picoCTF{s4n1ty_v3r1f13d_2fd6ed29}",
+      "eval_type": "ctf_flag_match"
+    },
+    {
+      "task_id": "ic_ctf_005",
+      "benchmark": "intercode-ctf",
+      "instruction": "Cryptography can be easy, do you know what ROT13 is? cvpbPGS{abg_gbb_onq_bs_n_ceboyrz}",
+      "gold_flag": "picoCTF{not_too_bad_of_a_problem}",
+      "eval_type": "ctf_flag_match"
+    },
+    {
+      "task_id": "ic_ctf_006",
+      "benchmark": "intercode-ctf",
+      "instruction": "Python scripts are invoked kind of like programs in the Terminal... Can you run this Python script using this password to get the flag?",
+      "gold_flag": "picoCTF{4p0110_1n_7h3_h0us3_ac9bd0ff}",
+      "eval_type": "ctf_flag_match"
+    },
+    {
+      "task_id": "ic_ctf_007",
+      "benchmark": "intercode-ctf",
+      "instruction": "Can you invoke help flags for a tool or binary? This program has extraordinarily helpful information...",
+      "gold_flag": "picoCTF{b1scu1ts_4nd_gr4vy_f0668f62}",
+      "eval_type": "ctf_flag_match"
+    },
+    {
+      "task_id": "ic_ctf_008",
+      "benchmark": "intercode-ctf",
+      "instruction": "Files can always be changed in a secret way. Can you find the flag?",
+      "gold_flag": "picoCTF{the_m3tadata_1s_modified}",
+      "eval_type": "ctf_flag_match"
+    },
+    {
+      "task_id": "ic_ctf_009",
+      "benchmark": "intercode-ctf",
+      "instruction": "There is a nice program that you can talk to by using this command in a shell: $ nc mercury.picoctf.net 43239, but it doesn't speak English...",
+      "gold_flag": "picoCTF{g00d_k1tty!_n1c3_k1tty!_7c0821f5}",
+      "eval_type": "ctf_flag_match"
+    },
+    {
+      "task_id": "ic_ctf_010",
+      "benchmark": "intercode-ctf",
+      "instruction": "I wonder what this really is...\n''.join([chr((ord(flag[i]) << 8) + ord(flag[i + 1])) for i in range(0, len(flag), 2)])",
+      "gold_flag": "picoCTF{16_bits_inst34d_of_8_d52c6b93}",
+      "eval_type": "ctf_flag_match"
+    },
+    {
+      "task_id": "frames_000",
+      "benchmark": "frames",
+      "instruction": "Answer the following question using web search and research tools:\n\nIf my future wife has the same first name as the 15th first lady of the United States' mother and her surname is the same as the second assassinated president's mother's maiden name, what is my future wife's name?",
+      "gold_answer": "Jane Ballou",
+      "reasoning_types": "Multiple constraints",
+      "wiki_links": "['https://en.wikipedia.org/wiki/President_of_the_United_States', 'https://en.wikipedia.org/wiki/James_Buchanan', 'https://en.wikipedia.org/wiki/Harriet_Lane', 'https://en.wikipedia.org/wiki/List_of_presidents_of_the_United_States_who_died_in_office', 'https://en.wikipedia.org/wiki/James_A._Garfield']",
+      "eval_type": "exact_match_normalized"
+    },
+    {
+      "task_id": "frames_002",
+      "benchmark": "frames",
+      "instruction": "Answer the following question using web search and research tools:\n\nHow many years earlier would Punxsutawney Phil have to be canonically alive to have made a Groundhog Day prediction in the same state as the US capitol?",
+      "gold_answer": "87",
+      "reasoning_types": "Numerical reasoning | Multiple constraints | Temporal reasoning",
+      "wiki_links": "['https://en.wikipedia.org/wiki/Punxsutawney_Phil', 'https://en.wikipedia.org/wiki/United_States_Capitol']",
+      "eval_type": "exact_match_normalized"
+    },
+    {
+      "task_id": "frames_004",
+      "benchmark": "frames",
+      "instruction": "Answer the following question using web search and research tools:\n\nWhat is the name of the vocalist from the first band to make it in the top 200 under the record label that produced the third studio album for Dismal Euphony?",
+      "gold_answer": "Jens Kidman",
+      "reasoning_types": "Multiple constraints",
+      "wiki_links": "['https://en.wikipedia.org/wiki/Dismal_Euphony', 'https://en.wikipedia.org/wiki/All_Little_Devils', 'https://en.wikipedia.org/wiki/Nuclear_Blast', 'https://en.wikipedia.org/wiki/Meshuggah']",
+      "eval_type": "exact_match_normalized"
+    },
+    {
+      "task_id": "frames_005",
+      "benchmark": "frames",
+      "instruction": "Answer the following question using web search and research tools:\n\nAccording to the 2000 United States census, what was the 2000 population of the birth city of the only 21st-century mayor of Austin, Texas who also served as mayor in the 1990s? Round your answer to the nearest thousand.",
+      "gold_answer": "506000",
+      "reasoning_types": "Numerical reasoning | Tabular reasoning | Multiple constraints",
+      "wiki_links": "['https://en.wikipedia.org/wiki/Mayor_of_Austin', 'https://en.wikipedia.org/wiki/Kirk_Watson', 'https://en.wikipedia.org/wiki/Oklahoma_City']",
+      "eval_type": "exact_match_normalized"
+    },
+    {
+      "task_id": "frames_006",
+      "benchmark": "frames",
+      "instruction": "Answer the following question using web search and research tools:\n\nI have an element in mind and would like you to identify the person it was named after. Here's a clue: The element's atomic number is 9 higher than that of an element discovered by the scientist who discovered Zirconium in the same year.",
+      "gold_answer": "Mendelevium is named after Dmitri Mendeleev.",
+      "reasoning_types": "Numerical reasoning | Multiple constraints | Temporal reasoning",
+      "wiki_links": "['https://en.wikipedia.org/wiki/Zirconium', 'https://en.wikipedia.org/wiki/Martin_Heinrich_Klaproth', 'https://en.wikipedia.org/wiki/Uranium', 'https://en.wikipedia.org/wiki/Mendelevium', 'https://en.wikipedia.org/wiki/Periodic_table']",
+      "eval_type": "exact_match_normalized"
+    },
+    {
+      "task_id": "frames_007",
+      "benchmark": "frames",
+      "instruction": "Answer the following question using web search and research tools:\n\nAs of Aug 3, 2024, the artist who released the album \"Father of Asahd\" went to the same high school as an Olympic diver. How many Olympic teams did this diver participate on?",
+      "gold_answer": "2",
+      "reasoning_types": "Multiple constraints | Temporal reasoning",
+      "wiki_links": "['https://en.wikipedia.org/wiki/Father_of_Asahd', 'https://en.wikipedia.org/wiki/DJ_Khaled', 'https://en.wikipedia.org/wiki/Dr._Phillips_High_School', 'https://en.wikipedia.org/wiki/Mark_Ruiz']",
+      "eval_type": "exact_match_normalized"
+    },
+    {
+      "task_id": "frames_008",
+      "benchmark": "frames",
+      "instruction": "Answer the following question using web search and research tools:\n\nA general motors vehicle is named after the largest ward in the country of Monaco.  How many people had walked on the moon as of the first model year of the vehicle? Note: the model year is not the same as the year the model was first produced.",
+      "gold_answer": "4",
+      "reasoning_types": "Tabular reasoning | Multiple constraints | Temporal reasoning",
+      "wiki_links": "['https://en.wikipedia.org/wiki/Monaco', 'https://en.wikipedia.org/wiki/List_of_Chevrolet_vehicles', 'https://en.wikipedia.org/wiki/Chevrolet_Monte_Carlo', 'https://en.wikipedia.org/wiki/Moon', 'https://en.wikipedia.org/wiki/Apollo_program', 'https://en.wikipedia.org/wiki/List_of_Apollo_missions']",
+      "eval_type": "exact_match_normalized"
+    },
+    {
+      "task_id": "frames_010",
+      "benchmark": "frames",
+      "instruction": "Answer the following question using web search and research tools:\n\nAn Australian artist, born the same year as artist Janet Cumbrae Stewart and fellow member of the Melbourne Society of Women Painters and Sculptors, had her painting featured on the cover of Women's World Magazine in 1923. What is the name of the painting?",
+      "gold_answer": "Reve d'Or",
+      "reasoning_types": "Multiple constraints | Temporal reasoning",
+      "wiki_links": "['https://en.wikipedia.org/wiki/Janet_Cumbrae_Stewart', 'https://en.wikipedia.org/wiki/Melbourne_Society_of_Women_Painters_and_Sculptors', 'https://en.wikipedia.org/wiki/Dora_Wilson']",
+      "eval_type": "exact_match_normalized"
+    },
+    {
+      "task_id": "frames_013",
+      "benchmark": "frames",
+      "instruction": "Answer the following question using web search and research tools:\n\nOne of Barbara Kingsolver's best known novels is about an American missionary family which moves to Africa. At the time, the country they move to was a Belgian colony. Which year did it become independent?",
+      "gold_answer": "1960",
+      "reasoning_types": "Multiple constraints",
+      "wiki_links": "['https://en.wikipedia.org/wiki/Barbara_Kingsolver', 'https://en.wikipedia.org/wiki/The_Poisonwood_Bible', 'https://en.wikipedia.org/wiki/Belgian_Congo']",
+      "eval_type": "exact_match_normalized"
+    },
+    {
+      "task_id": "frames_014",
+      "benchmark": "frames",
+      "instruction": "Answer the following question using web search and research tools:\n\nWhich football player got 15 or more assists in La Liga during the 2010-2011 season and also played for Arsenal at one point in his career?",
+      "gold_answer": "This was Mesut Ozil.",
+      "reasoning_types": "Numerical reasoning | Tabular reasoning | Multiple constraints",
+      "wiki_links": "['https://en.wikipedia.org/wiki/2010\u201311_La_Liga', 'https://en.wikipedia.org/wiki/Mesut_\u00d6zil', 'https://en.wikipedia.org/wiki/Dani_Alves', 'https://en.wikipedia.org/wiki/Lionel_Messi']",
+      "eval_type": "exact_match_normalized"
+    }
+  ]
+}
