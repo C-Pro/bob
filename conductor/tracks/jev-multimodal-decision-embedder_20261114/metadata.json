@@ -1,0 +1,8 @@
+{
+  "track_id": "jev-multimodal-decision-embedder_20261114",
+  "type": "feature",
+  "status": "in_progress",
+  "created_at": "2026-11-14T10:38:00Z",
+  "updated_at": "2026-11-14T10:38:00Z",
+  "description": "Phase 4 Unified 0.8B Multimodal Decision & Embedding Model (Qwen3.5-0.8B donor with Causal State-Prefix Isolation, W_emb multimodal head + PointerHead, two-stage distillation on Bob's 417 train trajectories, and Phase A/B llama-server integration)."
+}

@@ -12,6 +12,16 @@ Bob is an autonomous AI agent service designed for the [Besedka](https://github.
 - **LLM Provider:** OpenAI-compatible API client (`internal/llm`) with exponential retry backoff, embedding generation, and tool/function support.
 - **Durable FSM & Resilient Tool Loop:** SQLite-backed finite state machine (`internal/fsm`) for executing tool loops with channel-specific iteration budgets (10 in Townhall, 20 in DMs), parallel read-only dispatch, sequential mutating dispatch, per-step timeouts, exponential backoff retries, delayed transitions (`resume_at`), startup crash recovery, and automated retention pruning with incremental vacuuming.
 
+## Evaluation & Training Trajectory Datasets
+
+Bob includes a partitioned benchmarking and trajectory generation dataset infrastructure with strict zero-overlap isolation between evaluation and training:
+
+- **Held-Out Evaluation Suite (`eval/tasks/heldout/heldout_100.json`):** 100 frozen benchmark tasks (35 DeepMind FRAMES, 20 InterCode-Bash, 20 InterCode-CTF, 25 SWE-bench Lite) for zero-data-snooping evaluation. Baseline results on local `Qwen3.6-35B-A3B-MTP-GGUF` achieve a **55.0% end-to-end success rate** (see `eval/results/baseline_100_report.md`).
+- **Offline Training Trajectory Pool (`eval/tasks/train/train_pool.json`):** 417 clean tasks across all 4 domains, strictly isolated from held-out tasks (0% overlap guarantee).
+- **Recorded Training Trajectories (`eval/results/train/batch_train_pool_1794581821/`):** Full multi-turn rollouts generated using `gemini-3.5-flash-lite` (500 iterations / 1 hour limit), containing **19,706 interaction steps**, **2,004 SelfCompact compaction events** across 152 long-horizon tasks, 417 isolated SQLite database snapshots, and 48 candidate SWE patches.
+- **Data Schemas & Usage:** Detailed specifications for task definitions, rollout traces, step structures, compaction payloads, and Python analysis utilities are documented in **[`eval/DATASET.md`](eval/DATASET.md)**.
+- **Git Exclusions:** All task manifests (`eval/tasks/**/*.json`) and rollout trace files (`eval/results/**/*.json`, `*.patch`) are strictly excluded from version control via `.gitignore`.
+
 ## Coding Style
 
 - Use comments only when necessary. Prefer self-documenting code.

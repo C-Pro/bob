@@ -1,6 +1,8 @@
 # Bob Evaluation Suite & Benchmark Harness
 
-The `eval/` subsystem implements **Phase 3: Evaluation Dataset and Deterministic CLI Gatekeeper Harness** from Bob's architecture roadmap. It provides a reproducible, hermetic measurement environment designed to evaluate Bob's autonomous agent capabilities across coding, system navigation, CTF challenge solving, and multi-hop research without human supervision.
+The `eval/` subsystem implements **Phase 3: Evaluation Dataset and Deterministic CLI Gatekeeper Harness** from Bob's architecture roadmap. It provides a reproducible, hermetic measurement environment designed to evaluate Bob's autonomous agent capabilities across coding, system navigation, CTF challenge solving, and multi-hop research without human supervision, as well as a large-scale trajectory generation pool for Phase 4 Jev decision model distillation.
+
+For complete specifications of the dataset partitioning, schema, and trajectory statistics, see **[DATASET.md](DATASET.md)**.
 
 ---
 
@@ -32,6 +34,7 @@ The evaluation suite draws from standard open benchmarks:
 ```
 eval/
 ├── README.md                      # Evaluation guide, benchmark specs, and reproduction steps
+├── DATASET.md                     # Comprehensive dataset documentation, schema, and trajectory stats
 ├── harness/                       # Evaluation harness execution engine and testbed fixtures
 │   ├── runner.py                  # Primary evaluation runner (bwrap sandbox + Docker grading)
 │   ├── build_manifest.py          # Manifest generator (splits train/held-out task sets)
@@ -41,19 +44,36 @@ eval/
 │   ├── config_template.yaml       # Template configuration for local LLM inference
 │   ├── bash_fixtures/             # Setup fixtures and shell scripts for InterCode-Bash
 │   └── ctf_assets/                # Challenge binaries, scripts, and disk images for InterCode-CTF
-├── tasks/                         # Versioned JSON task manifests
-│   ├── heldout_100.json           # Frozen 100-task held-out evaluation suite (SHA256 frozen)
-│   ├── smoke_4.json               # Quick 4-task smoke test across all 4 benchmark suites
-│   ├── train_20.json              # 20-task training baseline slice
-│   ├── timeouts_44.json           # 44-task extended timeout subset
-│   ├── swe_failed_iterations_17.json # 17-task SWE-bench high-iteration subset
-│   └── train_pool.json            # Task pool (800+ tasks) for Phase 4 offline dataset curation
-└── results/                       # Archived evaluation summaries and rollout traces
+├── tasks/                         # Versioned JSON task manifests (partitioned; excluded from git)
+│   ├── heldout/                   # 100-task frozen evaluation suite (SHA256 frozen)
+│   │   ├── heldout_100.json       # Primary 100-task held-out evaluation manifest
+│   │   ├── timeouts_44.json       # 44-task extended timeout subset
+│   │   └── swe_failed_iterations_17.json # 17-task SWE-bench high-iteration subset
+│   ├── train/                     # Clean training task pool (0% overlap with heldout)
+│   │   ├── train_pool.json        # 417 clean training tasks across all 4 domains
+│   │   ├── train_20.json          # 20-task training baseline slice
+│   │   └── train_sample_5.json    # 5-task smoke validation set
+│   └── smoke_4.json               # Quick 4-task smoke test across all 4 benchmark suites
+└── results/                       # Archived evaluation summaries and rollout traces (excluded from git)
     ├── baseline_100_report.md     # Full comprehensive markdown report of the 100-task benchmark
-    ├── heldout_100/               # Initial baseline rollout (summary.json, patches, JSON traces)
-    ├── timeouts_44/               # 1-hour timeout re-run (summary.json, patches, JSON traces)
-    └── swe_iterations_17/         # 500-iteration Docker-graded SWE-bench rollout traces
+    ├── heldout/                   # Held-out evaluation rollouts
+    │   ├── heldout_100/           # Initial baseline rollout (local Qwen3.6-35B-A3B-MTP-GGUF)
+    │   ├── timeouts_44/           # 1-hour timeout re-run
+    │   └── swe_iterations_17/     # 500-iteration Docker-graded SWE-bench rollout traces
+    └── train/                     # Training trajectory rollout batches
+        └── batch_train_pool_1794581821/ # 417 rollouts, 19,706 steps, 2,004 compactions (gemini-3.5-flash-lite)
 ```
+
+---
+
+## Dataset Splits & Trajectory Pool
+
+The dataset provides strict separation between evaluation and training:
+- **Held-Out Evaluation Suite (`eval/tasks/heldout/heldout_100.json`):** 100 frozen tasks (35 FRAMES, 20 Bash, 20 CTF, 25 SWE-bench Lite) for zero-leakage evaluation.
+- **Training Trajectory Dataset (`eval/tasks/train/train_pool.json`):** 417 clean tasks (65 FRAMES, 198 Bash, 79 CTF, 75 SWE-bench Lite) with **0% overlap** with the held-out set.
+- **Recorded Training Rollouts (`eval/results/train/batch_train_pool_1794581821/`):** Full execution traces generated with `gemini-3.5-flash-lite` under `--timeout 3600` and `--max-iterations 500`. Contains **19,706 interaction steps**, **2,004 SelfCompact compaction events**, 417 SQLite database snapshots, and 48 candidate SWE patches.
+
+See **[DATASET.md](DATASET.md)** for complete schema definitions, compaction payloads, and Python analysis examples.
 
 ---
 

@@ -73,5 +73,5 @@
 
 ---
 
-- [ ] **Planned Next Track: Lightweight CPU ML Model for Multilingual Episode Tagging, Status Classification, & Local Control-Plane Decisions**
-*Scope: Research and integrate a simple, fast, small CPU-friendly ML model to replace hardcoded English keyword heuristics in `internal/memory/episode.go` (`extractTopicTags`, `inferEpisodeTaskStatus`) and drive local control-plane decisions.*
+- [~] **Track: Phase 4 — Unified 0.8B Multimodal Decision & Embedding Model (`Jev`)**
+*Link: [./tracks/jev-multimodal-decision-embedder_20261114/](./tracks/jev-multimodal-decision-embedder_20261114/)*

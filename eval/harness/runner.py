@@ -569,7 +569,105 @@ def extract_trajectory_from_db(db_path: Path) -> dict:
         "events": events
     }
 
-def run_single_task(task: dict, max_iterations: int = 500, timeout_sec: int = 900, batch_dir: Path = None) -> dict:
+def resolve_tavily_key() -> str:
+    k = os.environ.get("TAVILY_API_KEY", "")
+    if k:
+        return k
+    user_cfg = Path.home() / ".config" / "bob" / "config.yaml"
+    if user_cfg.exists():
+        try:
+            for line in user_cfg.read_text().splitlines():
+                if line.strip().startswith("tavily_api_key:"):
+                    cand = line.split(":", 1)[1].strip().strip('\"').strip('\'')
+                    if cand and not cand.startswith("${"):
+                        return cand
+        except Exception:
+            pass
+    env_file = REPO_ROOT / ".env"
+    if env_file.exists():
+        try:
+            for line in env_file.read_text().splitlines():
+                if line.startswith("TAVILY_API_KEY="):
+                    cand = line.split("=", 1)[1].strip().strip('\"').strip('\'')
+                    if cand:
+                        return cand
+        except Exception:
+            pass
+    return ""
+
+def resolve_llm_config(model: str = None, base_url: str = None, api_key: str = None):
+    if not model:
+        model = os.environ.get("BOB_EVAL_MODEL") or os.environ.get("GEMINI_MODEL") or os.environ.get("OPENAI_MODEL") or "Qwen3.6-35B-A3B-MTP-GGUF"
+    if model in ("3.5-flash-lite", "gemini-3.5-flash-lite"):
+        model = "gemini-3.5-flash-lite"
+    elif model in ("3.7-flash", "gemini-3.7-flash"):
+        model = "gemini-3.7-flash"
+    elif model in ("3.8-flash", "gemini-3.8-flash"):
+        model = "gemini-3.8-flash"
+
+    if not base_url:
+        base_url = os.environ.get("BOB_EVAL_BASE_URL") or os.environ.get("GEMINI_BASE_URL") or os.environ.get("OPENAI_BASE_URL")
+        if not base_url:
+            if "gemini" in model.lower():
+                base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+            else:
+                base_url = "http://127.0.0.1:15432/v1"
+
+    if not api_key:
+        api_key = os.environ.get("BOB_EVAL_API_KEY") or os.environ.get("GEMINI_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            user_cfg = Path.home() / ".config" / "bob" / "config.yaml"
+            if user_cfg.exists():
+                try:
+                    for line in user_cfg.read_text().splitlines():
+                        if line.strip().startswith("api_key:"):
+                            k = line.split(":", 1)[1].strip().strip('\"').strip('\'')
+                            if k and not k.startswith("${"):
+                                api_key = k
+                                break
+                except Exception:
+                    pass
+        if not api_key:
+            env_file = REPO_ROOT / ".env"
+            if env_file.exists():
+                try:
+                    for line in env_file.read_text().splitlines():
+                        if line.startswith("GEMINI_API_KEY=") or line.startswith("OPENAI_API_KEY="):
+                            k = line.split("=", 1)[1].strip().strip('\"').strip('\'')
+                            if k:
+                                api_key = k
+                                break
+                except Exception:
+                    pass
+        if not api_key:
+            api_key = "dummy-key"
+
+    return model, base_url, api_key
+
+def resolve_swe_repo(task: dict) -> Path:
+    repo = task.get("repo", "django/django")
+    repo_slug = repo.split("/")[-1]
+    candidates = [
+        REPOS_DIR / f"{repo_slug}.git",
+        REPO_ROOT / "scratch" / "eval_harness" / "repos" / f"{repo_slug}.git",
+        REPOS_DIR / f"{repo.replace('/', '__')}.git",
+        REPO_ROOT / "scratch" / "eval_harness" / "repos" / f"{repo.replace('/', '__')}.git",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+
+    target_dir = REPO_ROOT / "scratch" / "eval_harness" / "repos" / f"{repo_slug}.git"
+    print(f"[-] Cloned bare mirror of {repo} not found. Cloning to {target_dir}...")
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "clone", "--bare", f"https://github.com/{repo}.git", str(target_dir)],
+        check=True
+    )
+    return target_dir
+
+def run_single_task(task: dict, max_iterations: int = 500, timeout_sec: int = 900, batch_dir: Path = None,
+                    model: str = None, base_url: str = None, api_key: str = None) -> dict:
     if batch_dir is None:
         batch_dir = ROLLOUTS_DIR
     batch_dir.mkdir(parents=True, exist_ok=True)
@@ -590,24 +688,12 @@ def run_single_task(task: dict, max_iterations: int = 500, timeout_sec: int = 90
     data_dir.mkdir(parents=True, exist_ok=True)
     
     cfg_file = host_dir / "config.yaml"
-    tavily_key = os.environ.get("TAVILY_API_KEY", "")
-    if not tavily_key:
-        for p in [TEMPLATE_CONFIG, Path.home() / ".config" / "bob" / "config.yaml", REPO_ROOT / "scratch" / "config_lemond.yaml"]:
-            if p.exists():
-                try:
-                    import yaml
-                    with open(p) as f:
-                        cfg_data = yaml.safe_load(f)
-                        k = cfg_data.get("web", {}).get("tavily_api_key", "")
-                        if k and not k.startswith("${"):
-                            tavily_key = k
-                            break
-                except Exception:
-                    pass
+    tavily_key = resolve_tavily_key()
+    resolved_model, resolved_base_url, resolved_api_key = resolve_llm_config(model, base_url, api_key)
     cfg_content = f"""llm:
-  api_key: "dummy-key"
-  base_url: "http://127.0.0.1:15432/v1"
-  model: "Qwen3.6-35B-A3B-MTP-GGUF"
+  api_key: "{resolved_api_key}"
+  base_url: "{resolved_base_url}"
+  model: "{resolved_model}"
   first_byte_timeout: "5m"
   request_timeout: "10m"
 
@@ -658,19 +744,7 @@ fsm:
             
         # B. SWE Provisioning (Worktree -> Standalone local repo)
         elif bmark == "swe-bench-lite":
-            repo_dir = REPOS_DIR / "django.git"
-            if not repo_dir.exists():
-                scratch_repo = REPO_ROOT / "scratch" / "eval_harness" / "repos" / "django.git"
-                if scratch_repo.exists():
-                    repo_dir = scratch_repo
-                else:
-                    print(f"[-] Cloned bare mirror of django not found at {repo_dir}. Cloning...")
-                    REPOS_DIR.mkdir(parents=True, exist_ok=True)
-                    subprocess.run(
-                        ["git", "clone", "--bare", "https://github.com/django/django.git", str(repo_dir)],
-                        check=True
-                    )
-                
+            repo_dir = resolve_swe_repo(task)
             subprocess.run(
                 ["git", f"--git-dir={repo_dir}", "worktree", "add", str(workspace), task["base_commit"]],
                 check=True, capture_output=True
@@ -808,14 +882,13 @@ fsm:
         
     finally:
         if bmark == "swe-bench-lite":
-            repo_dir = REPOS_DIR / "django.git"
-            if not repo_dir.exists():
-                scratch_repo = REPO_ROOT / "scratch" / "eval_harness" / "repos" / "django.git"
-                if scratch_repo.exists():
-                    repo_dir = scratch_repo
-            if repo_dir.exists():
-                subprocess.run(["git", f"--git-dir={repo_dir}", "worktree", "remove", "--force", str(workspace)], check=False, capture_output=True)
-                subprocess.run(["git", f"--git-dir={repo_dir}", "worktree", "prune"], check=False, capture_output=True)
+            try:
+                repo_dir = resolve_swe_repo(task)
+                if repo_dir.exists():
+                    subprocess.run(["git", f"--git-dir={repo_dir}", "worktree", "remove", "--force", str(workspace)], check=False, capture_output=True)
+                    subprocess.run(["git", f"--git-dir={repo_dir}", "worktree", "prune"], check=False, capture_output=True)
+            except Exception:
+                pass
         shutil.rmtree(run_root, ignore_errors=True)
 
 def main():
@@ -844,19 +917,46 @@ def main():
         idx = sys.argv.index("--timeout")
         timeout_sec = int(sys.argv[idx + 1])
         
-    max_iterations = 500
+    max_iterations = 30
     if "--max-iterations" in sys.argv:
         idx = sys.argv.index("--max-iterations")
         max_iterations = int(sys.argv[idx + 1])
     elif "-m" in sys.argv:
         idx = sys.argv.index("-m")
         max_iterations = int(sys.argv[idx + 1])
-        
+
+    model = None
+    if "--model" in sys.argv:
+        model = sys.argv[sys.argv.index("--model") + 1]
+
+    base_url = None
+    if "--base-url" in sys.argv:
+        base_url = sys.argv[sys.argv.index("--base-url") + 1]
+
+    api_key = None
+    if "--api-key" in sys.argv:
+        api_key = sys.argv[sys.argv.index("--api-key") + 1]
+
+    split = None
+    if "--split" in sys.argv:
+        split = sys.argv[sys.argv.index("--split") + 1]
+    elif "train" in manifest_file.parts:
+        split = "train"
+    elif "heldout" in manifest_file.parts:
+        split = "heldout"
+
     batch_timestamp = int(time.time())
-    batch_dir = RESULTS_DIR / f"batch_{manifest_file.stem}_{batch_timestamp}"
+    if "--output-dir" in sys.argv:
+        batch_dir = Path(sys.argv[sys.argv.index("--output-dir") + 1])
+    elif split:
+        batch_dir = RESULTS_DIR / split / f"batch_{manifest_file.stem}_{batch_timestamp}"
+    else:
+        batch_dir = RESULTS_DIR / f"batch_{manifest_file.stem}_{batch_timestamp}"
     batch_dir.mkdir(parents=True, exist_ok=True)
     
+    resolved_model, resolved_base_url, _ = resolve_llm_config(model, base_url, api_key)
     print(f"[+] Loaded {len(tasks)} tasks from {manifest_file} (Timeout: {timeout_sec}s, Max iterations: {max_iterations})")
+    print(f"[+] Model: {resolved_model} (Base URL: {resolved_base_url})")
     print(f"[+] Batch output directory: {batch_dir}")
     
     results = []
@@ -864,10 +964,48 @@ def main():
     passed_count = 0
     swe_patch_count = 0
     swe_resolved_count = 0
+    resume = "--resume" in sys.argv
     
     for i, t in enumerate(tasks):
+        t_id = t.get("task_id") or t.get("instance_id") or f"{t.get('benchmark')}_{i}"
+        out_file = batch_dir / f"{t_id}.json"
+        if resume and out_file.exists():
+            try:
+                with open(out_file) as rf:
+                    r = json.load(rf)
+                print(f"\n[{i+1}/{len(tasks)}] Resuming {t_id} (already completed)")
+                results.append(r)
+                if r.get("grading_status") == "graded":
+                    graded_count += 1
+                    if r.get("benchmark_reward") == 1.0:
+                        passed_count += 1
+                if r.get("benchmark") == "swe-bench-lite":
+                    if r.get("patch_generated"):
+                        swe_patch_count += 1
+                    if r.get("resolved"):
+                        swe_resolved_count += 1
+                continue
+            except Exception as e:
+                print(f"[-] Could not read {out_file}: {e}. Re-running task...")
+
         print(f"\n[{i+1}/{len(tasks)}]")
-        r = run_single_task(t, max_iterations=max_iterations, timeout_sec=timeout_sec, batch_dir=batch_dir)
+        try:
+            r = run_single_task(t, max_iterations=max_iterations, timeout_sec=timeout_sec, batch_dir=batch_dir,
+                                model=resolved_model, base_url=resolved_base_url, api_key=api_key)
+        except Exception as e:
+            print(f"[-] Task {t_id} failed with unhandled exception: {e}")
+            r = {
+                "task_id": t_id,
+                "benchmark": t.get("benchmark"),
+                "status": "error",
+                "error": str(e),
+                "grading_status": "graded",
+                "benchmark_reward": 0.0,
+                "resolved": False,
+                "eval_details": f"Execution error: {e}",
+            }
+            with open(out_file, "w") as f:
+                json.dump(r, f, indent=2)
         results.append(r)
         
         if r.get("grading_status") == "graded":
@@ -893,6 +1031,8 @@ def main():
     with open(summary_file, "w") as f:
         json.dump({
             "manifest": str(manifest_file),
+            "model": resolved_model,
+            "base_url": resolved_base_url,
             "batch_timestamp": batch_timestamp,
             "total_tasks": len(tasks),
             "graded_tasks": graded_count,

@@ -232,7 +232,16 @@ To run the quick 4-task smoke test:
 ```sh
 python3 eval/harness/runner.py eval/tasks/smoke_4.json --timeout 300
 ```
-See the [`eval/` documentation](eval/README.md) and [full baseline evaluation report](eval/results/baseline_100_report.md) for detailed analysis and reproduction instructions.
+
+### Evaluation & Training Trajectory Datasets
+
+Bob maintains a partitioned dataset architecture with a strict zero-overlap guarantee between evaluation and training:
+
+- **Frozen Held-Out Evaluation Suite (`eval/tasks/heldout/heldout_100.json`):** 100 tasks (35 FRAMES, 20 InterCode-Bash, 20 InterCode-CTF, 25 SWE-bench Lite) reserved exclusively for unbiased capability benchmarking.
+- **Offline Training Trajectory Pool (`eval/tasks/train/train_pool.json`):** 417 clean tasks spanning the same 4 domains, used to generate dense execution traces for Phase 4 decision model distillation.
+- **Generated Training Trajectories (`eval/results/train/batch_train_pool_1794581821/`):** Full multi-turn rollout batch generated using `gemini-3.5-flash-lite` (500 iterations / 1 hour limit per task), containing **19,706 execution steps**, **2,004 SelfCompact compaction events** across 152 long-horizon tasks, 417 isolated SQLite state database checkpoints, and 48 candidate SWE patches.
+
+For full schemas, compaction event payloads, and Python loading examples, see the **[Dataset Specification (`eval/DATASET.md`)](eval/DATASET.md)** and the [`eval/` Guide](eval/README.md). See also the [full baseline evaluation report](eval/results/baseline_100_report.md) for detailed analysis and reproduction instructions.
 
 ## Project Structure
 
