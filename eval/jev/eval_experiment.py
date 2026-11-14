@@ -21,8 +21,11 @@ except ImportError:
     from train_experiment import DATASET, HERE, make_model, read_rows, smoke_rows
 
 
-def probabilities(logits, temperature=1.0):
-    values = np.asarray(logits, dtype=np.float64) / temperature
+def probabilities(logits, temperature=1.0, bias=0.0):
+    values = np.asarray(logits, dtype=np.float64).copy()
+    if values.shape[-1] == 2 and bias:
+        values[..., 1] += bias
+    values = values / temperature
     values -= values.max(axis=-1, keepdims=True)
     values = np.exp(values)
     return values / values.sum(axis=-1, keepdims=True)
@@ -35,6 +38,57 @@ def temperature_scale(logits, labels):
     candidates = np.exp(np.linspace(math.log(.05), math.log(20), 161))
     nll = [-np.log(probabilities(logits, t)[np.arange(len(labels)), labels].clip(1e-12)).mean() for t in candidates]
     return float(candidates[int(np.argmin(nll))])
+
+
+def affine_scale(logits, labels):
+    """Fit (temperature, binary option bias) strictly on calibration NLL."""
+    if len(labels) == 0:
+        raise ValueError("Calibration scaling needs calibration examples")
+    logits = np.asarray(logits, dtype=np.float64)
+    labels = np.asarray(labels, dtype=int)
+    if logits.shape[-1] != 2:
+        return temperature_scale(logits, labels), 0.0
+    temps = np.exp(np.linspace(math.log(.05), math.log(20), 81))
+    biases = np.linspace(-4.0, 4.0, 81)
+    best_nll, best_t, best_b = math.inf, 1.0, 0.0
+    for bias in biases:
+        shifted = logits.copy()
+        shifted[:, 1] += bias
+        for temp in temps:
+            nll = -np.log(probabilities(shifted, temp)[np.arange(len(labels)), labels].clip(1e-12)).mean()
+            if nll < best_nll:
+                best_nll, best_t, best_b = float(nll), float(temp), float(bias)
+    # Local refinement around best grid cell.
+    fine_t = np.exp(np.linspace(math.log(max(0.05, best_t / 1.5)), math.log(min(20.0, best_t * 1.5)), 41))
+    fine_b = np.linspace(best_b - 0.25, best_b + 0.25, 41)
+    for bias in fine_b:
+        shifted = logits.copy()
+        shifted[:, 1] += bias
+        for temp in fine_t:
+            nll = -np.log(probabilities(shifted, temp)[np.arange(len(labels)), labels].clip(1e-12)).mean()
+            if nll < best_nll:
+                best_nll, best_t, best_b = float(nll), float(temp), float(bias)
+    return best_t, best_b
+
+
+def balanced_decision_threshold(probs, labels):
+    """Choose positive-class cutoff maximizing balanced accuracy on cal only."""
+    probs = np.asarray(probs, dtype=np.float64)
+    labels = np.asarray(labels, dtype=int)
+    if probs.shape[-1] != 2 or not (labels == 0).any() or not (labels == 1).any():
+        return 0.5
+    pos_scores = probs[:, 1]
+    sorted_scores = np.sort(np.unique(pos_scores))
+    mids = (sorted_scores[:-1] + sorted_scores[1:]) * 0.5 if len(sorted_scores) > 1 else sorted_scores
+    candidates = np.unique(np.concatenate(([0.0, 0.5, 1.0], mids)))
+    best_thresh, best_bal = 0.5, -1.0
+    pos_mask, neg_mask = labels == 1, labels == 0
+    for thresh in candidates:
+        pred_pos = pos_scores >= thresh
+        bal = 0.5 * (float(pred_pos[pos_mask].mean()) + float((~pred_pos)[neg_mask].mean()))
+        if bal > best_bal + 1e-12 or (abs(bal - best_bal) <= 1e-12 and abs(thresh - 0.5) < abs(best_thresh - 0.5)):
+            best_bal, best_thresh = bal, float(thresh)
+    return best_thresh
 
 
 def risk_threshold(probs, labels, max_error=.05):
@@ -54,12 +108,27 @@ def risk_threshold(probs, labels, max_error=.05):
             "guarantee": "empirical_calibration_only_not_a_population_risk_bound"}
 
 
-def classification_metrics(probs, labels, threshold=None):
+def binary_ranking_metrics(pos_scores, labels):
+    pos_scores = np.asarray(pos_scores, dtype=np.float64)
+    labels = np.asarray(labels, dtype=int)
+    pos = pos_scores[labels == 1]
+    neg = pos_scores[labels == 0]
+    if not len(pos) or not len(neg):
+        return None, None
+    roc_auc = float((pos[:, None] > neg[None, :]).mean() + 0.5 * (pos[:, None] == neg[None, :]).mean())
+    order = np.argsort(-pos_scores, kind="mergesort")
+    sorted_labels = labels[order]
+    tp = np.cumsum(sorted_labels == 1)
+    precisions = tp[sorted_labels == 1] / (np.flatnonzero(sorted_labels == 1) + 1)
+    return roc_auc, float(precisions.mean())
+
+
+def classification_metrics(probs, labels, threshold=None, decision_cutoff=None):
     probs = np.asarray(probs, dtype=np.float64)
     labels = np.asarray(labels, dtype=int)
     if not len(labels):
         return {"count": 0}
-    predicted = probs.argmax(-1)
+    predicted = (probs[:, 1] >= decision_cutoff).astype(int) if (decision_cutoff is not None and probs.shape[1] == 2) else probs.argmax(-1)
     confidence = probs.max(-1)
     correct = predicted == labels
     per_class = {}
@@ -80,20 +149,22 @@ def classification_metrics(probs, labels, threshold=None):
     for i in range(10):
         mask = (confidence >= i / 10) & ((confidence < (i + 1) / 10) if i < 9 else (confidence <= 1))
         count = int(mask.sum())
-        accuracy = float(correct[mask].mean()) if count else None
+        accuracy = float((probs.argmax(-1) == labels)[mask].mean()) if count else None
         mean_conf = float(confidence[mask].mean()) if count else None
         if count:
             ece += count / len(labels) * abs(accuracy - mean_conf)
         bins.append({"count": count, "accuracy": accuracy, "confidence": mean_conf})
+    roc_auc, pr_auc = binary_ranking_metrics(probs[:, 1], labels) if probs.shape[1] == 2 else (None, None)
     result = {"count": len(labels), "accuracy": float(correct.mean()),
               "balanced_accuracy": float(np.mean(recalls)), "macro_f1": float(np.mean(f1s)),
+              "roc_auc": roc_auc, "pr_auc": pr_auc,
               "per_class": per_class, "brier": float(np.square(probs - onehot).sum(-1).mean()),
               "nll": float(-np.log(probs[np.arange(len(labels)), labels].clip(1e-12)).mean()),
               "ece_10bin": float(ece), "calibration_bins": bins}
     if threshold is not None:
         accepted = confidence >= threshold
         result["coverage_at_calibrated_5pct_error"] = float(accepted.mean())
-        result["selective_error"] = float(1 - correct[accepted].mean()) if accepted.any() else None
+        result["selective_error"] = float(1 - (probs.argmax(-1) == labels)[accepted].mean()) if accepted.any() else None
     return result
 
 
@@ -105,12 +176,18 @@ def decision_logits(model, rows, family, max_seq_len):
 
 def calibrated_evaluation(cal_logits, cal_rows, dev_logits, dev_rows):
     cal_labels = [row["label"] for row in cal_rows]
-    temperature = temperature_scale(cal_logits, cal_labels)
-    threshold = risk_threshold(probabilities(cal_logits, temperature), cal_labels)
-    probs = probabilities(dev_logits, temperature)
+    temperature, bias = affine_scale(cal_logits, cal_labels)
+    cal_probs = probabilities(cal_logits, temperature, bias)
+    threshold = risk_threshold(cal_probs, cal_labels)
+    bal_cutoff = balanced_decision_threshold(cal_probs, cal_labels)
+    probs = probabilities(dev_logits, temperature, bias)
     labels = [row["label"] for row in dev_rows]
-    result = {"temperature": temperature, "risk_policy": threshold,
-              "metrics": classification_metrics(probs, labels, threshold["threshold"]), "length_buckets": {}}
+    bal_metrics = classification_metrics(probs, labels, threshold["threshold"], decision_cutoff=bal_cutoff)
+    result = {"temperature": temperature, "bias": bias, "risk_policy": threshold,
+              "balanced_threshold": bal_cutoff,
+              "metrics": classification_metrics(probs, labels, threshold["threshold"]),
+              "balanced_operating_metrics": bal_metrics,
+              "length_buckets": {}}
     for name, low, high in (("<=512", 0, 512), ("513..1024", 513, 1024), (">1024", 1025, math.inf)):
         indices = [i for i, row in enumerate(dev_rows) if low <= row["token_count"] <= high]
         result["length_buckets"][name] = classification_metrics(probs[indices], [labels[i] for i in indices], threshold["threshold"])
@@ -212,12 +289,14 @@ def write_report(report, directory):
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "experiment_report.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     lines = ["# Jev experiment report", "", report["interpretation"], "",
-             "Temperature and empirical deferral thresholds were fitted on cal only. Checkpoints used a fixed training budget.",
-             "", "| Model | Task | Balanced accuracy | Macro-F1 | Brier | NLL | ECE | Coverage |", "|---|---|---:|---:|---:|---:|---:|---:|"]
+             "Temperature, class bias, balanced cutoff, and empirical deferral thresholds were fitted on cal only. Checkpoints used a fixed training budget.",
+             "", "| Model | Task | ROC-AUC | Bal Acc (Cal Thresh) | Bal Acc (Nat) | Macro-F1 | Brier | NLL | ECE | Coverage |", "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for name, value in report["models"].items():
         for family, decision in value.get("decisions", {}).items():
             m = decision["metrics"]
-            lines.append(f"| {name} | {family} | {m['balanced_accuracy']:.4f} | {m['macro_f1']:.4f} | {m['brier']:.4f} | {m['nll']:.4f} | {m['ece_10bin']:.4f} | {m['coverage_at_calibrated_5pct_error']:.4f} |")
+            bm = decision.get("balanced_operating_metrics", m)
+            auc = f"{m['roc_auc']:.4f}" if m.get("roc_auc") is not None else "n/a"
+            lines.append(f"| {name} | {family} | {auc} | {bm['balanced_accuracy']:.4f} | {m['balanced_accuracy']:.4f} | {m['macro_f1']:.4f} | {m['brier']:.4f} | {m['nll']:.4f} | {m['ece_10bin']:.4f} | {m['coverage_at_calibrated_5pct_error']:.4f} |")
     lines += ["", "Current-Policy reuses the teacher verdict that defines compaction labels; its score is circular, not independent policy validation.",
               "", "Coverage is measured on dev using the cal threshold; <=5% dev error is not guaranteed.",
               "", "All loop examples are none; the false-positive check cannot measure recall for actual loops.",
@@ -254,7 +333,8 @@ def run_evaluation(args):
         report["models"][name] = {"decisions": {"compaction": calibrated_evaluation(
             baseline_logits(cal, name), cal, baseline_logits(dev, name), dev)}}
     dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "bfloat16": torch.bfloat16}[args.dtype]
-    for name in ("zero_shot_kev", "exp_a", "exp_b"):
+    model_names = getattr(args, "models", None) or ("zero_shot_kev", "exp_a", "exp_b")
+    for name in model_names:
         checkpoint = Path(args.checkpoint_root) / name / "model.pt"
         if name != "zero_shot_kev" and not checkpoint.exists():
             report["models"][name] = {"status": "checkpoint_missing", "checkpoint": str(checkpoint)}
@@ -275,14 +355,16 @@ def run_evaluation(args):
             cal = data["cal"][family]
             logits = decision_logits(model, cal, family, args.max_seq_len)
             labels = [r["label"] for r in cal]
-            temp = temperature_scale(logits, labels)
-            policies[family] = (logits, temp, risk_threshold(probabilities(logits, temp), labels))
+            temp, bias = affine_scale(logits, labels)
+            cal_probs = probabilities(logits, temp, bias)
+            policies[family] = (logits, temp, bias, risk_threshold(cal_probs, labels), balanced_decision_threshold(cal_probs, labels))
         for family in ("compaction", "outcome_prefix"):
             dev = data["dev"][family]
             dev_logits = decision_logits(model, dev, family, args.max_seq_len)
-            logits, temp, threshold = policies[family]
+            logits, temp, bias, threshold, bal_cutoff = policies[family]
             decision = calibrated_evaluation(logits, data["cal"][family], dev_logits, dev)
-            assert decision["temperature"] == temp and decision["risk_policy"] == threshold
+            assert (decision["temperature"] == temp and decision["bias"] == bias
+                    and decision["risk_policy"] == threshold and decision["balanced_threshold"] == bal_cutoff)
             result["decisions"][family] = decision
         with torch.no_grad():
             result["embeddings"] = embedding_evaluation(model, data["dev"]["emb_pairs"], args.max_seq_len)
@@ -314,6 +396,7 @@ def parser():
     p.add_argument("--max-eval", type=int, default=0)
     p.add_argument("--loop-limit", type=int, default=128)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--models", nargs="+", default=None)
     p.add_argument("--smoke", action="store_true")
     return p
 

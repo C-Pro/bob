@@ -12,7 +12,9 @@ from torch.nn import functional as F
 
 BASE_MODEL = "Qwen/Qwen3.5-0.8B-Base"
 KEV_ADAPTER = "jaredpalmer/kev-0.8b"
-SPECIAL_TOKENS = ("<|state_end|>", "<|option_end|>", "<|query_end|>")
+# Reuse Qwen's native special delimiters aligned with jaredpalmer/kev-0.8b LoRA weights:
+# [state_prefix] -> [question] [opt_start ... opt_end]+ [decide].
+SPECIAL_TOKENS = ("<|fim_prefix|>", "<|fim_middle|>", "<|box_start|>", "<|box_end|>", "<|fim_suffix|>")
 SLICE_DIMS = (128, 256, 384)
 
 QUESTIONS = {
@@ -110,22 +112,19 @@ class DualHeadDecisionEmbedder(nn.Module):
 
     def _register_boundary_tokens(self):
         embedding = self.backbone.get_input_embeddings()
-        before = len(self.tokenizer)
-        missing = [token for token in SPECIAL_TOKENS if token not in self.tokenizer.get_vocab()]
-        if before + len(missing) > embedding.num_embeddings:
-            raise ValueError("Insufficient free vocabulary slots; refusing to resize model matrices")
-        self.tokenizer.add_special_tokens({"additional_special_tokens": list(SPECIAL_TOKENS)})
+        vocab = self.tokenizer.get_vocab()
+        missing = [token for token in SPECIAL_TOKENS if token not in vocab]
+        if missing:
+            raise ValueError(f"Tokenizer missing required native delimiter tokens: {missing}")
         self.special_ids = {token: self.tokenizer.convert_tokens_to_ids(token) for token in SPECIAL_TOKENS}
-        eos = self.tokenizer.eos_token_id
-        if eos is None:
-            raise ValueError("Tokenizer must define eos_token_id for boundary initialization")
-        with torch.no_grad():
-            for token in missing:
-                token_id = self.special_ids[token]
-                if not before <= token_id < embedding.num_embeddings:
-                    raise ValueError("Special token did not occupy an unused vocabulary slot")
-                embedding.weight[token_id].copy_(embedding.weight[eos])
-        self.state_end_id = self.special_ids[SPECIAL_TOKENS[0]]
+        for token, token_id in self.special_ids.items():
+            if not 0 <= token_id < embedding.num_embeddings:
+                raise ValueError(f"Delimiter token {token} ID {token_id} out of embedding bounds {embedding.num_embeddings}")
+        self.state_prefix_id = self.special_ids[SPECIAL_TOKENS[0]]
+        self.question_id = self.special_ids[SPECIAL_TOKENS[1]]
+        self.option_start_id = self.special_ids[SPECIAL_TOKENS[2]]
+        self.option_end_id = self.special_ids[SPECIAL_TOKENS[3]]
+        self.decide_id = self.special_ids[SPECIAL_TOKENS[4]]
 
     @classmethod
     def from_pretrained(cls, device="cpu", dtype=torch.float32, trainable_adapter=False):
@@ -169,13 +168,14 @@ class DualHeadDecisionEmbedder(nn.Module):
     def question_ids(self, question, options):
         if not options or len({name for name, _ in options}) != len(options):
             raise ValueError("Options require nonempty, unique names")
-        ids = self._text_ids("\n" + question + "\n")
+        ids = [self.question_id] + self._text_ids(question)
         ends = []
         for name, description in options:
-            ids.extend(self._text_ids(f"<opt> {name}: {description} </opt>"))
-            ids.append(self.special_ids[SPECIAL_TOKENS[1]])
+            ids.append(self.option_start_id)
+            ids.extend(self._text_ids(f"{name}: {description}"))
+            ids.append(self.option_end_id)
             ends.append(len(ids) - 1)
-        ids.append(self.special_ids[SPECIAL_TOKENS[2]])
+        ids.append(self.decide_id)
         return ids, ends, len(ids) - 1
 
     def state_ids(self, state, budget):
@@ -185,10 +185,26 @@ class DualHeadDecisionEmbedder(nn.Module):
         keep = budget - 1
         truncated = len(ids) > keep
         if truncated:
-            head = (keep + 1) // 2
-            tail = keep - head
-            ids = ids[:head] + (ids[-tail:] if tail else [])
-        return ids + [self.state_end_id], truncated
+            omitted = len(ids) - keep
+            marker = self._text_ids(f"\n[... {omitted} tokens omitted ...]\n")
+            for _ in range(4):
+                if len(marker) >= keep - 1:
+                    break
+                recalculated = len(ids) - (keep - len(marker))
+                new_marker = self._text_ids(f"\n[... {recalculated} tokens omitted ...]\n")
+                if len(new_marker) == len(marker):
+                    break
+                marker = new_marker
+            if len(marker) + 2 <= keep:
+                content_keep = keep - len(marker)
+                head = (content_keep + 1) // 2
+                tail = content_keep - head
+                ids = ids[:head] + marker + (ids[-tail:] if tail else [])
+            else:
+                head = (keep + 1) // 2
+                tail = keep - head
+                ids = ids[:head] + (ids[-tail:] if tail else [])
+        return [self.state_prefix_id] + ids, truncated
 
     def format_prompt(self, state, question, options, max_seq_len=1024):
         suffix, ends, query_end = self.question_ids(question, options)
@@ -201,6 +217,9 @@ class DualHeadDecisionEmbedder(nn.Module):
 
     def _run(self, ids, cache=None, use_cache=False):
         inputs = torch.tensor([ids], dtype=torch.long, device=self.device)
+        if torch.is_grad_enabled() and not any(p.requires_grad for p in self.backbone.parameters()):
+            with torch.no_grad():
+                return self.backbone(input_ids=inputs, past_key_values=cache, use_cache=use_cache, return_dict=True)
         return self.backbone(input_ids=inputs, past_key_values=cache, use_cache=use_cache, return_dict=True)
 
     def forward_prompt(self, prompt):
@@ -288,11 +307,13 @@ class DualHeadDecisionEmbedder(nn.Module):
 
 
 class ByteTokenizer:
-    """Deterministic synthetic tokenizer; deliberately reserves unused model rows."""
+    """Deterministic synthetic tokenizer reserving Qwen-compatible special tokens."""
     eos_token_id = 0
 
     def __init__(self):
         self.vocab = {f"byte_{i}": i + 1 for i in range(256)} | {"<eos>": 0}
+        for token in SPECIAL_TOKENS:
+            self.vocab[token] = len(self.vocab)
 
     def __len__(self):
         return len(self.vocab)

@@ -63,6 +63,15 @@ def class_balanced_weights(rows):
     return [float(r.get("task_balanced_weight", 1)) * len(rows) / (2 * mass[r["label"]]) for r in rows]
 
 
+def per_class_unit_weights(rows):
+    """Normalize task_balanced_weight within each class so balanced sampling keeps mean weight 1.0."""
+    by_label = {label: [float(r.get("task_balanced_weight", 1)) for r in rows if r["label"] == label] for label in (0, 1)}
+    if not all(by_label.values()):
+        raise ValueError("Decision training requires both classes")
+    means = {label: sum(vals) / len(vals) for label, vals in by_label.items()}
+    return [float(r.get("task_balanced_weight", 1)) / means[r["label"]] for r in rows]
+
+
 def option_order(count, seed, epoch, row_index):
     order = list(range(count))
     random.Random(f"{seed}:{epoch}:{row_index}").shuffle(order)
@@ -86,16 +95,33 @@ def iter_scheduled_steps(data, args):
     if not all(data.get(f) for f in families):
         raise ValueError("All three training tasks need examples")
     emb_batch_size = getattr(args, "emb_batch_size", 1)
+    balanced = getattr(args, "balanced_sampling", False)
     seed = getattr(args, "seed", 42)
     epochs = getattr(args, "epochs", 1)
     max_steps = getattr(args, "max_steps", 0)
 
     total_steps = 0
     for epoch in range(epochs):
-        indices = {family: list(range(len(data[family]))) for family in families}
         rng = random.Random(seed + epoch)
-        for values in indices.values():
-            rng.shuffle(values)
+        indices = {}
+        for family in families:
+            if balanced and family in ("compaction", "outcome_prefix"):
+                c0 = [i for i, r in enumerate(data[family]) if r["label"] == 0]
+                c1 = [i for i, r in enumerate(data[family]) if r["label"] == 1]
+                if not c0 or not c1:
+                    raise ValueError(f"Balanced sampling requires both classes in {family}")
+                rng.shuffle(c0)
+                rng.shuffle(c1)
+                pairs = max(len(c0), len(c1))
+                interleaved = []
+                for k in range(pairs):
+                    interleaved.append(c0[k % len(c0)])
+                    interleaved.append(c1[k % len(c1)])
+                indices[family] = interleaved
+            else:
+                values = list(range(len(data[family])))
+                rng.shuffle(values)
+                indices[family] = values
         rounds = max(len(v) for v in indices.values())
         for round_index in range(rounds):
             for family in families:
@@ -107,7 +133,7 @@ def iter_scheduled_steps(data, args):
                     order = None
                 else:
                     batch = None
-                    order = option_order(2, seed, epoch, index)
+                    order = option_order(2, seed, epoch, round_index * len(data[family]) + index if balanced else index)
                 total_steps += 1
                 yield {
                     "step": total_steps,
@@ -200,14 +226,16 @@ def run_training(args):
         args.max_seq_len = min(args.max_seq_len, 512)
         args.max_steps = min(args.max_steps or 12, 12)
     dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "bfloat16": torch.bfloat16}[args.dtype]
-    run_dir = (Path(args.out_dir) / "runs" / args.mode) if args.out_dir else HERE / "runs" / args.mode
-    checkpoint_dir = (Path(args.out_dir) / "checkpoints" / args.mode) if args.out_dir else HERE / "checkpoints" / args.mode
+    run_name = getattr(args, "run_name", None) or args.mode
+    run_dir = (Path(args.out_dir) / "runs" / run_name) if args.out_dir else HERE / "runs" / run_name
+    checkpoint_dir = (Path(args.out_dir) / "checkpoints" / run_name) if args.out_dir else HERE / "checkpoints" / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     data = smoke_rows("train") if args.smoke else {family: read_rows(args.dataset, family, "train")
                                                      for family in ("compaction", "outcome_prefix", "emb_pairs")}
     if not all(data[family] for family in ("compaction", "outcome_prefix", "emb_pairs")):
         raise ValueError("All three training tasks need examples")
-    weights = {family: class_balanced_weights(data[family]) for family in ("compaction", "outcome_prefix")}
+    weight_fn = per_class_unit_weights if getattr(args, "balanced_sampling", False) else class_balanced_weights
+    weights = {family: weight_fn(data[family]) for family in ("compaction", "outcome_prefix")}
     # Normalize embedding weights once over the dataset, never within a batch=1 row.
     emb_scale = len(data["emb_pairs"]) / sum(r.get("task_balanced_weight", 1) for r in data["emb_pairs"])
     for row in data["emb_pairs"]:
@@ -215,16 +243,23 @@ def run_training(args):
     model = make_model(args.smoke, args.device, dtype, args.seed)
     reference = frozen_reference_cache(model, data, args, run_dir / "reference_logits.pt") if args.mode == "exp_b" and args.kl_ref_weight else {}
     model.configure_training(args.mode, gradient_checkpointing=args.gradient_checkpointing)
-    head_params = list(model.pointer.parameters()) + list(model.W_emb.parameters())
+    pointer_params = list(model.pointer.parameters())
+    emb_params = list(model.W_emb.parameters())
     lora_params = [p for p in model.backbone.parameters() if p.requires_grad]
     if args.mode == "exp_b" and not lora_params:
         raise AssertionError("Experiment B has no trainable LoRA tensors")
-    optimizer = torch.optim.AdamW([{"params": head_params, "lr": args.head_lr},
-                                  {"params": lora_params, "lr": args.lr}], weight_decay=.01)
+    pointer_lr = args.pointer_lr if getattr(args, "pointer_lr", None) is not None else args.head_lr
+    emb_lr = args.emb_lr if getattr(args, "emb_lr", None) is not None else args.head_lr
+    optimizer = torch.optim.AdamW([
+        {"params": pointer_params, "lr": pointer_lr},
+        {"params": emb_params, "lr": emb_lr},
+        {"params": lora_params, "lr": args.lr},
+    ], weight_decay=.01)
     optimizer.zero_grad(set_to_none=True)
     initial_head = model.pointer.q.weight.detach().clone()
     initial_emb = model.W_emb.weight.detach().clone()
-    initial_lora = [p.detach().clone() for p in lora_params] if args.smoke else []
+    initial_lora_sums = [float(p.detach().float().abs().sum()) for p in lora_params]
+    head_params = pointer_params + emb_params
     task_steps = {family: 0 for family in ("compaction", "outcome_prefix", "emb_pairs")}
     total_steps, updates, pending = 0, 0, 0
     started = time.perf_counter()
@@ -260,10 +295,13 @@ def run_training(args):
                 torch.nn.utils.clip_grad_norm_(head_params + lora_params, 1.0)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                if model.device.type == "cuda":
+                    torch.cuda.synchronize()
                 updates += 1
                 pending = 0
             log.write(json.dumps({"step": total_steps, "epoch": epoch, "family": family,
                                   "loss": float(loss.detach()), "optimizer_updates": updates}) + "\n")
+            log.flush()
     if pending:
         for parameter in head_params + lora_params:
             if parameter.grad is not None:
@@ -271,12 +309,17 @@ def run_training(args):
         torch.nn.utils.clip_grad_norm_(head_params + lora_params, 1.0)
         optimizer.step()
         updates += 1
-    metrics = {"mode": args.mode, "smoke": args.smoke, "seed": args.seed,
+    metrics = {"mode": args.mode, "run_name": run_name, "smoke": args.smoke, "seed": args.seed,
                "steps": total_steps, "optimizer_updates": updates, "task_steps": task_steps,
+               "balanced_sampling": getattr(args, "balanced_sampling", False),
+               "pointer_lr": pointer_lr, "emb_lr": emb_lr, "lora_lr": args.lr,
+               "kl_ref_weight": args.kl_ref_weight, "perm_kl": args.perm_kl,
+               "emb_batch_size": args.emb_batch_size,
                "selection": "fixed_training_budget_no_cal_or_dev_access", "elapsed_seconds": time.perf_counter() - started,
                "head_changed": not torch.equal(initial_head, model.pointer.q.weight),
                "embedding_changed": not torch.equal(initial_emb, model.W_emb.weight),
-               "lora_changed": any(not torch.equal(old, new) for old, new in zip(initial_lora, lora_params)) if args.smoke else None,
+               "lora_changed": (any(abs(old - float(new.detach().float().abs().sum())) > 1e-6
+                                    for old, new in zip(initial_lora_sums, lora_params)) if lora_params else False),
                "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
                "reference_logit_count": len(reference), "max_seq_len": args.max_seq_len,
                "gradient_checkpointing": args.mode == "exp_b" and args.gradient_checkpointing,
@@ -298,8 +341,12 @@ def parser():
     p.add_argument("--max-steps", type=int, default=0, help="Training examples, not optimizer updates; 0 means full epochs")
     p.add_argument("--grad-accum", type=int, default=8)
     p.add_argument("--emb-batch-size", type=int, default=1)
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--head-lr", type=float, default=1e-3)
+    p.add_argument("--lr", type=float, default=3e-5)
+    p.add_argument("--head-lr", type=float, default=1e-3, help="Default LR for W_emb and fallback for pointer if --pointer-lr omitted")
+    p.add_argument("--pointer-lr", type=float, default=None)
+    p.add_argument("--emb-lr", type=float, default=None)
+    p.add_argument("--balanced-sampling", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--run-name", default=None)
     p.add_argument("--emb-weight", type=float, default=1.0)
     p.add_argument("--kl-ref-weight", type=float, default=.1)
     p.add_argument("--perm-kl", type=float, default=0)

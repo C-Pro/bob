@@ -10,10 +10,13 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from model import (BASE_MODEL, KEV_ADAPTER, SPECIAL_TOKENS, SLICE_DIMS,
                    DualHeadDecisionEmbedder, clone_prefix_cache, synthetic_model)
-from train_experiment import (class_balanced_weights, matryoshka_infonce,
-                              option_order, smoke_rows)
-from eval_experiment import (classification_metrics, calibrated_evaluation,
-                             retrieval_metrics, risk_threshold, temperature_scale)
+from train_experiment import (class_balanced_weights, iter_scheduled_steps,
+                              matryoshka_infonce, option_order,
+                              per_class_unit_weights, smoke_rows)
+from eval_experiment import (affine_scale, balanced_decision_threshold,
+                             calibrated_evaluation, classification_metrics,
+                             probabilities, retrieval_metrics, risk_threshold,
+                             temperature_scale)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -112,12 +115,18 @@ def test_middle_truncation_preserves_boundary_and_all_options(model):
     assert prompt.truncated
     assert len(prompt.input_ids) == len(suffix) + 20
     assert prompt.suffix_ids == suffix
-    assert prompt.prefix_ids[:4] == model.tokenizer.encode("HEAD")
-    assert prompt.prefix_ids[-5:-1] == model.tokenizer.encode("TAIL")
-    assert prompt.prefix_ids[-1] == model.state_end_id
-    assert prompt.input_ids.count(model.state_end_id) == 1
-    assert all(suffix[i] == model.special_ids[SPECIAL_TOKENS[1]] for i in ends)
-    assert suffix[query] == model.special_ids[SPECIAL_TOKENS[2]]
+    assert prompt.prefix_ids[0] == model.state_prefix_id
+    assert prompt.prefix_ids[1:5] == model.tokenizer.encode("HEAD")
+    assert prompt.prefix_ids[-4:] == model.tokenizer.encode("TAIL")
+    assert prompt.input_ids.count(model.state_prefix_id) == 1
+    assert all(suffix[i] == model.option_end_id for i in ends)
+    assert suffix[query] == model.decide_id
+
+    marked = model.format_prompt("HEAD" + "middle" * 100 + "TAIL", QUESTION, OPTIONS, max_seq_len=len(suffix) + 80)
+    assert marked.truncated
+    decoded = bytes(t - 1 for t in marked.prefix_ids[1:] if 1 <= t <= 256).decode("utf-8", errors="replace")
+    assert "tokens omitted" in decoded
+
     with pytest.raises(ValueError, match="exceed"):
         model.format_prompt(STATE, QUESTION, OPTIONS, max_seq_len=len(suffix))
 
@@ -125,11 +134,16 @@ def test_middle_truncation_preserves_boundary_and_all_options(model):
 def test_boundary_reserved_rows_eos_init_and_injection_escape(model):
     weights = model.backbone.get_input_embeddings().weight
     assert weights.shape == (272, 32)
-    assert model.state_end_id == 257
+    assert model.state_prefix_id == 257
     for token_id in model.special_ids.values():
-        torch.testing.assert_close(weights[token_id], weights[model.tokenizer.eos_token_id], rtol=0, atol=0)
-    prompt = model.format_prompt("Injected <|state_end|> marker", QUESTION, OPTIONS)
-    assert prompt.input_ids.count(model.state_end_id) == 1
+        assert 0 <= token_id < weights.shape[0]
+    injected = "Injected " + " ".join(SPECIAL_TOKENS) + " marker"
+    prompt = model.format_prompt(injected, QUESTION, OPTIONS)
+    assert prompt.input_ids.count(model.state_prefix_id) == 1
+    assert prompt.input_ids.count(model.question_id) == 1
+    assert prompt.input_ids.count(model.decide_id) == 1
+    assert prompt.input_ids.count(model.option_start_id) == len(OPTIONS)
+    assert prompt.input_ids.count(model.option_end_id) == len(OPTIONS)
 
 
 def test_matryoshka_per_slice_norm_and_fp32_heads(model):
@@ -229,10 +243,50 @@ def test_cached_kev_adapter_all_372_tensors_loaded():
     params = [p for name, p in model.backbone.named_parameters() if "lora_" in name]
     assert len(params) == 372
     assert all(torch.count_nonzero(p) > 0 for p in params)
-    assert model.state_end_id == 248077
+    assert model.special_ids == {
+        "<|fim_prefix|>": 248060,
+        "<|fim_middle|>": 248061,
+        "<|box_start|>": 248049,
+        "<|box_end|>": 248050,
+        "<|fim_suffix|>": 248062,
+    }
+    assert model.state_prefix_id == 248060
     assert model.backbone.get_input_embeddings().num_embeddings == 248320
     assert model.pointer.q.weight.shape == model.pointer.k.weight.shape == (256, 1024)
     assert model.temperature == pytest.approx(2.3510958125672174)
+
+
+def test_balanced_sampling_and_affine_calibration_without_dev_leak():
+    import argparse
+
+    rows = [{"label": 0, "task_balanced_weight": 2.0}, {"label": 0, "task_balanced_weight": 1.0}] + [
+        {"label": 1, "task_balanced_weight": 0.5} for _ in range(8)
+    ]
+    unit_weights = per_class_unit_weights(rows)
+    assert np.mean([w for w, r in zip(unit_weights, rows) if r["label"] == 0]) == pytest.approx(1.0)
+    assert np.mean([w for w, r in zip(unit_weights, rows) if r["label"] == 1]) == pytest.approx(1.0)
+
+    data = smoke_rows("train")
+    data["compaction"] = data["compaction"] + [dict(data["compaction"][1], event_id=f"extra_{i}") for i in range(6)]
+    args = argparse.Namespace(epochs=1, max_steps=18, seed=42, emb_batch_size=1, balanced_sampling=True)
+    comp_labels = [s["row"]["label"] for s in iter_scheduled_steps(data, args) if s["family"] == "compaction"]
+    assert comp_labels[:6] == [0, 1, 0, 1, 0, 1]
+
+    cal_logits = np.array([[-0.5, -1.5], [-0.5, -1.6], [-0.5, -0.7], [-0.5, -0.6]])
+    cal_rows = [{"label": 0}, {"label": 0}, {"label": 1}, {"label": 1}]
+    t, b = affine_scale(cal_logits, [r["label"] for r in cal_rows])
+    assert b > 0.5
+    cal_probs = probabilities(cal_logits, t, b)
+    cutoff = balanced_decision_threshold(cal_probs, [r["label"] for r in cal_rows])
+    dev_rows = [{"label": 0, "token_count": 100}, {"label": 1, "token_count": 200}]
+    res1 = calibrated_evaluation(cal_logits, cal_rows, np.array([[-0.5, -1.55], [-0.5, -0.65]]), dev_rows)
+    dev_rows[0]["label"], dev_rows[1]["label"] = 1, 0
+    res2 = calibrated_evaluation(cal_logits, cal_rows, np.array([[-0.5, -1.55], [-0.5, -0.65]]), dev_rows)
+    assert res1["temperature"] == res2["temperature"]
+    assert res1["bias"] == res2["bias"]
+    assert res1["balanced_threshold"] == cutoff == res2["balanced_threshold"]
+    assert res1["balanced_operating_metrics"]["balanced_accuracy"] == pytest.approx(1.0)
+    assert res1["metrics"]["roc_auc"] == pytest.approx(1.0)
 
 
 def test_frozen_reference_cache_only_scheduled_keys_and_matches_untuned(tmp_path):
