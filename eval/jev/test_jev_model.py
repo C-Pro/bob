@@ -367,3 +367,192 @@ def test_frozen_reference_cache_only_scheduled_keys_and_matches_untuned(tmp_path
     assert set(cache_perm.keys()) == set(expected_perm_keys.keys())
     for k in all_possible_keys - set(expected_perm_keys.keys()):
         assert k not in cache_perm
+
+
+def test_grad_cache_matches_full_infonce_gradients():
+    from train_experiment import matryoshka_infonce, matryoshka_infonce_grad_cache
+
+    rows = smoke_rows("train")["emb_pairs"][:3]
+    m1 = synthetic_model(seed=42, with_lora=True)
+    m2 = synthetic_model(seed=42, with_lora=True)
+    m1.configure_training("exp_b", gradient_checkpointing=False)
+    m2.configure_training("exp_b", gradient_checkpointing=False)
+
+    loss1 = 0.25 * matryoshka_infonce(m1, rows, max_seq_len=256)
+    loss1.backward()
+    loss2 = 0.25 * matryoshka_infonce_grad_cache(m2, rows, max_seq_len=256, loss_scale=0.25)
+
+    assert loss2 == pytest.approx(float(loss1.detach()), rel=1e-5, abs=1e-6)
+    compared = 0
+    for (n1, p1), (n2, p2) in zip(m1.named_parameters(), m2.named_parameters()):
+        if not p1.requires_grad:
+            continue
+        assert n1 == n2
+        if p1.grad is None:
+            assert p2.grad is None
+            continue
+        assert p2.grad is not None
+        torch.testing.assert_close(p1.grad, p2.grad, rtol=1e-4, atol=1e-5)
+        compared += 1
+    assert compared > 0
+
+
+def test_loop_kl_and_cosine_lr_smoke(tmp_path):
+    import argparse
+    from train_experiment import run_training
+
+    args = argparse.Namespace(
+        mode="exp_b", run_name="smoke_loop_kl", dataset=tmp_path, device="cpu", dtype="fp32",
+        max_seq_len=512, epochs=1, max_steps=8, grad_accum=2, emb_batch_size=2,
+        emb_grad_cache=True, lr=1e-4, head_lr=1e-3, pointer_lr=2e-5, emb_lr=5e-4,
+        cosine_lr=True, warmup_steps=1, balanced_sampling=True, emb_weight=1.0,
+        kl_ref_weight=0.05, kl_loop_weight=0.05, perm_kl=0.0, save_every=2,
+        gradient_checkpointing=False, seed=42, out_dir=tmp_path, smoke=True,
+    )
+    summary = run_training(args)
+    assert summary["task_steps"]["loop_guard"] == 2
+    assert summary["emb_grad_cache"] is True
+    assert summary["cosine_lr"] is True
+    assert (tmp_path / "checkpoints" / "smoke_loop_kl" / "latest" / "model.pt").exists()
+    assert (tmp_path / "checkpoints" / "smoke_loop_kl" / "model.pt").exists()
+
+
+def test_cal_cv_never_reads_dev(tmp_path, monkeypatch):
+    import argparse
+    import json
+    import eval_experiment
+    from eval_experiment import run_cal_cv_evaluation
+
+    monkeypatch.setattr(eval_experiment, "make_model", lambda smoke, device, dtype, seed: synthetic_model(seed=seed, with_lora=True))
+    cal = smoke_rows("cal")
+    # Duplicate cal rows across distinct task_groups so 5-fold CV has both classes per fold.
+    for family in ("compaction", "outcome_prefix", "emb_pairs", "loop_guard"):
+        expanded = []
+        for rep in range(3):
+            for idx, r in enumerate(cal[family]):
+                row = dict(r)
+                row["task_group"] = f"cal_g_{rep}_{idx}"
+                if family == "emb_pairs":
+                    row["positive_task_group"] = row["task_group"]
+                    row["hard_negative_task_group"] = f"neg_{rep}_{idx}"
+                expanded.append(row)
+        (tmp_path / f"{family}_cal.jsonl").write_text("\n".join(json.dumps(x) for x in expanded) + "\n")
+        (tmp_path / f"{family}_dev.jsonl").write_text("CORRUPT DEV SHOULD NEVER BE READ\n")
+
+    out = tmp_path / "cal_cv_out"
+    args = argparse.Namespace(
+        dataset=tmp_path, out_dir=out, checkpoint_root=tmp_path / "ckpts",
+        device="cpu", dtype="fp32", max_seq_len=512, max_eval=0, loop_limit=8,
+        seed=42, models=["zero_shot_kev"], cal_cv=True, smoke=False,
+    )
+    report = run_cal_cv_evaluation(args)
+    assert report["evaluation_split"] == "cal_5fold_oof"
+    assert (out / "cal_cv_report.json").exists()
+    assert not (out / "dev_evaluation_started.json").exists()
+    comp = report["models"]["zero_shot_kev"]["decisions"]["compaction"]
+    assert comp["cv_folds"] == 5
+    assert 0.0 <= comp["metrics"]["roc_auc"] <= 1.0
+    assert "raw_metrics" in comp
+    assert "per_benchmark" in comp["raw_metrics"]
+
+
+def test_save_checkpoint_preserves_frozen_lora_in_emb_only(tmp_path):
+    m = synthetic_model(seed=42, with_lora=True)
+    for name, p in m.backbone.named_parameters():
+        if "lora_" in name:
+            p.data.fill_(0.123)
+    m.configure_training("emb_only", gradient_checkpointing=False)
+    m.save_checkpoint(tmp_path / "frozen_emb_only", {"mode": "emb_only"})
+
+    reloaded = synthetic_model(seed=42, with_lora=True)
+    reloaded.load_checkpoint(tmp_path / "frozen_emb_only" / "model.pt")
+    lora_tensors = [p for name, p in reloaded.backbone.named_parameters() if "lora_" in name]
+    assert lora_tensors
+    for p in lora_tensors:
+        torch.testing.assert_close(p, torch.full_like(p, 0.123))
+
+
+def test_tie_safe_ap_and_cal_cv_raw_metrics():
+    from eval_experiment import binary_ranking_metrics, cal_cv_evaluation, group_distributed_rows
+
+    roc1, ap1 = binary_ranking_metrics([0.0, 0.0, 0.0, 0.0], [1, 1, 0, 0])
+    roc2, ap2 = binary_ranking_metrics([0.0, 0.0, 0.0, 0.0], [0, 0, 1, 1])
+    assert roc1 == pytest.approx(0.5)
+    assert roc2 == pytest.approx(0.5)
+    assert ap1 == pytest.approx(0.5)
+    assert ap2 == pytest.approx(0.5)
+
+    rows = [{"task_group": f"g{i}", "benchmark": "swe" if i < 6 else "ctf", "label": i % 2, "token_count": 200}
+            for i in range(10)]
+    const_logits = np.tile([-12.0, 12.0], (10, 1))
+    res = cal_cv_evaluation(const_logits, rows, n_folds=5)
+    assert res["raw_metrics"]["roc_auc"] == pytest.approx(0.5)
+    assert res["metrics"]["roc_auc"] == pytest.approx(0.5)
+    assert set(res["raw_metrics"]["per_benchmark"]) == {"ctf", "swe"}
+
+    dist = group_distributed_rows(rows, 5)
+    assert len({r["task_group"] for r in dist}) == 5
+
+
+def test_ratio_schedule_dual_teacher_emb_only_and_loop_ce_smoke(tmp_path):
+    import argparse
+    from eval_experiment import decision_logits
+    from train_experiment import run_training
+
+    init_model = synthetic_model(seed=42, with_lora=True)
+    for name, p in init_model.backbone.named_parameters():
+        if "lora_" in name:
+            p.data.add_(0.01)
+    init_dir = tmp_path / "checkpoints" / "init_b4"
+    init_model.save_checkpoint(init_dir, {"smoke": True})
+    init_ckpt = init_dir / "model.pt"
+
+    args = argparse.Namespace(
+        mode="exp_b", run_name="pilot_a_smoke", dataset=tmp_path, device="cpu", dtype="fp32",
+        max_seq_len=512, epochs=1, max_steps=8, grad_accum=8, emb_batch_size=2,
+        emb_grad_cache=False, emb_detach_backbone=True, schedule_mode="ratio_4_2_1_1",
+        init_checkpoint=init_ckpt, compaction_ref_checkpoint=None, outcome_ref_checkpoint=init_ckpt,
+        lr=2e-5, head_lr=1e-3, pointer_lr=1e-5, emb_lr=5e-4,
+        cosine_lr=True, warmup_steps=1, balanced_sampling=True, emb_weight=0.25,
+        kl_ref_weight=0.1, kl_compaction_weight=0.5, kl_outcome_weight=0.15, kl_loop_weight=0.08,
+        loop_ce_weight=0.5, perm_kl=0.0, save_every=0,
+        gradient_checkpointing=False, seed=42, out_dir=tmp_path, smoke=True,
+    )
+    summary_a = run_training(args)
+    assert summary_a["task_steps"] == {"compaction": 4, "outcome_prefix": 2, "emb_pairs": 1, "loop_guard": 1}
+    assert summary_a["optimizer_updates"] == 1
+    assert summary_a["emb_detach_backbone"] is True
+    assert summary_a["lora_changed"] is True
+
+    pilot_a_ckpt = tmp_path / "checkpoints" / "pilot_a_smoke" / "model.pt"
+    before_logits = decision_logits(
+        synthetic_model(seed=42, with_lora=True), smoke_rows("cal")["compaction"], "compaction", 512
+    )
+    m_before = synthetic_model(seed=42, with_lora=True)
+    m_before.load_checkpoint(pilot_a_ckpt)
+    m_before.eval()
+    logits_before = decision_logits(m_before, smoke_rows("cal")["compaction"], "compaction", 512)
+
+    args_b = argparse.Namespace(
+        mode="emb_only", run_name="pilot_b_smoke", dataset=tmp_path, device="cpu", dtype="fp32",
+        max_seq_len=512, epochs=1, max_steps=6, grad_accum=1, emb_batch_size=4,
+        emb_grad_cache=False, emb_detach_backbone=False, schedule_mode="legacy",
+        init_checkpoint=pilot_a_ckpt, compaction_ref_checkpoint=None, outcome_ref_checkpoint=None,
+        lr=0.0, head_lr=5e-4, pointer_lr=0.0, emb_lr=5e-4,
+        cosine_lr=True, warmup_steps=1, balanced_sampling=True, emb_weight=1.0,
+        kl_ref_weight=0.0, kl_compaction_weight=None, kl_outcome_weight=None, kl_loop_weight=0.0,
+        loop_ce_weight=0.0, perm_kl=0.0, save_every=0,
+        gradient_checkpointing=False, seed=42, out_dir=tmp_path, smoke=True,
+    )
+    summary_b = run_training(args_b)
+    assert summary_b["mode"] == "emb_only"
+    assert summary_b["head_changed"] is False
+    assert summary_b["lora_changed"] is False
+    assert summary_b["embedding_changed"] is True
+
+    m_after = synthetic_model(seed=42, with_lora=True)
+    m_after.load_checkpoint(tmp_path / "checkpoints" / "pilot_b_smoke" / "model.pt")
+    m_after.eval()
+    logits_after = decision_logits(m_after, smoke_rows("cal")["compaction"], "compaction", 512)
+    np.testing.assert_allclose(logits_before, logits_after, atol=1e-6)
+    assert before_logits.shape == logits_after.shape

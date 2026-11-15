@@ -263,23 +263,30 @@ class DualHeadDecisionEmbedder(nn.Module):
         outputs = [self.forward_prompt(Prompt(ids, suffix, ends, end, truncated)) for suffix, ends, end in suffixes]
         return torch.stack([out["logits"][0] for out in outputs]), outputs[0]["embeddings"]
 
-    def embed_state(self, state, max_seq_len=1024):
+    def state_hidden(self, state, max_seq_len=1024):
         ids, _ = self.state_ids(state, max_seq_len)
-        return self.embeddings(self._run(ids).last_hidden_state[0, -1])
+        return self._run(ids).last_hidden_state[0, -1]
+
+    def embed_state(self, state, max_seq_len=1024, detach_backbone=False):
+        if detach_backbone:
+            with torch.no_grad():
+                hidden = self.state_hidden(state, max_seq_len)
+            return self.embeddings(hidden.detach())
+        return self.embeddings(self.state_hidden(state, max_seq_len))
 
     def configure_training(self, mode, gradient_checkpointing=True):
-        if mode not in ("exp_a", "exp_b"):
-            raise ValueError("mode must be exp_a or exp_b")
+        if mode not in ("exp_a", "exp_b", "emb_only"):
+            raise ValueError("mode must be exp_a, exp_b, or emb_only")
         for name, parameter in self.backbone.named_parameters():
             parameter.requires_grad_(mode == "exp_b" and "lora_" in name)
         if mode == "exp_b" and gradient_checkpointing:
             self.backbone.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
             self.backbone.enable_input_require_grads()
-        self.pointer.requires_grad_(True)
+        self.pointer.requires_grad_(mode != "emb_only")
         self.W_emb.requires_grad_(True)
         self.train()
         # Dropout would otherwise make option permutation comparisons stochastic.
-        self.backbone.eval() if mode == "exp_a" else self.backbone.train()
+        self.backbone.eval() if mode in ("exp_a", "emb_only") else self.backbone.train()
         for module in self.backbone.modules():
             if isinstance(module, nn.Dropout):
                 module.p = 0.0
@@ -289,7 +296,7 @@ class DualHeadDecisionEmbedder(nn.Module):
         directory.mkdir(parents=True, exist_ok=True)
         trainable = {name for name, param in self.named_parameters() if param.requires_grad}
         tensors = {name: tensor.detach().cpu() for name, tensor in self.state_dict().items()
-                   if name in trainable or name.startswith(("pointer.", "W_emb."))}
+                   if name in trainable or "lora_" in name or name.startswith(("pointer.", "W_emb."))}
         torch.save({"tensors": tensors, "metadata": metadata, "temperature": self.temperature,
                     "special_ids": self.special_ids}, directory / "model.pt")
 
