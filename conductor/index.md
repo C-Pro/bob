@@ -75,3 +75,8 @@
 
 - [~] **Track: Phase 4 — Unified 0.8B Multimodal Decision & Embedding Model (`Jev`)**
 *Link: [./tracks/jev-multimodal-decision-embedder_20261114/](./tracks/jev-multimodal-decision-embedder_20261114/)*
+
+---
+
+- [~] **Track: Phase 4b — Comprehensive Multimodal Dataset, Zero-Shot Retention & Iterative Tuning Loop (`Jev`)**
+*Link: [./tracks/jev-multimodal-dataset-and-tuning_20261116/](./tracks/jev-multimodal-dataset-and-tuning_20261116/)*

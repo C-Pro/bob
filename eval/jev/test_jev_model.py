@@ -556,3 +556,356 @@ def test_ratio_schedule_dual_teacher_emb_only_and_loop_ce_smoke(tmp_path):
     logits_after = decision_logits(m_after, smoke_rows("cal")["compaction"], "compaction", 512)
     np.testing.assert_allclose(logits_before, logits_after, atol=1e-6)
     assert before_logits.shape == logits_after.shape
+
+
+def _make_pattern_image(width: int, height: int, seed_val: int = 0):
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (width, height), (20 + (seed_val * 37) % 180, 30, 50))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([4, 4, max(6, width // 2), max(6, height // 2)], fill=(230, (seed_val * 71) % 255, 40))
+    draw.line([(0, height - 1), (width - 1, 0)], fill=(255, 255, 255), width=2)
+    return img
+
+
+def test_multimodal_causal_invariance_and_equivariance():
+    model = synthetic_model(seed=19, include_vision=True)
+    img_a = _make_pattern_image(96, 64, seed_val=1)
+    img_b = _make_pattern_image(64, 96, seed_val=2)
+    with torch.no_grad():
+        first = model(STATE, QUESTION, OPTIONS, max_seq_len=256, images=[img_a, img_b])
+        second = model(
+            STATE,
+            "Another visual question?",
+            [("yes", "Proceed."), ("no", "Stop.")],
+            max_seq_len=256,
+            images=[img_a, img_b],
+        )
+        for dim in SLICE_DIMS:
+            torch.testing.assert_close(first["embeddings"][dim], second["embeddings"][dim], rtol=0, atol=1e-5)
+
+        ref_cached, ref_emb = model.equivariant_scores(STATE, QUESTION, OPTIONS, max_seq_len=256, use_cache=True, images=img_a)
+        ref_uncached, _ = model.equivariant_scores(STATE, QUESTION, OPTIONS, max_seq_len=256, use_cache=False, images=img_a)
+        torch.testing.assert_close(ref_cached, ref_uncached, rtol=2e-5, atol=2e-5)
+        for order in itertools.permutations(range(3)):
+            scores, emb = model.equivariant_scores(
+                STATE, QUESTION, [OPTIONS[i] for i in order], max_seq_len=256, use_cache=True, images=img_a
+            )
+            torch.testing.assert_close(scores, ref_cached[list(order)], rtol=0, atol=1e-5)
+            for dim in SLICE_DIMS:
+                torch.testing.assert_close(emb[dim], ref_emb[dim], rtol=0, atol=1e-6)
+
+
+def test_multimodal_prefix_cache_isolation_and_interleaved_prefixes():
+    model = synthetic_model(seed=23, include_vision=True)
+    img_a = _make_pattern_image(96, 64, seed_val=3)
+    img_b = _make_pattern_image(128, 96, seed_val=4)
+    questions = [
+        (QUESTION, OPTIONS),
+        ("Is a blocking modal visible?", [("clear", "No error modal."), ("blocked", "Blocking error modal visible.")]),
+    ]
+    reserve = max(len(model.question_ids(q, opts)[0]) for q, opts in questions)
+    with torch.no_grad():
+        prefix_a = model.encode_prefix(STATE, max_seq_len=320, suffix_reserve=reserve, images=[img_a])
+        saved_a = clone_prefix_cache(prefix_a.cache)
+        # Interleave a differently shaped image prefix before querying prefix_a.
+        prefix_b = model.encode_prefix("Different state", max_seq_len=320, suffix_reserve=reserve, images=[img_b])
+        _ = model.question_from_prefix(prefix_b, *questions[0])
+
+        for q, opts in questions:
+            cached = model.question_from_prefix(prefix_a, q, opts)
+            fresh = model(STATE, q, opts, max_seq_len=320, images=[img_a])
+            torch.testing.assert_close(cached["logits"], fresh["logits"], atol=2e-5, rtol=2e-5)
+            for dim in SLICE_DIMS:
+                torch.testing.assert_close(cached["embeddings"][dim], fresh["embeddings"][dim], atol=1e-5, rtol=0)
+
+        for layer, original in zip(prefix_a.cache.layers, saved_a.layers):
+            for name, value in vars(original).items():
+                if isinstance(value, torch.Tensor):
+                    torch.testing.assert_close(getattr(layer, name), value, atol=0, rtol=0)
+                elif isinstance(value, bool):
+                    assert getattr(layer, name) == value
+
+        model.question_from_prefix(prefix_a, *questions[0], isolate=False)
+        contaminated = model.question_from_prefix(prefix_a, *questions[1], isolate=False)
+        clean = model(STATE, *questions[1], max_seq_len=320, images=[img_a])
+        assert not torch.allclose(contaminated["logits"], clean["logits"], atol=1e-5, rtol=1e-5)
+
+        with pytest.raises(ValueError, match="exceed"):
+            too_long = [("a", "x " * 200), ("b", "y")]
+            model.question_from_prefix(prefix_a, "Long?", too_long)
+
+
+def test_multimodal_truncation_preserves_image_spans_and_escapes_markers():
+    from model import VISION_TOKENS
+
+    model = synthetic_model(seed=29, include_vision=True)
+    img1 = _make_pattern_image(96, 64, seed_val=5)
+    img2 = _make_pattern_image(64, 64, seed_val=6)
+    _, _, counts = model.preprocess_images([img1, img2])
+    suffix, _, _ = model.question_ids(QUESTION, OPTIONS)
+    vision_tokens_total = sum(c + 2 for c in counts)
+    exact_fit = len(suffix) + vision_tokens_total + 1  # +1 for state_prefix_id
+    prompt = model.format_prompt("HEAD" + "middle" * 50 + "TAIL", QUESTION, OPTIONS, max_seq_len=exact_fit, images=[img1, img2])
+    assert prompt.truncated
+    assert prompt.prefix_ids[0] == model.state_prefix_id
+    assert prompt.prefix_ids.count(model.vision_start_id) == 2
+    assert prompt.prefix_ids.count(model.vision_end_id) == 2
+    assert prompt.prefix_ids.count(model.image_token_id) == sum(counts)
+
+    with pytest.raises(ValueError, match="exceed"):
+        model.format_prompt("text", QUESTION, OPTIONS, max_seq_len=exact_fit - 1, images=[img1, img2])
+
+    injected = "Text with " + " ".join(VISION_TOKENS) + " tokens"
+    escaped = model.format_prompt(injected, QUESTION, OPTIONS, max_seq_len=320, images=[img1])
+    assert escaped.prefix_ids.count(model.vision_start_id) == 1
+    assert escaped.prefix_ids.count(model.vision_end_id) == 1
+    assert escaped.prefix_ids.count(model.image_token_id) == counts[0]
+
+
+def test_multimodal_image_sensitivity_frozen_vision_and_text_compat(tmp_path):
+    from PIL import Image
+
+    model_vis = synthetic_model(seed=31, with_lora=True, include_vision=True)
+    model_txt = synthetic_model(seed=31, with_lora=True, include_vision=False)
+    with torch.no_grad():
+        out_vis_no_img = model_vis(STATE, QUESTION, OPTIONS, images=[])
+        out_txt = model_txt(STATE, QUESTION, OPTIONS)
+        torch.testing.assert_close(out_vis_no_img["logits"], out_txt["logits"], atol=1e-6, rtol=0)
+
+    img1 = _make_pattern_image(96, 64, seed_val=10)
+    img2 = _make_pattern_image(96, 64, seed_val=25)
+    with torch.no_grad():
+        r1 = model_vis(STATE, QUESTION, OPTIONS, max_seq_len=256, images=img1)
+        r2 = model_vis(STATE, QUESTION, OPTIONS, max_seq_len=256, images=img2)
+    assert not torch.allclose(r1["logits"], r2["logits"], atol=1e-5)
+    for dim in SLICE_DIMS:
+        assert not torch.allclose(r1["embeddings"][dim], r2["embeddings"][dim], atol=1e-5)
+
+    # Grayscale, RGBA, narrow CHW, bfloat16, and non-finite validation.
+    gray = Image.new("L", (64, 64), 120)
+    rgba = Image.new("RGBA", (64, 64), (10, 20, 30, 255))
+    flt = torch.rand(3, 64, 64)
+    bf16 = torch.rand(3, 64, 64, dtype=torch.bfloat16)
+    pv, grid, counts = model_vis.preprocess_images([gray, rgba, flt, bf16])
+    assert len(counts) == 4 and grid.shape == (4, 3) and pv.ndim == 2
+
+    narrow_tensor = torch.randint(0, 255, (3, 64, 4), dtype=torch.uint8)
+    narrow_pil = Image.fromarray(narrow_tensor.permute(1, 2, 0).numpy(), mode="RGB")
+    pv_t, grid_t, _ = model_vis.preprocess_images([narrow_tensor])
+    pv_p, grid_p, _ = model_vis.preprocess_images([narrow_pil])
+    assert torch.equal(grid_t, grid_p)
+    torch.testing.assert_close(pv_t, pv_p, atol=1e-6, rtol=0)
+
+    bad_nan = torch.full((3, 32, 32), float("nan"))
+    with pytest.raises(ValueError, match="non-finite"):
+        model_vis.preprocess_images([bad_nan])
+
+    # Training keeps visual frozen and in eval mode even after .train().
+    for use_gc in (False, True):
+        model_vis.configure_training("exp_b", gradient_checkpointing=use_gc)
+        model_vis.train()
+        assert model_vis.visual.training is False
+        assert all(not p.requires_grad for p in model_vis.visual.parameters())
+        model_vis.zero_grad(set_to_none=True)
+        out = model_vis(STATE, QUESTION, OPTIONS, max_seq_len=256, images=img1)
+        loss = out["logits"].square().mean() + out["embeddings"][384].sum()
+        loss.backward()
+        assert all(p.grad is None for p in model_vis.visual.parameters())
+        assert any(p.grad is not None and torch.isfinite(p.grad).all() for n, p in model_vis.backbone.named_parameters() if "lora_" in n)
+        assert model_vis.pointer.q.weight.grad is not None and torch.isfinite(model_vis.pointer.q.weight.grad).all()
+
+    # Save checkpoint with custom preprocessing, modify temperature, and verify roundtrip + text->vision compat.
+    model_vis.eval()
+    model_vis.image_max_pixels = 128 * 16 * 16
+    model_vis.image_mean = (0.4, 0.45, 0.5)
+    model_vis.image_std = (0.25, 0.25, 0.25)
+    model_vis._image_processor = None
+    model_vis.temperature = 3.25
+    with torch.no_grad():
+        expected_custom = model_vis(STATE, QUESTION, OPTIONS, max_seq_len=256, images=img1)
+    model_vis.save_checkpoint(tmp_path / "vis_ckpt", {"smoke": True, "include_vision": False})
+    saved = torch.load(tmp_path / "vis_ckpt" / "model.pt", map_location="cpu", weights_only=True)
+    assert not any(k.startswith("visual.") for k in saved["tensors"])
+    assert saved["metadata"]["include_vision"] is True
+
+    restored = synthetic_model(seed=31, with_lora=True, include_vision=True)
+    restored.load_checkpoint(tmp_path / "vis_ckpt" / "model.pt")
+    assert restored.temperature == pytest.approx(3.25)
+    assert restored.image_max_pixels == 128 * 16 * 16
+    assert restored.image_mean == pytest.approx((0.4, 0.45, 0.5))
+    with torch.no_grad():
+        restored_custom = restored(STATE, QUESTION, OPTIONS, max_seq_len=256, images=img1)
+        torch.testing.assert_close(restored_custom["logits"], expected_custom["logits"], atol=1e-6, rtol=0)
+        torch.testing.assert_close(restored_custom["embeddings"][384], expected_custom["embeddings"][384], atol=1e-6, rtol=0)
+
+    model_txt.save_checkpoint(tmp_path / "txt_ckpt", {"smoke": True})
+    restored.load_checkpoint(tmp_path / "txt_ckpt" / "model.pt")
+
+
+def test_position_ids_match_qwen3_5_get_rope_index_oracle():
+    from transformers import Qwen3_5Config, Qwen3_5Model
+
+    model = synthetic_model(seed=37, include_vision=True)
+    img1 = _make_pattern_image(96, 64, seed_val=7)
+    img2 = _make_pattern_image(64, 128, seed_val=8)
+    prompt = model.format_prompt(STATE, QUESTION, OPTIONS, max_seq_len=320, images=[img1, img2])
+    input_ids = torch.tensor([prompt.input_ids], dtype=torch.long)
+    pos_4d, next_pos = model._compute_position_ids(input_ids, prompt.image_grid_thw)
+    assert torch.equal(pos_4d[0], torch.arange(len(prompt.input_ids)).unsqueeze(0))
+
+    oracle_cfg = Qwen3_5Config(
+        text_config={
+            "vocab_size": 272, "hidden_size": 32, "intermediate_size": 48,
+            "num_hidden_layers": 1, "layer_types": ["full_attention"],
+            "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 16,
+            "rope_parameters": {"rope_type": "default", "rope_theta": 10000., "partial_rotary_factor": .5,
+                                "mrope_interleaved": True, "mrope_section": [2, 1, 1]},
+        },
+        vision_config={"depth": 1, "hidden_size": 24, "intermediate_size": 32, "num_heads": 2,
+                       "patch_size": 16, "spatial_merge_size": 2, "temporal_patch_size": 2, "out_hidden_size": 32},
+    )
+    oracle = Qwen3_5Model(oracle_cfg)
+    mm_types = (input_ids == model.image_token_id).to(torch.int32)
+    oracle_pos, oracle_deltas = oracle.get_rope_index(input_ids, mm_types, image_grid_thw=prompt.image_grid_thw)
+    assert torch.equal(pos_4d[1:], oracle_pos)
+    assert next_pos == int(oracle_pos.max().item()) + 1
+    assert next_pos - len(prompt.input_ids) == int(oracle_deltas.item())
+
+
+def test_multitask_v2_training_and_v2_cal_cv_smoke(tmp_path):
+    import argparse
+    from eval_experiment import run_cal_cv_evaluation
+    from train_experiment import run_training
+
+    args = argparse.Namespace(
+        mode="exp_b", run_name="v2_smoke", dataset=tmp_path, device="cpu", dtype="fp32",
+        include_vision=True, max_seq_len=256, epochs=1, max_steps=16, grad_accum=4,
+        emb_batch_size=2, emb_grad_cache=True, emb_detach_backbone=False,
+        schedule_mode="multitask_v2",
+        v2_mix="compaction:2,outcome_prefix:2,loop_guard:3,generic_decisions:2,multimodal_decisions:2,emb_pairs:2,emb_pairs_bilingual:2,multimodal_emb_pairs:1",
+        init_checkpoint=None, compaction_ref_checkpoint=None, outcome_ref_checkpoint=None,
+        lr=1e-4, head_lr=1e-3, pointer_lr=2e-5, emb_lr=5e-4,
+        cosine_lr=True, warmup_steps=1, balanced_sampling=True, emb_weight=0.5,
+        kl_ref_weight=0.1, kl_compaction_weight=0.2, kl_outcome_weight=0.1,
+        kl_loop_weight=0.05, loop_ce_weight=0.5,
+        kl_generic_weight=0.5, generic_ce_weight=0.25,
+        kl_mm_weight=0.1, mm_ce_weight=1.0,
+        perm_kl=0.0, save_every=0, gradient_checkpointing=False,
+        seed=42, out_dir=tmp_path, smoke=True,
+    )
+    summary = run_training(args)
+    assert summary["include_vision"] is True
+    assert summary["optimizer_updates"] == 4
+    assert summary["task_steps"]["generic_decisions"] == 2
+    assert summary["task_steps"]["multimodal_decisions"] == 2
+    assert summary["task_steps"]["multimodal_emb_pairs"] == 1
+    assert summary["reference_logit_count"] > 0
+    v2_ckpt = tmp_path / "checkpoints" / "v2_smoke" / "model.pt"
+    assert v2_ckpt.exists()
+
+    # Stage-B multimodal emb_only refit across all 3 embedding families
+    args_emb = argparse.Namespace(
+        mode="emb_only", run_name="v2_emb_only", dataset=tmp_path, device="cpu", dtype="fp32",
+        include_vision=True, max_seq_len=256, epochs=1, max_steps=6, grad_accum=1,
+        emb_batch_size=2, emb_families="emb_pairs,emb_pairs_bilingual,multimodal_emb_pairs",
+        init_checkpoint=v2_ckpt, lr=0.0, head_lr=5e-4, emb_lr=5e-4,
+        cosine_lr=True, warmup_steps=1, seed=42, out_dir=tmp_path, smoke=True,
+    )
+    emb_summary = run_training(args_emb)
+    assert set(emb_summary["task_steps"]) == {"emb_pairs", "emb_pairs_bilingual", "multimodal_emb_pairs"}
+    assert emb_summary["embedding_changed"] is True
+    assert emb_summary["head_changed"] is False
+
+    # Smoke cal-CV evaluation across all v1 + v2 suites
+    eval_args = argparse.Namespace(
+        dataset=tmp_path, out_dir=tmp_path / "cv_out", checkpoint_root=tmp_path / "checkpoints",
+        device="cpu", dtype="fp32", include_vision=True, include_v2=True,
+        max_seq_len=256, max_eval=0, loop_limit=8, seed=42,
+        models=["zero_shot_kev", "v2_smoke"], cal_cv=True, smoke=True,
+    )
+    report = run_cal_cv_evaluation(eval_args)
+    m = report["models"]["v2_smoke"]
+    assert "generic_decisions" in m and "mean_kl_vs_zero_shot" in m["generic_decisions"]
+    assert "synthetic_3class" in m["loop_guard"]
+    assert "emb_pairs_bilingual" in m and "384" in m["emb_pairs_bilingual"]["slices"]
+    assert "multimodal_emb_pairs" in m and "128" in m["multimodal_emb_pairs"]["slices"]
+    assert "multimodal_decisions" in m and "mean_kl_vs_zero_shot" in m["multimodal_decisions"]
+    assert (tmp_path / "cv_out" / "cal_cv_report.md").exists()
+
+
+def test_exp_a_default_kl_multitask_v2_defaults_and_image_fingerprints(tmp_path):
+    import argparse
+    from PIL import Image
+    from eval_experiment import evaluate_variable_option_decisions
+    from train_experiment import image_fingerprints, run_training
+
+    # 1. exp_a with default kl_ref_weight=0.1 should not raise.
+    args_a = argparse.Namespace(
+        mode="exp_a", run_name="exp_a_default_kl", dataset=tmp_path, device="cpu", dtype="fp32",
+        max_seq_len=256, epochs=1, max_steps=6, grad_accum=2, emb_batch_size=1,
+        lr=1e-4, head_lr=1e-3, balanced_sampling=True, emb_weight=1.0, kl_ref_weight=0.1,
+        perm_kl=0.0, gradient_checkpointing=False, seed=42, out_dir=tmp_path, smoke=True,
+    )
+    summary_a = run_training(args_a)
+    assert summary_a["kl_compaction_weight"] == 0.0
+
+    # 2. multitask_v2 with omitted/None loss weights uses safe non-zero defaults.
+    args_v2 = argparse.Namespace(
+        mode="exp_b", run_name="v2_defaults", dataset=tmp_path, device="cpu", dtype="fp32",
+        max_seq_len=256, epochs=1, max_steps=16, grad_accum=4, emb_batch_size=2,
+        schedule_mode="multitask_v2", lr=1e-4, head_lr=1e-3, balanced_sampling=True,
+        emb_weight=0.5, kl_ref_weight=0.1, perm_kl=0.0, gradient_checkpointing=False,
+        seed=42, out_dir=tmp_path, smoke=True,
+    )
+    summary_v2 = run_training(args_v2)
+    assert summary_v2["loop_ce_weight"] > 0 and summary_v2["kl_generic_weight"] > 0
+
+    # 3. Equal-bytes different-shape PIL images produce distinct fingerprints.
+    img_tall = Image.new("RGB", (32, 64), (10, 20, 30))
+    img_wide = Image.new("RGB", (64, 32), (10, 20, 30))
+    assert img_tall.tobytes() == img_wide.tobytes()
+    fp1 = image_fingerprints({"state_images": [img_tall]})
+    fp2 = image_fingerprints({"state_images": [img_wide]})
+    assert fp1 != fp2
+
+    # 4. Incomplete or non-finite logits fail validation cleanly.
+    rows = smoke_rows("cal")["generic_decisions"][:2]
+    with pytest.raises(ValueError, match="logit count"):
+        evaluate_variable_option_decisions([[0.1, 0.2, 0.3]], rows, "generic_decisions")
+    with pytest.raises(ValueError, match="non-finite"):
+        evaluate_variable_option_decisions([[0.1, float("nan"), 0.3], [0.1, 0.2, 0.3]], rows, "generic_decisions")
+
+
+def test_cached_kev_multimodal_smoke():
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    try:
+        base = Path(snapshot_download(BASE_MODEL, local_files_only=True))
+        adapter = Path(snapshot_download(KEV_ADAPTER, local_files_only=True))
+    except LocalEntryNotFoundError:
+        pytest.skip("Qwen/Kev snapshots are not in the local HF cache")
+    if not list(base.glob("*.safetensors")) or not (adapter / "adapter_model.safetensors").exists() or not (adapter / "head.pt").exists():
+        pytest.skip("Qwen/Kev weight files are not fully cached")
+
+    model = DualHeadDecisionEmbedder.from_pretrained(device="cpu", dtype=torch.bfloat16, include_vision=True)
+    model.eval()
+    assert model.adapter_tensor_count == 372
+    assert model.visual is not None
+    assert model.visual.training is False
+    assert all(not p.requires_grad for p in model.visual.parameters())
+
+    img_a = _make_pattern_image(96, 64, seed_val=1)
+    img_b = _make_pattern_image(96, 64, seed_val=2)
+    q = "What color is the highlighted block?"
+    opts = [("red", "Red block."), ("green", "Green block.")]
+    with torch.no_grad():
+        full = model("Inspect screenshot.", q, opts, max_seq_len=256, images=[img_a])
+        prefix = model.encode_prefix("Inspect screenshot.", max_seq_len=256, suffix_reserve=64, images=[img_a])
+        cached = model.question_from_prefix(prefix, q, opts)
+        other = model("Inspect screenshot.", q, opts, max_seq_len=256, images=[img_b])
+    torch.testing.assert_close(full["logits"], cached["logits"], atol=1e-2, rtol=1e-2)
+    assert not torch.allclose(full["logits"], other["logits"], atol=1e-4)
+    assert not torch.allclose(full["embeddings"][384], other["embeddings"][384], atol=1e-4)
+

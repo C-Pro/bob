@@ -1,0 +1,8 @@
+{
+  "track_id": "jev-multimodal-dataset-and-tuning_20261116",
+  "type": "feature",
+  "status": "new",
+  "created_at": "2026-11-16T07:58:00Z",
+  "updated_at": "2026-11-16T07:58:00Z",
+  "description": "Comprehensive dataset construction (generic out-of-domain decisions, positive loop_guard, EN+RU Besedka memory, and multimodal image+text embeddings/decisions), frozen qwen3_5_vision integration & unit tests, and iterative small-scale training/evaluation loop prior to full-scale Jev training."
+}
