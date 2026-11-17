@@ -716,19 +716,69 @@ def cal_cv_evaluation(logits, rows, n_folds=5):
     }
 
 
-def _load_optional_v2_cal(dataset_dir: Path, max_eval: int, include_v2: bool, smoke: bool):
+def _load_optional_v2_split(dataset_dir: Path, split: str, max_eval: int, include_v2: bool, smoke: bool):
     v2_families = ("generic_decisions", "emb_pairs_bilingual", "multimodal_emb_pairs", "multimodal_decisions")
     if smoke:
         if not include_v2:
             return {}
-        sr = smoke_rows("cal")
+        sr = smoke_rows(split)
         return {f: sr[f] for f in v2_families}
     loaded = {}
     for fam in v2_families:
-        path = Path(dataset_dir) / f"{fam}_cal.jsonl"
+        path = Path(dataset_dir) / f"{fam}_{split}.jsonl"
         if path.exists():
-            loaded[fam] = read_rows(dataset_dir, fam, "cal", max_eval or None)
+            loaded[fam] = read_rows(dataset_dir, fam, split, max_eval or None)
     return loaded if include_v2 else {}
+
+
+def _load_optional_v2_cal(dataset_dir: Path, max_eval: int, include_v2: bool, smoke: bool):
+    return _load_optional_v2_split(dataset_dir, "cal", max_eval, include_v2, smoke)
+
+
+def _evaluate_v2_model_suites(model, name, eval_data, max_seq_len, zs_ref_logits, dataset_root, result):
+    if "generic_decisions" in eval_data:
+        g_logits = decision_logits_list(model, eval_data["generic_decisions"], "generic_decisions", max_seq_len)
+        if name == "zero_shot_kev":
+            zs_ref_logits["generic_decisions"] = g_logits
+        result["generic_decisions"] = evaluate_variable_option_decisions(
+            g_logits, eval_data["generic_decisions"], "generic_decisions",
+            reference_logits_list=zs_ref_logits.get("generic_decisions") if name != "zero_shot_kev" else None,
+        )
+        if name != "zero_shot_kev" and "generic_decisions" in zs_ref_logits:
+            zs_acc = evaluate_variable_option_decisions(
+                zs_ref_logits["generic_decisions"], eval_data["generic_decisions"], "generic_decisions"
+            )["accuracy"]
+            result["generic_decisions"]["accuracy_delta_vs_zero_shot"] = result["generic_decisions"]["accuracy"] - zs_acc
+    if "emb_pairs_bilingual" in eval_data:
+        bi_rows = eval_data["emb_pairs_bilingual"]
+        bi_eval = embedding_evaluation(model, bi_rows, max_seq_len)
+        by_lang = {}
+        for lang in sorted({r.get("language", "en") for r in bi_rows}):
+            sub = [r for r in bi_rows if r.get("language", "en") == lang]
+            if len(sub) >= 2:
+                by_lang[lang] = embedding_evaluation(model, sub, max_seq_len)["slices"]
+        bi_eval["per_language_slices"] = by_lang
+        result["emb_pairs_bilingual"] = bi_eval
+    if "multimodal_emb_pairs" in eval_data:
+        result["multimodal_emb_pairs"] = embedding_evaluation(
+            model, eval_data["multimodal_emb_pairs"], max_seq_len, dataset_root=dataset_root
+        )
+    if "multimodal_decisions" in eval_data:
+        mm_logits = decision_logits_list(
+            model, eval_data["multimodal_decisions"], "multimodal_decisions",
+            max_seq_len, dataset_root=dataset_root,
+        )
+        if name == "zero_shot_kev":
+            zs_ref_logits["multimodal_decisions"] = mm_logits
+        result["multimodal_decisions"] = evaluate_variable_option_decisions(
+            mm_logits, eval_data["multimodal_decisions"], "multimodal_decisions",
+            reference_logits_list=zs_ref_logits.get("multimodal_decisions") if name != "zero_shot_kev" else None,
+        )
+        if name != "zero_shot_kev" and "multimodal_decisions" in zs_ref_logits:
+            zs_mm_acc = evaluate_variable_option_decisions(
+                zs_ref_logits["multimodal_decisions"], eval_data["multimodal_decisions"], "multimodal_decisions"
+            )["accuracy"]
+            result["multimodal_decisions"]["accuracy_delta_vs_zero_shot"] = result["multimodal_decisions"]["accuracy"] - zs_mm_acc
 
 
 def run_cal_cv_evaluation(args):
@@ -820,49 +870,8 @@ def run_cal_cv_evaluation(args):
                 model, cal_data["loop_guard"], args.max_seq_len, args.loop_limit,
                 include_v2=include_v2, max_v2=args.max_eval,
             )
-            if "generic_decisions" in cal_data:
-                g_logits = decision_logits_list(model, cal_data["generic_decisions"], "generic_decisions", args.max_seq_len)
-                if name == "zero_shot_kev":
-                    zs_ref_logits["generic_decisions"] = g_logits
-                result["generic_decisions"] = evaluate_variable_option_decisions(
-                    g_logits, cal_data["generic_decisions"], "generic_decisions",
-                    reference_logits_list=zs_ref_logits.get("generic_decisions") if name != "zero_shot_kev" else None,
-                )
-                if name != "zero_shot_kev" and "generic_decisions" in zs_ref_logits:
-                    zs_acc = evaluate_variable_option_decisions(
-                        zs_ref_logits["generic_decisions"], cal_data["generic_decisions"], "generic_decisions"
-                    )["accuracy"]
-                    result["generic_decisions"]["accuracy_delta_vs_zero_shot"] = result["generic_decisions"]["accuracy"] - zs_acc
-            if "emb_pairs_bilingual" in cal_data:
-                bi_rows = cal_data["emb_pairs_bilingual"]
-                bi_eval = embedding_evaluation(model, bi_rows, args.max_seq_len)
-                by_lang = {}
-                for lang in sorted({r.get("language", "en") for r in bi_rows}):
-                    sub = [r for r in bi_rows if r.get("language", "en") == lang]
-                    if len(sub) >= 2:
-                        by_lang[lang] = embedding_evaluation(model, sub, args.max_seq_len)["slices"]
-                bi_eval["per_language_slices"] = by_lang
-                result["emb_pairs_bilingual"] = bi_eval
-            if "multimodal_emb_pairs" in cal_data:
-                result["multimodal_emb_pairs"] = embedding_evaluation(
-                    model, cal_data["multimodal_emb_pairs"], args.max_seq_len, dataset_root=dataset_root
-                )
-            if "multimodal_decisions" in cal_data:
-                mm_logits = decision_logits_list(
-                    model, cal_data["multimodal_decisions"], "multimodal_decisions",
-                    args.max_seq_len, dataset_root=dataset_root,
-                )
-                if name == "zero_shot_kev":
-                    zs_ref_logits["multimodal_decisions"] = mm_logits
-                result["multimodal_decisions"] = evaluate_variable_option_decisions(
-                    mm_logits, cal_data["multimodal_decisions"], "multimodal_decisions",
-                    reference_logits_list=zs_ref_logits.get("multimodal_decisions") if name != "zero_shot_kev" else None,
-                )
-                if name != "zero_shot_kev" and "multimodal_decisions" in zs_ref_logits:
-                    zs_mm_acc = evaluate_variable_option_decisions(
-                        zs_ref_logits["multimodal_decisions"], cal_data["multimodal_decisions"], "multimodal_decisions"
-                    )["accuracy"]
-                    result["multimodal_decisions"]["accuracy_delta_vs_zero_shot"] = result["multimodal_decisions"]["accuracy"] - zs_mm_acc
+            if "generic_decisions" in cal_data or "emb_pairs_bilingual" in cal_data or "multimodal_emb_pairs" in cal_data or "multimodal_decisions" in cal_data:
+                _evaluate_v2_model_suites(model, name, cal_data, args.max_seq_len, zs_ref_logits, dataset_root, result)
             result["latency"] = latency_metrics(model, cal_data["compaction"], args.max_seq_len)
         if record_in_report:
             report["models"][name] = result
@@ -883,10 +892,22 @@ def run_evaluation(args):
         args.max_seq_len = min(args.max_seq_len, 512)
     families = ("compaction", "outcome_prefix", "emb_pairs", "loop_guard")
     data = {split: smoke_rows(split) if args.smoke else {
-        family: read_rows(args.dataset, family, split, args.max_eval or None) for family in families}
+        family: read_rows(args.dataset, family, split, None if family == "loop_guard" else (args.max_eval or None))
+        for family in families}
         for split in ("cal", "dev")}
     if any(not data[split][family] for split in data for family in families):
         raise ValueError("Evaluation requires nonempty calibration and dev splits")
+    include_v2 = getattr(args, "include_v2", True)
+    for split in ("cal", "dev"):
+        v2_rows = _load_optional_v2_split(args.dataset, split, args.max_eval, include_v2, args.smoke)
+        for fam, rows in v2_rows.items():
+            data[split][fam] = rows
+    dataset_root = None if args.smoke else args.dataset
+    need_vision = bool(
+        getattr(args, "include_vision", False)
+        or "multimodal_decisions" in data["dev"]
+        or "multimodal_emb_pairs" in data["dev"]
+    )
     cal_groups = {r["task_group"] for rows in data["cal"].values() for r in rows}
     dev_groups = {r["task_group"] for rows in data["dev"].values() for r in rows}
     if cal_groups & dev_groups:
@@ -894,7 +915,8 @@ def run_evaluation(args):
     report = {"smoke": args.smoke, "models": {}, "calibration_split": "cal", "evaluation_split": "dev",
               "interpretation": "Synthetic smoke verification only; not benchmark performance." if args.smoke else "Fixed-checkpoint held-out dev evaluation.",
               "max_seq_len": args.max_seq_len, "max_eval": args.max_eval,
-              "device": args.device, "inference": "single_pass_uniform_delimiters_canonical_option_order",
+              "device": args.device, "include_vision": need_vision,
+              "inference": "single_pass_uniform_delimiters_canonical_option_order",
               "data_sha256": {split: hashlib.sha256(json.dumps(data[split], sort_keys=True, default=lambda o: f"<PIL:{o.size}>").encode()).hexdigest() for split in data}}
     output.mkdir(parents=True, exist_ok=True)
     (output / "dev_evaluation_started.json").write_text(json.dumps({"data_sha256": report["data_sha256"]}, indent=2) + "\n")
@@ -903,15 +925,23 @@ def run_evaluation(args):
         report["models"][name] = {"decisions": {"compaction": calibrated_evaluation(
             baseline_logits(cal, name), cal, baseline_logits(dev, name), dev)}}
     dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "bfloat16": torch.bfloat16}[args.dtype]
-    model_names = getattr(args, "models", None) or ("zero_shot_kev", "exp_a", "exp_b")
-    for name in model_names:
+    model_names = list(getattr(args, "models", None) or ("zero_shot_kev", "exp_a", "exp_b"))
+    zs_ref_logits = {}
+    need_zs_kl = bool(
+        ("generic_decisions" in data["dev"] or "multimodal_decisions" in data["dev"])
+        and any(m != "zero_shot_kev" for m in model_names)
+    )
+    ordered_models = (["zero_shot_kev"] + [m for m in model_names if m != "zero_shot_kev"]
+                      if ("zero_shot_kev" in model_names or need_zs_kl) else model_names)
+    for name in ordered_models:
+        record_in_report = name in model_names
         checkpoint = Path(args.checkpoint_root) / name / "model.pt"
         if name != "zero_shot_kev" and not checkpoint.exists():
-            report["models"][name] = {"status": "checkpoint_missing", "checkpoint": str(checkpoint)}
+            if record_in_report:
+                report["models"][name] = {"status": "checkpoint_missing", "checkpoint": str(checkpoint)}
             continue
-        use_vis = bool(getattr(args, "include_vision", False))
         model = (make_model(args.smoke, args.device, dtype, args.seed, include_vision=True)
-                 if use_vis else make_model(args.smoke, args.device, dtype, args.seed))
+                 if need_vision else make_model(args.smoke, args.device, dtype, args.seed))
         checkpoint_metadata = model.load_checkpoint(checkpoint) if name != "zero_shot_kev" else None
         if checkpoint_metadata and checkpoint_metadata["smoke"] != args.smoke:
             raise ValueError("Cannot mix synthetic and real checkpoints")
@@ -939,9 +969,14 @@ def run_evaluation(args):
             result["decisions"][family] = decision
         with torch.no_grad():
             result["embeddings"] = embedding_evaluation(model, data["dev"]["emb_pairs"], args.max_seq_len)
-            result["loop_guard"] = evaluate_loop_guard(model, data["dev"]["loop_guard"], args.max_seq_len, args.loop_limit)
+            result["loop_guard"] = evaluate_loop_guard(
+                model, data["dev"]["loop_guard"], args.max_seq_len, args.loop_limit,
+                include_v2=include_v2, max_v2=args.max_eval,
+            )
+            _evaluate_v2_model_suites(model, name, data["dev"], args.max_seq_len, zs_ref_logits, dataset_root, result)
             result["latency"] = latency_metrics(model, data["dev"]["compaction"], args.max_seq_len)
-        report["models"][name] = result
+        if record_in_report:
+            report["models"][name] = result
         del model
         gc.collect()
         if torch.cuda.is_available():

@@ -1,7 +1,9 @@
 """Tiny hybrid Qwen invariances plus an offline real-adapter integration check."""
 import itertools
+import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -421,7 +423,7 @@ def test_cal_cv_never_reads_dev(tmp_path, monkeypatch):
     import argparse
     import json
     import eval_experiment
-    from eval_experiment import run_cal_cv_evaluation
+    from eval_experiment import run_cal_cv_evaluation, run_evaluation
 
     monkeypatch.setattr(eval_experiment, "make_model", lambda smoke, device, dtype, seed: synthetic_model(seed=seed, with_lora=True))
     cal = smoke_rows("cal")
@@ -775,7 +777,7 @@ def test_position_ids_match_qwen3_5_get_rope_index_oracle():
 
 def test_multitask_v2_training_and_v2_cal_cv_smoke(tmp_path):
     import argparse
-    from eval_experiment import run_cal_cv_evaluation
+    from eval_experiment import run_cal_cv_evaluation, run_evaluation
     from train_experiment import run_training
 
     args = argparse.Namespace(
@@ -832,6 +834,15 @@ def test_multitask_v2_training_and_v2_cal_cv_smoke(tmp_path):
     assert "multimodal_emb_pairs" in m and "128" in m["multimodal_emb_pairs"]["slices"]
     assert "multimodal_decisions" in m and "mean_kl_vs_zero_shot" in m["multimodal_decisions"]
     assert (tmp_path / "cv_out" / "cal_cv_report.md").exists()
+
+    # Smoke dev evaluation across all v1 + v2 suites
+    dev_args = argparse.Namespace(**{**vars(eval_args), "out_dir": tmp_path / "dev_out", "cal_cv": False})
+    dev_report = run_evaluation(dev_args)
+    dm = dev_report["models"]["v2_smoke"]
+    assert "generic_decisions" in dm and "mean_kl_vs_zero_shot" in dm["generic_decisions"]
+    assert "synthetic_3class" in dm["loop_guard"]
+    assert "emb_pairs_bilingual" in dm and "multimodal_emb_pairs" in dm and "multimodal_decisions" in dm
+    assert (tmp_path / "dev_out" / "experiment_report.md").exists()
 
 
 def test_exp_a_default_kl_multitask_v2_defaults_and_image_fingerprints(tmp_path):
@@ -908,4 +919,62 @@ def test_cached_kev_multimodal_smoke():
     torch.testing.assert_close(full["logits"], cached["logits"], atol=1e-2, rtol=1e-2)
     assert not torch.allclose(full["logits"], other["logits"], atol=1e-4)
     assert not torch.allclose(full["embeddings"][384], other["embeddings"][384], atol=1e-4)
+
+
+def test_numbered_snapshots_and_resume_equivalence(tmp_path, monkeypatch):
+    import train_experiment
+
+    common = dict(
+        mode="exp_b", dataset=tmp_path, device="cpu", dtype="fp32", smoke=True, seed=99,
+        epochs=1, max_seq_len=256, schedule_mode="multitask_v2",
+        v2_mix="compaction:1,loop_guard:1,generic_decisions:1,emb_pairs:1",
+        grad_accum=4, emb_batch_size=1, emb_grad_cache=False, emb_detach_backbone=False,
+        balanced_sampling=True, emb_weight=0.5, lr=2e-4, head_lr=1e-3,
+        kl_ref_weight=0.05, kl_compaction_weight=0.05, kl_outcome_weight=0.05,
+        kl_loop_weight=0.0, loop_ce_weight=1.0,
+        kl_generic_weight=0.1, generic_ce_weight=0.25,
+        kl_mm_weight=0.0, mm_ce_weight=0.0,
+        perm_kl=0.0, gradient_checkpointing=False,
+        include_vision=False, cosine_lr=True, warmup_steps=1,
+    )
+    full_dir = tmp_path / "full"
+    full_metrics = train_experiment.run_training(SimpleNamespace(
+        **common, max_steps=8, save_every=1, resume=False,
+        run_name="snap_full", out_dir=full_dir,
+    ))
+    snap1 = full_dir / "checkpoints" / "snap_full" / "snapshots" / "u0001" / "model.pt"
+    snap2 = full_dir / "checkpoints" / "snap_full" / "snapshots" / "u0002" / "model.pt"
+    assert snap1.exists() and snap2.exists()
+    assert (full_dir / "checkpoints" / "snap_full" / "latest" / "trainer_state.pt").exists()
+    assert full_metrics["optimizer_updates"] == 2
+
+    resumed_dir = tmp_path / "resumed"
+    orig_decision_forward = train_experiment.decision_forward
+    calls = {"n": 0}
+
+    def crash_on_fifth_decision(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 4:
+            raise RuntimeError("simulated GPU hang after update 1")
+        return orig_decision_forward(*args, **kwargs)
+
+    monkeypatch.setattr(train_experiment, "decision_forward", crash_on_fifth_decision)
+    with pytest.raises(RuntimeError, match="simulated GPU hang"):
+        train_experiment.run_training(SimpleNamespace(
+            **common, max_steps=8, save_every=1, resume=False,
+            run_name="snap_resumed", out_dir=resumed_dir,
+        ))
+    monkeypatch.setattr(train_experiment, "decision_forward", orig_decision_forward)
+    resumed_metrics = train_experiment.run_training(SimpleNamespace(
+        **common, max_steps=8, save_every=1, resume=True,
+        run_name="snap_resumed", out_dir=resumed_dir,
+    ))
+    assert resumed_metrics["steps"] == 8
+    assert resumed_metrics["optimizer_updates"] == 2
+    assert resumed_metrics["task_steps"] == full_metrics["task_steps"]
+    full_log = [json.loads(line) for line in (full_dir / "runs" / "snap_full" / "metrics.jsonl").read_text().splitlines()]
+    resumed_log = [json.loads(line) for line in (resumed_dir / "runs" / "snap_resumed" / "metrics.jsonl").read_text().splitlines()]
+    assert [r["step"] for r in resumed_log] == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert pytest.approx(resumed_log[-1]["loss"], rel=1e-5, abs=1e-6) == full_log[-1]["loss"]
+
 

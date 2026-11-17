@@ -5,8 +5,10 @@ import argparse
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import random
+import shutil
 import time
 
 import torch
@@ -569,6 +571,12 @@ def _apply_checkpoint_preprocess(model, checkpoint_path):
         model._image_processor = None
 
 
+def _cuda_cleanup(device):
+    if getattr(device, "type", str(device)) == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
 def frozen_reference_cache(model, data, args, path, family_teachers=None):
     """Cache only CPU decision logits, fingerprinted by teacher checkpoint, images, and prompt format."""
     smoke_flag = bool(getattr(args, "smoke", False))
@@ -628,13 +636,36 @@ def frozen_reference_cache(model, data, args, path, family_teachers=None):
             else:
                 by_teacher.setdefault(ckpt_path, []).append((cache_key, family, row, ord_))
 
+    path.parent.mkdir(parents=True, exist_ok=True)
+    has_v2_targets = any(f in ("generic_decisions", "multimodal_decisions") for f in target_families)
+    if has_v2_targets:
+        fmt = "jev-kev-reference-v3"
+    elif any(v is not None for v in family_teachers.values()):
+        fmt = "jev-kev-reference-v2"
+    else:
+        fmt = "jev-kev-reference-v1"
+
+    def _flush_cache():
+        payload = {"format": fmt, "smoke": smoke_flag, "smoke_seed": seed_val if smoke_flag else None, "logits": cache}
+        _atomic_torch_save(payload, path)
+
+    student_device = model.device
+    student_offloaded = False
+    added_since_flush = 0
     for ckpt_path, pending_items in by_teacher.items():
         if ckpt_path is None:
+            if student_offloaded:
+                model.to(student_device)
+                student_offloaded = False
             teacher_model = model
         else:
+            if getattr(student_device, "type", "") == "cuda" and not student_offloaded:
+                model.to("cpu")
+                _cuda_cleanup(student_device)
+                student_offloaded = True
             dtype = next(model.parameters()).dtype
             teacher_model = make_model(
-                smoke_flag, str(model.device), dtype, seed_val,
+                smoke_flag, str(student_device), dtype, seed_val,
                 include_vision=(getattr(model, "visual", None) is not None),
             )
             teacher_model.load_checkpoint(ckpt_path)
@@ -644,20 +675,17 @@ def frozen_reference_cache(model, data, args, path, family_teachers=None):
                 cache[cache_key] = decision_forward(
                     teacher_model, family, row, ord_, args.max_seq_len, dataset_root=dataset_root
                 ).float().cpu()
+                _cuda_cleanup(student_device)
+                added_since_flush += 1
+                if not smoke_flag and added_since_flush >= 20:
+                    _flush_cache()
+                    added_since_flush = 0
         if ckpt_path is not None:
             del teacher_model
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    has_v2_targets = any(f in ("generic_decisions", "multimodal_decisions") for f in target_families)
-    if has_v2_targets:
-        fmt = "jev-kev-reference-v3"
-    elif any(v is not None for v in family_teachers.values()):
-        fmt = "jev-kev-reference-v2"
-    else:
-        fmt = "jev-kev-reference-v1"
-    torch.save({"format": fmt, "smoke": smoke_flag, "smoke_seed": seed_val if smoke_flag else None, "logits": cache}, path)
+            _cuda_cleanup(student_device)
+    if student_offloaded:
+        model.to(student_device)
+    _flush_cache()
     return cache
 
 
@@ -764,6 +792,47 @@ def _grad_norm(parameters):
     return float(torch.linalg.vector_norm(torch.stack(norms)))
 
 
+def _atomic_torch_save(payload, target_path):
+    target_path = Path(target_path)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target_path.with_suffix(target_path.suffix + ".tmp")
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, target_path)
+
+
+def _save_periodic_snapshot(model, checkpoint_dir, updates, metadata, trainer_state):
+    """Persist numbered snapshot and atomic latest trainer_state for crash-resilient resume."""
+    snap_dir = Path(checkpoint_dir) / "snapshots" / f"u{updates:04d}"
+    latest_dir = Path(checkpoint_dir) / "latest"
+    model.save_checkpoint(snap_dir, metadata)
+    latest_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(snap_dir / "model.pt", latest_dir / "model.pt")
+    _atomic_torch_save(trainer_state, latest_dir / "trainer_state.pt")
+
+
+def _try_load_resume_state(model, checkpoint_dir, optimizer, scheduler=None, emb_optimizer=None, emb_scheduler=None):
+    latest_dir = Path(checkpoint_dir) / "latest"
+    ckpt_path = latest_dir / "model.pt"
+    state_path = latest_dir / "trainer_state.pt"
+    if not ckpt_path.exists() or not state_path.exists():
+        return None
+    model.load_checkpoint(ckpt_path)
+    state = torch.load(state_path, map_location="cpu", weights_only=False)
+    if state.get("optimizer") is not None and optimizer is not None:
+        optimizer.load_state_dict(state["optimizer"])
+    if state.get("scheduler") is not None and scheduler is not None:
+        scheduler.load_state_dict(state["scheduler"])
+    if state.get("emb_optimizer") is not None and emb_optimizer is not None:
+        emb_optimizer.load_state_dict(state["emb_optimizer"])
+    if state.get("emb_scheduler") is not None and emb_scheduler is not None:
+        emb_scheduler.load_state_dict(state["emb_scheduler"])
+    if state.get("py_rng") is not None:
+        random.setstate(state["py_rng"])
+    if state.get("torch_rng") is not None:
+        torch.set_rng_state(state["torch_rng"])
+    return state
+
+
 def _run_emb_only(model, data, args, run_dir, checkpoint_dir, started):
     run_name = getattr(args, "run_name", None) or args.mode
     if getattr(args, "init_checkpoint", None):
@@ -772,7 +841,21 @@ def _run_emb_only(model, data, args, run_dir, checkpoint_dir, started):
     model.eval()
     dataset_root = None if args.smoke else args.dataset
     emb_families = [f for f in RETRIEVAL_FAMILIES if data.get(f)]
+    cache_sig = {
+        "init_sig": teacher_signature(getattr(args, "init_checkpoint", None)),
+        "max_seq_len": args.max_seq_len,
+        "emb_families": emb_families,
+        "smoke": bool(args.smoke),
+        "seed": args.seed,
+        "prep_sig": model_preprocess_signature(model),
+    }
+    cache_path = Path(run_dir) / "hidden_cache.pt"
     hidden_cache = {}
+    if not args.smoke and cache_path.exists():
+        saved_cache = torch.load(cache_path, map_location="cpu", weights_only=False)
+        if saved_cache.get("signature") == cache_sig and isinstance(saved_cache.get("states"), dict):
+            hidden_cache = saved_cache["states"]
+    added_states = 0
     with torch.no_grad():
         for fam in emb_families:
             for r in data[fam]:
@@ -782,8 +865,14 @@ def _run_emb_only(model, data, args, run_dir, checkpoint_dir, started):
                         hidden_cache[key] = model.state_hidden(
                             r[text_k], args.max_seq_len, images=resolve_images(r, dataset_root, img_k)
                         ).detach().float().cpu()
-    if model.device.type == "cuda":
-        torch.cuda.empty_cache()
+                        _cuda_cleanup(model.device)
+                        added_states += 1
+                        if not args.smoke and added_states >= 40:
+                            _atomic_torch_save({"signature": cache_sig, "states": hidden_cache}, cache_path)
+                            added_states = 0
+    if not args.smoke and added_states > 0:
+        _atomic_torch_save({"signature": cache_sig, "states": hidden_cache}, cache_path)
+    _cuda_cleanup(model.device)
 
     emb_params = list(model.W_emb.parameters())
     emb_lr = args.emb_lr if getattr(args, "emb_lr", None) is not None else args.head_lr
@@ -798,11 +887,29 @@ def _run_emb_only(model, data, args, run_dir, checkpoint_dir, started):
     rng = random.Random(args.seed)
     cycles = {fam: _GroupCycle(_group_buckets(data[fam]), rng) for fam in emb_families}
     task_steps = {fam: 0 for fam in emb_families}
+    start_step = 0
+    if getattr(args, "resume", False):
+        resumed = _try_load_resume_state(model, checkpoint_dir, emb_optimizer, scheduler=scheduler)
+        if resumed is not None:
+            start_step = int(resumed.get("step", 0))
+            task_steps = dict(resumed.get("task_steps", task_steps))
+            if resumed.get("initial_emb") is not None:
+                initial_emb = resumed["initial_emb"].to(device=initial_emb.device, dtype=initial_emb.dtype)
+            if resumed.get("initial_head") is not None:
+                initial_head = resumed["initial_head"].to(device=initial_head.device, dtype=initial_head.dtype)
+            model.configure_training("emb_only", gradient_checkpointing=False)
+    save_every = int(getattr(args, "save_every", 0) or 0)
     log_path = run_dir / "metrics.jsonl"
+    if start_step > 0 and log_path.exists():
+        kept = [line for line in log_path.read_text().splitlines() if line.strip() and json.loads(line).get("step", 0) <= start_step]
+        log_path.write_text("\n".join(kept) + ("\n" if kept else ""))
     model.W_emb.train()
-    with log_path.open("w") as log:
+    with log_path.open("a" if start_step > 0 else "w") as log:
         for step in range(1, total_updates + 1):
             fam = emb_families[(step - 1) % len(emb_families)]
+            if step <= start_step:
+                distinct_group_emb_batch(data[fam], cycles[fam], args.emb_batch_size)
+                continue
             batch = distinct_group_emb_batch(data[fam], cycles[fam], args.emb_batch_size)
             keys = (
                 [(r["anchor_text"], image_fingerprints(r, "anchor_images")) for r in batch] +
@@ -829,6 +936,18 @@ def _run_emb_only(model, data, args, run_dir, checkpoint_dir, started):
             log.write(json.dumps({"step": step, "epoch": 0, "family": fam,
                                   "loss": float(loss.detach()), "grad_norm": grad_norm,
                                   "optimizer_updates": step}) + "\n")
+            log.flush()
+            if save_every and step % save_every == 0:
+                _save_periodic_snapshot(
+                    model, checkpoint_dir, step,
+                    {"mode": args.mode, "run_name": run_name, "smoke": args.smoke,
+                     "steps": step, "optimizer_updates": step},
+                    {"step": step, "task_steps": task_steps,
+                     "optimizer": emb_optimizer.state_dict(),
+                     "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                     "initial_head": initial_head.cpu(), "initial_emb": initial_emb.cpu(),
+                     "py_rng": random.getstate(), "torch_rng": torch.get_rng_state()},
+                )
     metrics = {
         "mode": "emb_only", "run_name": run_name, "smoke": args.smoke, "seed": args.seed,
         "init_checkpoint": str(args.init_checkpoint) if getattr(args, "init_checkpoint", None) else None,
@@ -1011,15 +1130,39 @@ def run_training(args):
     decision_params = pointer_params + lora_params if emb_detach else pointer_params + emb_params + lora_params
     task_steps = {family: 0 for family in families}
     total_steps, updates, pending = 0, 0, 0
+    resume_step = 0
+    if getattr(args, "resume", False):
+        resumed = _try_load_resume_state(
+            model, checkpoint_dir, optimizer, scheduler=scheduler,
+            emb_optimizer=emb_optimizer, emb_scheduler=emb_scheduler,
+        )
+        if resumed is not None:
+            resume_step = int(resumed.get("step", 0))
+            total_steps = resume_step
+            updates = int(resumed.get("updates", 0))
+            pending = int(resumed.get("pending", 0))
+            task_steps = dict(resumed.get("task_steps", task_steps))
+            if resumed.get("initial_head") is not None:
+                initial_head = resumed["initial_head"].to(device=initial_head.device, dtype=initial_head.dtype)
+            if resumed.get("initial_emb") is not None:
+                initial_emb = resumed["initial_emb"].to(device=initial_emb.device, dtype=initial_emb.dtype)
+            if resumed.get("initial_lora_sums") is not None:
+                initial_lora_sums = list(resumed["initial_lora_sums"])
+            model.configure_training(args.mode, gradient_checkpointing=args.gradient_checkpointing)
     emb_grad_cache = bool(getattr(args, "emb_grad_cache", False))
     save_every = int(getattr(args, "save_every", 0) or 0)
     dataset_root = None if args.smoke else args.dataset
     prep_sig = model_preprocess_signature(model)
     started = time.perf_counter()
     log_path = run_dir / "metrics.jsonl"
-    with log_path.open("w") as log:
+    if resume_step > 0 and log_path.exists():
+        kept = [line for line in log_path.read_text().splitlines() if line.strip() and json.loads(line).get("step", 0) <= resume_step]
+        log_path.write_text("\n".join(kept) + ("\n" if kept else ""))
+    with log_path.open("a" if resume_step > 0 else "w") as log:
         for step_info in scheduled_steps:
             step = step_info["step"]
+            if step <= resume_step:
+                continue
             epoch = step_info["epoch"]
             family = step_info["family"]
             index = step_info["index"]
@@ -1035,6 +1178,8 @@ def run_training(args):
                         detach_backbone=emb_detach, dataset_root=dataset_root,
                     )
                     loss_scalar = args.emb_weight * loss_val
+                    if model.device.type == "cuda":
+                        torch.cuda.empty_cache()
                 else:
                     loss = matryoshka_infonce(
                         model, batch, args.max_seq_len, detach_backbone=emb_detach, dataset_root=dataset_root
@@ -1094,6 +1239,7 @@ def run_training(args):
                 (loss / args.grad_accum).backward()
                 loss_scalar = float(loss.detach())
 
+            _cuda_cleanup(model.device)
             pending += 1
             total_steps = step
             task_steps[family] += 1
@@ -1110,10 +1256,19 @@ def run_training(args):
                 updates += 1
                 pending = 0
                 if save_every and updates % save_every == 0:
-                    model.save_checkpoint(checkpoint_dir / "latest", {
-                        "mode": args.mode, "run_name": run_name, "smoke": args.smoke,
-                        "steps": total_steps, "optimizer_updates": updates,
-                    })
+                    _save_periodic_snapshot(
+                        model, checkpoint_dir, updates,
+                        {"mode": args.mode, "run_name": run_name, "smoke": args.smoke,
+                         "steps": total_steps, "optimizer_updates": updates},
+                        {"step": total_steps, "updates": updates, "pending": pending,
+                         "task_steps": task_steps, "optimizer": optimizer.state_dict(),
+                         "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                         "emb_optimizer": emb_optimizer.state_dict() if emb_optimizer is not None else None,
+                         "emb_scheduler": emb_scheduler.state_dict() if emb_scheduler is not None else None,
+                         "initial_head": initial_head.cpu(), "initial_emb": initial_emb.cpu(),
+                         "initial_lora_sums": initial_lora_sums,
+                         "py_rng": random.getstate(), "torch_rng": torch.get_rng_state()},
+                    )
             log.write(json.dumps({
                 "step": total_steps, "epoch": epoch, "family": family,
                 "benchmark": row.get("benchmark"), "task_group": row.get("task_group"),
@@ -1201,6 +1356,7 @@ def parser():
     p.add_argument("--mm-ce-weight", type=float, default=None)
     p.add_argument("--perm-kl", type=float, default=0)
     p.add_argument("--save-every", type=int, default=0)
+    p.add_argument("--resume", action="store_true", help="Resume from latest snapshot and trainer_state.pt if present")
     p.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out-dir", type=Path, help="Root containing runs/<mode> and checkpoints/<mode>")

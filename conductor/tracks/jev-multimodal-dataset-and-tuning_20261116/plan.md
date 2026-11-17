@@ -51,5 +51,5 @@
 - [x] Task 4.2: Iteration 2..N — Targeted diagnostics & refinement loop (consult `gpt-6-astra` via `agent-pair` as needed)
     - [x] Adjust sampling ratios, per-family KL weights, or Stage-B `W_emb` multimodal projection refit to resolve any gate regressions without touching `dev`.
     - [x] Repeat bounded small-scale runs until all Go/No-Go gates pass simultaneously on `cal`.
-- [ ] Task 4.3: Readiness Review for Full-Scale Training
-    - [ ] Present complete `cal` 5-fold CV comparison table (`zero_shot_kev` vs `exp_b7_final` vs winning small-scale candidate) across all text, generic, bilingual, and multimodal suites, and get user sign-off on the final full-scale training recipe.
+- [x] Task 4.3: Readiness Review for Full-Scale Training
+    - [x] Present complete `cal` 5-fold CV comparison table (`zero_shot_kev` vs `exp_b7_final` vs winning small-scale candidate) across all text, generic, bilingual, and multimodal suites, and get user sign-off on the final full-scale training recipe.
