@@ -14,7 +14,15 @@ from torch import nn
 from torch.nn import functional as F
 
 BASE_MODEL = "Qwen/Qwen3.5-0.8B-Base"
+BASE_MODEL_REVISION = "dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68"
 KEV_ADAPTER = "jaredpalmer/kev-0.8b"
+KEV_ADAPTER_REVISION = "bf75a6a8848ea6960ff2ed108d9ed44c2941174f"
+
+
+def resolve_cached_snapshot(repo_id: str, revision: str, cache_dir: str | Path | None = None, local_files_only: bool = True) -> Path:
+    from huggingface_hub import snapshot_download
+
+    return Path(snapshot_download(repo_id, revision=revision, cache_dir=cache_dir, local_files_only=local_files_only))
 # Reuse Qwen's native special delimiters aligned with jaredpalmer/kev-0.8b LoRA weights:
 # [state_prefix] -> [question] [opt_start ... opt_end]+ [decide].
 SPECIAL_TOKENS = ("<|fim_prefix|>", "<|fim_middle|>", "<|box_start|>", "<|box_end|>", "<|fim_suffix|>")
@@ -281,14 +289,14 @@ class DualHeadDecisionEmbedder(nn.Module):
         return pixel_values, image_grid_thw, token_counts
 
     @classmethod
-    def from_pretrained(cls, device="cpu", dtype=torch.float32, trainable_adapter=False, include_vision=False):
-        from huggingface_hub import snapshot_download
+    def from_pretrained(cls, device="cpu", dtype=torch.float32, trainable_adapter=False, include_vision=False,
+                        base_revision=BASE_MODEL_REVISION, adapter_revision=KEV_ADAPTER_REVISION, cache_dir=None):
         from peft import PeftModel
         from safetensors.torch import load_file
         from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen3_5ForConditionalGeneration
 
-        base_path = snapshot_download(BASE_MODEL, local_files_only=True)
-        adapter_path = Path(snapshot_download(KEV_ADAPTER, local_files_only=True))
+        base_path = str(resolve_cached_snapshot(BASE_MODEL, base_revision, cache_dir=cache_dir, local_files_only=True))
+        adapter_path = resolve_cached_snapshot(KEV_ADAPTER, adapter_revision, cache_dir=cache_dir, local_files_only=True)
         tokenizer = AutoTokenizer.from_pretrained(base_path, local_files_only=True)
         visual = None
         vision_config = None
@@ -644,6 +652,24 @@ class ByteTokenizer:
 
     def encode(self, text, add_special_tokens=False):
         return [value + 1 for value in text.encode("utf-8")]
+
+    def decode(self, ids, skip_special_tokens=False):
+        inv = {idx: tok for tok, idx in self.vocab.items()}
+        out = []
+        raw_bytes = bytearray()
+        for idx in ids:
+            tok = inv.get(int(idx), "")
+            if tok.startswith("byte_"):
+                raw_bytes.append(int(tok[5:]))
+                continue
+            if raw_bytes:
+                out.append(raw_bytes.decode("utf-8", errors="replace"))
+                raw_bytes.clear()
+            if not skip_special_tokens and tok:
+                out.append(tok)
+        if raw_bytes:
+            out.append(raw_bytes.decode("utf-8", errors="replace"))
+        return "".join(out)
 
 
 class SyntheticVisionModel(nn.Module):

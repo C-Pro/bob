@@ -293,6 +293,7 @@ def test_same_iteration_candidates_do_not_observe_one_another(counter):
 
 
 def test_exact_tokenizer_interface(monkeypatch):
+    import huggingface_hub
     import transformers
     seen = []
 
@@ -301,14 +302,22 @@ def test_exact_tokenizer_interface(monkeypatch):
             assert add_special_tokens is False
             return [11, 22, 33]
 
+    def fake_snapshot_download(repo_id, **kwargs):
+        seen.append(("snapshot", repo_id, kwargs.get("revision"), kwargs.get("local_files_only")))
+        return "/fake/snapshot/path"
+
     def from_pretrained(name, **kwargs):
-        seen.append(name)
+        seen.append(("tokenizer", name, kwargs.get("local_files_only")))
         return FakeTokenizer()
 
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
     monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", from_pretrained)
     counter = b.TokenCounter()
     assert counter("text whose character count is different") == 3
-    assert seen == ["Qwen/Qwen3.5-0.8B-Base"]
+    assert seen == [
+        ("snapshot", "Qwen/Qwen3.5-0.8B-Base", b.MODEL_REVISION, True),
+        ("tokenizer", "/fake/snapshot/path", True),
+    ]
 
 
 def test_end_to_end_files_weights_exclusions_and_pair_isolation(tmp_path, counter):

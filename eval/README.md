@@ -2,7 +2,7 @@
 
 The `eval/` subsystem implements **Phase 3: Evaluation Dataset and Deterministic CLI Gatekeeper Harness** from Bob's architecture roadmap. It provides a reproducible, hermetic measurement environment designed to evaluate Bob's autonomous agent capabilities across coding, system navigation, CTF challenge solving, and multi-hop research without human supervision, as well as a large-scale trajectory generation pool for Phase 4 Jev decision model distillation.
 
-For complete specifications of the dataset partitioning, schema, and trajectory statistics, see **[DATASET.md](DATASET.md)**.
+For complete specifications of the dataset partitioning, schema, and trajectory statistics, see **[DATASET.md](DATASET.md)**. For the trained 0.8B System-1 decision and embedding model (`bob-s1-0.8b`, dev codename `Jev`), see **[BOB_S1.md](BOB_S1.md)**.
 
 ---
 

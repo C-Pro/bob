@@ -11,10 +11,9 @@ The dataset is partitioned into two strictly isolated sets with **zero task over
 1. **Held-Out Evaluation Suite (`eval/tasks/heldout/`):**
    - 100 frozen tasks used exclusively for offline evaluation and capability benchmarking.
    - Guaranteed zero snooping: no training, fine-tuning, or prompt optimization uses these tasks.
-2. **Training Trajectory Dataset (`eval/tasks/train/` & `eval/results/train/`):**
-   - 417 clean tasks spanning the same 4 benchmark domains.
-   - Multi-turn execution traces collected with `gemini-3.5-flash-lite` for Phase 4 Jev decision model experiments.
-   - Full recording of all step-level tool invocations, stdout/stderr outputs, and SelfCompact compaction events.
+2. **Training Trajectory Source & Filtered Dataset (`eval/tasks/train/`, `eval/results/train/`, & `eval/results/jev_dataset/`):**
+   - `train_pool.json` contains `417` tasks spanning the same 4 benchmark domains after removing `7` initial overlaps from the candidate training pool (`batch_train_pool_1794581821` records all `417` source rollouts and `19,706` steps).
+   - Downstream extractor [`build_jev_dataset.py`](harness/build_jev_dataset.py) (`--quarantine-heldout`) further isolates and quarantines `2` residual held-out collisions (`ic_ctf_005`, `ic_ctf_068`), producing **`415` clean rollouts (`19,687` source steps)** in `eval/results/jev_dataset/`.
 
 ```
 eval/
@@ -52,7 +51,7 @@ Both splits draw from four standard benchmark suites representing diverse autono
 | **Total Tasks** | **100** | **417** | **517** | | |
 
 > [!IMPORTANT]
-> The training pool originally contained 7 tasks overlapping with `heldout_100.json`. These tasks were programmatically purged, ensuring a **strict 0% overlap guarantee** across task IDs and challenge instances.
+> Seven initially overlapping tasks were removed from the candidate training pool (`train_pool.json`), leaving `417` source rollouts in `batch_train_pool_1794581821` (with `heldout_100.json` untouched). Running `eval/harness/build_jev_dataset.py --quarantine-heldout` further quarantined `2` residual held-out identity collisions (`ic_ctf_005`, `ic_ctf_068`), leaving **`415` clean rollouts (`19,687` source steps)** in `eval/results/jev_dataset/` with `heldout_overlap_count = 0`. For the V2 extension splits (`generic_decisions`, 3-class `loop_guard`, bilingual `emb_pairs`, `multimodal_*`) and trained `bob-s1-0.8b` results, see [BOB_S1.md](BOB_S1.md).
 
 ---
 

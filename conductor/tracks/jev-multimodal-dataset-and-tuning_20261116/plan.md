@@ -53,3 +53,10 @@
     - [x] Repeat bounded small-scale runs until all Go/No-Go gates pass simultaneously on `cal`.
 - [x] Task 4.3: Readiness Review for Full-Scale Training
     - [x] Present complete `cal` 5-fold CV comparison table (`zero_shot_kev` vs `exp_b7_final` vs winning small-scale candidate) across all text, generic, bilingual, and multimodal suites, and get user sign-off on the final full-scale training recipe.
+
+---
+
+## Phase 5: 4k Full Training, GGUF Release (`bob-s1-0.8b`) & Track Wrap-Up
+- [x] Task 5.1: Full-context `4096`-token Stage 1 (`exp_b_v2_4k` → `u0048`) + Stage 2 (`exp_b_v2_4k_emb_onlymm`) training, `cal` gate sign-off (`cal_cv_v2_4k_u48_emb`), and locked V2 `dev` evaluation (`dev_final_v2_4k`)
+- [x] Task 5.2: Export `bob-s1-0.8b` GGUF artifacts (`bob-s1-0.8b-bf16.gguf`, `bob-s1-0.8b-q4_k_m.gguf`, `bob-s1-0.8b-mmproj-bf16.gguf`, `bob-s1-0.8b-heads.pt`, `bob-s1-0.8b-preprocess.json`), add symlink alias `eval/jev/checkpoints/bob-s1-0.8b -> exp_b_v2_4k_emb_onlymm`, and formalize + unit-test the export pipeline in `eval/jev/export_gguf.py` + `eval/jev/test_export_gguf.py`
+- [x] Task 5.3: Publish Model Card & Reproducible Technical Report ([`eval/BOB_S1.md`](../../../eval/BOB_S1.md)), critique via `agent-pair` (`gpt-6-astra`), and link from `README.md`, `eval/README.md`, `eval/DATASET.md`, and `conductor/index.md`

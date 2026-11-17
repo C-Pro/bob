@@ -25,6 +25,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 ROOT = Path(__file__).resolve().parents[2]
 MODEL = "Qwen/Qwen3.5-0.8B-Base"
+MODEL_REVISION = "dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68"
 SCHEMA_VERSION = "jev-extension-v2"
 RENDERER_VERSION = "jev-ext-builder-v2"
 SPLITS = ("train", "cal", "dev")
@@ -61,9 +62,11 @@ class TokenCounter:
         self.char_fallback = char_fallback
         self.tokenizer = None
         if not char_fallback:
+            from huggingface_hub import snapshot_download
             from transformers import AutoTokenizer
 
-            self.tokenizer = AutoTokenizer.from_pretrained(MODEL, cache_dir=cache_dir, local_files_only=True)
+            snap_dir = snapshot_download(MODEL, revision=MODEL_REVISION, cache_dir=cache_dir, local_files_only=True)
+            self.tokenizer = AutoTokenizer.from_pretrained(snap_dir, local_files_only=True)
 
     def __call__(self, text: str) -> int:
         if self.char_fallback:

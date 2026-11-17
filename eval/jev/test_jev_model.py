@@ -10,8 +10,9 @@ import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from model import (BASE_MODEL, KEV_ADAPTER, SPECIAL_TOKENS, SLICE_DIMS,
-                   DualHeadDecisionEmbedder, clone_prefix_cache, synthetic_model)
+from model import (BASE_MODEL, BASE_MODEL_REVISION, KEV_ADAPTER, KEV_ADAPTER_REVISION,
+                   SPECIAL_TOKENS, SLICE_DIMS, DualHeadDecisionEmbedder, clone_prefix_cache,
+                   resolve_cached_snapshot, synthetic_model)
 from train_experiment import (class_balanced_weights, iter_scheduled_steps,
                               matryoshka_infonce, option_order,
                               per_class_unit_weights, smoke_rows)
@@ -231,13 +232,12 @@ def test_metrics_and_tied_risk_threshold():
 
 
 def test_cached_kev_adapter_all_372_tensors_loaded():
-    from huggingface_hub import snapshot_download
     from huggingface_hub.errors import LocalEntryNotFoundError
     try:
-        base = Path(snapshot_download(BASE_MODEL, local_files_only=True))
-        adapter = Path(snapshot_download(KEV_ADAPTER, local_files_only=True))
+        base = resolve_cached_snapshot(BASE_MODEL, BASE_MODEL_REVISION, local_files_only=True)
+        adapter = resolve_cached_snapshot(KEV_ADAPTER, KEV_ADAPTER_REVISION, local_files_only=True)
     except LocalEntryNotFoundError:
-        pytest.skip("Qwen/Kev snapshots are not in the local HF cache")
+        pytest.skip("Pinned Qwen/Kev snapshots are not in the local HF cache")
     if not list(base.glob("*.safetensors")) or not (adapter / "adapter_model.safetensors").exists() or not (adapter / "head.pt").exists():
         pytest.skip("Qwen/Kev weight files are not fully cached")
     model = DualHeadDecisionEmbedder.from_pretrained(device="cpu", dtype=torch.bfloat16)
@@ -889,14 +889,13 @@ def test_exp_a_default_kl_multitask_v2_defaults_and_image_fingerprints(tmp_path)
 
 
 def test_cached_kev_multimodal_smoke():
-    from huggingface_hub import snapshot_download
     from huggingface_hub.errors import LocalEntryNotFoundError
 
     try:
-        base = Path(snapshot_download(BASE_MODEL, local_files_only=True))
-        adapter = Path(snapshot_download(KEV_ADAPTER, local_files_only=True))
+        base = resolve_cached_snapshot(BASE_MODEL, BASE_MODEL_REVISION, local_files_only=True)
+        adapter = resolve_cached_snapshot(KEV_ADAPTER, KEV_ADAPTER_REVISION, local_files_only=True)
     except LocalEntryNotFoundError:
-        pytest.skip("Qwen/Kev snapshots are not in the local HF cache")
+        pytest.skip("Pinned Qwen/Kev snapshots are not in the local HF cache")
     if not list(base.glob("*.safetensors")) or not (adapter / "adapter_model.safetensors").exists() or not (adapter / "head.pt").exists():
         pytest.skip("Qwen/Kev weight files are not fully cached")
 
