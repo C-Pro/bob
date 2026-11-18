@@ -1,0 +1,8 @@
+{
+  "track_id": "bob-s1-inference-sidecar_20261118",
+  "type": "feature",
+  "status": "in_progress",
+  "created_at": "2026-11-18T15:30:00Z",
+  "updated_at": "2026-11-18T15:30:00Z",
+  "description": "Temporary OpenAI-compatible Python inference sidecar for bob-s1-0.8b supporting multimodal Matryoshka embeddings (/v1/embeddings), System-1 PointerHead decisions (/v1/chat/completions), single-pass joint output, elastic max_seq_len, and frozen conformance fixtures for future native server patches (lemond/vllm/llama.cpp)."
+}

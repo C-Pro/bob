@@ -19,16 +19,16 @@ Replace expensive generative LLM control-plane calls and external embedding APIs
 
 ### Critical Gated DeltaNet Constraint
 Because `Qwen3.5` contains **18 Gated DeltaNet (linear attention + causal conv1d) layers**, attention masking alone **cannot** isolate sibling question branches on a single packed sequence: DeltaNet's recurrent state and short-conv history leak prior tokens across masked branches. Therefore:
-1. **Training & Correct Reference Semantics:** Evaluate each `(State 1..S, <|state_end|>, Question k)` on **independent rows** (matching `jaredpalmer/kev`), guaranteeing zero cross-question state contamination.
-2. **State-Prefix Invariance:** Within every row `[State 1..S] <|state_end|> [Question k & Options]`, causal attention and DeltaNet recurrence satisfy $\partial H_{S+1} / \partial x_{>S+1} = 0$. Reading `<|state_end|>` yields a **question-invariant** state representation in the exact same forward pass as answering Question `k`.
-3. **Inference Optimization (Forked `llama-server` / Python Cache):** Compute `(KV, Gated DeltaNet recurrent_state, conv_state)` once for `[State 1..S] <|state_end|>`, extract the embedding at `<|state_end|>`, then **clone** (never mutate in-place across siblings) the prefix cache per question branch with matching `position_ids`.
+1. **Training & Correct Reference Semantics:** Evaluate each `(State 1..S, Question k)` on **independent rows** (matching `jaredpalmer/kev`), guaranteeing zero cross-question state contamination. Implemented in `eval/jev/model.py` using Qwen native FIM/box delimiters: `<|fim_prefix|> [<|vision_start|> <|image_pad|>×N <|vision_end|>]* STATE` followed by `<|fim_middle|> Q (<|box_start|> opt_k: desc <|box_end|>)+ <|fim_suffix|>`.
+2. **State-Prefix Invariance:** Within every row `[Prefix 0..S-1] [Suffix S..L-1]`, causal attention and DeltaNet recurrence satisfy $\partial H_{S-1} / \partial x_{\ge S} = 0$. Reading the last prefix hidden state $H_{S-1}$ yields a **question-invariant** state representation in the exact same forward pass as answering Question `k`.
+3. **Inference Optimization (Python / Forked `llama-server` Cache):** Compute `(KV, Gated DeltaNet recurrent_state, conv_state)` once for the prefix `[0..S-1]`, extract the embedding at $H_{S-1}$, then **clone** (never mutate in-place across siblings) the prefix cache per question branch with matching `position_ids` (`question_from_prefix(..., isolate=True)`).
 
 ### Dual-Head Design & Anti-Collapse Controls
 1. **Dedicated Multimodal Embedding Head (`W_emb`):**
-   - Projects $H_{\langle\text{|state\_end|}\rangle} \in \mathbb{R}^{1024}$ to Matryoshka dims `[128, 256, 384]` (`L2`-normalized **per sliced dimension** independently).
-   - Accepts text-only states, `<__media__>` images, or interleaved screenshot+text states in one space via frozen `qwen3_5_vision`.
+   - Projects $H_{S-1} \in \mathbb{R}^{1024}$ to Matryoshka dims `[128, 256, 384]` (`L2`-normalized **per sliced dimension** independently).
+   - Accepts text-only states, images, or images-followed-by-text states in one space via frozen `qwen3_5_vision` (`prepare_state` prepends all image spans before text tokens; arbitrary text-image-text interleaving is not currently implemented).
 2. **Decision / Pointer Head (`PointerHead`):**
-   - `LayerNorm(hidden)` + `q = Linear(hidden, dim)` at `<answer>` + `k = Linear(hidden, dim)` at candidate option closing tokens -> `bmm(k, q) / sqrt(dim)`.
+   - Two bias-enabled linear projections without `LayerNorm` (matching `kev-0.8b`): `q = Linear(1024, 256, bias=True)` at `<|fim_suffix|>` + `k = Linear(1024, 256, bias=True)` at candidate `<|box_end|>` tokens -> `(q · k) / sqrt(256)`.
    - Primitives: `noul` (boolean), `choice` (`2..255` options + abstention threshold selected by risk-vs-coverage / asymmetric cost curves, never assuming rescaled `p_max` equals calibrated probability without domain calibration), and `score` (`2..10` levels -> $E[\text{score}]$).
 3. **Empirically Verified Head-Interference Prevention:**
    - **Baseline first:** Freeze the backbone and train `W_emb` + `PointerHead` linear/MLP heads only to measure separation without risking backbone drift.
@@ -68,6 +68,7 @@ Audited directly across all `417` rollout files in [`eval/results/train/batch_tr
 3. **Experiment 2 (Dual-Head + `W_emb` Offline Teacher Distillation):** Cache `Qwen/Qwen3-VL-Embedding-8B` / `SemIf-OpenJev` outputs offline (never co-loading 8B+4B teachers during student training on unified RAM), evaluate retrieval `Recall@1/5` + Alignment/Uniformity alongside decision metrics, and run all **4** prefix/cache invariance tests.
 4. **Experiment 3 (End-to-End Controller Eval):** **Compaction Gate Policy Explicit Spec:** When System-1 `ShouldCompact == YES`, Bob **must still invoke the structured summarizer LLM** to populate `CompactedTaskState` (`internal/fsm/compaction.go:785`), never silently falling back to `buildDeterministicCompactedState`. End-to-end latency savings come from skipping unnecessary summary calls (`NO`), and total latency must measure `gate + invoked summarizer`.
 
-### Phase A -> Phase B (`llama-server`) Deployment
-- **Phase A (Stock `llama-server`):** `/v1/systemone` (`PR #29818`) + `/v1/embeddings` (`--mmproj mmproj.gguf --embeddings`) with KV prefix cache reuse. Only used to validate GBNF single-token baselines and multimodal embedding transport.
-- **Phase B (Forked `llama-server` in `/home/cpro/work/experiments/llama.cpp`):** Custom single-pass endpoint cloning `(kv, recurrent_state, conv_state)` from `<|state_end|>`, returning `{embedding, decisions}` natively with `PointerHead` + `W_emb` (no stock `/v1/systemone` GBNF limitation).
+### Sidecar -> Phase B (`llama-server` / `lemond` / `vllm`) Deployment
+- **Measured Serving Gap (`eval/BOB_S1.md` §6.2):** Stock `llama-server`, `lemond`, and `Ollama` do not currently support multimodal `/embeddings` (`mmproj` hidden-state extraction) or `--pooling none` `PointerHead` scoring over `/v1/embeddings`.
+- **Interim Sidecar ([`bob-s1-inference-sidecar_20261118`](../bob-s1-inference-sidecar_20261118/spec.md)):** Temporary OpenAI-compatible Python inference sidecar under `services/bob_s1/` wrapping `DualHeadDecisionEmbedder` for multimodal embeddings (`POST /v1/embeddings`), `PointerHead` decisions (`POST /v1/chat/completions` with `bob-s1.decision.v1`), and single-pass joint output.
+- **Phase B (Native Inference Server Patches — Out of Sidecar Scope):** Patch `llama-server` / `lemond` / `vllm` to natively execute `W_emb` + `PointerHead` + `mmproj` and clone `(kv, recurrent_state, conv_state)` from the shared prefix while honoring the frozen OpenAI-compatible wire contract and conformance fixtures established by the sidecar track.

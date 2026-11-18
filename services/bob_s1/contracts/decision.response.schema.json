@@ -1,0 +1,171 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "bob-s1/decision.response.schema.json",
+  "title": "BobS1DecisionProtocolResponse",
+  "type": "object",
+  "required": ["protocol", "decisions", "embedding", "preparation"],
+  "additionalProperties": false,
+  "properties": {
+    "protocol": { "const": "bob-s1.decision.v1" },
+    "decisions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "task",
+          "scoring_mode",
+          "choice",
+          "choice_basis",
+          "scores",
+          "probability_kind",
+          "expected_score",
+          "calibration",
+          "prefix_tokens",
+          "suffix_tokens",
+          "truncated"
+        ],
+        "additionalProperties": false,
+        "if": {
+          "properties": { "probability_kind": { "const": "calibrated_affine" } }
+        },
+        "then": {
+          "properties": {
+            "choice_basis": { "const": "calibrated_argmax" },
+            "calibration": {
+              "type": "object",
+              "required": ["profile", "applied", "mismatch_reason", "temperature", "bias", "balanced_threshold", "risk_threshold_5pct"],
+              "properties": {
+                "profile": { "type": "string", "minLength": 1 },
+                "applied": { "const": true },
+                "mismatch_reason": { "type": "null" },
+                "temperature": { "type": "number", "exclusiveMinimum": 0 },
+                "bias": { "type": "number" },
+                "balanced_threshold": { "type": ["number", "null"] },
+                "risk_threshold_5pct": { "type": ["number", "null"] }
+              }
+            }
+          }
+        },
+        "else": {
+          "properties": {
+            "choice_basis": { "const": "raw_argmax" },
+            "calibration": {
+              "type": "object",
+              "required": ["profile", "applied", "mismatch_reason", "temperature", "bias", "balanced_threshold", "risk_threshold_5pct"],
+              "properties": {
+                "profile": { "type": "null" },
+                "applied": { "const": false },
+                "mismatch_reason": { "type": "string", "minLength": 1 },
+                "temperature": { "type": "null" },
+                "bias": { "type": "null" },
+                "balanced_threshold": { "type": "null" },
+                "risk_threshold_5pct": { "type": "null" }
+              }
+            }
+          }
+        },
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "task": { "type": ["string", "null"] },
+          "scoring_mode": { "type": "string", "enum": ["joint", "equivariant"] },
+          "choice": { "type": "string", "minLength": 1 },
+          "choice_basis": { "type": "string", "enum": ["raw_argmax", "calibrated_argmax"] },
+          "scores": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 255,
+            "items": {
+              "type": "object",
+              "required": ["id", "logit", "probability"],
+              "additionalProperties": false,
+              "properties": {
+                "id": { "type": "string", "minLength": 1 },
+                "logit": { "type": "number" },
+                "probability": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
+              }
+            }
+          },
+          "probability_kind": { "type": "string", "enum": ["uncalibrated_softmax", "calibrated_affine"] },
+          "expected_score": { "type": ["number", "null"] },
+          "calibration": {
+            "type": "object",
+            "required": ["profile", "applied", "mismatch_reason", "temperature", "bias", "balanced_threshold", "risk_threshold_5pct"],
+            "additionalProperties": false,
+            "properties": {
+              "profile": { "type": ["string", "null"] },
+              "applied": { "type": "boolean" },
+              "mismatch_reason": { "type": ["string", "null"] },
+              "temperature": { "type": ["number", "null"] },
+              "bias": { "type": ["number", "null"] },
+              "balanced_threshold": { "type": ["number", "null"] },
+              "risk_threshold_5pct": { "type": ["number", "null"] }
+            }
+          },
+          "prefix_tokens": { "type": "integer", "minimum": 1 },
+          "suffix_tokens": { "type": "integer", "minimum": 1 },
+          "truncated": { "type": "boolean" }
+        }
+      }
+    },
+    "embedding": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["dimensions", "encoding_format", "vector"],
+          "additionalProperties": false,
+          "properties": {
+            "dimensions": { "const": 128 },
+            "encoding_format": { "const": "float" },
+            "vector": { "type": "array", "minItems": 128, "maxItems": 128, "items": { "type": "number" } }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["dimensions", "encoding_format", "vector"],
+          "additionalProperties": false,
+          "properties": {
+            "dimensions": { "const": 256 },
+            "encoding_format": { "const": "float" },
+            "vector": { "type": "array", "minItems": 256, "maxItems": 256, "items": { "type": "number" } }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["dimensions", "encoding_format", "vector"],
+          "additionalProperties": false,
+          "properties": {
+            "dimensions": { "const": 384 },
+            "encoding_format": { "const": "float" },
+            "vector": { "type": "array", "minItems": 384, "maxItems": 384, "items": { "type": "number" } }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["dimensions", "encoding_format", "vector"],
+          "additionalProperties": false,
+          "properties": {
+            "dimensions": { "type": "integer", "enum": [128, 256, 384] },
+            "encoding_format": { "const": "base64" },
+            "vector": { "type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9+/=]+$" }
+          }
+        }
+      ]
+    },
+    "preparation": {
+      "type": "object",
+      "required": ["prefix_mode", "truncation_policy", "effective_max_seq_len", "suffix_reserve", "prefix_tokens", "truncated"],
+      "additionalProperties": false,
+      "properties": {
+        "prefix_mode": { "type": "string", "enum": ["per_question", "shared_prefix"] },
+        "truncation_policy": { "type": "string", "enum": ["head_tail", "error"] },
+        "effective_max_seq_len": { "type": "integer", "minimum": 1 },
+        "suffix_reserve": { "type": ["integer", "null"], "minimum": 0 },
+        "prefix_tokens": { "type": ["integer", "null"], "minimum": 1 },
+        "truncated": { "type": "boolean" }
+      }
+    }
+  }
+}

@@ -1,0 +1,81 @@
+{
+  "schema_version": "bob-s1-calibration-v1",
+  "checkpoint_id": "bob-s1-0.8b",
+  "source_report": "eval/results/jev_dataset/dev_final_v2_4k/experiment_report.json",
+  "source_experiment_key": "exp_b_v2_4k_emb_onlymm",
+  "calibration_split": "cal",
+  "provenance": {
+    "base_model": "Qwen/Qwen3.5-0.8B-Base",
+    "base_model_revision": "dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68",
+    "adapter_donor": "jaredpalmer/kev-0.8b",
+    "adapter_donor_revision": "bf75a6a8848ea6960ff2ed108d9ed44c2941174f",
+    "checkpoint_model_pt_sha256": "a0cfc5bb5fd214f76acdb2774cc99e2be35f4432c5cc85547ae9b410b731397c"
+  },
+  "binding_requirements": {
+    "checkpoint_id": "bob-s1-0.8b",
+    "checkpoint_model_pt_sha256": "a0cfc5bb5fd214f76acdb2774cc99e2be35f4432c5cc85547ae9b410b731397c",
+    "scoring_mode": "joint",
+    "prefix_mode": "per_question",
+    "effective_max_seq_len": 4096
+  },
+  "profiles": {
+    "compaction": {
+      "profile_id": "bob-s1-0.8b/compaction/cal_v2_4k",
+      "method": "binary_affine_sigmoid",
+      "positive_option_id": "compact",
+      "negative_option_id": "skip",
+      "question": "Should the observed task state be compacted now?",
+      "options": [
+        {
+          "id": "skip",
+          "description": "Keep raw context; no coherent verified checkpoint yet."
+        },
+        {
+          "id": "compact",
+          "description": "Summarize a coherent verified checkpoint into task state."
+        }
+      ],
+      "temperature": 1.895898683669047,
+      "bias": 4.25,
+      "balanced_threshold": 0.8964872561924658,
+      "balanced_threshold_target": "positive_class_probability",
+      "risk_policy": {
+        "threshold": 0.8393841862136965,
+        "threshold_target": "max_class_probability",
+        "cal_coverage": 0.8189415041782729,
+        "cal_error": 0.04761904761904767,
+        "target_error": 0.05,
+        "guarantee": "empirical_calibration_only_not_a_population_risk_bound"
+      }
+    },
+    "outcome_prefix": {
+      "profile_id": "bob-s1-0.8b/outcome_prefix/cal_v2_4k",
+      "method": "binary_affine_sigmoid",
+      "positive_option_id": "passed",
+      "negative_option_id": "failed",
+      "question": "Does the observed progress suggest eventual task success?",
+      "options": [
+        {
+          "id": "failed",
+          "description": "The task will fail its clean terminal evaluation."
+        },
+        {
+          "id": "passed",
+          "description": "The task will pass its clean terminal evaluation."
+        }
+      ],
+      "temperature": 3.1827525323597454,
+      "bias": -3.8375,
+      "balanced_threshold": 0.11540213902052458,
+      "balanced_threshold_target": "positive_class_probability",
+      "risk_policy": {
+        "threshold": 0.8490737114270981,
+        "threshold_target": "max_class_probability",
+        "cal_coverage": 0.5903614457831325,
+        "cal_error": 0.04081632653061229,
+        "target_error": 0.05,
+        "guarantee": "empirical_calibration_only_not_a_population_risk_bound"
+      }
+    }
+  }
+}

@@ -80,3 +80,8 @@
 
 - [x] **Track: Phase 4b — Comprehensive Multimodal Dataset, Zero-Shot Retention & Iterative Tuning Loop (`bob-s1-0.8b`, dev codename `Jev`)**
 *Link: [./tracks/jev-multimodal-dataset-and-tuning_20261116/](./tracks/jev-multimodal-dataset-and-tuning_20261116/) | [Model Card & Paper](../eval/BOB_S1.md)*
+
+---
+
+- [~] **Track: Temporary `bob-s1` Python Inference Sidecar (OpenAI-Compatible)**
+*Link: [./tracks/bob-s1-inference-sidecar_20261118/](./tracks/bob-s1-inference-sidecar_20261118/) (Multimodal `/v1/embeddings`, `bob-s1.decision.v1` over `/v1/chat/completions`, single-pass joint output, elastic `max_seq_len`)*

@@ -19,6 +19,8 @@ bin/
 /bob-proxy-fwd
 internal/sandbox/embedded/*.gz
 __pycache__/
+services/bob_s1/.venv/
+*.egg-info/
 eval/harness/repos/
 eval/tasks/**/*.json
 eval/tasks/*.json
