@@ -19,15 +19,15 @@
 ---
 
 ## Phase 3: Worker Scheduler, DeltaNet Prefix Isolation & OpenAI-Compatible Endpoints
-- [ ] Task 3.1: Implement single-worker inference scheduler (`worker.py`):
+- [x] Task 3.1: Implement single-worker inference scheduler (`worker.py`):
   - Dedicated device-owning thread + bounded FIFO queue (`BOB_S1_MAX_QUEUE_DEPTH`) executing unpadded `batch=1` forwards under `torch.inference_mode()` + `model.eval()`.
   - Handle client disconnects/cancellations safely at queue wait boundaries without releasing GPU lock mid-forward; return `429` (`queue_full`) on queue saturation.
   - Enforce exact `effective_max_seq_len` (`BOB_S1_MAX_SEQ_LEN` when omitted; reject explicit `max_seq_len > BOB_S1_MAX_SEQ_LEN` with `400`; accept in-range caps unchanged) across full token budgets (vision + delimiters + state + suffix).
-- [ ] Task 3.2: Implement embedding, decision, and joint execution paths + calibration engine (`calibration.py`):
+- [x] Task 3.2: Implement embedding, decision, and joint execution paths + calibration engine (`calibration.py`):
   - `/v1/embeddings`: standard `str` / `list[str]` and multimodal `[{"content": [...]}]` (images followed by optional text; reject repeated text, text-before-image, and token arrays); `dimensions` in `{128, 256, 384}` via `m.embeddings()`; `"float"` and little-endian float32 `"base64"`; `"error"` (default) and `"head_tail"` truncation; exact `400` when `text_budget < 1`.
   - `/v1/chat/completions`: structural parsing of outer Chat Completions envelope (`messages` = single `user` message with optional preceding `image_url` parts + JSON text part) + `bob-s1.decision.v1` JSON; explicit rejection of `stream: true`, `tools`, `logprobs: true`, and any sampling controls; `"per_question"` (default, grouping identical prepared prefixes) vs `"shared_prefix"` execution using `encode_prefix()` + `question_from_prefix(..., isolate=True)`; `"joint"` (default) vs `"equivariant"` scoring; `expected_score` requiring all-or-none finite `value`s; optional single-pass joint `embedding` output (requiring `shared_prefix` for multi-decision requests); exact `usage` accounting (`completion_tokens = 0`).
   - Calibration binding: apply `(T, b)` only when `apply_calibration=true`, `checkpoint_id == "bob-s1-0.8b"`, `scoring_mode == "joint"`, `prefix_mode == "per_question"`, `effective_max_seq_len == 4096`, and canonical `QUESTIONS` match; otherwise emit `"uncalibrated_softmax"` with explicit `calibration.mismatch_reason` (or `400` if `require_calibrated=true` / `calibration_conflict`).
-- [ ] Task 3.3: Implement FastAPI/Uvicorn HTTP server (`app.py`):
+- [x] Task 3.3: Implement FastAPI/Uvicorn HTTP server (`app.py`):
   - Endpoints: `GET /healthz`, `GET /v1/models`, `POST /v1/embeddings`, `POST /v1/chat/completions`, plus OpenAI error handler (`error.schema.json`).
   - Loopback-by-default bind (`127.0.0.1`), optional bearer auth (`BOB_S1_API_KEY`), request-size caps (`413` on body limit), and state/image/credential log redaction.
 

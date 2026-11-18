@@ -29,18 +29,15 @@ def configure_pillow_limits(max_pixels: int) -> None:
     Image.MAX_IMAGE_PIXELS = int(max_pixels)
 
 
-def decode_data_uri_image(
+def _decode_one_with_pixels(
     url: str,
     *,
-    max_bytes: int = 10 * 1024 * 1024,
-    max_pixels: int = 4096 * 4096,
+    max_bytes: int,
+    max_pixels: int,
+    remaining_total_pixels: int | None = None,
+    max_total_pixels: int | None = None,
     param: str | None = None,
-) -> Image.Image:
-    """Decode and validate an inline data:image/...;base64 URI into an RGB PIL Image.
-
-    Rejects remote URLs, file:// URIs, local filesystem paths, animated images,
-    corrupted headers/CRCs, oversized byte payloads, and decompression-bomb dimensions.
-    """
+) -> tuple[Image.Image, int]:
     if not isinstance(url, str) or not url:
         raise ImageValidationError("Image URL must be a non-empty string", param=param)
 
@@ -95,9 +92,17 @@ def decode_data_uri_image(
             width, height = probe.size
             if width <= 0 or height <= 0:
                 raise ImageValidationError(f"Invalid image dimensions {width}x{height}", param=param)
-            if width * height > max_pixels:
+            pixel_count = width * height
+            if pixel_count > max_pixels:
                 raise ImageValidationError(
-                    f"Image pixel count {width * height} exceeds max_image_pixels ({max_pixels})",
+                    f"Image pixel count {pixel_count} exceeds max_image_pixels ({max_pixels})",
+                    code="image_too_large",
+                    param=param,
+                )
+            if remaining_total_pixels is not None and pixel_count > remaining_total_pixels:
+                limit = max_total_pixels if max_total_pixels is not None else remaining_total_pixels
+                raise ImageValidationError(
+                    f"Aggregate decoded image pixels exceed request budget ({limit})",
                     code="image_too_large",
                     param=param,
                 )
@@ -105,7 +110,7 @@ def decode_data_uri_image(
 
         with Image.open(BytesIO(raw_bytes)) as img:
             img.load()
-            return img.convert("RGB")
+            return img.convert("RGB"), pixel_count
     except ImageValidationError:
         raise
     except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
@@ -116,3 +121,44 @@ def decode_data_uri_image(
         ) from exc
     except (UnidentifiedImageError, OSError, SyntaxError, ValueError) as exc:
         raise ImageValidationError(f"Failed to decode image payload: {exc}", param=param) from exc
+
+
+def decode_data_uri_image(
+    url: str,
+    *,
+    max_bytes: int = 10 * 1024 * 1024,
+    max_pixels: int = 4096 * 4096,
+    param: str | None = None,
+) -> Image.Image:
+    """Decode and validate an inline data:image/...;base64 URI into an RGB PIL Image."""
+    img, _ = _decode_one_with_pixels(
+        url,
+        max_bytes=max_bytes,
+        max_pixels=max_pixels,
+        param=param,
+    )
+    return img
+
+
+def decode_data_uri_images_batch(
+    items: list[tuple[str, str]],
+    *,
+    max_bytes: int,
+    max_pixels: int,
+    max_total_pixels: int,
+) -> list[Image.Image]:
+    """Decode a list of (url, param_path) pairs while enforcing an aggregate pixel budget."""
+    remaining = max_total_pixels
+    decoded: list[Image.Image] = []
+    for url, param in items:
+        img, used = _decode_one_with_pixels(
+            url,
+            max_bytes=max_bytes,
+            max_pixels=max_pixels,
+            remaining_total_pixels=remaining,
+            max_total_pixels=max_total_pixels,
+            param=param,
+        )
+        remaining -= used
+        decoded.append(img)
+    return decoded

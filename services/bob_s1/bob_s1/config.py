@@ -51,8 +51,10 @@ class SidecarConfig:
     max_decisions: int = 16
     max_options: int = 255
     max_images: int = 8
+    max_request_images: int = 16
     max_image_bytes: int = 10 * 1024 * 1024
     max_image_pixels: int = 4096 * 4096
+    max_request_image_pixels: int = 16 * 1024 * 1024
     max_body_bytes: int = 16 * 1024 * 1024
 
     @classmethod
@@ -120,7 +122,14 @@ class SidecarConfig:
             max_decisions=_parse_int("BOB_S1_MAX_DECISIONS", src.get("BOB_S1_MAX_DECISIONS"), 16, 1, 128),
             max_options=_parse_int("BOB_S1_MAX_OPTIONS", src.get("BOB_S1_MAX_OPTIONS"), 255, 2, 255),
             max_images=_parse_int("BOB_S1_MAX_IMAGES", src.get("BOB_S1_MAX_IMAGES"), 8, 1, 64),
+            max_request_images=_parse_int("BOB_S1_MAX_REQUEST_IMAGES", src.get("BOB_S1_MAX_REQUEST_IMAGES"), 16, 1, 256),
             max_image_bytes=_parse_int("BOB_S1_MAX_IMAGE_BYTES", src.get("BOB_S1_MAX_IMAGE_BYTES"), 10 * 1024 * 1024, 1024),
             max_image_pixels=_parse_int("BOB_S1_MAX_IMAGE_PIXELS", src.get("BOB_S1_MAX_IMAGE_PIXELS"), 4096 * 4096, 64),
+            max_request_image_pixels=_parse_int(
+                "BOB_S1_MAX_REQUEST_IMAGE_PIXELS",
+                src.get("BOB_S1_MAX_REQUEST_IMAGE_PIXELS"),
+                16 * 1024 * 1024,
+                64,
+            ),
             max_body_bytes=_parse_int("BOB_S1_MAX_BODY_BYTES", src.get("BOB_S1_MAX_BODY_BYTES"), 16 * 1024 * 1024, 1024),
         )
