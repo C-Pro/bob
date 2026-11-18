@@ -83,5 +83,5 @@
 
 ---
 
-- [~] **Track: Temporary `bob-s1` Python Inference Sidecar (OpenAI-Compatible)**
+- [x] **Track: Temporary `bob-s1` Python Inference Sidecar (OpenAI-Compatible)**
 *Link: [./tracks/bob-s1-inference-sidecar_20261118/](./tracks/bob-s1-inference-sidecar_20261118/) (Multimodal `/v1/embeddings`, `bob-s1.decision.v1` over `/v1/chat/completions`, single-pass joint output, elastic `max_seq_len`)*

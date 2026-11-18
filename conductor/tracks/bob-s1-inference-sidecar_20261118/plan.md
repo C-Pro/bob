@@ -34,14 +34,14 @@
 ---
 
 ## Phase 4: Verification, Parity Fixtures & Documentation
-- [ ] Task 4.1: Fast CPU unit & API conformance test suite (`services/bob_s1/tests/` using `synthetic_model()`):
+- [x] Task 4.1: Fast CPU unit & API conformance test suite (`services/bob_s1/tests/` using `synthetic_model()`):
   - Validate all Draft 2020-12 contract schemas and execute every case in `conformance_fixtures.json`.
   - `float` vs little-endian `base64` parity and per-slice L2 normalization across `128`, `256`, `384`.
   - Image sensitivity & security rejection tests (SSRF URLs, local paths, `image/jpg` vs `png|jpeg|webp|gif`, oversized/corrupt/animated images, text-before-image rejection).
   - Elastic `max_seq_len` boundary tests (`error` vs `head_tail`, `max_seq_len > server_max` -> `400`, `text_budget < 1` -> `400`, never truncating suffix/options).
   - Calibration math (`p_1 = sigmoid((z_1 - z_0 + b) / T)`), profile mismatch disclosure (`effective_max_seq_len != 4096`, `shared_prefix`, `equivariant`, `apply_calibration=false` + `require_calibrated=true`), `raw_argmax` vs `calibrated_argmax` separation, and `expected_score` all-or-none rule.
   - DeltaNet prefix cache isolation (`isolate=True`, sibling order/content invariance, cross-request isolation) and queue overload/cancellation behavior.
-- [ ] Task 4.2: Real-checkpoint parity & smoke test (gated/executed against cached `bob-s1-0.8b` on ROCm/CPU):
+- [x] Task 4.2: Real-checkpoint parity & smoke test (gated/executed against cached `bob-s1-0.8b` on ROCm/CPU):
   - Verify HTTP `/v1/embeddings` and `/v1/chat/completions` outputs match direct `DualHeadDecisionEmbedder` calls within declared numerical tolerance across text, multimodal, joint single-pass, and `compaction`/`outcome_prefix`/`loop_guard` fixtures.
   - Freeze numerical parity snapshot into `services/bob_s1/contracts/` for future `lemond`/`vllm`/`llama.cpp` server tests.
-- [ ] Task 4.3: Add `services/bob_s1/README.md` documenting startup flags, `uv` profile setup (CPU/CUDA/ROCm), elastic `max_seq_len` tradeoffs, wire examples (`curl` + `go-openai`), run `make check`, and update `conductor/tracks/bob-s1-inference-sidecar_20261118/metadata.json` on completion.
+- [x] Task 4.3: Add `services/bob_s1/README.md` documenting startup flags, `uv` profile setup (CPU/CUDA/ROCm), elastic `max_seq_len` tradeoffs, wire examples (`curl` + `go-openai`), run `make check`, and update `conductor/tracks/bob-s1-inference-sidecar_20261118/metadata.json` on completion.
