@@ -1766,3 +1766,39 @@ func TestBuildChatMessagesRepairsToolGroupsWithoutSteps(t *testing.T) {
 	assert.True(t, json.Valid([]byte(got[2].Content)))
 	assert.Contains(t, got[2].Content, "execution outcome is unknown")
 }
+
+func TestStripMarkdownJSONFence(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "plain json",
+			input:    `{"should_compact": true}`,
+			expected: `{"should_compact": true}`,
+		},
+		{
+			name:     "standard markdown code fence",
+			input:    "```json\n{\"should_compact\": true}\n```",
+			expected: `{"should_compact": true}`,
+		},
+		{
+			name:     "fence with conversational preamble",
+			input:    "Looking at candidate steps 20 and 21:\n\n```json\n{\"should_compact\": false}\n```",
+			expected: `{"should_compact": false}`,
+		},
+		{
+			name:     "raw json with conversational preamble and trailing text",
+			input:    "Here is the evaluation:\n{\"should_compact\": true, \"reason\": \"ok\"}\nHope this helps!",
+			expected: `{"should_compact": true, "reason": "ok"}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := stripMarkdownJSONFence(tc.input)
+			assert.Equal(t, tc.expected, got)
+		})
+	}
+}

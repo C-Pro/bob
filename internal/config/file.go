@@ -122,6 +122,14 @@ type fileConfig struct {
 		ExtraPaths          *[]string      `yaml:"extra_paths"`
 		AutoToolchains      *bool          `yaml:"auto_toolchains"`
 	} `yaml:"sandbox"`
+	FSM struct {
+		CompactionEnabled            *bool `yaml:"compaction_enabled"`
+		CompactionMinIterations      *int  `yaml:"compaction_min_iterations"`
+		CompactionIntervalIterations *int  `yaml:"compaction_interval_iterations"`
+		CompactionTailIterations     *int  `yaml:"compaction_tail_iterations"`
+		CompactionSoftThresholdBytes *int  `yaml:"compaction_soft_threshold_bytes"`
+		CompactionHardThresholdBytes *int  `yaml:"compaction_hard_threshold_bytes"`
+	} `yaml:"fsm"`
 }
 
 // checkFileSecurity verifies that a file is regular, has safe permissions, and is owned by expectedUID.
@@ -355,6 +363,26 @@ func LoadFromFile(path string) (*Config, error) {
 
 	if cfg.SandboxDockerImage == "" && len(cfg.SandboxAllowedImages) > 0 {
 		cfg.SandboxDockerImage = cfg.SandboxAllowedImages[0]
+	}
+
+	// 7. FSM / Compaction Settings
+	if fc.FSM.CompactionEnabled != nil {
+		cfg.FSMCompactionEnabled = *fc.FSM.CompactionEnabled
+	}
+	if fc.FSM.CompactionMinIterations != nil {
+		cfg.FSMCompactionMinIterations = *fc.FSM.CompactionMinIterations
+	}
+	if fc.FSM.CompactionIntervalIterations != nil {
+		cfg.FSMCompactionIntervalIterations = *fc.FSM.CompactionIntervalIterations
+	}
+	if fc.FSM.CompactionTailIterations != nil {
+		cfg.FSMCompactionTailIterations = *fc.FSM.CompactionTailIterations
+	}
+	if fc.FSM.CompactionSoftThresholdBytes != nil {
+		cfg.FSMCompactionSoftThresholdBytes = *fc.FSM.CompactionSoftThresholdBytes
+	}
+	if fc.FSM.CompactionHardThresholdBytes != nil {
+		cfg.FSMCompactionHardThresholdBytes = *fc.FSM.CompactionHardThresholdBytes
 	}
 
 	return cfg, nil

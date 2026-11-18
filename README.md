@@ -214,6 +214,34 @@ make build-fwd
 make check
 ```
 
+## Evaluation & Benchmarks
+
+Bob includes a deterministic evaluation harness ([`eval/`](eval/README.md)) that tests autonomous agent performance across coding, shell manipulation, CTF reverse engineering, and multi-hop research inside Bubblewrap and Docker testbeds.
+
+### Frozen 100-Task Held-Out Results (Local `Qwen3.6-35B-A3B-MTP-GGUF`)
+
+| Benchmark Suite | Total Tasks | Metric Type | Pass / Resolution Rate | Key Observations |
+| :--- | :---: | :---: | :---: | :--- |
+| **DeepMind FRAMES** | 35 | Gold Answer Match | **62.9%** (22/35) | Multi-hop reasoning via live web search. |
+| **InterCode-Bash** | 20 | State & Tree Match | **55.0%** (11/20) | Strict filesystem directory and file verification. |
+| **InterCode-CTF** | 20 | Flag Capture Match | **85.0%** (17/20) | Autonomous Python exploit scripting and binary analysis. |
+| **SWE-bench Lite** | 25 | Docker Testbed | **20.0% Resolved**<br>(**76.0% Patched**) | Official Django Docker containers verifying 100% test resolution. |
+| **Overall Suite** | **100** | **End-to-End Success** | **55.0%** (55/100) | **Zero host DB pollution**; 100% ephemeral isolation. |
+
+To run the quick 4-task smoke test:
+```sh
+python3 eval/harness/runner.py eval/tasks/smoke_4.json --timeout 300
+```
+
+### Evaluation & Training Trajectory Datasets
+
+Bob maintains a partitioned dataset architecture with a strict zero-overlap guarantee between evaluation and training:
+
+- **Frozen Held-Out Evaluation Suite (`eval/tasks/heldout/heldout_100.json`):** 100 tasks (35 FRAMES, 20 InterCode-Bash, 20 InterCode-CTF, 25 SWE-bench Lite) reserved exclusively for unbiased capability benchmarking.
+- **Offline Training Trajectory Pool (`eval/tasks/train/train_pool.json`):** `417` tasks spanning the same 4 domains (`7` initial overlaps removed from the candidate pool), generating **`417` source rollouts / `19,706` steps** (`batch_train_pool_1794581821/`); downstream dataset extraction quarantines `2` residual held-out collisions (`ic_ctf_005`, `ic_ctf_068`), leaving **`415` clean rollouts (`19,687` source steps)** for `bob-s1-0.8b` (`eval/results/jev_dataset/`).
+
+For full schemas, compaction event payloads, and Python loading examples, see the **[Dataset Specification (`eval/DATASET.md`)](eval/DATASET.md)**, the [`eval/` Guide](eval/README.md), and the **[`bob-s1-0.8b` Model Card & Technical Report](eval/BOB_S1.md)** (formerly codenamed `Jev`). See also the [full baseline evaluation report](eval/results/baseline_100_report.md) for detailed analysis and reproduction instructions.
+
 ## Project Structure
 
 ```
@@ -221,6 +249,10 @@ cmd/
   agent/            — Besedka chat daemon service entrypoint
   bob/              — Standalone CLI one-shot (and future TUI) entrypoint
   bob-proxy-fwd/    — Static helper utility for sandbox network proxying
+eval/
+  harness/          — Reproducible Bubblewrap and Docker benchmark evaluation runner
+  tasks/            — Versioned task manifests (held-out 100, smoke 4, training pools)
+  results/          — Archived benchmark evaluation reports, patches, and replayable traces
 internal/
   agent/            — High-level agent orchestration engine and turn loop
   agentapi/         — Transport-agnostic frontend interfaces, tools, and attachments

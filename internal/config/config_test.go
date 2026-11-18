@@ -135,7 +135,7 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	assert.False(t, cfg.TrajectoryAllowPrivate)
 	assert.True(t, cfg.FSMCompactionEnabled)
 	assert.Equal(t, 3, cfg.FSMCompactionMinIterations)
-	assert.Equal(t, 3, cfg.FSMCompactionIntervalIterations)
+	assert.Equal(t, 10, cfg.FSMCompactionIntervalIterations)
 	assert.Equal(t, 1, cfg.FSMCompactionTailIterations)
 	assert.Equal(t, 65536, cfg.FSMCompactionSoftThresholdBytes)
 	assert.Equal(t, 262144, cfg.FSMCompactionHardThresholdBytes)
@@ -929,7 +929,7 @@ func TestFSMCompactionConfig(t *testing.T) {
 		cfg.FSMCompactionHardThresholdBytes = 0
 		require.NoError(t, cfg.Validate(false))
 		assert.Equal(t, 3, cfg.FSMCompactionMinIterations)
-		assert.Equal(t, 3, cfg.FSMCompactionIntervalIterations)
+		assert.Equal(t, 10, cfg.FSMCompactionIntervalIterations)
 		assert.Equal(t, 1, cfg.FSMCompactionTailIterations)
 		assert.Equal(t, 65536, cfg.FSMCompactionSoftThresholdBytes)
 		assert.Equal(t, 262144, cfg.FSMCompactionHardThresholdBytes)

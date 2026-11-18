@@ -557,6 +557,37 @@ func (s *Store) GetVersion(ctx context.Context, versionID string) (Version, erro
 	return s.GetSkillVersion(ctx, versionID)
 }
 
+// KnowledgeCounts holds active memory and skill counts for a chat context.
+type KnowledgeCounts struct {
+	MemoryCount int
+	SkillCount  int
+}
+
+// ActiveCounts returns the number of active, non-expired memories and skills for a chat context.
+func (s *Store) ActiveCounts(ctx context.Context, chatID string) (KnowledgeCounts, error) {
+	if s.db == nil {
+		return KnowledgeCounts{}, errors.New("database connection is nil")
+	}
+
+	now := time.Now().Unix()
+	query := `
+		SELECT
+			(SELECT COUNT(*) FROM knowledge_items k
+			 WHERE k.chat_id = ? AND k.kind = 'memory' AND k.status = 'active'
+			   AND k.active_version_id IS NOT NULL AND k.active_version_id != ''
+			   AND k.active_version_id NOT IN (SELECT id FROM memory_versions WHERE expires_at IS NOT NULL AND expires_at <= ?)),
+			(SELECT COUNT(*) FROM knowledge_items k
+			 WHERE k.chat_id = ? AND k.kind = 'skill' AND k.status = 'active'
+			   AND k.active_version_id IS NOT NULL AND k.active_version_id != '')
+	`
+	var counts KnowledgeCounts
+	err := s.db.QueryRowContext(ctx, query, chatID, now, chatID).Scan(&counts.MemoryCount, &counts.SkillCount)
+	if err != nil {
+		return KnowledgeCounts{}, fmt.Errorf("failed to query knowledge counts: %w", err)
+	}
+	return counts, nil
+}
+
 // ListItems retrieves knowledge items matching the chat ID, kind, and optional status filter.
 func (s *Store) ListItems(ctx context.Context, chatID string, kind ItemKind, statusFilter string) ([]*KnowledgeItem, error) {
 	if s.db == nil {

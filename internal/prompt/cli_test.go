@@ -100,4 +100,36 @@ func TestRenderCLI(t *testing.T) {
 		assert.Contains(t, p, `"/home/user/workspace" is mounted at '/workspace' in read-write mode`)
 		assert.NotContains(t, p, "Note: The workspace is read-only")
 	})
+
+	t.Run("empty knowledge base", func(t *testing.T) {
+		ctx := CLIPromptContext{
+			Now: fixedTime,
+			TZ:  "UTC",
+			OS:  "linux",
+			Knowledge: &CLIKnowledgeInfo{
+				MemoryCount: 0,
+				SkillCount:  0,
+			},
+		}
+
+		p := RenderCLI(ctx)
+		assert.Contains(t, p, "Knowledge Base:")
+		assert.Contains(t, p, "Currently empty (0 memories, 0 skills stored). Do not attempt to query or load memories or skills.")
+	})
+
+	t.Run("populated knowledge base", func(t *testing.T) {
+		ctx := CLIPromptContext{
+			Now: fixedTime,
+			TZ:  "UTC",
+			OS:  "linux",
+			Knowledge: &CLIKnowledgeInfo{
+				MemoryCount: 14,
+				SkillCount:  3,
+			},
+		}
+
+		p := RenderCLI(ctx)
+		assert.Contains(t, p, "Knowledge Base:")
+		assert.Contains(t, p, "Available: 14 memories, 3 skills stored. Use discover_memories or discover_skills to query when relevant.")
+	})
 }

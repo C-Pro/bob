@@ -129,7 +129,7 @@ var (
 		"properties": map[string]interface{}{
 			"memory_id": map[string]interface{}{
 				"type":        "string",
-				"description": "The stable memory identifier (e.g. 'mem_abc123') discovered via discover_memories.",
+				"description": "The stable memory identifier returned by discover_memories. Do not guess or invent IDs; only use IDs explicitly returned by discover_memories.",
 			},
 		},
 		"required": []string{"memory_id"},
@@ -199,7 +199,7 @@ var (
 		"properties": map[string]interface{}{
 			"skill_id": map[string]interface{}{
 				"type":        "string",
-				"description": "The stable skill identifier (e.g. 'skill_abc123') discovered via discover_skills.",
+				"description": "The stable skill identifier returned by discover_skills. Do not guess or invent IDs; only use IDs explicitly returned by discover_skills.",
 			},
 		},
 		"required": []string{"skill_id"},

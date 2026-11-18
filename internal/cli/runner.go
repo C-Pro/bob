@@ -151,6 +151,9 @@ func Run(ctx context.Context, rt *bootstrap.Runtime, opts Options, stdout, stder
 		if rt.Config != nil && rt.Config.SandboxMaxLifetime > 0 {
 			lifetime = rt.Config.SandboxMaxLifetime
 		}
+		if opts.Timeout > lifetime {
+			lifetime = opts.Timeout
+		}
 
 		params := sandbox.ProvisionParams{
 			Driver:            sandbox.DriverType(effectiveDriver),
@@ -272,14 +275,33 @@ func Run(ctx context.Context, rt *bootstrap.Runtime, opts Options, stdout, stder
 		}
 	}
 
+	var kInfo *prompt.CLIKnowledgeInfo
+	if rt.StoreProvider != nil {
+		if kStore, err := rt.StoreProvider.GetKnowledgeStore(ctx, "cli", true); err == nil && kStore != nil {
+			if counts, err := kStore.ActiveCounts(ctx, "cli"); err == nil {
+				kInfo = &prompt.CLIKnowledgeInfo{
+					MemoryCount: counts.MemoryCount,
+					SkillCount:  counts.SkillCount,
+				}
+			}
+		}
+	}
+	if kInfo == nil {
+		kInfo = &prompt.CLIKnowledgeInfo{
+			MemoryCount: 0,
+			SkillCount:  0,
+		}
+	}
+
 	now := time.Now()
 	zone, _ := now.Zone()
 	sysPrompt := prompt.RenderCLI(prompt.CLIPromptContext{
-		Now:     now,
-		TZ:      zone,
-		OS:      runtime.GOOS,
-		Tools:   toolDefs,
-		Sandbox: sbInfo,
+		Now:       now,
+		TZ:        zone,
+		OS:        runtime.GOOS,
+		Tools:     toolDefs,
+		Sandbox:   sbInfo,
+		Knowledge: kInfo,
 	})
 
 	turn := agentapi.Turn{

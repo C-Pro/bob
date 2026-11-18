@@ -1,0 +1,27 @@
+llm:
+  api_key: "dummy-key"
+  base_url: "http://127.0.0.1:15432/v1"
+  model: "Qwen3.6-35B-A3B-MTP-GGUF"
+  first_byte_timeout: "5m"
+  request_timeout: "10m"
+
+web:
+  # Tavily API key for live web search tools (e.g. FRAMES benchmark)
+  # Reads from TAVILY_API_KEY environment variable if not specified here.
+  tavily_api_key: ""
+  tavily_base_url: "https://api.tavily.com"
+
+data_dir: "~/.local/share/bob"
+
+cli:
+  max_iterations: 30
+
+sandbox:
+  default_driver: "bwrap"
+  allowed_network_modes: ["none", "restricted", "full"]
+  default_exec_timeout: "2m"
+  max_exec_timeout: "1h"
+  max_lifetime: "2h"
+
+fsm:
+  compaction_interval_iterations: 10
