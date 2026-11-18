@@ -1,0 +1,17 @@
+# osv-scanner configuration for temporary bob-s1 Python sidecar
+
+[[IgnoredVulns]]
+id = "PYSEC-2026-139"
+reason = "torch 2.9.1+rocm6.4 pinned for ROCm 6.4 gfx1103 parity; pt2 Loading Handler is unused"
+
+[[IgnoredVulns]]
+id = "GHSA-63cw-57p8-fm3p"
+reason = "torch 2.9.1+rocm6.4 pinned for ROCm 6.4 gfx1103 parity; sidecar verifies checkpoint SHA-256 before torch.load and rejects untrusted paths"
+
+[[IgnoredVulns]]
+id = "GHSA-qfhq-4f3w-5fph"
+reason = "torch 2.9.1+rocm6.4 pinned for ROCm 6.4 gfx1103 parity; torch.lstm_cell is unused"
+
+[[IgnoredVulns]]
+id = "GHSA-rrmf-rvhw-rf47"
+reason = "torch 2.9.1+rocm6.4 pinned for ROCm 6.4 gfx1103 parity; torch.jit.script is unused"

@@ -8,11 +8,11 @@
 ---
 
 ## Phase 2: Service Packaging, Validated Model Loader & Secure Image Decoder (`services/bob_s1/`)
-- [ ] Task 2.1: Create `services/bob_s1/` package layout (`pyproject.toml`, `uv.lock`, `config.py`, `schemas.py`, `images.py`, `calibration.py`, `loader.py`, `worker.py`, `app.py`) with mutually exclusive `cpu`, `cuda`, and `rocm` Torch installation profiles and pinned `transformers`/`peft` dependencies.
-- [ ] Task 2.2: Implement `ModelLoader` interface and `CheckpointOverlayLoader` wrapping `DualHeadDecisionEmbedder` from [`eval/jev/model.py`](../../../eval/jev/model.py) (without importing `train_experiment.py` or `eval_experiment.py`):
+- [x] Task 2.1: Create `services/bob_s1/` package layout (`pyproject.toml`, `uv.lock`, `config.py`, `schemas.py`, `images.py`, `calibration.py`, `loader.py`, `worker.py`, `app.py`) with mutually exclusive `cpu`, `cuda`, and `rocm` Torch installation profiles and pinned `transformers`/`peft` dependencies. (Implemented `pyproject.toml`, `uv.lock`, `config.py`, `images.py`, `loader.py`, `osv-scanner.toml`; remaining runtime modules in Phase 3.)
+- [x] Task 2.2: Implement `ModelLoader` interface and `CheckpointOverlayLoader` wrapping `DualHeadDecisionEmbedder` from [`eval/jev/model.py`](../../../eval/jev/model.py) (without importing `train_experiment.py` or `eval_experiment.py`):
   - Support `BOB_S1_CHECKPOINT`, `BOB_S1_HF_CACHE_DIR`, `BOB_S1_DEVICE`, `BOB_S1_DTYPE`, `BOB_S1_ATTN_IMPLEMENTATION` (`eager` default, optional `sdpa`), and `BOB_S1_MAX_SEQ_LEN` (`4096` default, valid `256..262144`).
   - Explicitly verify required LoRA, `PointerHead`, and `W_emb` tensors, checkpoint SHA-256/identity, shapes, finiteness, special token IDs, and vision preprocessing metadata at startup; keep heads FP32; run startup warmup before marking `/healthz` ready.
-- [ ] Task 2.3: Implement strict inline image decoder (`images.py`):
+- [x] Task 2.3: Implement strict inline image decoder (`images.py`):
   - Accept only `data:image/(png|jpeg|webp|gif);base64,...` URIs; reject `http(s)://`, `file://`, and filesystem paths.
   - Validate decoded byte limit, `PIL.Image` verification, single-frame check, and pixel dimensions before passing `PIL.Image` objects to the model (never pass raw strings to `_to_pil_rgb()`).
 

@@ -1,0 +1,77 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bob-s1-sidecar"
+version = "0.1.0"
+description = "Temporary OpenAI-compatible Python inference sidecar for bob-s1-0.8b"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fastapi>=0.115.12,<1.0",
+  "huggingface-hub>=1.5.0,<2.0",
+  "numpy==2.5.1",
+  "peft==0.19.1",
+  "pillow==13.0.0",
+  "pydantic>=2.10,<3.0",
+  "safetensors>=0.5.0",
+  "transformers==5.13.0",
+  "uvicorn>=0.34,<1.0",
+]
+
+[project.optional-dependencies]
+cpu = ["torch==2.9.1"]
+cuda = ["torch==2.9.1"]
+rocm = [
+  "torch==2.9.1",
+  "pytorch-triton-rocm==3.5.1; sys_platform == 'linux'",
+]
+
+[dependency-groups]
+dev = [
+  "httpx>=0.28.1",
+  "jsonschema>=4.23.0",
+  "pytest>=8.3.0",
+]
+
+[project.scripts]
+bob-s1-sidecar = "bob_s1.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bob_s1"]
+
+[tool.uv]
+exclude-newer = "7 days"
+conflicts = [
+  [
+    { extra = "cpu" },
+    { extra = "cuda" },
+    { extra = "rocm" },
+  ],
+]
+
+[tool.uv.sources]
+pytorch-triton-rocm = { index = "pytorch-rocm", extra = "rocm" }
+torch = [
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu128", extra = "cuda" },
+  { index = "pytorch-rocm", extra = "rocm" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm6.4"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
