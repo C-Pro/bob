@@ -1,0 +1,544 @@
+{
+  "schema_version": "bob-s1-conformance-v1",
+  "description": "Self-contained OpenAI-compatible wire conformance cases for bob-s1-0.8b inference servers.",
+  "tolerances": {
+    "embedding_cosine_min_bf16": 0.999,
+    "multimodal_embedding_cosine_min_bf16": 0.995,
+    "decision_logit_max_abs_diff_bf16": 0.05,
+    "float_base64_max_abs_diff": 1e-6
+  },
+  "assets": {
+    "red_4x4_png": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGP4z8AARwzEcQCukw/x0F8jngAAAABJRU5ErkJggg==",
+    "blue_4x4_png": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGNgYPiPhIjiAACOsw/xs6MvMwAAAABJRU5ErkJggg=="
+  },
+  "valid_cases": [
+    {
+      "name": "embeddings_single_string_default_384",
+      "endpoint": "/v1/embeddings",
+      "server_config": {"max_seq_len": 4096},
+      "request": {
+        "model": "bob-s1-0.8b",
+        "input": "User asked to refactor internal/fsm/compaction.go and run go test."
+      },
+      "expected": {
+        "status": 200,
+        "dimensions": 384,
+        "encoding_format": "float",
+        "count": 1,
+        "l2_norm": 1.0
+      }
+    },
+    {
+      "name": "embeddings_batch_strings_128_base64",
+      "endpoint": "/v1/embeddings",
+      "server_config": {"max_seq_len": 4096},
+      "request": {
+        "model": "bob-s1-0.8b",
+        "input": ["First agent state", "Second agent state"],
+        "dimensions": 128,
+        "encoding_format": "base64"
+      },
+      "expected": {
+        "status": 200,
+        "dimensions": 128,
+        "encoding_format": "base64",
+        "count": 2,
+        "l2_norm": 1.0
+      }
+    },
+    {
+      "name": "embeddings_multimodal_image_and_text_256",
+      "endpoint": "/v1/embeddings",
+      "server_config": {"max_seq_len": 4096},
+      "request": {
+        "model": "bob-s1-0.8b",
+        "input": [
+          {
+            "content": [
+              {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGP4z8AARwzEcQCukw/x0F8jngAAAABJRU5ErkJggg=="}
+              },
+              {"type": "text", "text": "Terminal screenshot showing test pass."}
+            ]
+          }
+        ],
+        "dimensions": 256,
+        "encoding_format": "float"
+      },
+      "expected": {
+        "status": 200,
+        "dimensions": 256,
+        "encoding_format": "float",
+        "count": 1,
+        "l2_norm": 1.0
+      }
+    },
+    {
+      "name": "embeddings_multimodal_image_only",
+      "endpoint": "/v1/embeddings",
+      "server_config": {"max_seq_len": 4096},
+      "request": {
+        "model": "bob-s1-0.8b",
+        "input": [
+          {
+            "content": [
+              {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGNgYPiPhIjiAACOsw/xs6MvMwAAAABJRU5ErkJggg=="}
+              }
+            ]
+          }
+        ],
+        "dimensions": 384,
+        "encoding_format": "float"
+      },
+      "expected": {
+        "status": 200,
+        "dimensions": 384,
+        "encoding_format": "float",
+        "count": 1,
+        "l2_norm": 1.0
+      }
+    },
+    {
+      "name": "decision_builtin_compaction_calibrated",
+      "endpoint": "/v1/chat/completions",
+      "server_config": {"max_seq_len": 4096},
+      "request": {
+        "model": "bob-s1-0.8b",
+        "messages": [
+          {
+            "role": "user",
+            "content": "{\"protocol\":\"bob-s1.decision.v1\",\"state\":\"Iter 1..5: read compaction.go, ran go test ./internal/fsm/... -> PASS\",\"decisions\":[{\"id\":\"d1\",\"task\":\"compaction\"}]}"
+          }
+        ],
+        "response_format": {"type": "json_object"},
+        "stream": false
+      },
+      "expected": {
+        "status": 200,
+        "probability_kind": "calibrated_affine",
+        "calibration_applied": true,
+        "choice_basis": "calibrated_argmax",
+        "option_ids": ["skip", "compact"]
+      }
+    },
+    {
+      "name": "decision_builtin_outcome_prefix_calibrated",
+      "endpoint": "/v1/chat/completions",
+      "server_config": {"max_seq_len": 4096},
+      "request": {
+        "model": "bob-s1-0.8b",
+        "messages": [
+          {
+            "role": "user",
+            "content": "{\"protocol\":\"bob-s1.decision.v1\",\"state\":\"Iter 1..3: patch applied cleanly and unit tests pass\",\"decisions\":[{\"id\":\"op1\",\"task\":\"outcome_prefix\"}]}"
+          }
+        ],
+        "response_format": {"type": "json_object"},
+        "stream": false
+      },
+      "expected": {
+        "status": 200,
+        "probability_kind": "calibrated_affine",
+        "calibration_applied": true,
+        "choice_basis": "calibrated_argmax",
+        "option_ids": ["failed", "passed"]
+      }
+    },
+    {
+      "name": "decision_builtin_loop_guard_uncalibrated",
+      "endpoint": "/v1/chat/completions",
+      "server_config": {"max_seq_len": 4096},
+      "request": {
+        "model": "bob-s1-0.8b",
+        "messages": [
+          {
+            "role": "user",
+            "content": "{\"protocol\":\"bob-s1.decision.v1\",\"state\":\"Step 4: execute {cmd: cat missing.txt} -> exit 1; Step 5: execute {cmd: cat missing.txt} -> exit 1\",\"decisions\":[{\"id\":\"lg\",\"task\":\"loop_guard\"}]}"
+          }
+        ],
+        "response_format": {"type": "json_object"},
+        "stream": false
+      },
+      "expected": {
+        "status": 200,
+        "probability_kind": "uncalibrated_softmax",
+        "choice_basis": "raw_argmax",
+        "option_ids": ["none", "intercept", "force_synthesis"]
+      }
+    },
+    {
+      "name": "decision_equivariant_custom_valued_options",
+      "endpoint": "/v1/chat/completions",
+      "server_config": {"max_seq_len": 4096},
+      "request": {
+        "model": "bob-s1-0.8b",
+        "messages": [
+          {
+            "role": "user",
+            "content": "{\"protocol\":\"bob-s1.decision.v1\",\"state\":\"Observed clean build output.\",\"decisions\":[{\"id\":\"eq1\",\"question\":\"Rate readiness from 0 to 1\",\"scoring_mode\":\"equivariant\",\"options\":[{\"id\":\"low\",\"description\":\"Not ready\",\"value\":0.0},{\"id\":\"high\",\"description\":\"Ready\",\"value\":1.0}]}]}"
+          }
+        ],
+        "stream": false
+      },
+      "expected": {
+        "status": 200,
+        "scoring_mode": "equivariant",
+        "probability_kind": "uncalibrated_softmax",
+        "has_expected_score_for": "eq1"
+      }
+    },
+    {
+      "name": "decision_multimodal_joint_shared_prefix",
+      "endpoint": "/v1/chat/completions",
+      "server_config": {"max_seq_len": 4096},
+      "request": {
+        "model": "bob-s1-0.8b",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGP4z8AARwzEcQCukw/x0F8jngAAAABJRU5ErkJggg=="}
+              },
+              {
+                "type": "text",
+                "text": "{\"protocol\":\"bob-s1.decision.v1\",\"state\":\"Screenshot attached.\",\"prefix_mode\":\"shared_prefix\",\"embedding\":{\"dimensions\":128,\"encoding_format\":\"float\"},\"decisions\":[{\"id\":\"c1\",\"question\":\"Is the panel red?\",\"options\":[{\"id\":\"no\",\"description\":\"Not red\",\"value\":0.0},{\"id\":\"yes\",\"description\":\"Red\",\"value\":1.0}]},{\"id\":\"c2\",\"task\":\"loop_guard\"}]}"
+              }
+            ]
+          }
+        ],
+        "stream": false
+      },
+      "expected": {
+        "status": 200,
+        "has_embedding": true,
+        "embedding_dimensions": 128,
+        "has_expected_score_for": "c1",
+        "decision_count": 2
+      }
+    },
+    {
+      "name": "decision_builtin_compaction_matching_question_override",
+      "endpoint": "/v1/chat/completions",
+      "server_config": {"max_seq_len": 4096},
+      "request": {
+        "model": "bob-s1-0.8b",
+        "messages": [
+          {
+            "role": "user",
+            "content": "{\"protocol\":\"bob-s1.decision.v1\",\"state\":\"Iter 1..5: read compaction.go\",\"decisions\":[{\"id\":\"d1\",\"task\":\"compaction\",\"question\":\"Should the observed task state be compacted now?\"}]}"
+          }
+        ],
+        "stream": false
+      },
+      "expected": {
+        "status": 200,
+        "probability_kind": "calibrated_affine",
+        "calibration_applied": true
+      }
+    },
+    {
+      "name": "decision_elastic_8k_uncalibrated_disclosure",
+      "endpoint": "/v1/chat/completions",
+      "server_config": {"max_seq_len": 8192},
+      "request": {
+        "model": "bob-s1-0.8b",
+        "messages": [
+          {
+            "role": "user",
+            "content": "{\"protocol\":\"bob-s1.decision.v1\",\"state\":\"Long agent state\",\"max_seq_len\":8192,\"decisions\":[{\"id\":\"d1\",\"task\":\"compaction\",\"require_calibrated\":false}]}"
+          }
+        ],
+        "stream": false
+      },
+      "expected": {
+        "status": 200,
+        "effective_max_seq_len": 8192,
+        "probability_kind": "uncalibrated_softmax",
+        "calibration_applied": false
+      }
+    }
+  ],
+  "rejection_cases": [
+    {
+      "name": "embeddings_bad_dimension",
+      "endpoint": "/v1/embeddings",
+      "server_config": {"max_seq_len": 4096},
+      "request": {"model": "bob-s1-0.8b", "input": "hello", "dimensions": 512},
+      "expected": {"status": 400, "error_type": "invalid_request_error"}
+    },
+    {
+      "name": "embeddings_bad_encoding_format",
+      "endpoint": "/v1/embeddings",
+      "server_config": {"max_seq_len": 4096},
+      "request": {"model": "bob-s1-0.8b", "input": "hello", "encoding_format": "int8"},
+      "expected": {"status": 400, "error_type": "invalid_request_error"}
+    },
+    {
+      "name": "embeddings_interleaved_parts",
+      "endpoint": "/v1/embeddings",
+      "server_config": {"max_seq_len": 4096},
+      "request": {
+        "model": "bob-s1-0.8b",
+        "input": [{
+          "content": [
+            {"type": "text", "text": "before"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGP4z8AARwzEcQCukw/x0F8jngAAAABJRU5ErkJggg=="}}
+          ]
+        }]
+      },
+      "expected": {"status": 400, "error_type": "invalid_request_error"}
+    },
+    {
+      "name": "embeddings_token_array",
+      "endpoint": "/v1/embeddings",
+      "server_config": {"max_seq_len": 4096},
+      "request": {"model": "bob-s1-0.8b", "input": [[1, 2, 3]]},
+      "expected": {"status": 400, "error_type": "invalid_request_error"}
+    },
+    {
+      "name": "embeddings_remote_http_image",
+      "endpoint": "/v1/embeddings",
+      "server_config": {"max_seq_len": 4096},
+      "request": {
+        "model": "bob-s1-0.8b",
+        "input": [{"content": [{"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}]}]
+      },
+      "expected": {"status": 400, "error_type": "invalid_request_error"}
+    },
+    {
+      "name": "embeddings_max_seq_len_exceeds_server_cap",
+      "endpoint": "/v1/embeddings",
+      "server_config": {"max_seq_len": 4096},
+      "request": {"model": "bob-s1-0.8b", "input": "hello", "max_seq_len": 8192},
+      "expected": {"status": 400, "error_type": "invalid_request_error"}
+    },
+    {
+      "name": "chat_stream_true",
+      "endpoint": "/v1/chat/completions",
+      "server_config": {"max_seq_len": 4096},
+      "request": {
+        "model": "bob-s1-0.8b",
+        "stream": true,
+        "messages": [{"role": "user", "content": "{\"protocol\":\"bob-s1.decision.v1\",\"state\":\"x\",\"decisions\":[{\"id\":\"d1\",\"task\":\"compaction\"}]}"}]
+      },
+      "expected": {"status": 400, "error_type": "invalid_request_error"}
+    },
+    {
+      "name": "chat_tools_rejected",
+      "endpoint": "/v1/chat/completions",
+      "server_config": {"max_seq_len": 4096},
+      "request": {
+        "model": "bob-s1-0.8b",
+        "tools": [{"type": "function", "function": {"name": "noop"}}],
+        "messages": [{"role": "user", "content": "{\"protocol\":\"bob-s1.decision.v1\",\"state\":\"x\",\"decisions\":[{\"id\":\"d1\",\"task\":\"compaction\"}]}"}]
+      },
+      "expected": {"status": 400, "error_type": "invalid_request_error"}
+    },
+    {
+      "name": "chat_temperature_rejected",
+      "endpoint": "/v1/chat/completions",
+      "server_config": {"max_seq_len": 4096},
+      "request": {
+        "model": "bob-s1-0.8b",
+        "temperature": 0.0,
+        "messages": [{"role": "user", "content": "{\"protocol\":\"bob-s1.decision.v1\",\"state\":\"x\",\"decisions\":[{\"id\":\"d1\",\"task\":\"compaction\"}]}"}]
+      },
+      "expected": {"status": 400, "error_type": "invalid_request_error"}
+    },
+    {
+      "name": "chat_missing_question_and_task",
+      "endpoint": "/v1/chat/completions",
+      "server_config": {"max_seq_len": 4096},
+      "request": {
+        "model": "bob-s1-0.8b",
+        "messages": [{"role": "user", "content": "{\"protocol\":\"bob-s1.decision.v1\",\"state\":\"x\",\"decisions\":[{\"id\":\"d1\"}]}"}]
+      },
+      "expected": {"status": 400, "error_type": "invalid_request_error"}
+    },
+    {
+      "name": "chat_duplicate_decision_ids",
+      "endpoint": "/v1/chat/completions",
+      "server_config": {"max_seq_len": 4096},
+      "request": {
+        "model": "bob-s1-0.8b",
+        "messages": [{"role": "user", "content": "{\"protocol\":\"bob-s1.decision.v1\",\"state\":\"x\",\"decisions\":[{\"id\":\"d1\",\"task\":\"compaction\"},{\"id\":\"d1\",\"task\":\"loop_guard\"}]}"}]
+      },
+      "expected": {"status": 400, "error_type": "invalid_request_error"}
+    },
+    {
+      "name": "chat_duplicate_option_ids",
+      "endpoint": "/v1/chat/completions",
+      "server_config": {"max_seq_len": 4096},
+      "request": {
+        "model": "bob-s1-0.8b",
+        "messages": [{"role": "user", "content": "{\"protocol\":\"bob-s1.decision.v1\",\"state\":\"x\",\"decisions\":[{\"id\":\"d1\",\"question\":\"Q?\",\"options\":[{\"id\":\"a\",\"description\":\"A1\"},{\"id\":\"a\",\"description\":\"A2\"}]}]}"}]
+      },
+      "expected": {"status": 400, "error_type": "invalid_request_error"}
+    },
+    {
+      "name": "chat_partial_option_values",
+      "endpoint": "/v1/chat/completions",
+      "server_config": {"max_seq_len": 4096},
+      "request": {
+        "model": "bob-s1-0.8b",
+        "messages": [{"role": "user", "content": "{\"protocol\":\"bob-s1.decision.v1\",\"state\":\"x\",\"decisions\":[{\"id\":\"d1\",\"question\":\"Q?\",\"options\":[{\"id\":\"a\",\"description\":\"A1\",\"value\":0.0},{\"id\":\"b\",\"description\":\"B1\"}]}]}"}]
+      },
+      "expected": {"status": 400, "error_type": "invalid_request_error"}
+    },
+    {
+      "name": "chat_multi_question_joint_without_shared_prefix",
+      "endpoint": "/v1/chat/completions",
+      "server_config": {"max_seq_len": 4096},
+      "request": {
+        "model": "bob-s1-0.8b",
+        "messages": [{"role": "user", "content": "{\"protocol\":\"bob-s1.decision.v1\",\"state\":\"x\",\"embedding\":{\"dimensions\":128},\"decisions\":[{\"id\":\"d1\",\"task\":\"compaction\"},{\"id\":\"d2\",\"task\":\"loop_guard\"}]}"}]
+      },
+      "expected": {"status": 400, "error_type": "invalid_request_error"}
+    },
+    {
+      "name": "chat_apply_calibration_false_require_calibrated_true",
+      "endpoint": "/v1/chat/completions",
+      "server_config": {"max_seq_len": 4096},
+      "request": {
+        "model": "bob-s1-0.8b",
+        "messages": [{"role": "user", "content": "{\"protocol\":\"bob-s1.decision.v1\",\"state\":\"x\",\"decisions\":[{\"id\":\"d1\",\"task\":\"compaction\",\"apply_calibration\":false,\"require_calibrated\":true}]}"}]
+      },
+      "expected": {"status": 400, "error_type": "invalid_request_error", "code": "calibration_conflict"}
+    },
+    {
+      "name": "chat_require_calibrated_on_8k",
+      "endpoint": "/v1/chat/completions",
+      "server_config": {"max_seq_len": 8192},
+      "request": {
+        "model": "bob-s1-0.8b",
+        "messages": [{"role": "user", "content": "{\"protocol\":\"bob-s1.decision.v1\",\"state\":\"x\",\"max_seq_len\":8192,\"decisions\":[{\"id\":\"d1\",\"task\":\"compaction\",\"require_calibrated\":true}]}"}]
+      },
+      "expected": {"status": 400, "error_type": "invalid_request_error", "code": "calibration_unavailable"}
+    },
+    {
+      "name": "chat_contradictory_canonical_question_override",
+      "endpoint": "/v1/chat/completions",
+      "server_config": {"max_seq_len": 4096},
+      "request": {
+        "model": "bob-s1-0.8b",
+        "messages": [{"role": "user", "content": "{\"protocol\":\"bob-s1.decision.v1\",\"state\":\"x\",\"decisions\":[{\"id\":\"d1\",\"task\":\"compaction\",\"question\":\"Altered question?\"}]}"}]
+      },
+      "expected": {"status": 400, "error_type": "invalid_request_error"}
+    },
+    {
+      "name": "chat_budget_too_small_for_prefix_delimiter",
+      "endpoint": "/v1/chat/completions",
+      "server_config": {"max_seq_len": 4096},
+      "request": {
+        "model": "bob-s1-0.8b",
+        "messages": [{"role": "user", "content": "{\"protocol\":\"bob-s1.decision.v1\",\"state\":\"x\",\"max_seq_len\":10,\"truncation\":\"head_tail\",\"decisions\":[{\"id\":\"d1\",\"task\":\"compaction\"}]}"}]
+      },
+      "expected": {"status": 400, "error_type": "invalid_request_error", "code": "context_length_exceeded"}
+    }
+  ],
+  "response_rejection_cases": [
+    {
+      "name": "decision_response_wrong_vector_length_for_dimensions",
+      "schema": "decision.response.schema.json",
+      "payload": {
+        "protocol": "bob-s1.decision.v1",
+        "decisions": [{
+          "id": "d1",
+          "task": "loop_guard",
+          "scoring_mode": "joint",
+          "choice": "none",
+          "choice_basis": "raw_argmax",
+          "scores": [{"id": "none", "logit": 0.1, "probability": 0.6}, {"id": "intercept", "logit": -0.2, "probability": 0.4}],
+          "probability_kind": "uncalibrated_softmax",
+          "expected_score": null,
+          "calibration": {"profile": null, "applied": false, "mismatch_reason": "no_calibration_profile_for_task", "temperature": null, "bias": null, "balanced_threshold": null, "risk_threshold_5pct": null},
+          "prefix_tokens": 10,
+          "suffix_tokens": 20,
+          "truncated": false
+        }],
+        "embedding": {
+          "dimensions": 128,
+          "encoding_format": "float",
+          "vector": [0.0, 0.0, 0.0]
+        },
+        "preparation": {
+          "prefix_mode": "per_question",
+          "truncation_policy": "head_tail",
+          "effective_max_seq_len": 4096,
+          "suffix_reserve": 20,
+          "prefix_tokens": 10,
+          "truncated": false
+        }
+      }
+    },
+    {
+      "name": "decision_response_mismatched_encoding_type",
+      "schema": "decision.response.schema.json",
+      "payload": {
+        "protocol": "bob-s1.decision.v1",
+        "decisions": [{
+          "id": "d1",
+          "task": "loop_guard",
+          "scoring_mode": "joint",
+          "choice": "none",
+          "choice_basis": "raw_argmax",
+          "scores": [{"id": "none", "logit": 0.1, "probability": 0.6}, {"id": "intercept", "logit": -0.2, "probability": 0.4}],
+          "probability_kind": "uncalibrated_softmax",
+          "expected_score": null,
+          "calibration": {"profile": null, "applied": false, "mismatch_reason": "no_calibration_profile_for_task", "temperature": null, "bias": null, "balanced_threshold": null, "risk_threshold_5pct": null},
+          "prefix_tokens": 10,
+          "suffix_tokens": 20,
+          "truncated": false
+        }],
+        "embedding": {
+          "dimensions": 128,
+          "encoding_format": "float",
+          "vector": "AAAA"
+        },
+        "preparation": {
+          "prefix_mode": "per_question",
+          "truncation_policy": "head_tail",
+          "effective_max_seq_len": 4096,
+          "suffix_reserve": 20,
+          "prefix_tokens": 10,
+          "truncated": false
+        }
+      }
+    },
+    {
+      "name": "decision_response_calibrated_with_raw_basis",
+      "schema": "decision.response.schema.json",
+      "payload": {
+        "protocol": "bob-s1.decision.v1",
+        "decisions": [{
+          "id": "d1",
+          "task": "compaction",
+          "scoring_mode": "joint",
+          "choice": "compact",
+          "choice_basis": "raw_argmax",
+          "scores": [{"id": "skip", "logit": -1.2, "probability": 0.04}, {"id": "compact", "logit": 0.5, "probability": 0.96}],
+          "probability_kind": "calibrated_affine",
+          "expected_score": null,
+          "calibration": {"profile": "bob-s1-0.8b/compaction/cal_v2_4k", "applied": true, "mismatch_reason": null, "temperature": 1.895898683669047, "bias": 4.25, "balanced_threshold": 0.8964872561924658, "risk_threshold_5pct": 0.8393841862136965},
+          "prefix_tokens": 10,
+          "suffix_tokens": 20,
+          "truncated": false
+        }],
+        "embedding": null,
+        "preparation": {
+          "prefix_mode": "per_question",
+          "truncation_policy": "head_tail",
+          "effective_max_seq_len": 4096,
+          "suffix_reserve": 20,
+          "prefix_tokens": 10,
+          "truncated": false
+        }
+      }
+    }
+  ]
+}

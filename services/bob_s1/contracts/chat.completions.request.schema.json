@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "bob-s1/chat.completions.request.schema.json",
+  "title": "BobS1ChatCompletionsRequest",
+  "description": "Outer OpenAI-compatible /v1/chat/completions request envelope carrying bob-s1.decision.v1. Rejects streaming, tools, logprobs, and sampling/generation controls.",
+  "type": "object",
+  "required": ["model", "messages"],
+  "additionalProperties": false,
+  "properties": {
+    "model": { "type": "string", "minLength": 1 },
+    "messages": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["role", "content"],
+        "additionalProperties": false,
+        "properties": {
+          "role": { "const": "user" },
+          "content": {
+            "oneOf": [
+              { "type": "string", "minLength": 2 },
+              {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "required": ["type", "image_url"],
+                      "additionalProperties": false,
+                      "properties": {
+                        "type": { "const": "image_url" },
+                        "image_url": {
+                          "type": "object",
+                          "required": ["url"],
+                          "additionalProperties": false,
+                          "properties": {
+                            "url": {
+                              "type": "string",
+                              "pattern": "^data:image/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/=]+$"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "required": ["type", "text"],
+                      "additionalProperties": false,
+                      "properties": {
+                        "type": { "const": "text" },
+                        "text": { "type": "string", "minLength": 2 }
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "response_format": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "enum": ["text", "json_object"] }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "json_schema"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "json_schema" },
+            "json_schema": {
+              "type": "object",
+              "required": ["name", "schema"],
+              "additionalProperties": false,
+              "properties": {
+                "name": { "const": "bob_s1_decision_v1" },
+                "strict": { "type": "boolean" },
+                "schema": { "type": "object" }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "stream": { "const": false },
+    "logprobs": { "const": false },
+    "user": { "type": "string" }
+  }
+}

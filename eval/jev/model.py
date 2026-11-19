@@ -290,7 +290,8 @@ class DualHeadDecisionEmbedder(nn.Module):
 
     @classmethod
     def from_pretrained(cls, device="cpu", dtype=torch.float32, trainable_adapter=False, include_vision=False,
-                        base_revision=BASE_MODEL_REVISION, adapter_revision=KEV_ADAPTER_REVISION, cache_dir=None):
+                        base_revision=BASE_MODEL_REVISION, adapter_revision=KEV_ADAPTER_REVISION, cache_dir=None,
+                        attn_implementation="eager"):
         from peft import PeftModel
         from safetensors.torch import load_file
         from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen3_5ForConditionalGeneration
@@ -302,14 +303,14 @@ class DualHeadDecisionEmbedder(nn.Module):
         vision_config = None
         if include_vision:
             cond_model = Qwen3_5ForConditionalGeneration.from_pretrained(
-                base_path, dtype=dtype, local_files_only=True, attn_implementation="eager")
+                base_path, dtype=dtype, local_files_only=True, attn_implementation=attn_implementation)
             visual = cond_model.model.visual
             vision_config = cond_model.config.vision_config
             text_model = cond_model.model.language_model
             del cond_model
         else:
             causal_model = AutoModelForCausalLM.from_pretrained(
-                base_path, dtype=dtype, local_files_only=True, attn_implementation="eager")
+                base_path, dtype=dtype, local_files_only=True, attn_implementation=attn_implementation)
             text_model = causal_model.model
             del causal_model
         # Kev keys are base_model.model.layers.*, not base_model.model.model.layers.*.
