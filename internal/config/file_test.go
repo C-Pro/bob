@@ -4,6 +4,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -537,5 +538,204 @@ llm:
 		cfg, err := LoadFromFile(cfgFile)
 		require.NoError(t, err)
 		assert.True(t, cfg.SandboxAutoToolchains)
+	})
+}
+
+func TestLoadFromFile_SystemOne(t *testing.T) {
+	tempDir := t.TempDir()
+
+	t.Run("full valid system1 YAML loads and passes ValidateCLI", func(t *testing.T) {
+		cfgFile := filepath.Join(tempDir, "system1_full.yaml")
+		content := `
+llm:
+  api_key: "test-key"
+  model: "test-model"
+
+system1:
+  base_url: "http://127.0.0.1:8090/v1"
+  api_key: "s1-yaml-key"
+  model: "bob-s1-0.8b"
+  timeout: "45s"
+  max_seq_len: 8192
+  embedding_dims: 256
+  embeddings_enabled: false
+  compaction_enabled: true
+  compaction_defer_threshold: 0.85
+  loop_guard_mode: "SHADOW"
+  episodes_enabled: false
+  fallback_on_error: false
+`
+		require.NoError(t, os.WriteFile(cfgFile, []byte(content), 0600))
+		cfg, err := LoadFromFile(cfgFile)
+		require.NoError(t, err)
+		require.NoError(t, cfg.ValidateCLI())
+
+		assert.True(t, cfg.SystemOneEnabled())
+		assert.Equal(t, "http://127.0.0.1:8090/v1", cfg.SystemOneBaseURL)
+		assert.Equal(t, "s1-yaml-key", cfg.SystemOneAPIKey)
+		assert.Equal(t, "bob-s1-0.8b", cfg.SystemOneModel)
+		assert.Equal(t, 45*time.Second, cfg.SystemOneTimeout)
+		assert.Equal(t, 8192, cfg.SystemOneMaxSeqLen)
+		assert.Equal(t, 256, cfg.SystemOneEmbeddingDims)
+		assert.False(t, cfg.SystemOneEmbeddingsEnabled)
+		assert.True(t, cfg.SystemOneCompactionEnabled)
+		assert.Equal(t, 0.85, cfg.SystemOneCompactionDeferThreshold)
+		assert.Equal(t, "shadow", cfg.SystemOneLoopGuardMode)
+		assert.False(t, cfg.SystemOneEpisodesEnabled)
+		assert.False(t, cfg.SystemOneFallbackOnError)
+	})
+
+	t.Run("partial system1 YAML keeps defaults", func(t *testing.T) {
+		cfgFile := filepath.Join(tempDir, "system1_partial.yaml")
+		content := `
+llm:
+  api_key: "test-key"
+  model: "test-model"
+
+system1:
+  base_url: "http://127.0.0.1:8090"
+`
+		require.NoError(t, os.WriteFile(cfgFile, []byte(content), 0600))
+		cfg, err := LoadFromFile(cfgFile)
+		require.NoError(t, err)
+		require.NoError(t, cfg.ValidateCLI())
+
+		assert.True(t, cfg.SystemOneEnabled())
+		assert.Equal(t, DefaultSystemOneModel, cfg.SystemOneModel)
+		assert.Equal(t, DefaultSystemOneTimeout, cfg.SystemOneTimeout)
+		assert.Equal(t, 0, cfg.SystemOneMaxSeqLen)
+		assert.Equal(t, DefaultSystemOneEmbeddingDims, cfg.SystemOneEmbeddingDims)
+		assert.True(t, cfg.SystemOneEmbeddingsEnabled)
+		assert.True(t, cfg.SystemOneCompactionEnabled)
+		assert.Equal(t, 0.0, cfg.SystemOneCompactionDeferThreshold)
+		assert.Equal(t, DefaultSystemOneLoopGuardMode, cfg.SystemOneLoopGuardMode)
+		assert.True(t, cfg.SystemOneEpisodesEnabled)
+		assert.True(t, cfg.SystemOneFallbackOnError)
+	})
+
+	t.Run("invalid system1 YAML fields caught by ValidateCLI", func(t *testing.T) {
+		cases := []struct {
+			name   string
+			yaml   string
+			errSub string
+		}{
+			{
+				name:   "bad url",
+				yaml:   "system1:\n  base_url: \"not-a-url\"\n",
+				errSub: "invalid SYSTEM1_BASE_URL",
+			},
+			{
+				name:   "bad embedding dims",
+				yaml:   "system1:\n  base_url: \"http://127.0.0.1:8090\"\n  embedding_dims: 512\n",
+				errSub: "invalid SYSTEM1_EMBEDDING_DIMS",
+			},
+			{
+				name:   "bad max_seq_len",
+				yaml:   "system1:\n  base_url: \"http://127.0.0.1:8090\"\n  max_seq_len: 100\n",
+				errSub: "invalid SYSTEM1_MAX_SEQ_LEN",
+			},
+			{
+				name:   "bad loop guard mode",
+				yaml:   "system1:\n  base_url: \"http://127.0.0.1:8090\"\n  loop_guard_mode: \"always\"\n",
+				errSub: "invalid SYSTEM1_LOOP_GUARD_MODE",
+			},
+			{
+				name:   "bad defer threshold",
+				yaml:   "system1:\n  base_url: \"http://127.0.0.1:8090\"\n  compaction_defer_threshold: 1.5\n",
+				errSub: "invalid SYSTEM1_COMPACTION_DEFER_THRESHOLD",
+			},
+			{
+				name:   "explicit zero timeout rejected",
+				yaml:   "system1:\n  base_url: \"http://127.0.0.1:8090\"\n  timeout: \"0s\"\n",
+				errSub: "invalid SYSTEM1_TIMEOUT",
+			},
+			{
+				name:   "explicit zero embedding dims rejected",
+				yaml:   "system1:\n  base_url: \"http://127.0.0.1:8090\"\n  embedding_dims: 0\n",
+				errSub: "invalid SYSTEM1_EMBEDDING_DIMS",
+			},
+			{
+				name:   "explicit zero timeout rejected even without base_url",
+				yaml:   "system1:\n  timeout: \"0s\"\n",
+				errSub: "invalid SYSTEM1_TIMEOUT",
+			},
+			{
+				name:   "explicit zero embedding dims rejected even without base_url",
+				yaml:   "system1:\n  embedding_dims: 0\n",
+				errSub: "invalid SYSTEM1_EMBEDDING_DIMS",
+			},
+			{
+				name:   "explicit empty loop guard mode rejected",
+				yaml:   "system1:\n  base_url: \"http://127.0.0.1:8090\"\n  loop_guard_mode: \"\"\n",
+				errSub: "invalid SYSTEM1_LOOP_GUARD_MODE",
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				f := filepath.Join(tempDir, "invalid_"+strings.ReplaceAll(tc.name, " ", "_")+".yaml")
+				content := "llm:\n  api_key: \"test-key\"\n  model: \"test-model\"\n\n" + tc.yaml
+				require.NoError(t, os.WriteFile(f, []byte(content), 0600))
+				cfg, err := LoadFromFile(f)
+				require.NoError(t, err)
+				assert.ErrorContains(t, cfg.ValidateCLI(), tc.errSub)
+			})
+		}
+	})
+
+	t.Run("unknown field under system1 rejected", func(t *testing.T) {
+		f := filepath.Join(tempDir, "system1_unknown.yaml")
+		content := "llm:\n  api_key: \"test-key\"\n\nsystem1:\n  unknown_option: true\n"
+		require.NoError(t, os.WriteFile(f, []byte(content), 0600))
+		_, err := LoadFromFile(f)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "field unknown_option not found")
+	})
+
+	t.Run("environment variables do not leak into YAML file config", func(t *testing.T) {
+		t.Setenv("SYSTEM1_BASE_URL", "http://127.0.0.1:9999/v1")
+		t.Setenv("SYSTEM1_API_KEY", "env-secret")
+
+		f := filepath.Join(tempDir, "system1_isolation.yaml")
+		content := "llm:\n  api_key: \"test-key\"\n  model: \"test-model\"\n"
+		require.NoError(t, os.WriteFile(f, []byte(content), 0600))
+		cfg, err := LoadFromFile(f)
+		require.NoError(t, err)
+		assert.False(t, cfg.SystemOneEnabled())
+		assert.Equal(t, "", cfg.SystemOneBaseURL)
+		assert.Equal(t, "", cfg.SystemOneAPIKey)
+	})
+
+	t.Run("uncommented system1 template block parses and validates", func(t *testing.T) {
+		uncommented := ConfigTemplateContent
+		for _, oldLine := range []string{
+			"# system1:",
+			"#   base_url:",
+			"#   api_key:",
+			"#   model:",
+			"#   timeout:",
+			"#   max_seq_len:",
+			"#   embedding_dims:",
+			"#   embeddings_enabled:",
+			"#   compaction_enabled:",
+			"#   compaction_defer_threshold:",
+			"#   loop_guard_mode:",
+			"#   episodes_enabled:",
+			"#   fallback_on_error:",
+		} {
+			uncommented = strings.Replace(uncommented, oldLine, strings.TrimPrefix(oldLine, "# "), 1)
+		}
+		uncommented = strings.Replace(uncommented, `api_key: "" # Required: OpenAI or Google Gemini API key`, `api_key: "test-key"`, 1)
+
+		f := filepath.Join(tempDir, "template_system1.yaml")
+		require.NoError(t, os.WriteFile(f, []byte(uncommented), 0600))
+		cfg, err := LoadFromFile(f)
+		require.NoError(t, err)
+		require.NoError(t, cfg.ValidateCLI())
+		assert.True(t, cfg.SystemOneEnabled())
+		assert.Equal(t, "http://127.0.0.1:8090/v1", cfg.SystemOneBaseURL)
+		assert.Equal(t, DefaultSystemOneModel, cfg.SystemOneModel)
+		assert.Equal(t, DefaultSystemOneEmbeddingDims, cfg.SystemOneEmbeddingDims)
+		assert.Equal(t, DefaultSystemOneLoopGuardMode, cfg.SystemOneLoopGuardMode)
 	})
 }

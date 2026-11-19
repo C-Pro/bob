@@ -111,6 +111,73 @@ func TestNew_EmbeddingModelSelection(t *testing.T) {
 
 		require.NoError(t, rt.Close())
 	})
+
+	t.Run("system1 configured and embeddings enabled selects SystemOneEmbedder when embedding_model empty", func(t *testing.T) {
+		cfg := testConfig(t)
+		cfg.EmbeddingModel = ""
+		cfg.SystemOneBaseURL = "http://127.0.0.1:8090"
+		cfg.SystemOneEmbeddingDims = 256
+		cfg.SystemOneEmbeddingsEnabled = true
+
+		rt, err := New(cfg, Options{})
+		require.NoError(t, err)
+		require.NotNil(t, rt.SystemOneClient)
+
+		emb := rt.MemoryManager.Embedder()
+		sysEmb, ok := emb.(*llm.SystemOneEmbedder)
+		require.True(t, ok)
+		assert.Equal(t, 256, sysEmb.Dim())
+
+		require.NoError(t, rt.Close())
+	})
+
+	t.Run("embedding_model none overrides system1", func(t *testing.T) {
+		cfg := testConfig(t)
+		cfg.EmbeddingModel = "none"
+		cfg.SystemOneBaseURL = "http://127.0.0.1:8090"
+		cfg.SystemOneEmbeddingsEnabled = true
+
+		rt, err := New(cfg, Options{})
+		require.NoError(t, err)
+		require.NotNil(t, rt.SystemOneClient)
+		assert.Nil(t, rt.MemoryManager.Embedder())
+
+		require.NoError(t, rt.Close())
+	})
+
+	t.Run("explicit embedding_model overrides system1", func(t *testing.T) {
+		cfg := testConfig(t)
+		cfg.EmbeddingModel = "text-embedding-3-small"
+		cfg.SystemOneBaseURL = "http://127.0.0.1:8090"
+		cfg.SystemOneEmbeddingsEnabled = true
+
+		rt, err := New(cfg, Options{})
+		require.NoError(t, err)
+		require.NotNil(t, rt.SystemOneClient)
+
+		emb, ok := rt.MemoryManager.Embedder().(*llm.Embedder)
+		require.True(t, ok)
+		assert.Equal(t, "text-embedding-3-small", emb.Model())
+
+		require.NoError(t, rt.Close())
+	})
+
+	t.Run("system1 embeddings disabled falls back to LazyLocalEmbedder", func(t *testing.T) {
+		t.Setenv("BOB_MODELS_DIR", t.TempDir())
+		cfg := testConfig(t)
+		cfg.EmbeddingModel = ""
+		cfg.SystemOneBaseURL = "http://127.0.0.1:8090"
+		cfg.SystemOneEmbeddingsEnabled = false
+
+		rt, err := New(cfg, Options{})
+		require.NoError(t, err)
+		require.NotNil(t, rt.SystemOneClient)
+
+		_, ok := rt.MemoryManager.Embedder().(*llm.LazyLocalEmbedder)
+		require.True(t, ok)
+
+		require.NoError(t, rt.Close())
+	})
 }
 
 func TestRegisterFrontend(t *testing.T) {

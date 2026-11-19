@@ -869,4 +869,3 @@ func TestGeminiTransport_ReasoningNormalization(t *testing.T) {
 	assert.Equal(t, "Let's think carefully step by step.", resp.Choices[0].Message.ReasoningContent)
 	assert.Equal(t, "Hello world", resp.Choices[0].Message.Content)
 }
-

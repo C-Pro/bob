@@ -1,6 +1,7 @@
 package config
 
 import (
+	"math"
 	"os"
 	"testing"
 	"time"
@@ -78,6 +79,18 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	_ = os.Unsetenv("FSM_COMPACTION_TAIL_ITERATIONS")
 	_ = os.Unsetenv("FSM_COMPACTION_SOFT_THRESHOLD_BYTES")
 	_ = os.Unsetenv("FSM_COMPACTION_HARD_THRESHOLD_BYTES")
+	_ = os.Unsetenv("SYSTEM1_BASE_URL")
+	_ = os.Unsetenv("SYSTEM1_API_KEY")
+	_ = os.Unsetenv("SYSTEM1_MODEL")
+	_ = os.Unsetenv("SYSTEM1_TIMEOUT")
+	_ = os.Unsetenv("SYSTEM1_MAX_SEQ_LEN")
+	_ = os.Unsetenv("SYSTEM1_EMBEDDING_DIMS")
+	_ = os.Unsetenv("SYSTEM1_EMBEDDINGS_ENABLED")
+	_ = os.Unsetenv("SYSTEM1_COMPACTION_ENABLED")
+	_ = os.Unsetenv("SYSTEM1_COMPACTION_DEFER_THRESHOLD")
+	_ = os.Unsetenv("SYSTEM1_LOOP_GUARD_MODE")
+	_ = os.Unsetenv("SYSTEM1_EPISODES_ENABLED")
+	_ = os.Unsetenv("SYSTEM1_FALLBACK_ON_ERROR")
 
 	cfg, err := LoadFromEnv()
 	require.NoError(t, err)
@@ -139,6 +152,19 @@ func TestLoadFromEnvDefaults(t *testing.T) {
 	assert.Equal(t, 1, cfg.FSMCompactionTailIterations)
 	assert.Equal(t, 65536, cfg.FSMCompactionSoftThresholdBytes)
 	assert.Equal(t, 262144, cfg.FSMCompactionHardThresholdBytes)
+	assert.False(t, cfg.SystemOneEnabled())
+	assert.Equal(t, "", cfg.SystemOneBaseURL)
+	assert.Equal(t, "", cfg.SystemOneAPIKey)
+	assert.Equal(t, DefaultSystemOneModel, cfg.SystemOneModel)
+	assert.Equal(t, DefaultSystemOneTimeout, cfg.SystemOneTimeout)
+	assert.Equal(t, 0, cfg.SystemOneMaxSeqLen)
+	assert.Equal(t, DefaultSystemOneEmbeddingDims, cfg.SystemOneEmbeddingDims)
+	assert.True(t, cfg.SystemOneEmbeddingsEnabled)
+	assert.True(t, cfg.SystemOneCompactionEnabled)
+	assert.Equal(t, 0.0, cfg.SystemOneCompactionDeferThreshold)
+	assert.Equal(t, DefaultSystemOneLoopGuardMode, cfg.SystemOneLoopGuardMode)
+	assert.True(t, cfg.SystemOneEpisodesEnabled)
+	assert.True(t, cfg.SystemOneFallbackOnError)
 }
 
 func TestLoadFromEnvStandardOpenAI(t *testing.T) {
@@ -937,5 +963,345 @@ func TestFSMCompactionConfig(t *testing.T) {
 		cfg.FSMCompactionSoftThresholdBytes = 100000
 		cfg.FSMCompactionHardThresholdBytes = 50000
 		assert.ErrorContains(t, cfg.Validate(false), "FSM_COMPACTION_HARD_THRESHOLD_BYTES (50000) cannot be less than FSM_COMPACTION_SOFT_THRESHOLD_BYTES (100000)")
+	})
+}
+
+func TestLoadFromEnvSystemOne(t *testing.T) {
+	t.Run("custom values from env", func(t *testing.T) {
+		t.Setenv("SYSTEM1_BASE_URL", " http://127.0.0.1:8090/v1/ ")
+		t.Setenv("SYSTEM1_API_KEY", "s1-secret")
+		t.Setenv("SYSTEM1_MODEL", "bob-s1-custom")
+		t.Setenv("SYSTEM1_TIMEOUT", "45s")
+		t.Setenv("SYSTEM1_MAX_SEQ_LEN", "8192")
+		t.Setenv("SYSTEM1_EMBEDDING_DIMS", "256")
+		t.Setenv("SYSTEM1_EMBEDDINGS_ENABLED", "false")
+		t.Setenv("SYSTEM1_COMPACTION_ENABLED", "false")
+		t.Setenv("SYSTEM1_COMPACTION_DEFER_THRESHOLD", "-1")
+		t.Setenv("SYSTEM1_LOOP_GUARD_MODE", "SHADOW")
+		t.Setenv("SYSTEM1_EPISODES_ENABLED", "false")
+		t.Setenv("SYSTEM1_FALLBACK_ON_ERROR", "false")
+
+		cfg, err := LoadFromEnv()
+		require.NoError(t, err)
+		assert.True(t, cfg.SystemOneEnabled())
+		assert.Equal(t, "http://127.0.0.1:8090/v1/", cfg.SystemOneBaseURL)
+		assert.Equal(t, "s1-secret", cfg.SystemOneAPIKey)
+		assert.Equal(t, "bob-s1-custom", cfg.SystemOneModel)
+		assert.Equal(t, 45*time.Second, cfg.SystemOneTimeout)
+		assert.Equal(t, 8192, cfg.SystemOneMaxSeqLen)
+		assert.Equal(t, 256, cfg.SystemOneEmbeddingDims)
+		assert.False(t, cfg.SystemOneEmbeddingsEnabled)
+		assert.False(t, cfg.SystemOneCompactionEnabled)
+		assert.Equal(t, -1.0, cfg.SystemOneCompactionDeferThreshold)
+		assert.Equal(t, "shadow", cfg.SystemOneLoopGuardMode)
+		assert.False(t, cfg.SystemOneEpisodesEnabled)
+		assert.False(t, cfg.SystemOneFallbackOnError)
+		require.NoError(t, cfg.Validate(false))
+	})
+
+	t.Run("invalid SYSTEM1_TIMEOUT", func(t *testing.T) {
+		t.Setenv("SYSTEM1_TIMEOUT", "0s")
+		_, err := LoadFromEnv()
+		assert.ErrorContains(t, err, "invalid duration for SYSTEM1_TIMEOUT")
+	})
+
+	t.Run("invalid SYSTEM1_MAX_SEQ_LEN", func(t *testing.T) {
+		t.Setenv("SYSTEM1_MAX_SEQ_LEN", "-5")
+		_, err := LoadFromEnv()
+		assert.ErrorContains(t, err, "invalid non-negative integer for SYSTEM1_MAX_SEQ_LEN")
+	})
+
+	t.Run("invalid SYSTEM1_EMBEDDING_DIMS", func(t *testing.T) {
+		t.Setenv("SYSTEM1_EMBEDDING_DIMS", "0")
+		_, err := LoadFromEnv()
+		assert.ErrorContains(t, err, "invalid integer for SYSTEM1_EMBEDDING_DIMS")
+	})
+
+	t.Run("invalid SYSTEM1_COMPACTION_DEFER_THRESHOLD", func(t *testing.T) {
+		t.Setenv("SYSTEM1_COMPACTION_DEFER_THRESHOLD", "NaN")
+		_, err := LoadFromEnv()
+		assert.ErrorContains(t, err, "invalid float for SYSTEM1_COMPACTION_DEFER_THRESHOLD")
+
+		t.Setenv("SYSTEM1_COMPACTION_DEFER_THRESHOLD", "not-a-float")
+		_, err = LoadFromEnv()
+		assert.ErrorContains(t, err, "invalid float for SYSTEM1_COMPACTION_DEFER_THRESHOLD")
+	})
+
+	t.Run("invalid SYSTEM1_EMBEDDINGS_ENABLED", func(t *testing.T) {
+		t.Setenv("SYSTEM1_EMBEDDINGS_ENABLED", "maybe")
+		_, err := LoadFromEnv()
+		assert.ErrorContains(t, err, "invalid boolean value")
+	})
+
+	t.Run("invalid SYSTEM1_COMPACTION_ENABLED", func(t *testing.T) {
+		t.Setenv("SYSTEM1_COMPACTION_ENABLED", "maybe")
+		_, err := LoadFromEnv()
+		assert.ErrorContains(t, err, "invalid boolean value")
+	})
+
+	t.Run("invalid SYSTEM1_EPISODES_ENABLED", func(t *testing.T) {
+		t.Setenv("SYSTEM1_EPISODES_ENABLED", "maybe")
+		_, err := LoadFromEnv()
+		assert.ErrorContains(t, err, "invalid boolean value")
+	})
+
+	t.Run("invalid SYSTEM1_FALLBACK_ON_ERROR", func(t *testing.T) {
+		t.Setenv("SYSTEM1_FALLBACK_ON_ERROR", "maybe")
+		_, err := LoadFromEnv()
+		assert.ErrorContains(t, err, "invalid boolean value")
+	})
+}
+
+func TestNormalizeSystemOneURLs(t *testing.T) {
+	tests := []struct {
+		name       string
+		raw        string
+		wantAPI    string
+		wantHealth string
+		wantErr    string
+	}{
+		{
+			name:       "bare origin",
+			raw:        "http://127.0.0.1:8090",
+			wantAPI:    "http://127.0.0.1:8090/v1",
+			wantHealth: "http://127.0.0.1:8090/healthz",
+		},
+		{
+			name:       "origin with trailing slash",
+			raw:        "http://127.0.0.1:8090/",
+			wantAPI:    "http://127.0.0.1:8090/v1",
+			wantHealth: "http://127.0.0.1:8090/healthz",
+		},
+		{
+			name:       "origin with /v1",
+			raw:        "http://127.0.0.1:8090/v1",
+			wantAPI:    "http://127.0.0.1:8090/v1",
+			wantHealth: "http://127.0.0.1:8090/healthz",
+		},
+		{
+			name:       "origin with /v1/",
+			raw:        "https://sidecar.local:8443/v1/",
+			wantAPI:    "https://sidecar.local:8443/v1",
+			wantHealth: "https://sidecar.local:8443/healthz",
+		},
+		{
+			name:       "reverse proxy prefix",
+			raw:        "https://gateway.local/bob-s1",
+			wantAPI:    "https://gateway.local/bob-s1/v1",
+			wantHealth: "https://gateway.local/bob-s1/healthz",
+		},
+		{
+			name:       "reverse proxy prefix with /v1/",
+			raw:        "https://gateway.local/bob-s1/v1/",
+			wantAPI:    "https://gateway.local/bob-s1/v1",
+			wantHealth: "https://gateway.local/bob-s1/healthz",
+		},
+		{
+			name:       "escaped slash preserved in reverse proxy path",
+			raw:        "https://gateway.local/a%2Fb/v1",
+			wantAPI:    "https://gateway.local/a%2Fb/v1",
+			wantHealth: "https://gateway.local/a%2Fb/healthz",
+		},
+		{
+			name:       "escaped slash before v1 not treated as /v1 suffix",
+			raw:        "https://gateway.local/a%2Fv1",
+			wantAPI:    "https://gateway.local/a%2Fv1/v1",
+			wantHealth: "https://gateway.local/a%2Fv1/healthz",
+		},
+		{
+			name:       "escaped percent and space preserved",
+			raw:        "https://gateway.local/100%25/my%20proxy/v1/",
+			wantAPI:    "https://gateway.local/100%25/my%20proxy/v1",
+			wantHealth: "https://gateway.local/100%25/my%20proxy/healthz",
+		},
+		{
+			name:       "ipv6 origin",
+			raw:        "http://[::1]:8090",
+			wantAPI:    "http://[::1]:8090/v1",
+			wantHealth: "http://[::1]:8090/healthz",
+		},
+		{
+			name:    "empty",
+			raw:     "   ",
+			wantErr: "cannot be empty",
+		},
+		{
+			name:    "unsupported scheme",
+			raw:     "ftp://127.0.0.1:8090/v1",
+			wantErr: "invalid URL scheme",
+		},
+		{
+			name:    "missing host",
+			raw:     "http:///v1",
+			wantErr: "must specify a hostname",
+		},
+		{
+			name:    "port only authority without hostname",
+			raw:     "http://:8090/v1",
+			wantErr: "must specify a hostname",
+		},
+		{
+			name:    "query rejected",
+			raw:     "http://127.0.0.1:8090/v1?foo=bar",
+			wantErr: "query parameters and fragments are not supported",
+		},
+		{
+			name:    "empty query delimiter on origin rejected",
+			raw:     "http://127.0.0.1:8090?",
+			wantErr: "query parameters and fragments are not supported",
+		},
+		{
+			name:    "empty query delimiter on /v1 rejected",
+			raw:     "http://127.0.0.1:8090/v1?",
+			wantErr: "query parameters and fragments are not supported",
+		},
+		{
+			name:    "fragment rejected",
+			raw:     "http://127.0.0.1:8090/v1#section",
+			wantErr: "fragment",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			apiURL, healthURL, err := NormalizeSystemOneURLs(tc.raw)
+			if tc.wantErr != "" {
+				require.Error(t, err)
+				assert.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantAPI, apiURL)
+			assert.Equal(t, tc.wantHealth, healthURL)
+		})
+	}
+}
+
+func TestSystemOneValidation(t *testing.T) {
+	baseCfg := func() *Config {
+		return &Config{
+			BotHandle:             "@bot",
+			TownhallMaxParagraphs: 2,
+			DMMaxParagraphs:       10,
+			MsgRingBufferSize:     100,
+		}
+	}
+
+	t.Run("disabled zero struct literal passes and stays disabled", func(t *testing.T) {
+		cfg := baseCfg()
+		require.NoError(t, cfg.Validate(false))
+		assert.False(t, cfg.SystemOneEnabled())
+	})
+
+	t.Run("enabled zero struct literal fills defaults cleanly", func(t *testing.T) {
+		cfg := baseCfg()
+		cfg.SystemOneBaseURL = "http://127.0.0.1:8090"
+		require.NoError(t, cfg.Validate(false))
+		assert.True(t, cfg.SystemOneEnabled())
+		assert.Equal(t, DefaultSystemOneModel, cfg.SystemOneModel)
+		assert.Equal(t, DefaultSystemOneTimeout, cfg.SystemOneTimeout)
+		assert.Equal(t, DefaultSystemOneEmbeddingDims, cfg.SystemOneEmbeddingDims)
+		assert.Equal(t, DefaultSystemOneLoopGuardMode, cfg.SystemOneLoopGuardMode)
+
+		apiURL, healthURL, err := cfg.SystemOneURLs()
+		require.NoError(t, err)
+		assert.Equal(t, "http://127.0.0.1:8090/v1", apiURL)
+		assert.Equal(t, "http://127.0.0.1:8090/healthz", healthURL)
+	})
+
+	t.Run("valid embedding dimensions accepted", func(t *testing.T) {
+		for _, dims := range []int{128, 256, 384} {
+			cfg := Defaults()
+			cfg.SystemOneBaseURL = "http://127.0.0.1:8090/v1"
+			cfg.SystemOneEmbeddingDims = dims
+			require.NoError(t, cfg.Validate(false))
+		}
+	})
+
+	t.Run("invalid fields rejected", func(t *testing.T) {
+		cases := []struct {
+			name   string
+			mutate func(c *Config)
+			errSub string
+		}{
+			{
+				name: "bad base url",
+				mutate: func(c *Config) {
+					c.SystemOneBaseURL = "ftp://127.0.0.1:8090"
+				},
+				errSub: "invalid SYSTEM1_BASE_URL",
+			},
+			{
+				name: "bad embedding dims",
+				mutate: func(c *Config) {
+					c.SystemOneEmbeddingDims = 512
+				},
+				errSub: "invalid SYSTEM1_EMBEDDING_DIMS",
+			},
+			{
+				name: "max_seq_len below min",
+				mutate: func(c *Config) {
+					c.SystemOneMaxSeqLen = 128
+				},
+				errSub: "invalid SYSTEM1_MAX_SEQ_LEN",
+			},
+			{
+				name: "max_seq_len above max",
+				mutate: func(c *Config) {
+					c.SystemOneMaxSeqLen = 300000
+				},
+				errSub: "invalid SYSTEM1_MAX_SEQ_LEN",
+			},
+			{
+				name: "negative max_seq_len",
+				mutate: func(c *Config) {
+					c.SystemOneMaxSeqLen = -1
+				},
+				errSub: "invalid SYSTEM1_MAX_SEQ_LEN",
+			},
+			{
+				name: "negative timeout",
+				mutate: func(c *Config) {
+					c.SystemOneTimeout = -time.Second
+				},
+				errSub: "invalid SYSTEM1_TIMEOUT",
+			},
+			{
+				name: "invalid loop guard mode",
+				mutate: func(c *Config) {
+					c.SystemOneLoopGuardMode = "strict"
+				},
+				errSub: "invalid SYSTEM1_LOOP_GUARD_MODE",
+			},
+			{
+				name: "defer threshold above 1",
+				mutate: func(c *Config) {
+					c.SystemOneCompactionDeferThreshold = 1.05
+				},
+				errSub: "invalid SYSTEM1_COMPACTION_DEFER_THRESHOLD",
+			},
+			{
+				name: "defer threshold NaN",
+				mutate: func(c *Config) {
+					c.SystemOneCompactionDeferThreshold = math.NaN()
+				},
+				errSub: "invalid SYSTEM1_COMPACTION_DEFER_THRESHOLD",
+			},
+			{
+				name: "defer threshold Inf",
+				mutate: func(c *Config) {
+					c.SystemOneCompactionDeferThreshold = math.Inf(1)
+				},
+				errSub: "invalid SYSTEM1_COMPACTION_DEFER_THRESHOLD",
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				cfg := Defaults()
+				tc.mutate(cfg)
+				assert.ErrorContains(t, cfg.Validate(false), tc.errSub)
+			})
+		}
 	})
 }

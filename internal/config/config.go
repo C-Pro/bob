@@ -21,82 +21,108 @@ const DefaultUserAgent = "Besedka-Bot/1.0"
 // DefaultMaxAttachmentSizeBytes is the default maximum size for attachment downloads/uploads (25MB).
 const DefaultMaxAttachmentSizeBytes int64 = 25 * 1024 * 1024
 
+// System-1 (bob-s1) inference defaults and bounds.
+const (
+	DefaultSystemOneModel         = "bob-s1-0.8b"
+	DefaultSystemOneTimeout       = 30 * time.Second
+	DefaultSystemOneEmbeddingDims = 384
+	DefaultSystemOneLoopGuardMode = "hybrid"
+	MinSystemOneMaxSeqLen         = 256
+	MaxSystemOneMaxSeqLen         = 262144
+)
+
 // Config holds runtime configuration settings for the agent.
 type Config struct {
-	BotHandle                       string
-	BesedkaURL                      string
-	BesedkaAPIKey                   string
-	OpenAIAPIKey                    string
-	OpenAIModel                     string
-	OpenAIBaseURL                   string
-	GeminiAPIKey                    string // Deprecated: backward-compatible fallback for OpenAIAPIKey
-	GeminiModel                     string // Deprecated: backward-compatible fallback for OpenAIModel
-	GeminiBaseURL                   string // Deprecated: backward-compatible fallback for OpenAIBaseURL
-	LLMRequestTimeout               time.Duration
-	LLMFirstByteTimeout             time.Duration
-	TownhallMaxParagraphs           int
-	DMMaxParagraphs                 int
-	MsgRingBufferSize               int
-	TownhallToolMaxIterations       int
-	DMToolMaxIterations             int
-	FSMRetentionDays                int
-	TavilyAPIKey                    string
-	TavilyBaseURL                   string
-	DataDir                         string
-	EmbeddingModel                  string
-	EmbeddingPrecision              string
-	Secret                          string
-	S3Endpoint                      string
-	S3Region                        string
-	S3Bucket                        string
-	S3AccessKey                     string
-	S3SecretKey                     string
-	S3PathStyle                     bool
-	S3BackupInterval                time.Duration
-	S3BackupKeep                    int
-	S3BackupPrefix                  string
-	SandboxEnabled                  bool
-	SandboxDrivers                  []string
-	SandboxDockerSocket             string
-	SandboxAllowedImages            []string
-	SandboxAllowedNetworkModes      []string
-	SandboxMaxLifetime              time.Duration
-	SandboxDefaultExecTimeout       time.Duration
-	SandboxMaxExecTimeout           time.Duration
-	SandboxCPULimit                 float64
-	SandboxMemoryLimitMB            int
-	SandboxTasksMax                 int
-	SandboxHostDataDir              string
-	SandboxProxyFwdPath             string
-	SandboxAllowRuntimeBuild        *bool
-	SchedulerMinRunTimeout          time.Duration
-	SchedulerMaxRunTimeout          time.Duration
-	SchedulerMinMaxTurns            int
-	SchedulerMaxMaxTurns            int
-	MaxAttachmentSizeBytes          int64
-	KnowledgeMaxLoadedMemories      int
-	KnowledgeMaxLoadedMemoryBytes   int
-	KnowledgeMaxLoadedSkills        int
-	KnowledgeMaxLoadedSkillBytes    int
-	KnowledgeDefaultDiscoveryLimit  int
-	KnowledgeMaxDiscoveryLimit      int
-	KnowledgeReconcileInterval      time.Duration
-	CLIMaxIterations                int
-	SandboxDefaultDriver            string
-	SandboxDockerImage              string
-	SandboxExtraPaths               []string
-	SandboxAutoToolchains           bool
-	TrajectoryEnabled               bool
-	TrajectoryS3Bucket              string
-	TrajectoryS3Prefix              string
-	TrajectoryFlushDelay            time.Duration
-	TrajectoryAllowPrivate          bool
-	FSMCompactionEnabled            bool
-	FSMCompactionMinIterations      int
-	FSMCompactionIntervalIterations int
-	FSMCompactionTailIterations     int
-	FSMCompactionSoftThresholdBytes int
-	FSMCompactionHardThresholdBytes int
+	BotHandle                         string
+	BesedkaURL                        string
+	BesedkaAPIKey                     string
+	OpenAIAPIKey                      string
+	OpenAIModel                       string
+	OpenAIBaseURL                     string
+	GeminiAPIKey                      string // Deprecated: backward-compatible fallback for OpenAIAPIKey
+	GeminiModel                       string // Deprecated: backward-compatible fallback for OpenAIModel
+	GeminiBaseURL                     string // Deprecated: backward-compatible fallback for OpenAIBaseURL
+	LLMRequestTimeout                 time.Duration
+	LLMFirstByteTimeout               time.Duration
+	TownhallMaxParagraphs             int
+	DMMaxParagraphs                   int
+	MsgRingBufferSize                 int
+	TownhallToolMaxIterations         int
+	DMToolMaxIterations               int
+	FSMRetentionDays                  int
+	TavilyAPIKey                      string
+	TavilyBaseURL                     string
+	DataDir                           string
+	EmbeddingModel                    string
+	EmbeddingPrecision                string
+	Secret                            string
+	S3Endpoint                        string
+	S3Region                          string
+	S3Bucket                          string
+	S3AccessKey                       string
+	S3SecretKey                       string
+	S3PathStyle                       bool
+	S3BackupInterval                  time.Duration
+	S3BackupKeep                      int
+	S3BackupPrefix                    string
+	SandboxEnabled                    bool
+	SandboxDrivers                    []string
+	SandboxDockerSocket               string
+	SandboxAllowedImages              []string
+	SandboxAllowedNetworkModes        []string
+	SandboxMaxLifetime                time.Duration
+	SandboxDefaultExecTimeout         time.Duration
+	SandboxMaxExecTimeout             time.Duration
+	SandboxCPULimit                   float64
+	SandboxMemoryLimitMB              int
+	SandboxTasksMax                   int
+	SandboxHostDataDir                string
+	SandboxProxyFwdPath               string
+	SandboxAllowRuntimeBuild          *bool
+	SchedulerMinRunTimeout            time.Duration
+	SchedulerMaxRunTimeout            time.Duration
+	SchedulerMinMaxTurns              int
+	SchedulerMaxMaxTurns              int
+	MaxAttachmentSizeBytes            int64
+	KnowledgeMaxLoadedMemories        int
+	KnowledgeMaxLoadedMemoryBytes     int
+	KnowledgeMaxLoadedSkills          int
+	KnowledgeMaxLoadedSkillBytes      int
+	KnowledgeDefaultDiscoveryLimit    int
+	KnowledgeMaxDiscoveryLimit        int
+	KnowledgeReconcileInterval        time.Duration
+	CLIMaxIterations                  int
+	SandboxDefaultDriver              string
+	SandboxDockerImage                string
+	SandboxExtraPaths                 []string
+	SandboxAutoToolchains             bool
+	TrajectoryEnabled                 bool
+	TrajectoryS3Bucket                string
+	TrajectoryS3Prefix                string
+	TrajectoryFlushDelay              time.Duration
+	TrajectoryAllowPrivate            bool
+	FSMCompactionEnabled              bool
+	FSMCompactionMinIterations        int
+	FSMCompactionIntervalIterations   int
+	FSMCompactionTailIterations       int
+	FSMCompactionSoftThresholdBytes   int
+	FSMCompactionHardThresholdBytes   int
+	SystemOneBaseURL                  string
+	SystemOneAPIKey                   string
+	SystemOneModel                    string
+	SystemOneTimeout                  time.Duration
+	SystemOneMaxSeqLen                int
+	SystemOneEmbeddingDims            int
+	SystemOneEmbeddingsEnabled        bool
+	SystemOneCompactionEnabled        bool
+	SystemOneCompactionDeferThreshold float64
+	SystemOneLoopGuardMode            string
+	SystemOneEpisodesEnabled          bool
+	SystemOneFallbackOnError          bool
+
+	systemOneTimeoutExplicitInvalid   bool
+	systemOneDimsExplicitInvalid      bool
+	systemOneLoopGuardExplicitInvalid bool
 }
 
 // DefaultSandboxAllowedImages defines standard safe container images.
@@ -118,70 +144,154 @@ func (c *Config) TrajectoryBucket() string {
 	return c.S3Bucket
 }
 
+// SystemOneEnabled reports whether a System-1 inference endpoint is configured.
+func (c *Config) SystemOneEnabled() bool {
+	return c != nil && strings.TrimSpace(c.SystemOneBaseURL) != ""
+}
+
+// NormalizeSystemOneURLs validates a System-1 base URL and resolves both the
+// OpenAI-compatible /v1 API root and the server's /healthz readiness endpoint.
+func NormalizeSystemOneURLs(rawURL string) (openAIBaseURL string, healthURL string, err error) {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return "", "", errors.New("SYSTEM1_BASE_URL cannot be empty")
+	}
+	if strings.Contains(trimmed, "#") {
+		return "", "", errors.New("invalid URL: fragment is not supported")
+	}
+	u, err := url.ParseRequestURI(trimmed)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", "", fmt.Errorf("invalid URL scheme %q, must be http or https", u.Scheme)
+	}
+	if u.Hostname() == "" {
+		return "", "", errors.New("URL must specify a hostname")
+	}
+	if u.ForceQuery || u.RawQuery != "" || u.Fragment != "" {
+		return "", "", errors.New("invalid URL: query parameters and fragments are not supported")
+	}
+
+	escapedPath := u.EscapedPath()
+	trimmedEscaped := strings.TrimRight(escapedPath, "/")
+	var apiEscaped, healthEscaped string
+	switch {
+	case trimmedEscaped == "":
+		apiEscaped = "/v1"
+		healthEscaped = "/healthz"
+	case strings.HasSuffix(trimmedEscaped, "/v1"):
+		apiEscaped = trimmedEscaped
+		healthEscaped = strings.TrimSuffix(trimmedEscaped, "/v1") + "/healthz"
+	default:
+		apiEscaped = trimmedEscaped + "/v1"
+		healthEscaped = trimmedEscaped + "/healthz"
+	}
+
+	apiPath, err := url.PathUnescape(apiEscaped)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid URL path: %w", err)
+	}
+	healthPath, err := url.PathUnescape(healthEscaped)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid URL path: %w", err)
+	}
+
+	apiURL := *u
+	apiURL.Path = apiPath
+	apiURL.RawPath = apiEscaped
+
+	healthURLObj := *u
+	healthURLObj.Path = healthPath
+	healthURLObj.RawPath = healthEscaped
+
+	return apiURL.String(), healthURLObj.String(), nil
+}
+
+// SystemOneURLs returns the normalized OpenAI /v1 base URL and /healthz URL for System-1.
+func (c *Config) SystemOneURLs() (openAIBaseURL string, healthURL string, err error) {
+	if c == nil {
+		return NormalizeSystemOneURLs("")
+	}
+	return NormalizeSystemOneURLs(c.SystemOneBaseURL)
+}
+
 // Defaults returns a Config populated with sensible base defaults.
 // Slices and pointers returned are freshly allocated and isolated.
 func Defaults() *Config {
 	return &Config{
-		BotHandle:                       "@bot",
-		BesedkaURL:                      "http://127.0.0.1:8080",
-		OpenAIModel:                     "gemini-3.8-flash",
-		OpenAIBaseURL:                   "https://generativelanguage.googleapis.com/v1beta/openai/",
-		GeminiModel:                     "gemini-3.8-flash",
-		GeminiBaseURL:                   "https://generativelanguage.googleapis.com/v1beta/openai/",
-		LLMRequestTimeout:               10 * time.Minute,
-		LLMFirstByteTimeout:             1 * time.Minute,
-		TavilyBaseURL:                   "https://api.tavily.com",
-		TownhallMaxParagraphs:           2,
-		DMMaxParagraphs:                 10,
-		MsgRingBufferSize:               100,
-		TownhallToolMaxIterations:       10,
-		DMToolMaxIterations:             20,
-		CLIMaxIterations:                100,
-		FSMRetentionDays:                7,
-		DataDir:                         "./data",
-		EmbeddingModel:                  "",
-		EmbeddingPrecision:              "bf16",
-		S3Region:                        "us-east-1",
-		S3BackupInterval:                1 * time.Hour,
-		S3BackupKeep:                    7,
-		S3BackupPrefix:                  "bob_agent/",
-		S3PathStyle:                     true,
-		SandboxEnabled:                  true,
-		SandboxDefaultDriver:            "bwrap",
-		SandboxDrivers:                  []string{"bwrap", "docker"},
-		SandboxDockerSocket:             "/var/run/docker.sock",
-		SandboxDockerImage:              "python:3.12-slim",
-		SandboxAllowedImages:            append([]string(nil), DefaultSandboxAllowedImages...),
-		SandboxAllowedNetworkModes:      append([]string(nil), DefaultSandboxAllowedNetworkModes...),
-		SandboxMaxLifetime:              30 * time.Minute,
-		SandboxDefaultExecTimeout:       1 * time.Minute,
-		SandboxMaxExecTimeout:           10 * time.Minute,
-		SandboxCPULimit:                 1.0,
-		SandboxMemoryLimitMB:            512,
-		SandboxTasksMax:                 64,
-		SchedulerMinRunTimeout:          1 * time.Minute,
-		SchedulerMaxRunTimeout:          1 * time.Hour,
-		SchedulerMinMaxTurns:            10,
-		SchedulerMaxMaxTurns:            100,
-		MaxAttachmentSizeBytes:          DefaultMaxAttachmentSizeBytes,
-		KnowledgeMaxLoadedMemories:      8,
-		KnowledgeMaxLoadedMemoryBytes:   16384,
-		KnowledgeMaxLoadedSkills:        3,
-		KnowledgeMaxLoadedSkillBytes:    24576,
-		KnowledgeDefaultDiscoveryLimit:  5,
-		KnowledgeMaxDiscoveryLimit:      10,
-		KnowledgeReconcileInterval:      1 * time.Minute,
-		TrajectoryEnabled:               false,
-		TrajectoryS3Bucket:              "",
-		TrajectoryS3Prefix:              "trajectories/",
-		TrajectoryFlushDelay:            15 * time.Minute,
-		TrajectoryAllowPrivate:          false,
-		FSMCompactionEnabled:            true,
-		FSMCompactionMinIterations:      3,
-		FSMCompactionIntervalIterations: 10,
-		FSMCompactionTailIterations:     1,
-		FSMCompactionSoftThresholdBytes: 65536,
-		FSMCompactionHardThresholdBytes: 262144,
+		BotHandle:                         "@bot",
+		BesedkaURL:                        "http://127.0.0.1:8080",
+		OpenAIModel:                       "gemini-3.8-flash",
+		OpenAIBaseURL:                     "https://generativelanguage.googleapis.com/v1beta/openai/",
+		GeminiModel:                       "gemini-3.8-flash",
+		GeminiBaseURL:                     "https://generativelanguage.googleapis.com/v1beta/openai/",
+		LLMRequestTimeout:                 10 * time.Minute,
+		LLMFirstByteTimeout:               1 * time.Minute,
+		TavilyBaseURL:                     "https://api.tavily.com",
+		TownhallMaxParagraphs:             2,
+		DMMaxParagraphs:                   10,
+		MsgRingBufferSize:                 100,
+		TownhallToolMaxIterations:         10,
+		DMToolMaxIterations:               20,
+		CLIMaxIterations:                  100,
+		FSMRetentionDays:                  7,
+		DataDir:                           "./data",
+		EmbeddingModel:                    "",
+		EmbeddingPrecision:                "bf16",
+		S3Region:                          "us-east-1",
+		S3BackupInterval:                  1 * time.Hour,
+		S3BackupKeep:                      7,
+		S3BackupPrefix:                    "bob_agent/",
+		S3PathStyle:                       true,
+		SandboxEnabled:                    true,
+		SandboxDefaultDriver:              "bwrap",
+		SandboxDrivers:                    []string{"bwrap", "docker"},
+		SandboxDockerSocket:               "/var/run/docker.sock",
+		SandboxDockerImage:                "python:3.12-slim",
+		SandboxAllowedImages:              append([]string(nil), DefaultSandboxAllowedImages...),
+		SandboxAllowedNetworkModes:        append([]string(nil), DefaultSandboxAllowedNetworkModes...),
+		SandboxMaxLifetime:                30 * time.Minute,
+		SandboxDefaultExecTimeout:         1 * time.Minute,
+		SandboxMaxExecTimeout:             10 * time.Minute,
+		SandboxCPULimit:                   1.0,
+		SandboxMemoryLimitMB:              512,
+		SandboxTasksMax:                   64,
+		SchedulerMinRunTimeout:            1 * time.Minute,
+		SchedulerMaxRunTimeout:            1 * time.Hour,
+		SchedulerMinMaxTurns:              10,
+		SchedulerMaxMaxTurns:              100,
+		MaxAttachmentSizeBytes:            DefaultMaxAttachmentSizeBytes,
+		KnowledgeMaxLoadedMemories:        8,
+		KnowledgeMaxLoadedMemoryBytes:     16384,
+		KnowledgeMaxLoadedSkills:          3,
+		KnowledgeMaxLoadedSkillBytes:      24576,
+		KnowledgeDefaultDiscoveryLimit:    5,
+		KnowledgeMaxDiscoveryLimit:        10,
+		KnowledgeReconcileInterval:        1 * time.Minute,
+		TrajectoryEnabled:                 false,
+		TrajectoryS3Bucket:                "",
+		TrajectoryS3Prefix:                "trajectories/",
+		TrajectoryFlushDelay:              15 * time.Minute,
+		TrajectoryAllowPrivate:            false,
+		FSMCompactionEnabled:              true,
+		FSMCompactionMinIterations:        3,
+		FSMCompactionIntervalIterations:   10,
+		FSMCompactionTailIterations:       1,
+		FSMCompactionSoftThresholdBytes:   65536,
+		FSMCompactionHardThresholdBytes:   262144,
+		SystemOneBaseURL:                  "",
+		SystemOneAPIKey:                   "",
+		SystemOneModel:                    DefaultSystemOneModel,
+		SystemOneTimeout:                  DefaultSystemOneTimeout,
+		SystemOneMaxSeqLen:                0,
+		SystemOneEmbeddingDims:            DefaultSystemOneEmbeddingDims,
+		SystemOneEmbeddingsEnabled:        true,
+		SystemOneCompactionEnabled:        true,
+		SystemOneCompactionDeferThreshold: 0,
+		SystemOneLoopGuardMode:            DefaultSystemOneLoopGuardMode,
+		SystemOneEpisodesEnabled:          true,
+		SystemOneFallbackOnError:          true,
 	}
 }
 
@@ -408,6 +518,60 @@ func LoadFromEnv() (*Config, error) {
 		return nil, err
 	}
 	cfg.FSMCompactionHardThresholdBytes = fsmCompactionHardBytes
+
+	cfg.SystemOneBaseURL = strings.TrimSpace(os.Getenv("SYSTEM1_BASE_URL"))
+	cfg.SystemOneAPIKey = strings.TrimSpace(os.Getenv("SYSTEM1_API_KEY"))
+	cfg.SystemOneModel = getEnvOrDefault("SYSTEM1_MODEL", cfg.SystemOneModel)
+
+	sys1Timeout, err := getEnvDurationStrict("SYSTEM1_TIMEOUT", cfg.SystemOneTimeout)
+	if err != nil {
+		return nil, err
+	}
+	cfg.SystemOneTimeout = sys1Timeout
+
+	sys1MaxSeqLen, err := getEnvNonNegIntStrict("SYSTEM1_MAX_SEQ_LEN", cfg.SystemOneMaxSeqLen)
+	if err != nil {
+		return nil, err
+	}
+	cfg.SystemOneMaxSeqLen = sys1MaxSeqLen
+
+	sys1Dims, err := getEnvIntStrict("SYSTEM1_EMBEDDING_DIMS", cfg.SystemOneEmbeddingDims)
+	if err != nil {
+		return nil, err
+	}
+	cfg.SystemOneEmbeddingDims = sys1Dims
+
+	sys1EmbeddingsEnabled, err := getEnvBoolOrDefault("SYSTEM1_EMBEDDINGS_ENABLED", cfg.SystemOneEmbeddingsEnabled)
+	if err != nil {
+		return nil, err
+	}
+	cfg.SystemOneEmbeddingsEnabled = sys1EmbeddingsEnabled
+
+	sys1CompactionEnabled, err := getEnvBoolOrDefault("SYSTEM1_COMPACTION_ENABLED", cfg.SystemOneCompactionEnabled)
+	if err != nil {
+		return nil, err
+	}
+	cfg.SystemOneCompactionEnabled = sys1CompactionEnabled
+
+	sys1DeferThreshold, err := getEnvFloatStrict("SYSTEM1_COMPACTION_DEFER_THRESHOLD", cfg.SystemOneCompactionDeferThreshold)
+	if err != nil {
+		return nil, err
+	}
+	cfg.SystemOneCompactionDeferThreshold = sys1DeferThreshold
+
+	cfg.SystemOneLoopGuardMode = strings.ToLower(getEnvOrDefault("SYSTEM1_LOOP_GUARD_MODE", cfg.SystemOneLoopGuardMode))
+
+	sys1EpisodesEnabled, err := getEnvBoolOrDefault("SYSTEM1_EPISODES_ENABLED", cfg.SystemOneEpisodesEnabled)
+	if err != nil {
+		return nil, err
+	}
+	cfg.SystemOneEpisodesEnabled = sys1EpisodesEnabled
+
+	sys1FallbackOnError, err := getEnvBoolOrDefault("SYSTEM1_FALLBACK_ON_ERROR", cfg.SystemOneFallbackOnError)
+	if err != nil {
+		return nil, err
+	}
+	cfg.SystemOneFallbackOnError = sys1FallbackOnError
 
 	cfg.SandboxDrivers = getEnvSliceOrDefault("SANDBOX_DRIVERS", cfg.SandboxDrivers)
 	cfg.SandboxDockerSocket = getEnvOrDefault("SANDBOX_DOCKER_SOCKET", cfg.SandboxDockerSocket)
@@ -638,9 +802,56 @@ func (c *Config) Validate(requireAPIKey bool) error {
 			return errors.New("TRAJECTORY_FLUSH_DELAY must be greater than 0")
 		}
 	}
+	if err := c.validateSystemOne(); err != nil {
+		return err
+	}
 	sbxCfg := c.SandboxConfig()
 	if err := sbxCfg.Validate(); err != nil {
 		return err
+	}
+	return nil
+}
+
+func (c *Config) validateSystemOne() error {
+	if c.systemOneTimeoutExplicitInvalid || c.SystemOneTimeout < 0 {
+		return fmt.Errorf("invalid SYSTEM1_TIMEOUT: %v", c.SystemOneTimeout)
+	}
+	if c.SystemOneMaxSeqLen < 0 || (c.SystemOneMaxSeqLen > 0 && (c.SystemOneMaxSeqLen < MinSystemOneMaxSeqLen || c.SystemOneMaxSeqLen > MaxSystemOneMaxSeqLen)) {
+		return fmt.Errorf("invalid SYSTEM1_MAX_SEQ_LEN (%d): must be 0 or in %d..%d", c.SystemOneMaxSeqLen, MinSystemOneMaxSeqLen, MaxSystemOneMaxSeqLen)
+	}
+	if c.systemOneDimsExplicitInvalid || (c.SystemOneEmbeddingDims != 0 && c.SystemOneEmbeddingDims != 128 && c.SystemOneEmbeddingDims != 256 && c.SystemOneEmbeddingDims != 384) {
+		return fmt.Errorf("invalid SYSTEM1_EMBEDDING_DIMS (%d): must be 128, 256, or 384", c.SystemOneEmbeddingDims)
+	}
+	if math.IsNaN(c.SystemOneCompactionDeferThreshold) || math.IsInf(c.SystemOneCompactionDeferThreshold, 0) || c.SystemOneCompactionDeferThreshold > 1.0 {
+		return fmt.Errorf("invalid SYSTEM1_COMPACTION_DEFER_THRESHOLD (%v): must be finite and <= 1.0", c.SystemOneCompactionDeferThreshold)
+	}
+	mode := strings.ToLower(strings.TrimSpace(c.SystemOneLoopGuardMode))
+	if c.systemOneLoopGuardExplicitInvalid || (mode != "" && mode != "off" && mode != "shadow" && mode != "hybrid") {
+		return fmt.Errorf("invalid SYSTEM1_LOOP_GUARD_MODE %q: must be off, shadow, or hybrid", c.SystemOneLoopGuardMode)
+	}
+	c.SystemOneLoopGuardMode = mode
+
+	if !c.SystemOneEnabled() {
+		return nil
+	}
+
+	if _, _, err := NormalizeSystemOneURLs(c.SystemOneBaseURL); err != nil {
+		return fmt.Errorf("invalid SYSTEM1_BASE_URL: %w", err)
+	}
+	c.SystemOneBaseURL = strings.TrimSpace(c.SystemOneBaseURL)
+	if strings.TrimSpace(c.SystemOneModel) == "" {
+		c.SystemOneModel = DefaultSystemOneModel
+	} else {
+		c.SystemOneModel = strings.TrimSpace(c.SystemOneModel)
+	}
+	if c.SystemOneTimeout == 0 {
+		c.SystemOneTimeout = DefaultSystemOneTimeout
+	}
+	if c.SystemOneEmbeddingDims == 0 {
+		c.SystemOneEmbeddingDims = DefaultSystemOneEmbeddingDims
+	}
+	if c.SystemOneLoopGuardMode == "" {
+		c.SystemOneLoopGuardMode = DefaultSystemOneLoopGuardMode
 	}
 	return nil
 }
@@ -762,6 +973,30 @@ func getEnvIntStrict(key string, defaultValue int) (int, error) {
 		return 0, fmt.Errorf("invalid integer for %s: %q", key, val)
 	}
 	return i, nil
+}
+
+func getEnvNonNegIntStrict(key string, defaultValue int) (int, error) {
+	val := strings.TrimSpace(os.Getenv(key))
+	if val == "" {
+		return defaultValue, nil
+	}
+	i, err := strconv.Atoi(val)
+	if err != nil || i < 0 {
+		return 0, fmt.Errorf("invalid non-negative integer for %s: %q", key, val)
+	}
+	return i, nil
+}
+
+func getEnvFloatStrict(key string, defaultValue float64) (float64, error) {
+	val := strings.TrimSpace(os.Getenv(key))
+	if val == "" {
+		return defaultValue, nil
+	}
+	f, err := strconv.ParseFloat(val, 64)
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, fmt.Errorf("invalid float for %s: %q", key, val)
+	}
+	return f, nil
 }
 
 func parsePathList(val string) []string {
