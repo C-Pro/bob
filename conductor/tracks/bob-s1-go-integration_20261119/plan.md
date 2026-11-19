@@ -54,6 +54,6 @@
 
 ## Step 5: Controlled Evaluation Harness & Held-Out Benchmark (`eval/harness`)
 - [x] Task: Extend `eval/harness/runner.py` and `eval/harness/config_template.yaml` with `--system1-url`, `--system1-model`, `--system1-loop-guard-mode`, `--system1-fallback-on-error`, and `BOB_EVAL_SYSTEM1_URL` env support.
-- [ ] Task: Verify end-to-end execution on `eval/tasks/smoke_4.json` against a live external `services/bob_s1` sidecar with `fallback_on_error: false` (checking `/healthz`, `calibration.applied == true` on `task == "compaction"`, zero unexpected fallbacks, and `system1_decision` telemetry in exported trajectories).
+- [x] Task: Verify end-to-end execution on `eval/tasks/smoke_4.json` against a live external `services/bob_s1` sidecar with `fallback_on_error: false` (checking `/healthz`, `calibration.applied == true` on `task == "compaction"`, zero unexpected fallbacks, and `system1_decision` telemetry in exported trajectories).
 - [ ] Task: Run controlled evaluation on `eval/tasks/heldout/heldout_100.json` under identical actor model (`Qwen3.6-35B-A3B-MTP-GGUF`), iteration/timeout budgets, and Docker grader against the 55.0% baseline; record pass rate, per-benchmark breakdown, compaction latency (`gate + summarizer`), skipped probes, loop-guard interventions, and fallback/error counts in `eval/results/`.
 - [ ] Task: Run final `make check` and confirm 0 errors.

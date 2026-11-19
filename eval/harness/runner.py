@@ -20,6 +20,7 @@ import string
 import unicodedata
 import hashlib
 import tempfile
+import importlib.util
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -119,6 +120,31 @@ def grade_frames(task: dict, workspace: Path, stdout_output: str) -> dict:
         "grading_status": "graded"
     }
 
+def resolve_swebench_python() -> str:
+    override = os.environ.get("BOB_EVAL_SWEBENCH_PYTHON", "").strip()
+    if override:
+        return override
+    if importlib.util.find_spec("swebench") is not None:
+        return sys.executable
+    candidates = sorted(
+        (Path.home() / ".local" / "share" / "mise" / "installs" / "python").glob("*/bin/python"),
+        reverse=True,
+    )
+    for cand in candidates:
+        try:
+            res = subprocess.run(
+                [str(cand), "-c", "import swebench"],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            if res.returncode == 0:
+                return str(cand)
+        except Exception:
+            continue
+    return sys.executable
+
+
 def evaluate_swe_patch_docker(task_id: str, patch_content: str, timeout_sec: int = 600) -> tuple:
     inst_id = task_id.replace("swe_", "")
     pred = [{
@@ -133,7 +159,7 @@ def evaluate_swe_patch_docker(task_id: str, patch_content: str, timeout_sec: int
         
     run_id = f"eval_{inst_id}_{int(time.time())}"
     cmd = [
-        sys.executable, "-m", "swebench.harness.run_evaluation",
+        resolve_swebench_python(), "-m", "swebench.harness.run_evaluation",
         "-d", "SWE-bench/SWE-bench_Lite",
         "-p", str(pred_path),
         "-i", inst_id,
