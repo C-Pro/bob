@@ -192,12 +192,9 @@ func New(cfg *config.Config, opts Options) (*Runtime, error) {
 	var agentEngine *agent.Engine
 
 	if llmClient != nil {
-		fsmEngine = fsm.NewEngine(
-			storeProvider,
-			llmClient,
-			toolsRegistry,
+		fsmOpts := []fsm.EngineOption{
 			fsm.WithDefaultModel(cfg.OpenAIModel),
-			fsm.WithPollInterval(2*time.Second),
+			fsm.WithPollInterval(2 * time.Second),
 			fsm.WithKnowledgeBudgetLimits(tools.KnowledgeBudgetLimits{
 				MaxLoadedMemories:    cfg.KnowledgeMaxLoadedMemories,
 				MaxLoadedMemoryBytes: cfg.KnowledgeMaxLoadedMemoryBytes,
@@ -232,7 +229,19 @@ func New(cfg *config.Config, opts Options) (*Runtime, error) {
 				}
 				return errors.Join(errs...)
 			}),
-		)
+		}
+		if systemOneClient != nil {
+			fsmOpts = append(fsmOpts,
+				fsm.WithSystemOneClient(systemOneClient),
+				fsm.WithSystemOneConfig(fsm.SystemOneControlConfig{
+					CompactionEnabled:        cfg.SystemOneCompactionEnabled,
+					CompactionDeferThreshold: cfg.SystemOneCompactionDeferThreshold,
+					LoopGuardMode:            cfg.SystemOneLoopGuardMode,
+					FallbackOnError:          cfg.SystemOneFallbackOnError,
+				}),
+			)
+		}
+		fsmEngine = fsm.NewEngine(storeProvider, llmClient, toolsRegistry, fsmOpts...)
 
 		var err error
 		agentEngine, err = agent.NewEngine(agent.Dependencies{

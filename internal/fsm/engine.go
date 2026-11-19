@@ -200,6 +200,20 @@ func WithLoopGuardConfig(cfg LoopGuardConfig) EngineOption {
 	}
 }
 
+// WithSystemOneClient configures the optional System-1 inference sidecar client for the engine.
+func WithSystemOneClient(c SystemOneDecisionClient) EngineOption {
+	return func(e *Engine) {
+		e.systemOneClient = c
+	}
+}
+
+// WithSystemOneConfig configures System-1 control-plane policies for the engine.
+func WithSystemOneConfig(cfg SystemOneControlConfig) EngineOption {
+	return func(e *Engine) {
+		e.systemOneCfg = cfg
+	}
+}
+
 // Engine coordinates durable FSM workflow executions, state dispatching, delayed transitions, and crash recovery.
 type Engine struct {
 	storeProvider           StoreProvider
@@ -217,6 +231,8 @@ type Engine struct {
 	compactionCfg           CompactionConfig
 	compactionDecider       CompactionDecider
 	loopGuardCfg            LoopGuardConfig
+	systemOneClient         SystemOneDecisionClient
+	systemOneCfg            SystemOneControlConfig
 
 	frontendsMu sync.RWMutex
 	frontends   map[string]agentapi.Frontend
@@ -284,6 +300,10 @@ func NewEngine(storeProvider StoreProvider, llmClient LLMClient, invoker ToolInv
 		runner.SetCompactionDecider(e.compactionDecider)
 	}
 	runner.SetLoopGuardConfig(e.loopGuardCfg)
+	if e.systemOneClient != nil {
+		runner.SetSystemOneClient(e.systemOneClient)
+	}
+	runner.SetSystemOneConfig(e.systemOneCfg)
 	e.RegisterRunner(FSMTypeToolLoop, runner)
 
 	return e

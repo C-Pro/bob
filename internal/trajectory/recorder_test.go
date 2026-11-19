@@ -136,6 +136,50 @@ func TestRecorder_EventConstructors(t *testing.T) {
 		StateJSON:     json.RawMessage(`{invalid json`),
 	})
 	require.Error(t, err)
+
+	// System-1 decision event + optional compaction metadata
+	s1Ev, err := MakeSystemOneDecisionEvent("traj-1", "run-1", 1, 3, "compaction", "", 2, SystemOneDecisionPayload{
+		Task:               "compaction",
+		Choice:             "skip",
+		ChoiceBasis:        "calibrated_argmax",
+		Scores:             []SystemOneScoreEntry{{ID: "skip", Logit: -1.1, Probability: 0.88}},
+		CalibrationProfile: "cal_v2_4k",
+		CalibrationApplied: true,
+		PrefixTokens:       320,
+		SuffixTokens:       24,
+		Truncated:          false,
+		LatencyMs:          14,
+		AppliedAction:      "skip",
+		DeferReason:        "",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "system1_decision", s1Ev.EventType)
+	assert.Equal(t, "compaction", s1Ev.Phase)
+	assert.Equal(t, "system1_compaction_i3", s1Ev.StepID)
+	assert.Equal(t, 2, s1Ev.Attempt)
+
+	var decodedS1 SystemOneDecisionPayload
+	require.NoError(t, json.Unmarshal(s1Ev.Payload, &decodedS1))
+	assert.Equal(t, "compaction", decodedS1.Task)
+	assert.True(t, decodedS1.CalibrationApplied)
+	assert.Equal(t, "cal_v2_4k", decodedS1.CalibrationProfile)
+	assert.Equal(t, int64(14), decodedS1.LatencyMs)
+
+	metaCompEv, err := MakeCompactionEvent("traj-1", "run-1", 1, 4, "", CompactionEventPayload{
+		Version:             1,
+		CompactedUpToIter:   3,
+		ShouldCompact:       true,
+		RubricVerdict:       "probed_compact",
+		DecisionSource:      "system1_gate_system2_summarizer",
+		SystemOneLatencyMs:  12,
+		SummarizerLatencyMs: 650,
+	})
+	require.NoError(t, err)
+	var decodedMeta CompactionEventPayload
+	require.NoError(t, json.Unmarshal(metaCompEv.Payload, &decodedMeta))
+	assert.Equal(t, "system1_gate_system2_summarizer", decodedMeta.DecisionSource)
+	assert.Equal(t, int64(12), decodedMeta.SystemOneLatencyMs)
+	assert.Equal(t, int64(650), decodedMeta.SummarizerLatencyMs)
 }
 
 func TestRecorder_ParseExitCode(t *testing.T) {

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"bob/internal/agentapi"
+	"bob/internal/trajectory"
 
 	openai "github.com/sashabaranov/go-openai"
 )
@@ -300,7 +301,12 @@ func parseFlexibleStringSlice(raw json.RawMessage) []string {
 
 // CompactionProbeResult represents the structured decision returned by a SelfCompact rubric probe.
 type CompactionProbeResult struct {
-	ShouldCompact bool                `json:"should_compact"`
-	Reason        string              `json:"reason"`
-	State         *CompactedTaskState `json:"state,omitempty"`
+	ShouldCompact       bool                                 `json:"should_compact"`
+	Reason              string                               `json:"reason"`
+	State               *CompactedTaskState                  `json:"state,omitempty"`
+	DecisionSource      string                               `json:"-"`
+	SystemOneLatencyMs  int64                                `json:"-"`
+	SummarizerLatencyMs int64                                `json:"-"`
+	RequireNonNilState  bool                                 `json:"-"`
+	DecisionTelemetry   *trajectory.SystemOneDecisionPayload `json:"-"`
 }

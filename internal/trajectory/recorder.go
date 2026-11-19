@@ -183,6 +183,45 @@ func MakeCompactionEvent(trajID, runID string, gen, iteration int, stepID string
 	}, nil
 }
 
+// MakeSystemOneDecisionEvent constructs an immutable outbox event for a System-1 sidecar probe.
+func MakeSystemOneDecisionEvent(trajID, runID string, gen, iteration int, phase, stepID string, attempt int, payload SystemOneDecisionPayload) (*Event, error) {
+	if gen <= 0 {
+		gen = 1
+	}
+	if attempt <= 0 {
+		attempt = 1
+	}
+	phase = strings.TrimSpace(phase)
+	if phase == "" {
+		phase = "loop"
+	}
+	stepID = strings.TrimSpace(stepID)
+	if stepID == "" {
+		taskName := strings.TrimSpace(payload.Task)
+		if taskName == "" {
+			taskName = "decision"
+		}
+		stepID = fmt.Sprintf("system1_%s_i%d", taskName, iteration)
+	}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal system1_decision payload: %w", err)
+	}
+	return &Event{
+		ID:           newEventID(),
+		TrajectoryID: trajID,
+		RunID:        runID,
+		Generation:   gen,
+		Iteration:    iteration,
+		Phase:        phase,
+		StepID:       stepID,
+		Attempt:      attempt,
+		EventType:    "system1_decision",
+		Payload:      payloadBytes,
+		CreatedAt:    time.Now().UTC(),
+	}, nil
+}
+
 // ParseExitCode scans tool output text for structured "Exit Code: <int>" lines.
 func ParseExitCode(content string) *int {
 	lines := strings.Split(content, "\n")

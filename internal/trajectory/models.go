@@ -119,14 +119,45 @@ type TurnTerminalPayload struct {
 
 // CompactionEventPayload records a task trajectory compaction probe or snapshot transition.
 type CompactionEventPayload struct {
-	Version           int             `json:"version"`
-	ParentVersion     int             `json:"parent_version"`
-	CompactedUpToIter int             `json:"compacted_up_to_iter"`
-	ShouldCompact     bool            `json:"should_compact"`
-	RubricVerdict     string          `json:"rubric_verdict"` // "probed_compact", "probed_skip", or "backstop_forced"
-	Reason            string          `json:"reason,omitempty"`
-	Model             string          `json:"model,omitempty"`
-	InputBytes        int             `json:"input_bytes"`
-	OutputBytes       int             `json:"output_bytes"`
-	StateJSON         json.RawMessage `json:"state_json,omitempty"`
+	Version             int             `json:"version"`
+	ParentVersion       int             `json:"parent_version"`
+	CompactedUpToIter   int             `json:"compacted_up_to_iter"`
+	ShouldCompact       bool            `json:"should_compact"`
+	RubricVerdict       string          `json:"rubric_verdict"` // "probed_compact", "probed_skip", or "backstop_forced"
+	Reason              string          `json:"reason,omitempty"`
+	Model               string          `json:"model,omitempty"`
+	InputBytes          int             `json:"input_bytes"`
+	OutputBytes         int             `json:"output_bytes"`
+	StateJSON           json.RawMessage `json:"state_json,omitempty"`
+	DecisionSource      string          `json:"decision_source,omitempty"`
+	SystemOneLatencyMs  int64           `json:"system1_latency_ms,omitempty"`
+	SummarizerLatencyMs int64           `json:"summarizer_latency_ms,omitempty"`
+}
+
+// SystemOneScoreEntry captures a single option score from a bob-s1 decision response.
+type SystemOneScoreEntry struct {
+	ID          string  `json:"id"`
+	Logit       float64 `json:"logit"`
+	Probability float64 `json:"probability"`
+}
+
+// SystemOneDecisionPayload records a System-1 sidecar decision probe and control-plane outcome.
+type SystemOneDecisionPayload struct {
+	Task               string                `json:"task"`
+	Choice             string                `json:"choice,omitempty"`
+	ChoiceBasis        string                `json:"choice_basis,omitempty"`
+	Scores             []SystemOneScoreEntry `json:"scores,omitempty"`
+	CalibrationProfile string                `json:"calibration_profile,omitempty"`
+	CalibrationApplied bool                  `json:"calibration_applied"`
+	MismatchReason     string                `json:"mismatch_reason,omitempty"`
+	PrefixTokens       int                   `json:"prefix_tokens"`
+	SuffixTokens       int                   `json:"suffix_tokens"`
+	Truncated          bool                  `json:"truncated"`
+	LatencyMs          int64                 `json:"latency_ms"`
+	AppliedAction      string                `json:"applied_action"`
+	HeuristicAction    string                `json:"heuristic_action,omitempty"`
+	FallbackUsed       bool                  `json:"fallback_used"`
+	ShadowMode         bool                  `json:"shadow_mode"`
+	DeferReason        string                `json:"defer_reason,omitempty"`
+	Error              string                `json:"error,omitempty"`
 }

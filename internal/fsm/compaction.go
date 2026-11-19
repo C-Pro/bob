@@ -9,6 +9,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"bob/internal/llm"
 	"bob/internal/trajectory"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -23,6 +24,14 @@ const (
 	maxProbeCompletionToks  = 8192
 	maxCompactedStateBytes  = 32768
 )
+
+// SystemOneControlConfig configures System-1 sidecar gating and fallback policies in the FSM.
+type SystemOneControlConfig struct {
+	CompactionEnabled        bool
+	CompactionDeferThreshold float64 // 0 = use sidecar risk_threshold_5pct; < 0 = disable uncertainty deferral
+	LoopGuardMode            string  // "off", "shadow", "hybrid"
+	FallbackOnError          bool
+}
 
 // CompactionConfig configures adaptive task trajectory compaction (SelfCompact) for the FSM tool loop.
 type CompactionConfig struct {
@@ -481,18 +490,85 @@ Respond ONLY with valid JSON matching this schema:
   }
 }`
 
+const selfCompactSummarizerSystemPrompt = `You are evaluating Stage 2 of the SelfCompact trajectory summarizer for an autonomous tool-using agent.
+A calibrated compaction gate has ALREADY approved compacting the candidate iterations into a durable task state snapshot.
+Distill ONLY verified facts, constraints, decisions/rejected paths, exact artifact paths, current subgoal, next intended actions, and unresolved blockers strictly grounded in the candidate steps and prior compacted state. Do not invent outcomes or claim unverified checks passed.
+
+Respond ONLY with valid JSON matching this schema:
+{
+  "should_compact": true,
+  "reason": "concise summary",
+  "state": {
+    "original_objective": "string",
+    "immutable_constraints": ["string"],
+    "verified_findings": [{"summary": "string", "source_step_ids": ["step_id"]}],
+    "decisions_and_rejected": ["string"],
+    "current_subgoal": "string",
+    "next_intended_actions": ["string"],
+    "unresolved_blockers": ["string"],
+    "produced_artifacts": ["string"]
+  }
+}`
+
 type llmCompactionDecider struct {
 	client LLMClient
 }
 
 func (d *llmCompactionDecider) DecideCompaction(ctx context.Context, input CompactionProbeInput) (*CompactionProbeResult, error) {
-	if d == nil || d.client == nil {
+	return runCompactionLLMQuery(ctx, d.client, selfCompactRubricSystemPrompt, input)
+}
+
+func runCompactionLLMQuery(ctx context.Context, client LLMClient, systemPrompt string, input CompactionProbeInput) (*CompactionProbeResult, error) {
+	if client == nil {
 		return nil, fmt.Errorf("llm client is not configured for compaction decider")
 	}
 
 	probeCtx, cancel := context.WithTimeout(ctx, compactionProbeTimeout)
 	defer cancel()
 
+	userPrompt := renderFullCompactionPrompt(input)
+
+	req := openai.ChatCompletionRequest{
+		Model:               input.Model,
+		MaxCompletionTokens: maxProbeCompletionToks,
+		Messages: []openai.ChatCompletionMessage{
+			{
+				Role:    openai.ChatMessageRoleSystem,
+				Content: systemPrompt,
+			},
+			{
+				Role:    openai.ChatMessageRoleUser,
+				Content: userPrompt,
+			},
+		},
+	}
+
+	resp, err := client.CreateChatCompletion(probeCtx, req)
+	if err != nil {
+		return nil, err
+	}
+	if len(resp.Choices) == 0 {
+		return nil, fmt.Errorf("compaction probe returned empty choices")
+	}
+	finishReason := resp.Choices[0].FinishReason
+	if finishReason == openai.FinishReasonLength {
+		slog.Warn("compaction probe output was truncated", "finish_reason", finishReason, "max_completion_tokens", maxProbeCompletionToks)
+	}
+
+	raw := strings.TrimSpace(resp.Choices[0].Message.Content)
+	if len(raw) > maxCompactedStateBytes*2 {
+		return nil, fmt.Errorf("compaction probe response (%d bytes) exceeds maximum allowed size", len(raw))
+	}
+	raw = stripMarkdownJSONFence(raw)
+
+	var result CompactionProbeResult
+	if err := json.Unmarshal([]byte(raw), &result); err != nil {
+		return nil, fmt.Errorf("failed to parse compaction probe JSON (finish_reason=%s, raw_preview=%.512q): %w", finishReason, raw, err)
+	}
+	return &result, nil
+}
+
+func renderFullCompactionPrompt(input CompactionProbeInput) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Run ID: %s\n", input.Run.ID)
 	fmt.Fprintf(&b, "Candidate Compaction Boundary: Iterations 1..%d (Current Run Iteration: %d)\n", input.TargetIter, input.Run.Iteration)
@@ -543,45 +619,262 @@ func (d *llmCompactionDecider) DecideCompaction(ctx context.Context, input Compa
 	if len(userPrompt) > maxProbePromptBytes {
 		userPrompt = truncateUTF8Bytes(userPrompt, maxProbePromptBytes-16) + "\n...[truncated]"
 	}
+	return userPrompt
+}
 
-	req := openai.ChatCompletionRequest{
-		Model:               input.Model,
-		MaxCompletionTokens: maxProbeCompletionToks,
-		Messages: []openai.ChatCompletionMessage{
-			{
-				Role:    openai.ChatMessageRoleSystem,
-				Content: selfCompactRubricSystemPrompt,
-			},
-			{
-				Role:    openai.ChatMessageRoleUser,
-				Content: userPrompt,
-			},
-		},
-	}
+type systemOneCompactionDecider struct {
+	s1Client        SystemOneDecisionClient
+	llmClient       LLMClient
+	fallbackDecider CompactionDecider
+	cfg             SystemOneControlConfig
+}
 
-	resp, err := d.client.CreateChatCompletion(probeCtx, req)
-	if err != nil {
-		return nil, err
-	}
-	if len(resp.Choices) == 0 {
-		return nil, fmt.Errorf("compaction probe returned empty choices")
-	}
-	finishReason := resp.Choices[0].FinishReason
-	if finishReason == openai.FinishReasonLength {
-		slog.Warn("compaction probe output was truncated", "finish_reason", finishReason, "max_completion_tokens", maxProbeCompletionToks)
+func (d *systemOneCompactionDecider) DecideCompaction(ctx context.Context, input CompactionProbeInput) (*CompactionProbeResult, error) {
+	if d == nil || d.s1Client == nil {
+		if d != nil && d.fallbackDecider != nil {
+			return d.fallbackDecider.DecideCompaction(ctx, input)
+		}
+		return nil, fmt.Errorf("system1 client is not configured for compaction decider")
 	}
 
-	raw := strings.TrimSpace(resp.Choices[0].Message.Content)
-	if len(raw) > maxCompactedStateBytes*2 {
-		return nil, fmt.Errorf("compaction probe response (%d bytes) exceeds maximum allowed size", len(raw))
+	fallback := d.fallbackDecider
+	if fallback == nil {
+		fallback = &llmCompactionDecider{client: d.llmClient}
 	}
-	raw = stripMarkdownJSONFence(raw)
 
-	var result CompactionProbeResult
-	if err := json.Unmarshal([]byte(raw), &result); err != nil {
-		return nil, fmt.Errorf("failed to parse compaction probe JSON (finish_reason=%s, raw_preview=%.512q): %w", finishReason, raw, err)
+	rendered := RenderSystemOneCompactionState(input)
+	probeStart := time.Now()
+	entry, resp, s1Err := d.s1Client.DecideCompaction(ctx, rendered.Text, llm.SystemOneCalibratedSeqLen)
+	s1LatencyMs := time.Since(probeStart).Milliseconds()
+	if resp != nil && resp.Latency > 0 {
+		s1LatencyMs = resp.Latency.Milliseconds()
 	}
-	return &result, nil
+
+	var telemetry *trajectory.SystemOneDecisionPayload
+	if s1Err != nil {
+		telemetry = &trajectory.SystemOneDecisionPayload{
+			Task:          llm.SystemOneTaskCompaction,
+			Truncated:     rendered.Truncated,
+			LatencyMs:     s1LatencyMs,
+			AppliedAction: "probe_error",
+			FallbackUsed:  d.cfg.FallbackOnError,
+			Error:         s1Err.Error(),
+		}
+		return d.handleGateError(ctx, input, fallback, telemetry, s1Err)
+	}
+
+	telemetry = buildSystemOneDecisionTelemetry(llm.SystemOneTaskCompaction, entry, resp, s1LatencyMs, rendered.Truncated)
+	if err := validateCompactionCalibration(entry, d.cfg.CompactionDeferThreshold); err != nil {
+		telemetry.AppliedAction = "calibration_error"
+		telemetry.FallbackUsed = d.cfg.FallbackOnError
+		telemetry.Error = err.Error()
+		return d.handleGateError(ctx, input, fallback, telemetry, err)
+	}
+
+	effectiveDefer := resolveEffectiveDeferThreshold(entry, d.cfg.CompactionDeferThreshold)
+	maxProb := entry.MaxProbability()
+	if effectiveDefer > 0 && maxProb < effectiveDefer {
+		telemetry.DeferReason = fmt.Sprintf("max_prob=%.4f < defer_threshold=%.4f", maxProb, effectiveDefer)
+		telemetry.AppliedAction = "defer_to_system2"
+		sumStart := time.Now()
+		res, fbErr := fallback.DecideCompaction(ctx, input)
+		sumLatencyMs := time.Since(sumStart).Milliseconds()
+		if fbErr != nil {
+			telemetry.Error = fbErr.Error()
+			return &CompactionProbeResult{
+				DecisionSource:     "system2_defer",
+				SystemOneLatencyMs: s1LatencyMs,
+				DecisionTelemetry:  telemetry,
+			}, fbErr
+		}
+		if res == nil {
+			res = &CompactionProbeResult{}
+		}
+		res.DecisionSource = "system2_defer"
+		res.SystemOneLatencyMs = s1LatencyMs
+		res.SummarizerLatencyMs = sumLatencyMs
+		res.DecisionTelemetry = telemetry
+		return res, nil
+	}
+
+	if entry.Choice == "skip" {
+		telemetry.AppliedAction = "skip"
+		return &CompactionProbeResult{
+			ShouldCompact:      false,
+			Reason:             fmt.Sprintf("system1_calibrated_skip (p=%.4f)", maxProb),
+			DecisionSource:     "system1_skip",
+			SystemOneLatencyMs: s1LatencyMs,
+			DecisionTelemetry:  telemetry,
+		}, nil
+	}
+
+	if entry.Choice != "compact" {
+		err := fmt.Errorf("unexpected bob-s1 compaction choice %q", entry.Choice)
+		telemetry.AppliedAction = "probe_error"
+		telemetry.FallbackUsed = d.cfg.FallbackOnError
+		telemetry.Error = err.Error()
+		return d.handleGateError(ctx, input, fallback, telemetry, err)
+	}
+
+	sumStart := time.Now()
+	sumRes, sumErr := runCompactionLLMQuery(ctx, d.llmClient, selfCompactSummarizerSystemPrompt, input)
+	sumLatencyMs := time.Since(sumStart).Milliseconds()
+	if sumErr != nil {
+		telemetry.AppliedAction = "probe_error"
+		telemetry.Error = fmt.Sprintf("stage2_summarizer_error: %v", sumErr)
+		return &CompactionProbeResult{
+			DecisionSource:      "system1_gate_system2_summarizer",
+			SystemOneLatencyMs:  s1LatencyMs,
+			SummarizerLatencyMs: sumLatencyMs,
+			RequireNonNilState:  true,
+			DecisionTelemetry:   telemetry,
+		}, fmt.Errorf("stage2 compaction summarizer failed: %w", sumErr)
+	}
+	if sumRes == nil || sumRes.State == nil {
+		err := fmt.Errorf("stage2 compaction summarizer returned nil state")
+		telemetry.AppliedAction = "probe_error"
+		telemetry.Error = err.Error()
+		return &CompactionProbeResult{
+			DecisionSource:      "system1_gate_system2_summarizer",
+			SystemOneLatencyMs:  s1LatencyMs,
+			SummarizerLatencyMs: sumLatencyMs,
+			RequireNonNilState:  true,
+			DecisionTelemetry:   telemetry,
+		}, err
+	}
+
+	telemetry.AppliedAction = "compact"
+	sumRes.ShouldCompact = true
+	sumRes.DecisionSource = "system1_gate_system2_summarizer"
+	sumRes.SystemOneLatencyMs = s1LatencyMs
+	sumRes.SummarizerLatencyMs = sumLatencyMs
+	sumRes.RequireNonNilState = true
+	sumRes.DecisionTelemetry = telemetry
+	return sumRes, nil
+}
+
+func (d *systemOneCompactionDecider) handleGateError(
+	ctx context.Context,
+	input CompactionProbeInput,
+	fallback CompactionDecider,
+	telemetry *trajectory.SystemOneDecisionPayload,
+	gateErr error,
+) (*CompactionProbeResult, error) {
+	if !d.cfg.FallbackOnError || fallback == nil {
+		return &CompactionProbeResult{
+			ShouldCompact:      false,
+			DecisionSource:     "system1_error",
+			SystemOneLatencyMs: telemetry.LatencyMs,
+			DecisionTelemetry:  telemetry,
+		}, gateErr
+	}
+	fbStart := time.Now()
+	res, fbErr := fallback.DecideCompaction(ctx, input)
+	fbLatencyMs := time.Since(fbStart).Milliseconds()
+	if fbErr != nil {
+		telemetry.Error = fmt.Sprintf("%s; fallback_error: %v", telemetry.Error, fbErr)
+		return &CompactionProbeResult{
+			DecisionSource:     "system2_fallback",
+			SystemOneLatencyMs: telemetry.LatencyMs,
+			DecisionTelemetry:  telemetry,
+		}, fbErr
+	}
+	if res == nil {
+		res = &CompactionProbeResult{}
+	}
+	if res.ShouldCompact {
+		telemetry.AppliedAction = "compact"
+	} else {
+		telemetry.AppliedAction = "skip"
+	}
+	res.DecisionSource = "system2_fallback"
+	res.SystemOneLatencyMs = telemetry.LatencyMs
+	res.SummarizerLatencyMs = fbLatencyMs
+	res.DecisionTelemetry = telemetry
+	return res, nil
+}
+
+func validateCompactionCalibration(entry *llm.DecisionResultEntry, configuredThreshold float64) error {
+	if entry == nil {
+		return fmt.Errorf("bob-s1 compaction returned nil entry")
+	}
+	if !entry.Calibration.Applied {
+		reason := ""
+		if entry.Calibration.MismatchReason != nil {
+			reason = *entry.Calibration.MismatchReason
+		}
+		return fmt.Errorf("bob-s1 compaction calibration was not applied (%s)", reason)
+	}
+	if entry.ProbabilityKind != "calibrated_affine" {
+		return fmt.Errorf("bob-s1 compaction probability_kind=%q, expected calibrated_affine", entry.ProbabilityKind)
+	}
+	if configuredThreshold == 0 && entry.Calibration.RiskThreshold5Pct == nil {
+		return fmt.Errorf("bob-s1 compaction response missing calibration.risk_threshold_5pct")
+	}
+	return nil
+}
+
+func resolveEffectiveDeferThreshold(entry *llm.DecisionResultEntry, configuredThreshold float64) float64 {
+	if configuredThreshold < 0 {
+		return -1
+	}
+	if configuredThreshold > 0 {
+		return configuredThreshold
+	}
+	if entry != nil && entry.Calibration.RiskThreshold5Pct != nil {
+		return *entry.Calibration.RiskThreshold5Pct
+	}
+	return -1
+}
+
+func buildSystemOneDecisionTelemetry(
+	task string,
+	entry *llm.DecisionResultEntry,
+	resp *llm.DecisionResponse,
+	fallbackLatencyMs int64,
+	renderTruncated bool,
+) *trajectory.SystemOneDecisionPayload {
+	p := &trajectory.SystemOneDecisionPayload{
+		Task:      task,
+		Truncated: renderTruncated,
+		LatencyMs: fallbackLatencyMs,
+	}
+	if resp != nil {
+		if resp.Latency > 0 {
+			p.LatencyMs = resp.Latency.Milliseconds()
+		}
+		if resp.Preparation.Truncated {
+			p.Truncated = true
+		}
+	}
+	if entry == nil {
+		return p
+	}
+	p.Choice = entry.Choice
+	p.ChoiceBasis = entry.ChoiceBasis
+	p.CalibrationApplied = entry.Calibration.Applied
+	if entry.Calibration.Profile != nil {
+		p.CalibrationProfile = *entry.Calibration.Profile
+	}
+	if entry.Calibration.MismatchReason != nil {
+		p.MismatchReason = *entry.Calibration.MismatchReason
+	}
+	p.PrefixTokens = entry.PrefixTokens
+	p.SuffixTokens = entry.SuffixTokens
+	if entry.Truncated {
+		p.Truncated = true
+	}
+	if len(entry.Scores) > 0 {
+		p.Scores = make([]trajectory.SystemOneScoreEntry, len(entry.Scores))
+		for i, s := range entry.Scores {
+			p.Scores[i] = trajectory.SystemOneScoreEntry{
+				ID:          s.ID,
+				Logit:       s.Logit,
+				Probability: s.Probability,
+			}
+		}
+	}
+	return p
 }
 
 func stripMarkdownJSONFence(s string) string {
@@ -608,16 +901,23 @@ func stripMarkdownJSONFence(s string) string {
 	return trimmed
 }
 
-func recordProbeSkipEvent(ctx context.Context, store *Store, runID string, iteration, prevVersion, prevCompactedIter int, model string, activeBytes int, reason string) error {
+func recordProbeSkipEvent(ctx context.Context, store *Store, runID string, iteration, prevVersion, prevCompactedIter int, model string, activeBytes int, reason string, meta ...CompactionEventMeta) error {
+	var m CompactionEventMeta
+	if len(meta) > 0 {
+		m = meta[0]
+	}
 	ev, err := trajectory.MakeCompactionEvent(runID, runID, 1, iteration, "", trajectory.CompactionEventPayload{
-		Version:           0,
-		ParentVersion:     prevVersion,
-		CompactedUpToIter: prevCompactedIter,
-		ShouldCompact:     false,
-		RubricVerdict:     CompactionVerdictProbedSkip,
-		Reason:            reason,
-		Model:             model,
-		InputBytes:        activeBytes,
+		Version:             0,
+		ParentVersion:       prevVersion,
+		CompactedUpToIter:   prevCompactedIter,
+		ShouldCompact:       false,
+		RubricVerdict:       CompactionVerdictProbedSkip,
+		Reason:              reason,
+		Model:               model,
+		InputBytes:          activeBytes,
+		DecisionSource:      m.DecisionSource,
+		SystemOneLatencyMs:  m.SystemOneLatencyMs,
+		SummarizerLatencyMs: m.SummarizerLatencyMs,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to build probe skip event: %w", err)
@@ -658,6 +958,8 @@ func (r *ToolLoopRunner) maybeCompact(ctx context.Context, run *FSMRun, store *S
 	r.mu.RLock()
 	cfg := r.compactionCfg
 	decider := r.compactionDecider
+	s1Client := r.systemOneClient
+	s1Cfg := r.systemOneCfg
 	r.mu.RUnlock()
 
 	if !cfg.Enabled || store == nil || run == nil {
@@ -766,24 +1068,63 @@ func (r *ToolLoopRunner) maybeCompact(ctx context.Context, run *FSMRun, store *S
 	}
 
 	if decider == nil {
-		decider = &llmCompactionDecider{client: r.llmClient}
+		baseDecider := CompactionDecider(&llmCompactionDecider{client: r.llmClient})
+		if s1Client != nil && s1Cfg.CompactionEnabled {
+			decider = &systemOneCompactionDecider{
+				s1Client:        s1Client,
+				llmClient:       r.llmClient,
+				fallbackDecider: baseDecider,
+				cfg:             s1Cfg,
+			}
+		} else {
+			decider = baseDecider
+		}
 	}
 
 	probeRes, err := decider.DecideCompaction(ctx, input)
+	recordS1Telemetry := func(appliedOverride string) {
+		if probeRes == nil || probeRes.DecisionTelemetry == nil {
+			return
+		}
+		tel := *probeRes.DecisionTelemetry
+		if appliedOverride != "" {
+			tel.AppliedAction = appliedOverride
+		}
+		if telErr := store.RecordSystemOneDecision(ctx, run.ID, run.Iteration, "compaction", "", tel); telErr != nil {
+			slog.Warn("failed to record system1 compaction decision telemetry", "run_id", run.ID, "iteration", run.Iteration, "error", telErr)
+		}
+	}
+
+	var compMeta CompactionEventMeta
+	if probeRes != nil {
+		compMeta = CompactionEventMeta{
+			DecisionSource:      probeRes.DecisionSource,
+			SystemOneLatencyMs:  probeRes.SystemOneLatencyMs,
+			SummarizerLatencyMs: probeRes.SummarizerLatencyMs,
+		}
+	}
+
 	if err != nil {
 		slog.Warn("fsm compaction rubric probe failed, recording probe skip event", "run_id", run.ID, "iteration", run.Iteration, "error", err)
-		return recordProbeSkipEvent(ctx, store, run.ID, run.Iteration, prevVersion, prevCompactedIter, model, activeBytes, fmt.Sprintf("probe_error: %v", err))
+		recordS1Telemetry("probe_error")
+		return recordProbeSkipEvent(ctx, store, run.ID, run.Iteration, prevVersion, prevCompactedIter, model, activeBytes, fmt.Sprintf("probe_error: %v", err), compMeta)
 	}
 	if probeRes == nil || !probeRes.ShouldCompact {
 		reason := ""
 		if probeRes != nil {
 			reason = probeRes.Reason
 		}
-		return recordProbeSkipEvent(ctx, store, run.ID, run.Iteration, prevVersion, prevCompactedIter, model, activeBytes, reason)
+		recordS1Telemetry("")
+		return recordProbeSkipEvent(ctx, store, run.ID, run.Iteration, prevVersion, prevCompactedIter, model, activeBytes, reason, compMeta)
 	}
 
 	state := probeRes.State
 	if state == nil {
+		if probeRes.RequireNonNilState {
+			slog.Warn("fsm stage2 compaction summarizer returned nil state, recording probe_error skip", "run_id", run.ID, "iteration", run.Iteration)
+			recordS1Telemetry("probe_error")
+			return recordProbeSkipEvent(ctx, store, run.ID, run.Iteration, prevVersion, prevCompactedIter, model, activeBytes, "probe_error: stage2_summarizer_returned_nil_state", compMeta)
+		}
 		state = buildDeterministicCompactedState(input, CompactionVerdictProbedCompact)
 	} else {
 		state.ID = ""
@@ -826,16 +1167,20 @@ func (r *ToolLoopRunner) maybeCompact(ctx context.Context, run *FSMRun, store *S
 			"iteration", run.Iteration,
 			"reason", skipReason,
 		)
-		return recordProbeSkipEvent(ctx, store, run.ID, run.Iteration, prevVersion, prevCompactedIter, model, activeBytes, skipReason)
+		recordS1Telemetry("skip:" + skipReason)
+		return recordProbeSkipEvent(ctx, store, run.ID, run.Iteration, prevVersion, prevCompactedIter, model, activeBytes, skipReason, compMeta)
 	}
 
-	ev, err := MakeSnapshotCompactionEvent(state, run.ID, 1, run.Iteration, probeRes.Reason)
+	ev, err := MakeSnapshotCompactionEventWithMeta(state, run.ID, 1, run.Iteration, probeRes.Reason, compMeta)
 	if err != nil {
+		recordS1Telemetry("probe_error")
 		return fmt.Errorf("failed to build probed compaction event: %w", err)
 	}
 	if err := store.SaveCompactionWithEvent(ctx, state, ev); err != nil {
+		recordS1Telemetry("probe_error")
 		return fmt.Errorf("failed to save probed compaction state: %w", err)
 	}
+	recordS1Telemetry("compact")
 	slog.Info("fsm trajectory compacted via rubric probe",
 		"run_id", run.ID,
 		"version", state.Version,

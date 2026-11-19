@@ -38,6 +38,8 @@ type ToolLoopRunner struct {
 	compactionCfgSet  bool
 	compactionDecider CompactionDecider
 	loopGuardCfg      LoopGuardConfig
+	systemOneClient   SystemOneDecisionClient
+	systemOneCfg      SystemOneControlConfig
 }
 
 // NewToolLoopRunner creates a new ToolLoopRunner.
@@ -59,6 +61,20 @@ func (r *ToolLoopRunner) SetLoopGuardConfig(cfg LoopGuardConfig) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.loopGuardCfg = cfg
+}
+
+// SetSystemOneClient configures the optional System-1 sidecar client for compaction and loop guard.
+func (r *ToolLoopRunner) SetSystemOneClient(c SystemOneDecisionClient) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.systemOneClient = c
+}
+
+// SetSystemOneConfig configures System-1 control-plane policies for the runner.
+func (r *ToolLoopRunner) SetSystemOneConfig(cfg SystemOneControlConfig) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.systemOneCfg = cfg
 }
 
 // SetCompactionConfig configures adaptive task trajectory compaction for the runner.
@@ -455,6 +471,8 @@ func (r *ToolLoopRunner) handlePrepareSteps(ctx context.Context, run *FSMRun, st
 
 	r.mu.RLock()
 	lgCfg := r.loopGuardCfg
+	s1Client := r.systemOneClient
+	s1Cfg := r.systemOneCfg
 	r.mu.RUnlock()
 
 	historySteps, err := store.ListStepsByRun(ctx, run.ID)
@@ -462,7 +480,22 @@ func (r *ToolLoopRunner) handlePrepareSteps(ctx context.Context, run *FSMRun, st
 		return fmt.Errorf("failed to list steps for loop guard: %w", err)
 	}
 
-	verdict := DetectLoop(historySteps, lastMsg.ToolCalls, lgCfg)
+	goal := ""
+	if s1Client != nil && len(historySteps) >= 2 && strings.ToLower(strings.TrimSpace(s1Cfg.LoopGuardMode)) != "off" {
+		if baseMsgs, decErr := DecodeMessages(run.ContextJSON); decErr == nil {
+			goal = extractOriginalObjective(baseMsgs)
+		}
+	}
+
+	verdict, lgTelemetry, err := EvaluateLoopGuard(ctx, run, goal, historySteps, lastMsg.ToolCalls, lgCfg, s1Client, s1Cfg)
+	if lgTelemetry != nil {
+		if telErr := store.RecordSystemOneDecision(ctx, run.ID, run.Iteration, "loop", "", *lgTelemetry); telErr != nil {
+			slog.Warn("failed to record system1 loop_guard decision telemetry", "run_id", run.ID, "iteration", run.Iteration, "error", telErr)
+		}
+	}
+	if err != nil {
+		return err
+	}
 	if verdict.Action == LoopActionForceSynthesis {
 		slog.Warn("loop guard detected stuck loop; forcing synthesis", "run_id", run.ID, "reason", verdict.Reason)
 		run.CurrentState = StateSynthesis

@@ -178,6 +178,20 @@ func TestNew_EmbeddingModelSelection(t *testing.T) {
 
 		require.NoError(t, rt.Close())
 	})
+
+	t.Run("system1 config wires SystemOneClient into FSMEngine", func(t *testing.T) {
+		cfg := testConfig(t)
+		cfg.SystemOneBaseURL = "http://127.0.0.1:8090"
+		cfg.SystemOneCompactionEnabled = true
+		cfg.SystemOneLoopGuardMode = "hybrid"
+
+		rt, err := New(cfg, Options{})
+		require.NoError(t, err)
+		require.NotNil(t, rt.SystemOneClient)
+		require.NotNil(t, rt.FSMEngine)
+
+		require.NoError(t, rt.Close())
+	})
 }
 
 func TestRegisterFrontend(t *testing.T) {

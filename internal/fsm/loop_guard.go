@@ -1,12 +1,20 @@
 package fsm
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
+	"time"
+
+	"bob/internal/llm"
+	"bob/internal/trajectory"
 
 	openai "github.com/sashabaranov/go-openai"
 )
+
+const loopGuardHybridBackstopCeiling = 5
 
 // LoopGuardNoticePrefix is the prefix used for step observations intercepted by the loop guard.
 const LoopGuardNoticePrefix = "Loop guard notice:"
@@ -43,8 +51,8 @@ const (
 
 // LoopVerdict contains the outcome of loop guard analysis.
 type LoopVerdict struct {
-	Action      LoopVerdictAction
-	Reason      string
+	Action       LoopVerdictAction
+	Reason       string
 	NoticeByCall map[int]string // candidate tool call index -> notice message
 }
 
@@ -94,39 +102,11 @@ func DetectLoop(history []FSMStep, candidateCalls []openai.ToolCall, cfg LoopGua
 		cfg.MaxCycleLength = 5
 	}
 
-	// Check if a previous strike 1 interception has already occurred in this run
-	hasPriorStrike := false
-	for _, s := range history {
-		if s.ErrorText == LoopGuardBlockedErrorText || strings.HasPrefix(s.ResultJSON, LoopGuardNoticePrefix) {
-			hasPriorStrike = true
-			break
-		}
-	}
-
-	historySigs := make([]toolCallSig, len(history))
-	for i, s := range history {
-		historySigs[i] = makeSig(s.ToolName, s.ArgsJSON)
-	}
-
-	candidateSigs := make([]toolCallSig, len(candidateCalls))
-	for i, tc := range candidateCalls {
-		candidateSigs[i] = makeSig(tc.Function.Name, tc.Function.Arguments)
-	}
-
-	// If a candidate call matches a tool call that was already blocked by the loop guard, immediately force synthesis
-	if hasPriorStrike {
-		for _, s := range history {
-			if s.ErrorText == LoopGuardBlockedErrorText || strings.HasPrefix(s.ResultJSON, LoopGuardNoticePrefix) {
-				blockedSig := makeSig(s.ToolName, s.ArgsJSON)
-				for _, cSig := range candidateSigs {
-					if cSig == blockedSig {
-						return LoopVerdict{
-							Action: LoopActionForceSynthesis,
-							Reason: fmt.Sprintf("tool %q repeated after being blocked by loop guard", cSig.name),
-						}
-					}
-				}
-			}
+	hasPriorStrike, blockedReason, historySigs, candidateSigs := inspectLoopHistory(history, candidateCalls)
+	if blockedReason != "" {
+		return LoopVerdict{
+			Action: LoopActionForceSynthesis,
+			Reason: blockedReason,
 		}
 	}
 
@@ -134,46 +114,13 @@ func DetectLoop(history []FSMStep, candidateCalls []openai.ToolCall, cfg LoopGua
 	totalCalls := len(allSigs)
 
 	// 1. Check for consecutive identical calls (period p = 1)
-	lastSig := allSigs[totalCalls-1]
-	consecutive := 0
-	for i := totalCalls - 1; i >= 0; i-- {
-		if allSigs[i] == lastSig {
-			consecutive++
-		} else {
-			break
-		}
-	}
+	consecutive, lastSig := trailingConsecutiveCalls(allSigs)
 
 	consecutiveDetected := false
 	if consecutive >= cfg.MaxConsecutiveCalls {
 		consecutiveDetected = true
-	} else if consecutive >= 2 && len(history) >= 2 {
-		// If called consecutively with unchanged output from previous executions
-		identicalOutputs := true
-		countMatchingHistory := 0
-		for i := len(history) - 1; i >= 0 && len(history)-1-i < consecutive-len(candidateCalls); i-- {
-			if historySigs[i] == lastSig {
-				countMatchingHistory++
-			}
-		}
-		if countMatchingHistory >= 2 {
-			var firstOut string
-			firstSet := false
-			for i := len(history) - 1; i >= 0; i-- {
-				if historySigs[i] == lastSig {
-					if !firstSet {
-						firstOut = history[i].ResultJSON
-						firstSet = true
-					} else if history[i].ResultJSON != firstOut {
-						identicalOutputs = false
-						break
-					}
-				}
-			}
-			if identicalOutputs && firstSet {
-				consecutiveDetected = true
-			}
-		}
+	} else if consecutive >= 2 && len(history) >= 2 && hasMatchingUnchangedOutputs(history, historySigs, candidateCalls, lastSig, consecutive) {
+		consecutiveDetected = true
 	}
 
 	if consecutiveDetected {
@@ -191,8 +138,8 @@ func DetectLoop(history []FSMStep, candidateCalls []openai.ToolCall, cfg LoopGua
 			}
 		}
 		return LoopVerdict{
-			Action:      LoopActionIntercept,
-			Reason:      reason,
+			Action:       LoopActionIntercept,
+			Reason:       reason,
 			NoticeByCall: notices,
 		}
 	}
@@ -228,12 +175,243 @@ func DetectLoop(history []FSMStep, candidateCalls []openai.ToolCall, cfg LoopGua
 				notices[i] = FormatLoopGuardNotice(candidateCalls[i].Function.Name, candidateCalls[i].Function.Arguments)
 			}
 			return LoopVerdict{
-				Action:      LoopActionIntercept,
-				Reason:      reason,
+				Action:       LoopActionIntercept,
+				Reason:       reason,
 				NoticeByCall: notices,
 			}
 		}
 	}
 
 	return LoopVerdict{Action: LoopActionNone}
+}
+
+func isBlockedLoopStep(s FSMStep) bool {
+	return s.ErrorText == LoopGuardBlockedErrorText || strings.HasPrefix(s.ResultJSON, LoopGuardNoticePrefix)
+}
+
+func inspectLoopHistory(history []FSMStep, candidateCalls []openai.ToolCall) (hasPriorStrike bool, blockedRepeatReason string, historySigs []toolCallSig, candidateSigs []toolCallSig) {
+	historySigs = make([]toolCallSig, len(history))
+	for i, s := range history {
+		historySigs[i] = makeSig(s.ToolName, s.ArgsJSON)
+		if isBlockedLoopStep(s) {
+			hasPriorStrike = true
+		}
+	}
+
+	candidateSigs = make([]toolCallSig, len(candidateCalls))
+	for i, tc := range candidateCalls {
+		candidateSigs[i] = makeSig(tc.Function.Name, tc.Function.Arguments)
+	}
+
+	if hasPriorStrike {
+		for i, s := range history {
+			if !isBlockedLoopStep(s) {
+				continue
+			}
+			blockedSig := historySigs[i]
+			for _, cSig := range candidateSigs {
+				if cSig == blockedSig {
+					return true, fmt.Sprintf("tool %q repeated after being blocked by loop guard", cSig.name), historySigs, candidateSigs
+				}
+			}
+		}
+	}
+	return hasPriorStrike, "", historySigs, candidateSigs
+}
+
+func trailingConsecutiveCalls(allSigs []toolCallSig) (int, toolCallSig) {
+	if len(allSigs) == 0 {
+		return 0, toolCallSig{}
+	}
+	lastSig := allSigs[len(allSigs)-1]
+	consecutive := 0
+	for i := len(allSigs) - 1; i >= 0; i-- {
+		if allSigs[i] == lastSig {
+			consecutive++
+		} else {
+			break
+		}
+	}
+	return consecutive, lastSig
+}
+
+func hasMatchingUnchangedOutputs(history []FSMStep, historySigs []toolCallSig, candidateCalls []openai.ToolCall, targetSig toolCallSig, consecutive int) bool {
+	trailingCount := consecutive - len(candidateCalls)
+	if trailingCount < 2 || len(history) < trailingCount {
+		return false
+	}
+	var firstOut string
+	firstSet := false
+	start := len(history) - trailingCount
+	for i := start; i < len(history); i++ {
+		if historySigs[i] != targetSig {
+			return false
+		}
+		if !firstSet {
+			firstOut = history[i].ResultJSON
+			firstSet = true
+		} else if history[i].ResultJSON != firstOut {
+			return false
+		}
+	}
+	return firstSet
+}
+
+func buildAllCandidateNotices(candidateCalls []openai.ToolCall) map[int]string {
+	notices := make(map[int]string, len(candidateCalls))
+	for i, tc := range candidateCalls {
+		notices[i] = FormatLoopGuardNotice(tc.Function.Name, tc.Function.Arguments)
+	}
+	return notices
+}
+
+// EvaluateLoopGuard runs deterministic and optional System-1 semantic loop detection
+// according to off/shadow/hybrid policies.
+func EvaluateLoopGuard(
+	ctx context.Context,
+	run *FSMRun,
+	goal string,
+	history []FSMStep,
+	candidateCalls []openai.ToolCall,
+	cfg LoopGuardConfig,
+	s1Client SystemOneDecisionClient,
+	s1Cfg SystemOneControlConfig,
+) (LoopVerdict, *trajectory.SystemOneDecisionPayload, error) {
+	if !cfg.Enabled || len(candidateCalls) == 0 {
+		return LoopVerdict{Action: LoopActionNone}, nil, nil
+	}
+
+	hasPriorStrike, blockedReason, historySigs, candidateSigs := inspectLoopHistory(history, candidateCalls)
+	if blockedReason != "" {
+		return LoopVerdict{
+			Action: LoopActionForceSynthesis,
+			Reason: blockedReason,
+		}, nil, nil
+	}
+
+	heuristicVerdict := DetectLoop(history, candidateCalls, cfg)
+	mode := strings.ToLower(strings.TrimSpace(s1Cfg.LoopGuardMode))
+	if s1Client == nil || mode == "" || mode == "off" || len(history) < 2 {
+		return heuristicVerdict, nil, nil
+	}
+
+	rendered := RenderSystemOneLoopGuardState(run, goal, history, candidateCalls)
+	probeStart := time.Now()
+	entry, resp, s1Err := s1Client.DecideLoopGuard(ctx, rendered.Text, nil)
+	elapsedMs := time.Since(probeStart).Milliseconds()
+	if s1Err != nil {
+		latencyMs := elapsedMs
+		if resp != nil && resp.Latency > 0 {
+			latencyMs = resp.Latency.Milliseconds()
+		}
+		telemetry := &trajectory.SystemOneDecisionPayload{
+			Task:            llm.SystemOneTaskLoopGuard,
+			Truncated:       rendered.Truncated,
+			LatencyMs:       latencyMs,
+			AppliedAction:   string(heuristicVerdict.Action),
+			HeuristicAction: string(heuristicVerdict.Action),
+			FallbackUsed:    mode == "hybrid" && s1Cfg.FallbackOnError,
+			ShadowMode:      mode == "shadow",
+			Error:           s1Err.Error(),
+		}
+		if mode == "shadow" {
+			// Shadow mode never alters deterministic execution; strict policy still logs/surfaces error explicitly.
+			if !s1Cfg.FallbackOnError {
+				slog.Error("system1 loop_guard shadow probe failed under strict fallback_on_error=false",
+					"error", s1Err,
+					"latency_ms", latencyMs,
+				)
+			}
+			return heuristicVerdict, telemetry, nil
+		}
+		if !s1Cfg.FallbackOnError {
+			telemetry.AppliedAction = "error"
+			return LoopVerdict{}, telemetry, fmt.Errorf("system1 loop_guard probe failed: %w", s1Err)
+		}
+		return heuristicVerdict, telemetry, nil
+	}
+
+	telemetry := buildSystemOneDecisionTelemetry(llm.SystemOneTaskLoopGuard, entry, resp, elapsedMs, rendered.Truncated)
+	telemetry.HeuristicAction = string(heuristicVerdict.Action)
+	telemetry.ShadowMode = mode == "shadow"
+
+	if mode == "shadow" {
+		telemetry.AppliedAction = string(heuristicVerdict.Action)
+		return heuristicVerdict, telemetry, nil
+	}
+
+	if mode != "hybrid" {
+		err := fmt.Errorf("unsupported system1 loop_guard_mode %q", s1Cfg.LoopGuardMode)
+		telemetry.Error = err.Error()
+		if !s1Cfg.FallbackOnError {
+			telemetry.AppliedAction = "error"
+			return LoopVerdict{}, telemetry, err
+		}
+		telemetry.AppliedAction = string(heuristicVerdict.Action)
+		telemetry.FallbackUsed = true
+		return heuristicVerdict, telemetry, nil
+	}
+
+	choice := ""
+	if entry != nil {
+		choice = entry.Choice
+	}
+
+	switch choice {
+	case string(LoopActionNone):
+		// Enforce deterministic hard backstop ceiling (>= 5 consecutive unchanged calls) against false negatives.
+		allSigs := append(append([]toolCallSig(nil), historySigs...), candidateSigs...)
+		consecutive, lastSig := trailingConsecutiveCalls(allSigs)
+		if consecutive >= loopGuardHybridBackstopCeiling &&
+			len(history) >= 2 &&
+			hasMatchingUnchangedOutputs(history, historySigs, candidateCalls, lastSig, consecutive) {
+			reason := fmt.Sprintf("hard backstop triggered after %d consecutive unchanged calls to %q", consecutive, lastSig.name)
+			if hasPriorStrike {
+				telemetry.AppliedAction = string(LoopActionForceSynthesis)
+				return LoopVerdict{Action: LoopActionForceSynthesis, Reason: reason}, telemetry, nil
+			}
+			telemetry.AppliedAction = string(LoopActionIntercept)
+			return LoopVerdict{
+				Action:       LoopActionIntercept,
+				Reason:       reason,
+				NoticeByCall: buildAllCandidateNotices(candidateCalls),
+			}, telemetry, nil
+		}
+		telemetry.AppliedAction = string(LoopActionNone)
+		return LoopVerdict{Action: LoopActionNone}, telemetry, nil
+
+	case string(LoopActionIntercept):
+		telemetry.AppliedAction = string(LoopActionIntercept)
+		return LoopVerdict{
+			Action:       LoopActionIntercept,
+			Reason:       "bob-s1 loop_guard intercepted repetitive tool execution",
+			NoticeByCall: buildAllCandidateNotices(candidateCalls),
+		}, telemetry, nil
+
+	case string(LoopActionForceSynthesis):
+		if !hasPriorStrike {
+			telemetry.AppliedAction = string(LoopActionIntercept)
+			return LoopVerdict{
+				Action:       LoopActionIntercept,
+				Reason:       "bob-s1 loop_guard downgraded force_synthesis to intercept before strike 1",
+				NoticeByCall: buildAllCandidateNotices(candidateCalls),
+			}, telemetry, nil
+		}
+		telemetry.AppliedAction = string(LoopActionForceSynthesis)
+		return LoopVerdict{
+			Action: LoopActionForceSynthesis,
+			Reason: "bob-s1 loop_guard confirmed repeated blocked loop; forcing synthesis",
+		}, telemetry, nil
+
+	default:
+		err := fmt.Errorf("unexpected bob-s1 loop_guard choice %q", choice)
+		telemetry.Error = err.Error()
+		if !s1Cfg.FallbackOnError {
+			telemetry.AppliedAction = "error"
+			return LoopVerdict{}, telemetry, err
+		}
+		telemetry.AppliedAction = string(heuristicVerdict.Action)
+		telemetry.FallbackUsed = true
+		return heuristicVerdict, telemetry, nil
+	}
 }
