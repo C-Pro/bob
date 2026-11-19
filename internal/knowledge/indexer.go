@@ -26,9 +26,10 @@ type VectorDB interface {
 
 // Indexer coordinates synchronization between the authoritative relational Store and VectorDB.
 type Indexer struct {
-	store  *Store
-	vector VectorDB
-	now    func() time.Time
+	store    *Store
+	vector   VectorDB
+	now      func() time.Time
+	saveHook func(context.Context, cortexdb.MemorySaveRequest) error
 }
 
 // NewIndexer creates a new knowledge Indexer.
@@ -38,6 +39,23 @@ func NewIndexer(store *Store, vector VectorDB) *Indexer {
 		vector: vector,
 		now:    time.Now,
 	}
+}
+
+// SetVectorSaveFunc overrides direct VectorDB.SaveMemory calls so callers can enforce
+// vector-space compatibility, dimensionality checks, and stamping consistently.
+func (idx *Indexer) SetVectorSaveFunc(fn func(context.Context, cortexdb.MemorySaveRequest) error) {
+	if idx == nil {
+		return
+	}
+	idx.saveHook = fn
+}
+
+func (idx *Indexer) saveToVectorDB(ctx context.Context, req cortexdb.MemorySaveRequest) error {
+	if idx.saveHook != nil {
+		return idx.saveHook(ctx, req)
+	}
+	_, err := idx.vector.SaveMemory(ctx, req)
+	return err
 }
 
 // IndexVersion indexes a specific version into CortexDB.
@@ -98,7 +116,7 @@ func (idx *Indexer) indexMemoryVersion(ctx context.Context, item *KnowledgeItem,
 		}
 	}
 
-	_, err = idx.vector.SaveMemory(ctx, cortexdb.MemorySaveRequest{
+	err = idx.saveToVectorDB(ctx, cortexdb.MemorySaveRequest{
 		MemoryID:   ver.ID,
 		Scope:      cortexdb.MemoryScopeGlobal,
 		Namespace:  NamespaceMemories,
@@ -142,7 +160,7 @@ func (idx *Indexer) indexSkillVersion(ctx context.Context, item *KnowledgeItem, 
 		return fmt.Errorf("%w: version %s provenance does not match item %s", ErrUnauthorized, versionID, item.ID)
 	}
 
-	_, err = idx.vector.SaveMemory(ctx, cortexdb.MemorySaveRequest{
+	err = idx.saveToVectorDB(ctx, cortexdb.MemorySaveRequest{
 		MemoryID:  ver.ID,
 		Scope:     cortexdb.MemoryScopeGlobal,
 		Namespace: NamespaceSkills,

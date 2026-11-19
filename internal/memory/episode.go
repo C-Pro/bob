@@ -7,11 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"bob/internal/llm"
 
 	"github.com/liliang-cn/cortexdb/v2/pkg/cortexdb"
 )
@@ -122,8 +125,11 @@ func (e Episode) ToMemoryItem(sourceLabel string, score float64) MemoryItem {
 	}
 }
 
-func (m *Manager) enrichChunksAndMergeEpisodes(ctx context.Context, db *cortexdb.DB, chatID, sourceLabel, query string, chunkItems []MemoryItem, limit int) []MemoryItem {
-	allEps, _ := queryEpisodesFromSQL(ctx, db.SQL(), chatID)
+func (m *Manager) enrichChunksAndMergeEpisodes(ctx context.Context, db *cortexdb.DB, chatID, sourceLabel, query string, chunkItems []MemoryItem, limit int) ([]MemoryItem, error) {
+	allEps, sqlErr := queryEpisodesFromSQL(ctx, db.SQL(), chatID)
+	if sqlErr != nil && !m.FallbackOnError() {
+		return nil, sqlErr
+	}
 	epByChunkID := make(map[string]Episode, len(allEps))
 	for _, ep := range allEps {
 		if ep.ChatID != chatID {
@@ -166,8 +172,15 @@ func (m *Manager) enrichChunksAndMergeEpisodes(ctx context.Context, db *cortexdb
 	}
 
 	matchedEps, err := m.searchEpisodesInDB(ctx, db, chatID, query, limit)
-	if err != nil || len(matchedEps) == 0 {
-		return enriched
+	if err != nil {
+		if !m.FallbackOnError() {
+			return nil, err
+		}
+		slog.Warn("episode enrichment search failed, returning chunk matches", "chat_id", chatID, "error", err)
+		return enriched, nil
+	}
+	if len(matchedEps) == 0 {
+		return enriched, nil
 	}
 
 	qLower := strings.ToLower(strings.TrimSpace(query))
@@ -196,7 +209,7 @@ func (m *Manager) enrichChunksAndMergeEpisodes(ctx context.Context, db *cortexdb
 		return enriched[i].Score > enriched[j].Score
 	})
 
-	return enriched
+	return enriched, nil
 }
 
 func (m *Manager) initEpisodeTable(ctx context.Context, rawDB *sql.DB) error {
@@ -239,6 +252,34 @@ func uniqueChatIDSlug(chatID string) string {
 
 // buildEpisodeFromMessages constructs an Episode record from a batch of evicted messages and their raw chunk IDs.
 func buildEpisodeFromMessages(chatID string, isDM bool, msgs []MessageToStore, chunkIDs []string) Episode {
+	return assembleEpisodeFromMessages(chatID, isDM, msgs, chunkIDs, inferEpisodeTaskStatus(msgs))
+}
+
+func (m *Manager) buildEpisodeFromMessages(ctx context.Context, chatID string, isDM bool, msgs []MessageToStore, chunkIDs []string) (Episode, error) {
+	taskStatus := inferEpisodeTaskStatus(msgs)
+	if m != nil {
+		m.s1Mu.RLock()
+		classifier := m.episodeClassifier
+		enabled := m.episodesEnabled
+		fallback := m.fallbackOnError
+		m.s1Mu.RUnlock()
+
+		if classifier != nil && enabled {
+			classified, err := classifyEpisodeTaskStatusWithSystemOne(ctx, classifier, msgs)
+			if err != nil {
+				if !fallback {
+					return Episode{}, fmt.Errorf("system1 episode task_status classification failed: %w", err)
+				}
+				slog.Warn("system1 episode classification failed, falling back to heuristic", "chat_id", chatID, "error", err)
+			} else {
+				taskStatus = classified
+			}
+		}
+	}
+	return assembleEpisodeFromMessages(chatID, isDM, msgs, chunkIDs, taskStatus), nil
+}
+
+func assembleEpisodeFromMessages(chatID string, isDM bool, msgs []MessageToStore, chunkIDs []string, taskStatus string) Episode {
 	chatType := "townhall"
 	if isDM && chatID != "townhall" {
 		chatType = "dm"
@@ -280,7 +321,9 @@ func buildEpisodeFromMessages(chatID string, isDM bool, msgs []MessageToStore, c
 	}
 
 	topicTags := extractTopicTags(msgs, maxEpisodeTopicTags)
-	taskStatus := inferEpisodeTaskStatus(msgs)
+	if strings.TrimSpace(taskStatus) == "" {
+		taskStatus = EpisodeStatusDiscussion
+	}
 
 	epID := fmt.Sprintf("ep_%s_%d_%d", uniqueChatIDSlug(chatID), startSeq, endSeq)
 	header := fmt.Sprintf("[Model-Derived Episode Summary | seq %d-%d]", startSeq, endSeq)
@@ -348,11 +391,8 @@ func truncateUTF8Bytes(s string, maxBytes int) string {
 	return s[:cut] + "..."
 }
 
-// TODO(next-track): This hardcoded English stop-word and keyword heuristic is brittle and does not
-// work across languages. Immediately after finalizing track context-assembly-compaction_20261105,
-// research and replace extractTopicTags and inferEpisodeTaskStatus with a simple, fast, small
-// multilingual ML model running locally on CPU.
 var episodeStopWords = map[string]struct{}{
+	// English stop words
 	"the": {}, "and": {}, "for": {}, "that": {}, "this": {}, "with": {}, "from": {},
 	"have": {}, "has": {}, "had": {}, "not": {}, "are": {}, "was": {}, "were": {},
 	"will": {}, "would": {}, "could": {}, "should": {}, "can": {}, "about": {},
@@ -362,6 +402,15 @@ var episodeStopWords = map[string]struct{}{
 	"then": {}, "also": {}, "very": {}, "here": {}, "there": {}, "been": {}, "being": {},
 	"over": {}, "under": {}, "after": {}, "before": {}, "between": {}, "through": {},
 	"please": {}, "thanks": {}, "thank": {}, "hello": {}, "hey": {}, "yes": {}, "okay": {},
+	// Russian stop words
+	"что": {}, "как": {}, "так": {}, "это": {}, "все": {}, "всё": {}, "она": {}, "они": {},
+	"оно": {}, "его": {}, "наш": {}, "ваш": {}, "для": {}, "при": {}, "без": {}, "под": {},
+	"над": {}, "про": {}, "или": {}, "уже": {}, "ещё": {}, "еще": {}, "если": {}, "тогда": {},
+	"когда": {}, "где": {}, "куда": {}, "здесь": {}, "там": {}, "потом": {}, "очень": {},
+	"можно": {}, "нужно": {}, "надо": {}, "быть": {}, "был": {}, "была": {}, "были": {},
+	"будет": {}, "есть": {}, "нет": {}, "даже": {}, "только": {}, "меня": {}, "тебя": {},
+	"себя": {}, "этот": {}, "этого": {}, "этой": {}, "этих": {}, "того": {}, "чтобы": {},
+	"потому": {}, "пожалуйста": {}, "спасибо": {}, "привет": {}, "хорошо": {}, "ладно": {},
 }
 
 func extractTopicTags(msgs []MessageToStore, maxTags int) []string {
@@ -425,7 +474,8 @@ func tokenizeForTags(s string) []string {
 		}
 		tok := strings.ToLower(strings.Trim(cur.String(), "_-."))
 		cur.Reset()
-		if len(tok) < 4 || len(tok) > 36 {
+		runeLen := utf8.RuneCountInString(tok)
+		if runeLen < 3 || runeLen > 36 {
 			return
 		}
 		// Skip pure numbers
@@ -452,8 +502,108 @@ func tokenizeForTags(s string) []string {
 	return tokens
 }
 
-// TODO(next-track): Replace keyword-based task status inference with the lightweight local CPU
-// classification model planned immediately after track context-assembly-compaction_20261105.
+func classifyEpisodeTaskStatusWithSystemOne(ctx context.Context, classifier EpisodeClassifier, msgs []MessageToStore) (string, error) {
+	const (
+		maxEpisodeStateBytes   = 8192
+		maxOpeningContextBytes = 512
+	)
+	formatLine := func(msg MessageToStore) string {
+		sender := strings.TrimSpace(msg.SenderName)
+		if sender == "" {
+			sender = strings.TrimSpace(msg.Role)
+		}
+		if sender == "" {
+			sender = "user"
+		}
+		return fmt.Sprintf("%s: %s", sender, compactSnippet(msg.Content, 300))
+	}
+
+	var stateBuilder strings.Builder
+	remainingBudget := maxEpisodeStateBytes
+	startIdx := 0
+	if len(msgs) > 1 {
+		opening := "[opening] " + formatLine(msgs[0])
+		if len(opening) > maxOpeningContextBytes {
+			opening = opening[:maxOpeningContextBytes]
+			for len(opening) > 0 && !utf8.ValidString(opening) {
+				opening = opening[:len(opening)-1]
+			}
+		}
+		stateBuilder.WriteString(opening)
+		remainingBudget -= len(opening) + 1
+		startIdx = 1
+	}
+
+	// Preserve newest messages within remaining budget, then render chronologically.
+	var tailRev []string
+	used := 0
+	for i := len(msgs) - 1; i >= startIdx; i-- {
+		line := formatLine(msgs[i])
+		need := len(line)
+		if len(tailRev) > 0 {
+			need++
+		}
+		if used+need > remainingBudget {
+			if len(tailRev) == 0 && remainingBudget > 0 {
+				cut := remainingBudget
+				if cut > len(line) {
+					cut = len(line)
+				}
+				tailRev = append(tailRev, strings.ToValidUTF8(line[:cut], ""))
+			}
+			break
+		}
+		tailRev = append(tailRev, line)
+		used += need
+	}
+
+	if len(tailRev) > 0 && startIdx == 1 && len(msgs)-len(tailRev) > 1 {
+		const ellipsis = "\n...[earlier messages omitted]..."
+		if stateBuilder.Len()+len(ellipsis)+used <= maxEpisodeStateBytes {
+			stateBuilder.WriteString(ellipsis)
+		}
+	}
+	for i := len(tailRev) - 1; i >= 0; i-- {
+		if stateBuilder.Len() > 0 {
+			stateBuilder.WriteByte('\n')
+		}
+		stateBuilder.WriteString(tailRev[i])
+	}
+
+	options := []llm.DecisionOptionSpec{
+		{ID: EpisodeStatusCompleted, Description: "The task or issue was completed, verified, resolved, fixed, or merged."},
+		{ID: EpisodeStatusOngoing, Description: "Work is still actively continuing with next steps or investigation remaining."},
+		{ID: EpisodeStatusUnresolved, Description: "An error, failure, blocker, or broken state remains unresolved."},
+		{ID: EpisodeStatusDiscussion, Description: "General conversation, question, or informational exchange without a task outcome."},
+	}
+	// Prefer images from the preserved tail window cleanly (most recent up to 8).
+	recentMsgs := msgs
+	if len(tailRev) > 0 && len(tailRev) < len(msgs) {
+		recentMsgs = msgs[len(msgs)-len(tailRev):]
+	}
+	images := collectChunkImages(recentMsgs, llm.SystemOneMaxImagesPerItem)
+	entry, _, err := classifier.DecideCustom(
+		ctx,
+		"episode_task_status",
+		"Classify the current outcome status of this conversation segment.",
+		options,
+		stateBuilder.String(),
+		images,
+	)
+	if err != nil {
+		return "", err
+	}
+	if entry == nil {
+		return "", errors.New("bob-s1 episode classification returned nil entry")
+	}
+	switch entry.Choice {
+	case EpisodeStatusCompleted, EpisodeStatusOngoing, EpisodeStatusUnresolved, EpisodeStatusDiscussion:
+		return entry.Choice, nil
+	default:
+		return "", fmt.Errorf("unexpected bob-s1 episode task_status choice %q", entry.Choice)
+	}
+}
+
 func inferEpisodeTaskStatus(msgs []MessageToStore) string {
 	if len(msgs) == 0 {
 		return EpisodeStatusDiscussion
@@ -547,15 +697,14 @@ func (m *Manager) saveEpisode(ctx context.Context, db *cortexdb.DB, ep Episode) 
 		"model_derived":    ep.ModelDerived,
 	}
 
-	_, err = db.SaveMemory(ctx, cortexdb.MemorySaveRequest{
+	if err := m.SaveMemoryWithGuard(ctx, db, cortexdb.MemorySaveRequest{
 		MemoryID:  EpisodeIDPrefix + ep.ID,
 		Scope:     cortexdb.MemoryScopeGlobal,
 		Namespace: NamespaceEpisodes,
 		Role:      "system",
 		Content:   ep.FormatNavigationEntry(),
 		Metadata:  metadata,
-	})
-	if err != nil {
+	}); err != nil {
 		return fmt.Errorf("failed to index episode %s in cortexdb: %w", ep.ID, err)
 	}
 	return nil
@@ -671,12 +820,27 @@ func (m *Manager) SearchEpisodes(ctx context.Context, query string, chatID strin
 	if err != nil {
 		return nil, err
 	}
-	dmEps, _ := m.searchEpisodesInDB(ctx, dmDB, chatID, query, limit)
+	dmEps, dmErr := m.searchEpisodesInDB(ctx, dmDB, chatID, query, limit)
+	if dmErr != nil {
+		if !m.FallbackOnError() {
+			return nil, dmErr
+		}
+		slog.Warn("episode search in DM db failed", "chat_id", chatID, "error", dmErr)
+	}
 
 	thDB, err := m.GetDB(ctx, "townhall", false)
 	var thEps []Episode
 	if err == nil {
-		thEps, _ = m.searchEpisodesInDB(ctx, thDB, "townhall", query, limit)
+		var thErr error
+		thEps, thErr = m.searchEpisodesInDB(ctx, thDB, "townhall", query, limit)
+		if thErr != nil {
+			if !m.FallbackOnError() {
+				return nil, thErr
+			}
+			slog.Warn("episode search in Townhall db failed", "error", thErr)
+		}
+	} else if !m.FallbackOnError() {
+		return nil, err
 	}
 
 	seen := make(map[string]struct{}, len(dmEps)+len(thEps))
@@ -710,14 +874,33 @@ func (m *Manager) searchEpisodesInDB(ctx context.Context, db *cortexdb.DB, chatI
 		TopK:      limit,
 	}
 	var hits []cortexdb.MemorySearchHit
-	resp, err := db.SearchMemory(ctx, req)
-	if err != nil {
+	searchCtx, postCheck, lexicalOnly, compatErr := m.PrepareVectorSearch(ctx, db)
+	if compatErr != nil {
+		return nil, compatErr
+	}
+	if lexicalOnly {
 		req.RetrievalMode = cortexdb.RetrievalModeLexical
 		if lexResp, lexErr := db.SearchMemory(ctx, req); lexErr == nil && lexResp != nil {
 			hits = lexResp.Results
+		} else if lexErr != nil {
+			return nil, lexErr
 		}
-	} else if resp != nil {
-		hits = resp.Results
+	} else {
+		resp, err := db.SearchMemory(searchCtx, req)
+		if err == nil && postCheck != nil {
+			err = postCheck()
+		}
+		if err != nil {
+			if !m.FallbackOnError() {
+				return nil, err
+			}
+			req.RetrievalMode = cortexdb.RetrievalModeLexical
+			if lexResp, lexErr := db.SearchMemory(ctx, req); lexErr == nil && lexResp != nil {
+				hits = lexResp.Results
+			}
+		} else if resp != nil {
+			hits = resp.Results
+		}
 	}
 
 	seen := make(map[string]struct{})

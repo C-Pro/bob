@@ -136,6 +136,15 @@ func (e *SystemOneEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][
 
 // EmbedMultimodal computes a joint image+text embedding with cap enforcement and optional text-only fallback.
 func (e *SystemOneEmbedder) EmbedMultimodal(ctx context.Context, text string, imageDataURIs []string) ([]float32, error) {
+	return e.embedMultimodalWithPolicy(ctx, text, imageDataURIs, e.fallbackOnError)
+}
+
+// EmbedMultimodalStrict computes a joint image+text embedding without ever falling back to text-only on image errors.
+func (e *SystemOneEmbedder) EmbedMultimodalStrict(ctx context.Context, text string, imageDataURIs []string) ([]float32, error) {
+	return e.embedMultimodalWithPolicy(ctx, text, imageDataURIs, false)
+}
+
+func (e *SystemOneEmbedder) embedMultimodalWithPolicy(ctx context.Context, text string, imageDataURIs []string, allowFallback bool) ([]float32, error) {
 	if strings.TrimSpace(text) == "" {
 		return nil, errors.New("empty text provided")
 	}
@@ -149,8 +158,8 @@ func (e *SystemOneEmbedder) EmbedMultimodal(ctx context.Context, text string, im
 		)
 	}
 	if len(validImgs) == 0 {
-		if !e.fallbackOnError && invalidCount > 0 {
-			return nil, fmt.Errorf("all %d multimodal image URI(s) were invalid in strict mode", invalidCount)
+		if !allowFallback {
+			return nil, fmt.Errorf("multimodal embedding has no valid images (invalidDropped=%d)", invalidCount)
 		}
 		return e.embedSingleText(ctx, text)
 	}
@@ -174,7 +183,7 @@ func (e *SystemOneEmbedder) EmbedMultimodal(ctx context.Context, text string, im
 	}
 	vecs, err := e.sendEmbeddingsRequest(ctx, input, 1)
 	if err != nil {
-		if e.fallbackOnError && shouldFallbackMultimodalError(err) {
+		if allowFallback && shouldFallbackMultimodalError(err) {
 			slog.Warn("multimodal bob-s1 embedding failed, falling back to text-only embedding",
 				"imageCount", len(validImgs),
 				"error", err,

@@ -116,6 +116,9 @@ func New(cfg *config.Config, opts Options) (*Runtime, error) {
 	}
 
 	memoryManager := memory.NewManager(cfg, embedder)
+	if systemOneClient != nil {
+		memoryManager.SetSystemOneConfig(systemOneClient, cfg.SystemOneEpisodesEnabled, cfg.SystemOneFallbackOnError)
+	}
 	storeProvider := agentstore.NewMemoryStoreProvider(memoryManager, cfg.DataDir)
 	if cfg.KnowledgeMaxDiscoveryLimit > 0 {
 		storeProvider.SetMaxDiscoveryLimit(cfg.KnowledgeMaxDiscoveryLimit)

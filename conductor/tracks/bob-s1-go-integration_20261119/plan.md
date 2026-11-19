@@ -41,14 +41,14 @@
 ---
 
 ## Step 4: Multimodal Memory, Bilingual Episodes & Vector Re-Indexing (`internal/memory`, `internal/gateway`, `cmd/agent`)
-- [ ] Task: Persist active DB vector-space metadata (`embedder_id`, `dims`) and gate incompatible vector searches until `--regenerate-vectors` migrates existing vectors (failing explicitly in strict `fallback_on_error: false` mode).
-- [ ] Task: Add `Images []string` to `memory.MessageToStore` (`internal/memory/store.go`), populate image data URIs in `Gateway.handleEvictedBatch` and `Gateway.CatchupChatMemory` (`internal/gateway/gateway.go`), attach up to 8 images via `llm.WithEmbeddingImages` during `Manager.IndexMessages`, store bounded image/attachment metadata (`has_images: true`), and ensure multimodal chunks store non-null vectors (without silently swallowing errors in strict mode).
-- [ ] Task: Update `internal/memory/episode.go`:
+- [x] Task: Persist active DB vector-space metadata (`embedder_id`, `dims`) and gate incompatible vector searches until `--regenerate-vectors` migrates existing vectors (failing explicitly in strict `fallback_on_error: false` mode).
+- [x] Task: Add `Images []string` to `memory.MessageToStore` (`internal/memory/store.go`), populate image data URIs in `Gateway.handleEvictedBatch` and `Gateway.CatchupChatMemory` (`internal/gateway/gateway.go`), attach up to 8 images via `llm.WithEmbeddingImages` during `Manager.IndexMessages`, store bounded image/attachment metadata (`has_images: true`), and ensure multimodal chunks store non-null vectors (without silently swallowing errors in strict mode).
+- [x] Task: Update `internal/memory/episode.go`:
   - Classify `TaskStatus` (`completed`, `ongoing`, `unresolved`, `discussion`) via `bob-s1` `DecideCustom` with heuristic fallback when disabled or `fallback_on_error: true` (erroring when `fallback_on_error: false`).
   - Add Russian stop-words to `episodeStopWords` and change topic-tag minimum token length from 4 bytes to 3 Unicode runes (`utf8.RuneCountInString`).
-- [ ] Task: Update `internal/memory/regenerate.go` & `cmd/agent --regenerate-vectors` / `--reembed` to select `SystemOneEmbedder` using the same precedence as `bootstrap.New`, re-embed chunks/episodes/`dm_memories`/`dm_skills` (batch size `<= 16`), reconstruct or safely preserve `has_images: true` multimodal vectors instead of overwriting them with text-only embeddings, and update DB vector-space metadata.
-- [ ] Task: Add bilingual EN+RU episode classification + multimodal image-chunk retrieval tests (including CortexDB `memorySemanticFloor` validation) across `internal/memory` and `internal/gateway`.
-- [ ] Task: Run `make check` and confirm 0 errors.
+- [x] Task: Update `internal/memory/regenerate.go` & `cmd/agent --regenerate-vectors` / `--reembed` to select `SystemOneEmbedder` using the same precedence as `bootstrap.New`, re-embed chunks/episodes/`dm_memories`/`dm_skills` (batch size `<= 16`), reconstruct or safely preserve `has_images: true` multimodal vectors instead of overwriting them with text-only embeddings, and update DB vector-space metadata.
+- [x] Task: Add bilingual EN+RU episode classification + multimodal image-chunk retrieval tests (including CortexDB `memorySemanticFloor` validation) across `internal/memory` and `internal/gateway`.
+- [x] Task: Run `make check` and confirm 0 errors.
 
 ---
 

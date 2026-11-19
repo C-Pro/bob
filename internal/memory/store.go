@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -53,6 +54,16 @@ type MemoryItem struct {
 	ModelDerived   bool     `json:"modelDerived,omitempty"`
 }
 
+const (
+	maxChunkSize              = 33
+	maxMetadataImageURIsBytes = 256 * 1024
+)
+
+// EpisodeClassifier abstracts System-1 episode task-status classification.
+type EpisodeClassifier interface {
+	DecideCustom(ctx context.Context, id, question string, options []llm.DecisionOptionSpec, state string, images []string) (*llm.DecisionResultEntry, *llm.DecisionResponse, error)
+}
+
 // MessageToStore represents an individual message to be included in an indexed chunk.
 type MessageToStore struct {
 	Seq        int64
@@ -62,16 +73,21 @@ type MessageToStore struct {
 	SenderName string
 	Role       string
 	Content    string
+	Images     []string
 }
 
 // Manager manages isolated SQLite sqvect databases per chat and watermark tracking.
 type Manager struct {
-	cfg         *config.Config
-	embedder    cortexdb.Embedder
-	dbsMu       sync.RWMutex
-	dbs         map[string]*cortexdb.DB
-	chatLocksMu sync.Mutex
-	chatLocks   map[chatLockKey]*chatIndexLock
+	cfg               *config.Config
+	embedder          cortexdb.Embedder
+	dbsMu             sync.RWMutex
+	dbs               map[string]*cortexdb.DB
+	chatLocksMu       sync.Mutex
+	chatLocks         map[chatLockKey]*chatIndexLock
+	s1Mu              sync.RWMutex
+	episodeClassifier EpisodeClassifier
+	episodesEnabled   bool
+	fallbackOnError   bool
 }
 
 type chatLockKey struct {
@@ -141,24 +157,140 @@ func NewManager(cfg *config.Config, embedder cortexdb.Embedder) *Manager {
 	if isNilEmbedder(embedder) {
 		embedder = nil
 	}
+	fallback := true
+	if cfg != nil && cfg.SystemOneEnabled() {
+		fallback = cfg.SystemOneFallbackOnError
+	}
 	if embedder == nil && cfg != nil {
 		modelSetting := strings.ToLower(strings.TrimSpace(cfg.EmbeddingModel))
 		if modelSetting == "" {
 			if flag.Lookup("test.v") != nil && os.Getenv("BOB_MODELS_DIR") == "" && !hasLocalModelInDir(cfg.DataDir) {
 				return &Manager{
-					cfg:      cfg,
-					embedder: nil,
-					dbs:      make(map[string]*cortexdb.DB),
+					cfg:             cfg,
+					embedder:        nil,
+					dbs:             make(map[string]*cortexdb.DB),
+					fallbackOnError: fallback,
 				}
 			}
 			embedder = llm.NewLazyLocalEmbedder(cfg)
 		}
 	}
 	return &Manager{
-		cfg:      cfg,
-		embedder: embedder,
-		dbs:      make(map[string]*cortexdb.DB),
+		cfg:             cfg,
+		embedder:        embedder,
+		dbs:             make(map[string]*cortexdb.DB),
+		fallbackOnError: fallback,
 	}
+}
+
+// SetSystemOneConfig configures System-1 episode classification and strict fallback policy on the manager.
+func (m *Manager) SetSystemOneConfig(classifier EpisodeClassifier, episodesEnabled, fallbackOnError bool) {
+	if m == nil {
+		return
+	}
+	m.s1Mu.Lock()
+	defer m.s1Mu.Unlock()
+	m.episodeClassifier = classifier
+	m.episodesEnabled = episodesEnabled
+	m.fallbackOnError = fallbackOnError
+}
+
+// SetFallbackOnError overrides the fallback-on-error policy used for strict evaluation mode.
+func (m *Manager) SetFallbackOnError(fallback bool) {
+	if m == nil {
+		return
+	}
+	m.s1Mu.Lock()
+	defer m.s1Mu.Unlock()
+	m.fallbackOnError = fallback
+}
+
+// FallbackOnError returns whether non-fatal degradation to lexical/heuristic fallbacks is permitted.
+func (m *Manager) FallbackOnError() bool {
+	if m == nil {
+		return true
+	}
+	m.s1Mu.RLock()
+	defer m.s1Mu.RUnlock()
+	return m.fallbackOnError
+}
+
+// PrepareVectorSearch checks vector-space compatibility for db and prepares a context + post-search
+// verifier so strict mode (!FallbackOnError) never silently degrades inside CortexDB when embedding fails.
+func (m *Manager) PrepareVectorSearch(ctx context.Context, db *cortexdb.DB) (searchCtx context.Context, postCheck func() error, lexicalOnly bool, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if m == nil || db == nil || isNilEmbedder(m.embedder) {
+		return ctx, nil, false, nil
+	}
+	expectedDims, compatErr := checkVectorSpaceCompatibilityWithDims(ctx, db.SQL(), m.embedder)
+	if compatErr != nil {
+		if !m.FallbackOnError() {
+			return nil, nil, false, compatErr
+		}
+		slog.Warn("vector space mismatch in database, gating semantic search to lexical FTS5", "error", compatErr)
+		return ctx, nil, true, nil
+	}
+	strict := !m.FallbackOnError()
+	sCtx, sink := withEmbedContext(ctx, expectedDims, strict)
+	if !strict || sink == nil {
+		return sCtx, nil, false, nil
+	}
+	return sCtx, sink.get, false, nil
+}
+
+// SaveMemoryWithGuard validates vector space compatibility, enforces runtime dimensionality via context,
+// verifies non-null vector storage under strict mode, and establishes the DB vector-space stamp.
+func (m *Manager) SaveMemoryWithGuard(ctx context.Context, db *cortexdb.DB, req cortexdb.MemorySaveRequest) error {
+	if db == nil {
+		return fmt.Errorf("database is nil")
+	}
+	if m == nil || isNilEmbedder(m.embedder) {
+		_, err := db.SaveMemory(ctx, req)
+		return err
+	}
+
+	expectedDims, compatErr := checkVectorSpaceCompatibilityWithDims(ctx, db.SQL(), m.embedder)
+	if compatErr != nil {
+		return compatErr
+	}
+
+	saveCtx, sink := withEmbedContext(ctx, expectedDims, true)
+	_, err := db.SaveMemory(saveCtx, req)
+	if err != nil {
+		return err
+	}
+
+	if sinkErr := sink.get(); sinkErr != nil {
+		var mismatch *VectorSpaceMismatchError
+		if errors.As(sinkErr, &mismatch) || !m.FallbackOnError() {
+			if _, delErr := db.DeleteMemory(context.WithoutCancel(ctx), cortexdb.MemoryDeleteRequest{
+				MemoryID: req.MemoryID,
+			}); delErr != nil {
+				slog.Warn("failed to roll back guarded memory row after embed error", "memory_id", req.MemoryID, "error", delErr)
+			}
+			return sinkErr
+		}
+	}
+
+	if !m.FallbackOnError() {
+		if err := verifyStoredVectorNonNull(ctx, db.SQL(), req.MemoryID); err != nil {
+			if _, delErr := db.DeleteMemory(context.WithoutCancel(ctx), cortexdb.MemoryDeleteRequest{
+				MemoryID: req.MemoryID,
+			}); delErr != nil {
+				slog.Warn("failed to roll back guarded memory row with null vector", "memory_id", req.MemoryID, "error", delErr)
+			}
+			return err
+		}
+	}
+
+	if m.embedder.Dim() > 0 {
+		if err := StampVectorSpace(ctx, db.SQL(), m.embedder); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // HasLocalModelInDir reports whether the default local model weights exist in dataDir.
@@ -236,7 +368,7 @@ func (m *Manager) GetDB(ctx context.Context, chatID string, isDM bool) (*cortexd
 
 	opts := make([]cortexdb.Option, 0, 1)
 	if m.embedder != nil {
-		opts = append(opts, cortexdb.WithEmbedder(m.embedder))
+		opts = append(opts, cortexdb.WithEmbedder(wrapEmbedder(m.embedder)))
 	}
 
 	dbConfig := cortexdb.DefaultConfig(path)
@@ -253,6 +385,11 @@ func (m *Manager) GetDB(ctx context.Context, chatID string, isDM bool) (*cortexd
 	if err := m.initEpisodeTable(ctx, openedDB.SQL()); err != nil {
 		_ = openedDB.Close()
 		return nil, fmt.Errorf("failed to init episode table at %s: %w", path, err)
+	}
+
+	if err := initVectorSpaceTable(ctx, openedDB.SQL()); err != nil {
+		_ = openedDB.Close()
+		return nil, fmt.Errorf("failed to init vector space table at %s: %w", path, err)
 	}
 
 	m.dbs[key] = openedDB
@@ -305,8 +442,6 @@ func (m *Manager) SetWatermark(ctx context.Context, chatID string, isDM bool, se
 	return err
 }
 
-const maxChunkSize = 33
-
 // IndexMessages stores batches of messages as formatted conversation chunks into the chat's isolated database and updates the watermark.
 func (m *Manager) IndexMessages(ctx context.Context, chatID string, isDM bool, msgs []MessageToStore) error {
 	release, err := m.acquireChatLock(ctx, chatID, isDM)
@@ -322,6 +457,9 @@ func (m *Manager) IndexMessages(ctx context.Context, chatID string, isDM bool, m
 	db, err := m.GetDB(ctx, chatID, isDM)
 	if err != nil {
 		return err
+	}
+	if compatErr := CheckVectorSpaceCompatibility(ctx, db.SQL(), m.embedder); compatErr != nil {
+		return fmt.Errorf("cannot index messages into %s: %w", chatID, compatErr)
 	}
 
 	var maxSeq int64
@@ -391,19 +529,37 @@ func (m *Manager) IndexMessages(ctx context.Context, chatID string, isDM bool, m
 			"msg_count":  len(chunkMsgs),
 		}
 
-		_, err := db.SaveMemory(ctx, cortexdb.MemorySaveRequest{
+		chunkImages := collectChunkImages(chunkMsgs, llm.SystemOneMaxImagesPerItem)
+		if len(chunkImages) > 0 {
+			metadata["has_images"] = true
+			metadata["image_count"] = len(chunkImages)
+			boundedURIs := boundMetadataImageURIs(chunkImages, maxMetadataImageURIsBytes)
+			metadata["image_uris_complete"] = len(boundedURIs) == len(chunkImages)
+			if len(boundedURIs) > 0 {
+				metadata["image_uris"] = boundedURIs
+			}
+		}
+
+		saveCtx := ctx
+		if len(chunkImages) > 0 {
+			saveCtx = llm.WithEmbeddingImages(ctx, chunkImages)
+		}
+
+		if err := m.SaveMemoryWithGuard(saveCtx, db, cortexdb.MemorySaveRequest{
 			MemoryID: chunkID,
 			Role:     "user",
 			Content:  formattedContent,
 			Metadata: metadata,
-		})
-		if err != nil {
+		}); err != nil {
 			return fmt.Errorf("failed to save memory chunk: %w", err)
 		}
 	}
 
 	if len(chunkIDs) > 0 {
-		ep := buildEpisodeFromMessages(chatID, isDM, msgs, chunkIDs)
+		ep, err := m.buildEpisodeFromMessages(ctx, chatID, isDM, msgs, chunkIDs)
+		if err != nil {
+			return fmt.Errorf("failed to build episode for chat %s: %w", chatID, err)
+		}
 		if err := m.saveEpisode(ctx, db, ep); err != nil {
 			return fmt.Errorf("failed to save episode for chat %s: %w", chatID, err)
 		}
@@ -444,7 +600,10 @@ func (m *Manager) Search(ctx context.Context, query string, chatID string, isDM 
 		if err != nil {
 			return nil, err
 		}
-		items := m.enrichChunksAndMergeEpisodes(ctx, townhallDB, "townhall", "[Townhall]", query, toMemoryItems(hits, "[Townhall]"), limit)
+		items, err := m.enrichChunksAndMergeEpisodes(ctx, townhallDB, "townhall", "[Townhall]", query, toMemoryItems(hits, "[Townhall]"), limit)
+		if err != nil {
+			return nil, err
+		}
 		if len(items) > limit {
 			items = items[:limit]
 		}
@@ -458,18 +617,33 @@ func (m *Manager) Search(ctx context.Context, query string, chatID string, isDM 
 	}
 	dmHits, err := m.searchDB(ctx, dmDB, query, limit)
 	if err != nil {
+		if !m.FallbackOnError() {
+			return nil, err
+		}
 		slog.Warn("search in DM db failed", "chat_id", chatID, "error", err)
 	}
-	dmItems := m.enrichChunksAndMergeEpisodes(ctx, dmDB, chatID, "[Direct Message]", query, toMemoryItems(dmHits, "[Direct Message]"), limit)
+	dmItems, err := m.enrichChunksAndMergeEpisodes(ctx, dmDB, chatID, "[Direct Message]", query, toMemoryItems(dmHits, "[Direct Message]"), limit)
+	if err != nil {
+		return nil, err
+	}
 
 	townhallDB, err := m.GetDB(ctx, "townhall", false)
 	var thItems []MemoryItem
 	if err == nil {
 		thHits, thErr := m.searchDB(ctx, townhallDB, query, limit)
 		if thErr != nil {
+			if !m.FallbackOnError() {
+				return nil, thErr
+			}
 			slog.Warn("search in Townhall db for DM context failed", "error", thErr)
 		}
-		thItems = m.enrichChunksAndMergeEpisodes(ctx, townhallDB, "townhall", "[Townhall]", query, toMemoryItems(thHits, "[Townhall]"), limit)
+		var epErr error
+		thItems, epErr = m.enrichChunksAndMergeEpisodes(ctx, townhallDB, "townhall", "[Townhall]", query, toMemoryItems(thHits, "[Townhall]"), limit)
+		if epErr != nil {
+			return nil, epErr
+		}
+	} else if !m.FallbackOnError() {
+		return nil, err
 	}
 
 	merged := make([]MemoryItem, 0, len(dmItems)+len(thItems))
@@ -499,11 +673,36 @@ func (m *Manager) Search(ctx context.Context, query string, chatID string, isDM 
 }
 
 func (m *Manager) searchDB(ctx context.Context, db *cortexdb.DB, query string, limit int) ([]cortexdb.MemorySearchHit, error) {
-	resp, err := db.SearchMemory(ctx, cortexdb.MemorySearchRequest{
+	searchCtx, postCheck, lexicalOnly, compatErr := m.PrepareVectorSearch(ctx, db)
+	if compatErr != nil {
+		return nil, compatErr
+	}
+	if lexicalOnly {
+		lexResp, lexErr := db.SearchMemory(ctx, cortexdb.MemorySearchRequest{
+			Query:         query,
+			RetrievalMode: cortexdb.RetrievalModeLexical,
+			TopK:          limit,
+		})
+		if lexErr != nil {
+			return nil, lexErr
+		}
+		if lexResp == nil {
+			return nil, nil
+		}
+		return lexResp.Results, nil
+	}
+
+	resp, err := db.SearchMemory(searchCtx, cortexdb.MemorySearchRequest{
 		Query: query,
 		TopK:  limit,
 	})
+	if err == nil && postCheck != nil {
+		err = postCheck()
+	}
 	if err != nil {
+		if !m.FallbackOnError() {
+			return nil, err
+		}
 		slog.Warn("memory search encountered error, falling back to lexical search", "query", query, "error", err)
 		lexResp, lexErr := db.SearchMemory(ctx, cortexdb.MemorySearchRequest{
 			Query:         query,
@@ -516,6 +715,59 @@ func (m *Manager) searchDB(ctx context.Context, db *cortexdb.DB, query string, l
 		return nil, err
 	}
 	return resp.Results, nil
+}
+
+func collectChunkImages(msgs []MessageToStore, limit int) []string {
+	if limit <= 0 {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	var out []string
+	for _, msg := range msgs {
+		for _, rawURI := range msg.Images {
+			trimmed := strings.TrimSpace(rawURI)
+			if !llm.IsValidSystemOneImageDataURI(trimmed) {
+				continue
+			}
+			if _, exists := seen[trimmed]; exists {
+				continue
+			}
+			seen[trimmed] = struct{}{}
+			out = append(out, trimmed)
+			if len(out) >= limit {
+				return out
+			}
+		}
+	}
+	return out
+}
+
+func boundMetadataImageURIs(uris []string, maxTotalBytes int) []string {
+	if len(uris) == 0 || maxTotalBytes <= 0 {
+		return nil
+	}
+	var out []string
+	total := 0
+	for _, uri := range uris {
+		if total+len(uri) > maxTotalBytes {
+			break
+		}
+		total += len(uri)
+		out = append(out, uri)
+	}
+	return out
+}
+
+func verifyStoredVectorNonNull(ctx context.Context, rawDB *sql.DB, id string) error {
+	var hasVector bool
+	err := rawDB.QueryRowContext(ctx, `SELECT vector IS NOT NULL FROM messages WHERE id = ?`, id).Scan(&hasVector)
+	if err != nil {
+		return fmt.Errorf("verify non-null vector for %s: %w", id, err)
+	}
+	if !hasVector {
+		return fmt.Errorf("memory item %s stored with NULL vector under strict fallback_on_error=false mode", id)
+	}
+	return nil
 }
 
 func toMemoryItems(hits []cortexdb.MemorySearchHit, sourceLabel string) []MemoryItem {
