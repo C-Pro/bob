@@ -694,6 +694,7 @@ def resolve_system1_config(
     system1_model: str = None,
     system1_loop_guard_mode: str = None,
     system1_fallback_on_error=None,
+    system1_timeout: str = None,
 ) -> dict:
     url = (
         system1_url
@@ -726,12 +727,19 @@ def resolve_system1_config(
         else parse_bool_flag(env_fallback, default=True)
     )
 
+    timeout = (
+        system1_timeout
+        if system1_timeout is not None
+        else (os.environ.get("BOB_EVAL_SYSTEM1_TIMEOUT") or os.environ.get("SYSTEM1_TIMEOUT") or "60s")
+    ).strip() or "60s"
+
     return {
         "enabled": bool(url),
         "url": url,
         "model": model,
         "loop_guard_mode": loop_guard_mode,
         "fallback_on_error": fallback_on_error,
+        "timeout": timeout,
     }
 
 
@@ -801,10 +809,12 @@ fsm:
 """
     if system1_cfg and system1_cfg.get("url"):
         fallback_literal = "true" if system1_cfg.get("fallback_on_error", True) else "false"
+        timeout_val = system1_cfg.get("timeout", "60s")
         cfg += f"""
 system1:
   base_url: {_yaml_quote(system1_cfg["url"])}
   model: {_yaml_quote(system1_cfg.get("model", "bob-s1-0.8b"))}
+  timeout: {_yaml_quote(timeout_val)}
   loop_guard_mode: {_yaml_quote(system1_cfg.get("loop_guard_mode", "hybrid"))}
   fallback_on_error: {fallback_literal}
 """
@@ -1212,11 +1222,13 @@ def main():
     system1_model = _extract_cli_value(sys.argv, "--system1-model")
     system1_loop_guard_mode = _extract_cli_value(sys.argv, "--system1-loop-guard-mode")
     system1_fallback_on_error = _extract_cli_bool(sys.argv, "--system1-fallback-on-error")
+    system1_timeout = _extract_cli_value(sys.argv, "--system1-timeout")
     system1_cfg = resolve_system1_config(
         system1_url=system1_url,
         system1_model=system1_model,
         system1_loop_guard_mode=system1_loop_guard_mode,
         system1_fallback_on_error=system1_fallback_on_error,
+        system1_timeout=system1_timeout,
     )
 
     split = _extract_cli_value(sys.argv, "--split")

@@ -235,6 +235,9 @@ class CheckpointOverlayLoader:
                 f"Checkpoint SHA-256 mismatch: expected {self.cfg.expected_checkpoint_sha256}, got {actual_sha}"
             )
 
+        if self.cfg.cpu_threads is not None:
+            torch.set_num_threads(self.cfg.cpu_threads)
+
         device, torch_dtype, dtype_name = resolve_device_and_dtype(self.cfg)
         jev_model = import_jev_model_module(self.cfg.repo_root)
 
@@ -252,6 +255,8 @@ class CheckpointOverlayLoader:
         payload = torch.load(ckpt_path, map_location="cpu", weights_only=True)  # nosemgrep: trailofbits.python.pickles-in-pytorch.pickles-in-pytorch
         validate_checkpoint_payload(payload, model, expected_lora_count=self.expected_lora_count)
         model.load_checkpoint(ckpt_path)
+        if self.cfg.merge_lora and hasattr(model.backbone, "merge_and_unload"):
+            model.backbone = model.backbone.merge_and_unload()
         model.to(device=device)
 
         preprocess_meta = verify_model_runtime(model, device=device, max_seq_len=self.cfg.max_seq_len)
