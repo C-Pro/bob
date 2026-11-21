@@ -20,6 +20,11 @@ import random
 import re
 import unicodedata
 
+try:
+    from eval.harness import train_provenance
+except ModuleNotFoundError:
+    import train_provenance
+
 ROOT = Path(__file__).resolve().parents[2]
 MODEL = "Qwen/Qwen3.5-0.8B-Base"
 MODEL_REVISION = "dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68"
@@ -321,6 +326,11 @@ class TokenCounter:
 def row_metadata(record, event_id, phase, cutoff_iter, cutoff_step, previous, source, quality, text, truncated, counter):
     return {
         "schema_version": SCHEMA_VERSION, "task_id": record["task_id"],
+        "source_task_id": record["task_id"],
+        "group_id": record["task_group"],
+        "partition": record.get("partition", record["split"]),
+        "rollout_sha256": record["source_sha256"],
+        "label_policy": f"jev-v1:{source}",
         "task_group": record["task_group"], "benchmark": record["benchmark"],
         "run_id": record["trajectory"].get("run", {}).get("id", ""),
         "event_id": event_id, "decision_phase": phase, "cutoff_iter": cutoff_iter,
@@ -631,7 +641,14 @@ def implicit_signal(record):
 
 
 def build_dataset(rollout_dir, heldout_path, output_dir, counter, seed=42, tail_iterations=1,
-                  quarantine_heldout: bool = False):
+                  quarantine_heldout: bool = False, *, train_manifest_path=None, certificate_path=None):
+    certified = train_manifest_path is not None or certificate_path is not None or heldout_path is None
+    certificate = (train_provenance.load_certificate(
+        certificate_path=certificate_path,
+        train_manifest_path=train_manifest_path or (ROOT / "eval/tasks/train/train_pool.json" if heldout_path is None and certificate_path is None else None),
+    ) if certified else None)
+    if certified and quarantine_heldout:
+        raise ValueError("--quarantine-heldout is only supported in the legacy held-out audit mode")
     records = []
     paths = sorted(p for p in Path(rollout_dir).glob("*.json") if p.name != "summary.json")
     if not paths:
@@ -640,10 +657,17 @@ def build_dataset(rollout_dir, heldout_path, output_dir, counter, seed=42, tail_
         raw = path.read_bytes()
         record = json.loads(raw)
         record["source_sha256"] = hashlib.sha256(raw).hexdigest()
+        if certified:
+            entry = train_provenance.certify_task(record.get("task_id", ""), certificate, record)
+            record["task_group"] = entry["group_id"]
+            record["split"] = record["partition"] = entry["partition"]
         records.append(record)
-    heldout_bytes = Path(heldout_path).read_bytes()
-    heldout = json.loads(heldout_bytes)
-    heldout = heldout["tasks"] if isinstance(heldout, dict) else heldout
+    heldout_bytes = None
+    heldout = []
+    if not certified:
+        heldout_bytes = Path(heldout_path).read_bytes()
+        heldout = json.loads(heldout_bytes)
+        heldout = heldout["tasks"] if isinstance(heldout, dict) else heldout
     quarantined, excluded = [], []
     if quarantine_heldout:
         group_tasks(records, [])
@@ -665,8 +689,13 @@ def build_dataset(rollout_dir, heldout_path, output_dir, counter, seed=42, tail_
                         heldout_matches=component_matches[record["task_group"]])
             excluded.append(item)
         records = retained
-    group_tasks(records, heldout)
-    assignment = split_tasks(records, seed, heldout=heldout)
+    if certified:
+        assignment = {r["task_group"]: r["split"] for r in records}
+        splits = train_provenance.PARTITIONS
+    else:
+        group_tasks(records, heldout)
+        assignment = split_tasks(records, seed, heldout=heldout)
+        splits = SPLITS
     rows = {family: [] for family in FAMILIES}
     prefixes = []
     for record in records:
@@ -688,7 +717,9 @@ def build_dataset(rollout_dir, heldout_path, output_dir, counter, seed=42, tail_
         "input_rollout_count": len(paths), "rollout_count": len(records), "task_group_count": len(assignment),
         "quarantine_heldout": quarantine_heldout, "quarantined_count": len(quarantined),
         "quarantined_task_ids": sorted(set(quarantined)),
-        "heldout_source_sha256": hashlib.sha256(heldout_bytes).hexdigest(),
+        "heldout_source_sha256": hashlib.sha256(heldout_bytes).hexdigest() if heldout_bytes is not None else None,
+        "train_certificate_sha256": certificate["certificate_sha256"] if certificate else None,
+        "train_manifest_sha256": certificate["manifest_sha256"] if certificate else None,
         "clean_outcome_counts": dict(sorted(Counter(outcome_class(r) for r in records).items())),
         "implicit_signal_nonzero_count": sum(implicit_signal(r) != 0 for r in records),
         "source_step_count": sum(len(ordered_steps(r)) for r in records),
@@ -706,7 +737,7 @@ def build_dataset(rollout_dir, heldout_path, output_dir, counter, seed=42, tail_
             "Embedding negatives are lexical candidates, not verified semantic negatives.",
         ],
     }
-    for split in SPLITS:
+    for split in splits:
         members = [r for r in records if r["split"] == split]
         stats["splits"][split] = {"tasks": len(members), "task_groups": len({r["task_group"] for r in members}),
                                   "strata": dict(sorted(Counter(f"{r['benchmark']}|{outcome_class(r)}" for r in members).items()))}
@@ -715,8 +746,8 @@ def build_dataset(rollout_dir, heldout_path, output_dir, counter, seed=42, tail_
         stats["families"][family] = {"rows": len(values), "labels": dict(sorted(Counter(str(r.get("label", "pair")) for r in values).items())),
                                       "truncated": sum(r["truncated"] for r in values),
                                       "max_rendered_bytes": max((r["rendered_bytes"] for r in values), default=0),
-                                      "splits": {s: sum(r["split"] == s for r in values) for s in SPLITS}}
-        for split in SPLITS:
+                                      "splits": {s: sum(r["split"] == s for r in values) for s in splits}}
+        for split in splits:
             with (output_dir / f"{family}_{split}.jsonl").open("w") as handle:
                 for row in values:
                     if row["split"] == split:
@@ -737,7 +768,9 @@ def build_dataset(rollout_dir, heldout_path, output_dir, counter, seed=42, tail_
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rollout-dir", type=Path, default=ROOT / "eval/results/train/batch_train_pool_1794581821")
-    parser.add_argument("--heldout", type=Path, default=ROOT / "eval/tasks/heldout/heldout_100.json")
+    parser.add_argument("--heldout", type=Path, help="Legacy held-out audit mode only")
+    parser.add_argument("--train-manifest", type=Path)
+    parser.add_argument("--train-certificate", type=Path)
     parser.add_argument("--output-dir", type=Path, default=ROOT / "eval/results/jev_dataset")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--tail-iterations", type=int, default=1)
@@ -746,11 +779,14 @@ def main():
     parser.add_argument("--quarantine-heldout", action="store_true",
                         help="Exclude entire task groups colliding with held-out identities; audit in excluded.jsonl")
     args = parser.parse_args()
+    if args.heldout and (args.train_manifest or args.train_certificate):
+        parser.error("--heldout cannot be combined with certified train inputs")
     if args.tail_iterations < 0:
         parser.error("--tail-iterations must be nonnegative")
     counter = TokenCounter(args.char_fallback, args.tokenizer_cache)
     stats = build_dataset(args.rollout_dir, args.heldout, args.output_dir, counter, args.seed, args.tail_iterations,
-                          quarantine_heldout=args.quarantine_heldout)
+                          quarantine_heldout=args.quarantine_heldout, train_manifest_path=args.train_manifest,
+                          certificate_path=args.train_certificate)
     print(json.dumps(stats, indent=2, sort_keys=True))
 
 
