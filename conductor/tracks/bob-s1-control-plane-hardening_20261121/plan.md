@@ -20,5 +20,5 @@
 - [x] Task: Eliminate duplicate tokenization in `services/bob_s1/bob_s1/worker.py`, add bounded prefix cache & worker progress/latency telemetry in `/healthz`, and set APU-safe CPU default optimization flags.
 
 ## Phase 5: Train-Acceptance Gates, Repository Verification & Blind Held-Out Re-Evaluation
-- [ ] Task: Run full verification gates (`make check`, `eval/harness` pytest suite, `eval/jev` pytest suite, `services/bob_s1` pytest suite) and validate on `train_acceptance` / smoke suite.
-- [ ] Task: Run locked blind re-evaluation on `eval/tasks/heldout/heldout_100.json` and update `eval/results/system1_heldout_100_report.md`.
+- [x] Task: Run full verification gates (`make check`, `eval/harness` pytest suite, `eval/jev` pytest suite, `services/bob_s1` pytest suite) and validate on `train_acceptance` / smoke suite.
+- [x] Task: Run locked blind re-evaluation on `eval/tasks/heldout/heldout_100.json` and update `eval/results/system1_heldout_100_report.md`.
