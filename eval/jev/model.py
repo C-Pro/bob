@@ -355,7 +355,7 @@ class DualHeadDecisionEmbedder(nn.Module):
         ids.append(self.decide_id)
         return ids, ends, len(ids) - 1
 
-    def prepare_state(self, state, budget, images=None):
+    def prepare_state(self, state, budget, images=None, *, raw_text_ids=None):
         pixel_values, image_grid_thw, token_counts = self.preprocess_images(images)
         image_tokens = []
         for count in token_counts:
@@ -365,7 +365,7 @@ class DualHeadDecisionEmbedder(nn.Module):
         text_budget = budget - len(image_tokens)
         if text_budget < 1:
             raise ValueError("Images and suffix exceed sequence budget")
-        ids = self._text_ids(state)
+        ids = self._text_ids(state) if raw_text_ids is None else raw_text_ids
         keep = text_budget - 1
         truncated = len(ids) > keep
         if truncated:

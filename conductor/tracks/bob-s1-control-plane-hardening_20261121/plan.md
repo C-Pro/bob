@@ -17,7 +17,7 @@
 - [x] Task: Extend `services/bob_s1/bob_s1/calibration.py` and `contracts/calibration_profiles.json` with cost-sensitive compaction action thresholds (`compact`/`skip`/`defer`) and calibrated `loop_guard` thresholds fitted exclusively on `train_calibration` and bound to runtime config metadata.
 
 ## Phase 4: Sidecar & Runtime Performance (`services/bob_s1`, `internal/config`)
-- [ ] Task: Eliminate duplicate tokenization in `services/bob_s1/bob_s1/worker.py`, add bounded prefix cache & worker progress/latency telemetry in `/healthz`, and set APU-safe CPU default optimization flags.
+- [x] Task: Eliminate duplicate tokenization in `services/bob_s1/bob_s1/worker.py`, add bounded prefix cache & worker progress/latency telemetry in `/healthz`, and set APU-safe CPU default optimization flags.
 
 ## Phase 5: Train-Acceptance Gates, Repository Verification & Blind Held-Out Re-Evaluation
 - [ ] Task: Run full verification gates (`make check`, `eval/harness` pytest suite, `eval/jev` pytest suite, `services/bob_s1` pytest suite) and validate on `train_acceptance` / smoke suite.

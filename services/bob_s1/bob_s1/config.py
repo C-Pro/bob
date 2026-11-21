@@ -49,6 +49,7 @@ class SidecarConfig:
     cpu_threads: int | None = None
     max_seq_len: int = DEFAULT_MAX_SEQ_LEN
     max_queue_depth: int = 16
+    max_cache_entries: int = 256
     max_batch_size: int = 16
     max_decisions: int = 16
     max_options: int = 255
@@ -131,6 +132,7 @@ class SidecarConfig:
                 MODEL_MAX_POSITION_EMBEDDINGS,
             ),
             max_queue_depth=_parse_int("BOB_S1_MAX_QUEUE_DEPTH", src.get("BOB_S1_MAX_QUEUE_DEPTH"), 16, 1, 1024),
+            max_cache_entries=_parse_int("BOB_S1_MAX_CACHE_ENTRIES", src.get("BOB_S1_MAX_CACHE_ENTRIES"), 256, 0, 65536),
             max_batch_size=_parse_int("BOB_S1_MAX_BATCH_SIZE", src.get("BOB_S1_MAX_BATCH_SIZE"), 16, 1, 256),
             max_decisions=_parse_int("BOB_S1_MAX_DECISIONS", src.get("BOB_S1_MAX_DECISIONS"), 16, 1, 128),
             max_options=_parse_int("BOB_S1_MAX_OPTIONS", src.get("BOB_S1_MAX_OPTIONS"), 255, 2, 255),
