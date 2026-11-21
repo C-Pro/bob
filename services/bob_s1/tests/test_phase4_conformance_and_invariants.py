@@ -14,11 +14,33 @@ from PIL import Image
 import pytest
 
 from bob_s1.app import create_app
-from bob_s1.calibration import BUILTIN_QUESTIONS, CalibrationRegistry, score_decision
+from bob_s1.calibration import (BUILTIN_QUESTIONS, CalibrationRegistry, calibration_metrics,
+                                compaction_action, evaluate_train_partitions, score_decision)
 from bob_s1.config import SidecarConfig
 from bob_s1.loader import LoadedModelBundle, import_jev_model_module, verify_model_runtime
 
 CONTRACTS_DIR = Path(__file__).resolve().parents[1] / "contracts"
+
+
+def test_train_only_tri_zone_policy_and_partition_metrics():
+    assert compaction_action(0.90, balanced_threshold=0.85, skip_threshold=0.30) == "compact"
+    assert compaction_action(0.20, balanced_threshold=0.85, skip_threshold=0.30) == "system1_skip"
+    assert compaction_action(0.60, balanced_threshold=0.85, skip_threshold=0.30) == "defer_to_system2"
+    assert compaction_action(0.20, balanced_threshold=0.85, skip_threshold=0.30,
+                             selective_policy=False) == "defer_to_system2"
+    metrics = calibration_metrics([0.9, 0.2, 0.6, 0.1], [1, 0, 1, 0], threshold=0.8, skip_threshold=0.3)
+    assert metrics["skip_rate"] == 0.5
+    assert metrics["precision"] == 1.0
+    assert metrics["recall"] == 0.5
+    assert metrics["brier"] > 0
+    assert metrics["nll"] > 0
+    report = evaluate_train_partitions({
+        "train_calibration": [{"partition": "train_calibration", "probability": .9, "label": 1}],
+        "train_acceptance": [{"partition": "train_acceptance", "probability": .1, "label": 0}],
+    }, balanced_threshold=.85, skip_threshold=.3)
+    assert set(report["partitions"]) == {"train_calibration", "train_acceptance"}
+    with pytest.raises(ValueError, match="train partitions only"):
+        evaluate_train_partitions({"heldout": []}, balanced_threshold=.8, skip_threshold=.2)
 
 
 def _load_schemas() -> dict[str, dict]:

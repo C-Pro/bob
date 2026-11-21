@@ -100,7 +100,8 @@
               "temperature": { "type": ["number", "null"] },
               "bias": { "type": ["number", "null"] },
               "balanced_threshold": { "type": ["number", "null"] },
-              "risk_threshold_5pct": { "type": ["number", "null"] }
+              "risk_threshold_5pct": { "type": ["number", "null"] },
+              "selective_policy": { "type": "boolean" }
             }
           },
           "prefix_tokens": { "type": "integer", "minimum": 1 },

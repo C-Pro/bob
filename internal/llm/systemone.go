@@ -147,6 +147,7 @@ type DecisionCalibrationMeta struct {
 	Bias              *float64 `json:"bias"`
 	BalancedThreshold *float64 `json:"balanced_threshold"`
 	RiskThreshold5Pct *float64 `json:"risk_threshold_5pct"`
+	SelectivePolicy   bool     `json:"selective_policy,omitempty"`
 }
 
 // DecisionResultEntry holds the scored result for one decision item.

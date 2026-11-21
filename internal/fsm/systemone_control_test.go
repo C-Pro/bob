@@ -63,6 +63,8 @@ type recordedEventRow struct {
 	Payload   []byte
 }
 
+func floatPtr(value float64) *float64 { return &value }
+
 func listRecordedEvents(t *testing.T, db *sql.DB, runID string) []recordedEventRow {
 	t.Helper()
 	rows, err := db.QueryContext(context.Background(),
@@ -99,6 +101,8 @@ func makeCalibratedCompactionResult(choice string, pSkip, pCompact float64) (*ll
 			Profile:           &profile,
 			Applied:           true,
 			RiskThreshold5Pct: &riskThresh,
+			BalancedThreshold: floatPtr(0.8393841862136965),
+			SelectivePolicy:   true,
 		},
 		PrefixTokens: 250,
 		SuffixTokens: 24,
@@ -222,7 +226,7 @@ func TestSystemOneCompactionGate_PoliciesAndInvariants(t *testing.T) {
 				var p trajectory.SystemOneDecisionPayload
 				require.NoError(t, json.Unmarshal(ev.Payload, &p))
 				assert.Equal(t, "skip", p.Choice)
-				assert.Equal(t, "skip", p.AppliedAction)
+				assert.Equal(t, "system1_skip", p.AppliedAction)
 				assert.True(t, p.CalibrationApplied)
 				assert.False(t, p.FallbackUsed)
 			}
@@ -255,6 +259,9 @@ func TestSystemOneCompactionGate_PoliciesAndInvariants(t *testing.T) {
 		s1 := &mockSystemOneDecisionClient{
 			compactionFn: func(ctx context.Context, state string, maxSeqLen int) (*llm.DecisionResultEntry, *llm.DecisionResponse, error) {
 				e, r := makeCalibratedCompactionResult("compact", 0.35, 0.65) // < 0.8394
+				skipThreshold := 0.30
+				e.Calibration.RiskThreshold5Pct = &skipThreshold
+				r.Decisions[0].Calibration.RiskThreshold5Pct = &skipThreshold
 				return e, r, nil
 			},
 		}

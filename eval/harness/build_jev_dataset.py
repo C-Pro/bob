@@ -538,6 +538,53 @@ def compaction_rows(record, counter, excluded, tail_iterations=1):
                    cutoff_source="event" if verdict == "probed_compact" else "inferred_default_tail_iterations",
                    recorded_verdict=verdict, **recall_metadata(steps, event, events))
         rows.append(row)
+    rows.extend(interval10_compaction_rows(record, counter, events))
+    return rows
+
+
+def interval10_compaction_rows(record, counter, events):
+    """Mine true interval-10 decisions from train trajectories, including selective skips."""
+    steps = ordered_steps(record)
+    iterations = sorted({int(step["iteration"]) for step in steps})
+    rows = []
+    for iteration in iterations:
+        if iteration <= 0 or iteration % 10:
+            continue
+        prior = [step for step in steps if step["iteration"] <= iteration]
+        following = [step for step in steps if iteration < step["iteration"] <= iteration + 2]
+        boundary_events = [event for event in events if int(event.get("iteration", -1)) == iteration]
+        compact_events = [event for event in boundary_events if event["payload"].get("rubric_verdict") == "probed_compact"]
+        skip_events = [event for event in boundary_events if event["payload"].get("rubric_verdict") == "probed_skip"]
+        if compact_events:
+            label, source, reason = 1, "recorded_interval10_compact", "recorded_compact"
+        elif skip_events:
+            label, source, reason = 0, "recorded_interval10_skip", "recorded_skip"
+        else:
+            outputs = {id(s): stored_result(s.get("result_json") or "") for s in prior}
+            byte_growth = sum(len(outputs[id(s)].encode()) for s in prior[-10:])
+            utility = byte_growth / max(1, sum(len(outputs[id(s)].encode()) for s in prior))
+            mid_derivation = any(
+                any(token in outputs[id(s)].casefold() for token in ("step 1", "continued below", "partial", "intermediate", "next chunk"))
+                and any(any(token in as_text(later.get("args_json") or "").casefold() for token in ("continue", "next", "remaining", "step 2")) for later in following)
+                for s in prior[-2:]
+            )
+            if mid_derivation:
+                label, source, reason = 0, "train_interval10_selectivity", "active_mid_derivation_reference"
+            elif byte_growth < 4096 or utility < 0.15:
+                label, source, reason = 0, "train_interval10_selectivity", "low_byte_growth_or_utility"
+            else:
+                continue
+        cutoff = iteration
+        previous = prior_state(events, iteration)
+        text, metadata = render_state(record, steps, cutoff, iteration, previous, steps, return_metadata=True)
+        row = row_metadata(record, f"interval10_{iteration}", "interval10_compaction_decision", cutoff,
+                           len(prior), previous, source, "train_derived" if not compact_events and not skip_events else "teacher",
+                           text, metadata["truncated"], counter)
+        row.update(row_type="compaction", state_text=text, label=label, execution_iter=iteration,
+                   interval=10, decision_reason=reason, genuine_recorded_decision=bool(compact_events or skip_events),
+                   partition=record.get("partition", record["split"]),
+                   **{key: metadata[key] for key in ("retained_steps", "omitted_steps", "retained_step_range", "omitted_sections", "essential_evidence_present")})
+        rows.append(row)
     return rows
 
 
@@ -691,6 +738,11 @@ def loop_rows(record, counter):
                    productive_progress=progress,
                    constructive_nonzero=action == "none" and any(observation(s)[1] not in (None, 0) for s in history[-2:]))
         rows.append(row)
+    for row in rows:
+        if row["label"] == "none" and row.get("productive_progress"):
+            row["contrastive_class"] = "productive_progression"
+        elif row["label"] in ("intercept", "force_synthesis"):
+            row["contrastive_class"] = "semantic_stall"
     return rows
 
 

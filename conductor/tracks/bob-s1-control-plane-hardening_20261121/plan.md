@@ -13,8 +13,8 @@
 - [x] Task: Implement section-aware head/tail state rendering (`internal/fsm/systemone_state.go`) with reserved candidate/recent-step budgets, structured truncation telemetry, and Go/Python parity tests.
 
 ## Phase 3: Train-Only Dataset Rebuilding & Action-Policy Calibration (`eval/harness`, `services/bob_s1`)
-- [ ] Task: Mine interval-10 compaction selectivity states and contrastive semantic-stall vs. productive-progression loop states strictly from `train_pool` rollouts.
-- [ ] Task: Extend `services/bob_s1/bob_s1/calibration.py` and `contracts/calibration_profiles.json` with cost-sensitive compaction action thresholds (`compact`/`skip`/`defer`) and calibrated `loop_guard` thresholds fitted exclusively on `train_calibration` and bound to runtime config metadata.
+- [x] Task: Mine interval-10 compaction selectivity states and contrastive semantic-stall vs. productive-progression loop states strictly from `train_pool` rollouts.
+- [x] Task: Extend `services/bob_s1/bob_s1/calibration.py` and `contracts/calibration_profiles.json` with cost-sensitive compaction action thresholds (`compact`/`skip`/`defer`) and calibrated `loop_guard` thresholds fitted exclusively on `train_calibration` and bound to runtime config metadata.
 
 ## Phase 4: Sidecar & Runtime Performance (`services/bob_s1`, `internal/config`)
 - [ ] Task: Eliminate duplicate tokenization in `services/bob_s1/bob_s1/worker.py`, add bounded prefix cache & worker progress/latency telemetry in `/healthz`, and set APU-safe CPU default optimization flags.

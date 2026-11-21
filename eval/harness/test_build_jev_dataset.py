@@ -323,6 +323,19 @@ def test_constructive_nonzero_and_unexecuted_force_synthesis(counter):
     assert row["cutoff_step"] == 2
 
 
+def test_interval10_compaction_mining_uses_train_skip_evidence(counter):
+    r = record(count=12)
+    for s in r["trajectory"]["steps"]:
+        s["result_json"] = "small output"
+    rows = b.interval10_compaction_rows(r, counter, [])
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["interval"] == 10 and row["label"] == 0
+    assert row["decision_reason"] == "low_byte_growth_or_utility"
+    assert row["partition"] == r["split"]
+    assert row["renderer_version"] == b.RENDERER_VERSION
+
+
 def test_same_iteration_candidates_do_not_observe_one_another(counter):
     r = record(count=2)
     r["trajectory"]["steps"][1]["iteration"] = 1

@@ -747,7 +747,25 @@ func (d *systemOneCompactionDecider) DecideCompaction(ctx context.Context, input
 
 	effectiveDefer := resolveEffectiveDeferThreshold(entry, d.cfg.CompactionDeferThreshold)
 	maxProb := entry.MaxProbability()
-	if effectiveDefer > 0 && maxProb < effectiveDefer {
+	compactProb := -1.0
+	for _, score := range entry.Scores {
+		if score.ID == "compact" {
+			compactProb = score.Probability
+			break
+		}
+	}
+	balancedThreshold := 1.0
+	if entry.Calibration.BalancedThreshold != nil {
+		balancedThreshold = *entry.Calibration.BalancedThreshold
+	}
+	selectivePolicy := entry.Calibration.SelectivePolicy
+	if selectivePolicy && effectiveDefer > 0 && compactProb >= 0 && compactProb < effectiveDefer {
+		telemetry.AppliedAction = "system1_skip"
+		return &CompactionProbeResult{ShouldCompact: false,
+			Reason:         fmt.Sprintf("system1_selective_skip (p_compact=%.4f < skip_threshold=%.4f)", compactProb, effectiveDefer),
+			DecisionSource: "system1_skip", SystemOneLatencyMs: s1LatencyMs, DecisionTelemetry: telemetry}, nil
+	}
+	if effectiveDefer > 0 && compactProb >= 0 && compactProb < balancedThreshold {
 		telemetry.DeferReason = fmt.Sprintf("max_prob=%.4f < defer_threshold=%.4f", maxProb, effectiveDefer)
 		telemetry.AppliedAction = "defer_to_system2"
 		sumStart := time.Now()
@@ -771,7 +789,7 @@ func (d *systemOneCompactionDecider) DecideCompaction(ctx context.Context, input
 		return res, nil
 	}
 
-	if entry.Choice == "skip" {
+	if entry.Choice == "skip" && (!selectivePolicy || compactProb < effectiveDefer) {
 		telemetry.AppliedAction = "skip"
 		return &CompactionProbeResult{
 			ShouldCompact:      false,

@@ -59,6 +59,7 @@ class CalibrationProfile:
     bias: float
     balanced_threshold: float | None
     risk_threshold_5pct: float | None
+    selective_policy: bool = False
 
 
 @dataclass(frozen=True)
@@ -94,6 +95,7 @@ class CalibrationRegistry:
                 bias=float(entry["bias"]),
                 balanced_threshold=float(entry["balanced_threshold"]) if entry.get("balanced_threshold") is not None else None,
                 risk_threshold_5pct=float(risk["threshold"]) if risk.get("threshold") is not None else None,
+                selective_policy=bool(entry.get("selective_policy", False)),
             )
         return cls(
             checkpoint_id=str(req["checkpoint_id"]),
@@ -218,6 +220,7 @@ def score_decision(
             "bias": profile.bias,
             "balanced_threshold": profile.balanced_threshold,
             "risk_threshold_5pct": profile.risk_threshold_5pct,
+            "selective_policy": profile.selective_policy,
         }
 
     choice_idx = _argmax_earliest(probs)
@@ -237,3 +240,60 @@ def score_decision(
         "expected_score": expected_score,
         "calibration": calibration_meta,
     }
+
+
+def compaction_action(probability: float, *, balanced_threshold: float, skip_threshold: float,
+                      selective_policy: bool = True) -> str:
+    """Map calibrated P(compact) into compact, skip, or System-2 uncertainty zones."""
+    if not math.isfinite(probability) or not 0 <= probability <= 1:
+        raise ValueError("probability must be finite and in [0, 1]")
+    if not 0 <= skip_threshold <= balanced_threshold <= 1:
+        raise ValueError("thresholds must satisfy 0 <= skip <= balanced <= 1")
+    if probability >= balanced_threshold:
+        return "compact"
+    if selective_policy and probability < skip_threshold:
+        return "system1_skip"
+    return "defer_to_system2"
+
+
+def calibration_metrics(probabilities: list[float], labels: list[int], *, threshold: float,
+                        skip_threshold: float | None = None) -> dict[str, float | int | None]:
+    """Train-only binary metrics for a named calibration/acceptance partition."""
+    if len(probabilities) != len(labels) or not probabilities:
+        raise ValueError("probabilities and labels must be nonempty and have equal length")
+    if any(not math.isfinite(p) or not 0 <= p <= 1 for p in probabilities):
+        raise ValueError("probabilities must be finite and in [0, 1]")
+    if any(label not in (0, 1) for label in labels):
+        raise ValueError("labels must be binary")
+    eps = 1e-15
+    tp = sum(p >= threshold and y == 1 for p, y in zip(probabilities, labels))
+    fp = sum(p >= threshold and y == 0 for p, y in zip(probabilities, labels))
+    fn = sum(p < threshold and y == 1 for p, y in zip(probabilities, labels))
+    predicted = sum(p >= threshold for p in probabilities)
+    return {
+        "count": len(labels), "skip_rate": sum(p < skip_threshold for p in probabilities) / len(labels) if skip_threshold is not None else None,
+        "precision": tp / max(1, tp + fp), "recall": tp / max(1, tp + fn),
+        "brier": sum((p - y) ** 2 for p, y in zip(probabilities, labels)) / len(labels),
+        "nll": -sum(y * math.log(max(eps, p)) + (1-y) * math.log(max(eps, 1-p)) for p, y in zip(probabilities, labels)) / len(labels),
+        "predicted_compact_rate": predicted / len(labels),
+    }
+
+
+def evaluate_train_partitions(partition_rows: dict[str, list[dict[str, Any]]], *,
+                              balanced_threshold: float, skip_threshold: float) -> dict[str, Any]:
+    """Evaluate only explicitly supplied train_calibration/train_acceptance scored rows."""
+    allowed = {"train_calibration", "train_acceptance"}
+    unexpected = set(partition_rows) - allowed
+    if unexpected:
+        raise ValueError(f"evaluation accepts train partitions only: {sorted(unexpected)}")
+    result: dict[str, Any] = {}
+    for partition, rows in partition_rows.items():
+        if any(row.get("partition") != partition for row in rows):
+            raise ValueError(f"row partition mismatch in {partition}")
+        result[partition] = calibration_metrics(
+            [float(row["probability"]) for row in rows],
+            [int(row["label"]) for row in rows],
+            threshold=balanced_threshold,
+            skip_threshold=skip_threshold,
+        )
+    return {"source": "certified_train_only", "partitions": result}

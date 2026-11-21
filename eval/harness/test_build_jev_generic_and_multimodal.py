@@ -6,6 +6,7 @@ from pathlib import Path
 
 from PIL import Image
 import pytest
+from eval.harness import train_provenance
 
 SPEC = importlib.util.spec_from_file_location(
     "build_jev_generic_and_multimodal",
@@ -13,6 +14,43 @@ SPEC = importlib.util.spec_from_file_location(
 )
 ext = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ext)
+
+
+def test_certified_train_control_mining_preserves_partitions(tmp_path):
+    task = {"task_id": "train_task", "instruction": "inspect repository"}
+    manifest = tmp_path / "train.json"
+    manifest.write_text(json.dumps({"tasks": [task]}))
+    certificate = train_provenance.generate_certificate(manifest)
+    entry = certificate["assignments"]["train_task"]
+    rollout_dir = tmp_path / "rollouts"
+    rollout_dir.mkdir()
+    steps = [{"id": f"s{i}", "iteration": i, "step_index": 0, "tool_name": "read_file",
+              "args_json": {"path": f"file{i}.go"}, "result_json": {"content": "short"},
+              "status": "COMPLETED"} for i in range(1, 13)]
+    rollout = {"task_id": "train_task", "instruction": "inspect repository", "benchmark": "frames",
+               "benchmark_reward": 1, "grading_status": "graded",
+               "trajectory": {"run": {"id": "run_train_task", "context_json": "[]"},
+                              "steps": steps, "events": [], "compactions": [], "trajectory": {}}}
+    (rollout_dir / "train_task.json").write_text(json.dumps(rollout))
+    rows = ext.mine_train_control_rows(rollout_dir, certificate, ext.TokenCounter(char_fallback=True))
+    compaction = next(row for row in rows if row["row_type"] == "compaction")
+    assert compaction["decision_reason"] == "low_byte_growth_or_utility"
+    assert compaction["label"] == "skip"
+    assert compaction["partition"] == entry["partition"]
+    assert compaction["group_id"] == entry["group_id"]
+    assert compaction["rollout_sha256"]
+
+
+def test_certified_train_group_assignment_is_inherited_by_extension_rows():
+    partition = train_provenance.PARTITIONS[2]
+    group_id = "certified_group"
+    train_row = {"task_group": group_id, "split_group": group_id, "split": partition}
+    generated_row = {"task_group": "derived_extension_row", "split_group": group_id, "split": "train"}
+    assignments = ext.assign_split_groups(
+        [train_row, generated_row], {group_id: partition}, certified=True
+    )
+    assert assignments[group_id] == partition
+    assert train_row["split"] == generated_row["split"] == partition
 
 
 def _write_v1_fixture(directory: Path):

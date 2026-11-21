@@ -1711,6 +1711,65 @@ def build_multimodal_datasets(
     return mm_decisions, mm_emb_pairs
 
 
+def mine_train_control_rows(rollout_dir: Path, certificate: dict, counter: TokenCounter) -> list[dict]:
+    """Adapt certified train rollout decisions into extension rows with preserved lineage."""
+    from eval.harness import build_jev_dataset as source_builder
+
+    rows = []
+    for path in sorted(Path(rollout_dir).glob("*.json")):
+        if path.name == "summary.json":
+            continue
+        raw = path.read_bytes()
+        record = json.loads(raw)
+        entry = train_provenance.certify_task(record.get("task_id", ""), certificate, record)
+        record.update(task_group=entry["group_id"], partition=entry["partition"], split=entry["partition"],
+                      source_sha256=sha256_bytes(raw))
+        excluded: list[dict] = []
+        compact_rows = source_builder.compaction_rows(record, counter, excluded)
+        loop_rows = source_builder.loop_rows(record, counter)
+        for source_row in compact_rows + loop_rows:
+            label = source_row["label"]
+            if source_row["row_type"] == "compaction":
+                subfamily = "interval10_compaction" if source_row.get("interval") == 10 else "recorded_compaction"
+                label = "compact" if label else "skip"
+            else:
+                subfamily = "train_loop_guard"
+                label = label if label in {"none", "intercept", "force_synthesis"} else "none"
+            if source_row["row_type"] == "loop_guard":
+                if label == "none" and source_row.get("productive_progress"):
+                    contrast = "productive_progression"
+                elif label in {"intercept", "force_synthesis"}:
+                    contrast = "semantic_stall"
+                else:
+                    contrast = "uncertain"
+            else:
+                contrast = ""
+            task_id = source_row["source_task_id"]
+            task_entry = certificate["assignments"][task_id]
+            row = {
+                "schema_version": SCHEMA_VERSION,
+                "row_type": source_row["row_type"], "task_id": task_id,
+                "source_task_id": task_id, "task_group": task_entry["group_id"],
+                "group_id": task_entry["group_id"], "partition": task_entry["partition"],
+                "split": task_entry["partition"], "split_group": task_entry["group_id"],
+                "event_id": source_row["event_id"], "benchmark": record["benchmark"],
+                "subfamily": subfamily, "language": "en", "template_id": source_row["label_source"],
+                "state_text": source_row["state_text"], "label": label,
+                "label_source": source_row["label_source"], "label_policy": source_row["label_policy"],
+                "label_quality": source_row["label_quality"], "renderer_version": source_row["renderer_version"],
+                "rollout_sha256": source_row["rollout_sha256"], "source_sha256": source_row["rollout_sha256"],
+                "token_count": source_row["token_count"], "rendered_bytes": source_row["rendered_bytes"],
+                "truncated": source_row["truncated"], "contrastive_class": contrast,
+                "interval": source_row.get("interval"), "decision_reason": source_row.get("decision_reason"),
+            }
+            if row["row_type"] == "loop_guard":
+                row.update(raw_detect_loop_action=source_row.get("raw_detect_loop_action"),
+                           productive_progress=source_row.get("productive_progress"),
+                           candidates=source_row.get("candidates", []))
+            rows.append(row)
+    return rows
+
+
 def build_extension_dataset(
     output_dir: Path,
     heldout_path: Path | None,
@@ -1719,6 +1778,7 @@ def build_extension_dataset(
     *,
     train_manifest_path: Path | None = None,
     certificate_path: Path | None = None,
+    train_rollout_dir: Path | None = None,
 ) -> dict:
     certified = train_manifest_path is not None or certificate_path is not None or heldout_path is None
     certificate = (train_provenance.load_certificate(
@@ -1739,6 +1799,13 @@ def build_extension_dataset(
     mm_dec_rows, mm_emb_rows = build_multimodal_datasets(assets_dir, counter, seed=seed + 3)
 
     all_new_rows = gen_rows + loop_syn_rows + bi_rows + mm_dec_rows + mm_emb_rows
+    train_control_rows = mine_train_control_rows(train_rollout_dir, certificate, counter) if certified and train_rollout_dir is not None else []
+    all_new_rows.extend(train_control_rows)
+    for row in train_control_rows:
+        prior = existing_group_splits.get(row["task_group"])
+        if prior is not None and prior != row["partition"]:
+            raise ValueError(f"certified group {row['task_group']} conflicts with existing partition {prior}")
+        existing_group_splits[row["task_group"]] = row["partition"]
 
     # Held-out collision check on substantive normalized state/anchor text + task_id
     for row in all_new_rows:
@@ -1751,7 +1818,12 @@ def build_extension_dataset(
             raise ValueError(f"Held-out instruction collision in {row['event_id']}")
 
     sg_assignments = assign_split_groups(all_new_rows, existing_group_splits, seed=seed, certified=certified)
+    train_control_row_ids = {id(row) for row in train_control_rows}
     for row in all_new_rows:
+        if id(row) in train_control_row_ids:
+            if row["split"] != row["partition"]:
+                raise AssertionError(f"certified row {row['event_id']} moved across partitions")
+            continue
         row.update(source_task_id=None, group_id=row["task_group"], partition=row["split"],
                    rollout_sha256=None, label_policy=f"synthetic:{row['template_id']}")
     for split in splits:
@@ -1784,6 +1856,7 @@ def build_extension_dataset(
         "emb_pairs_bilingual": bi_rows,
         "multimodal_emb_pairs": mm_emb_rows,
         "multimodal_decisions": mm_dec_rows,
+        "train_control_mining": train_control_rows,
     }
     for family, fam_rows in family_map.items():
         for split in splits:
@@ -1823,6 +1896,7 @@ def build_extension_dataset(
         ("emb_pairs_bilingual", bi_rows),
         ("multimodal_emb_pairs", mm_emb_rows),
         ("multimodal_decisions", mm_dec_rows),
+        ("train_control_mining", train_control_rows),
     ):
         stats["families"][name] = {
             "rows": len(fam_rows),
@@ -1854,6 +1928,7 @@ def main():
     p.add_argument("--heldout", type=Path, help="Legacy held-out audit mode only")
     p.add_argument("--train-manifest", type=Path)
     p.add_argument("--train-certificate", type=Path)
+    p.add_argument("--train-rollout-dir", type=Path)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--char-fallback", action="store_true")
     p.add_argument("--tokenizer-cache", type=Path, default=None)
@@ -1863,7 +1938,8 @@ def main():
     counter = TokenCounter(args.char_fallback, args.tokenizer_cache)
     stats = build_extension_dataset(args.output_dir, args.heldout, counter, seed=args.seed,
                                     train_manifest_path=args.train_manifest,
-                                    certificate_path=args.train_certificate)
+                                    certificate_path=args.train_certificate,
+                                    train_rollout_dir=args.train_rollout_dir)
     print(json.dumps(stats, indent=2, sort_keys=True))
 
 
