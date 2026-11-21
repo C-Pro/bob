@@ -5,8 +5,8 @@
 - [x] Task: Update `eval/harness/build_jev_dataset.py` and `eval/harness/build_jev_generic_and_multimodal.py` (plus unit tests) to enforce the certified train allowlist without requiring `eval/tasks/heldout/*` access at build time.
 
 ## Phase 1: Go Control-Plane & FSM Hardening (`internal/fsm`)
-- [ ] Task: Replace global `hasPriorStrike` in `internal/fsm/loop_guard.go` and `internal/fsm/tool_loop.go` with candidate-scoped, execution-backed stall evidence, non-destructive sidecar advisories when executed evidence is absent, explicit blocked step disposition, mixed-batch scoping, and state-change repetition reset.
-- [ ] Task: Harden Stage-2 summarizer parsing in `internal/fsm/models.go` and `internal/fsm/compaction.go` (provenance-checked string-to-`VerifiedFinding` normalization, single shared-deadline repair retry, independent probe cooldown tracking, and hard-byte backstop precedence) with comprehensive unit tests.
+- [x] Task: Replace global `hasPriorStrike` in `internal/fsm/loop_guard.go` and `internal/fsm/tool_loop.go` with candidate-scoped, execution-backed stall evidence, non-destructive sidecar advisories when executed evidence is absent, explicit blocked step disposition, mixed-batch scoping, and state-change repetition reset.
+- [x] Task: Harden Stage-2 summarizer parsing in `internal/fsm/models.go` and `internal/fsm/compaction.go` (provenance-checked string-to-`VerifiedFinding` normalization, single shared-deadline repair retry, independent probe cooldown tracking, and hard-byte backstop precedence) with comprehensive unit tests.
 
 ## Phase 2: Event-Triggered Probing & Truncation-Aware State Rendering (`internal/fsm`, `services/bob_s1`)
 - [ ] Task: Implement progress ledger, event-triggered `loop_guard` invocation gating, cooldowns, and exact-state decision cache in `internal/fsm`.

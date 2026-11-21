@@ -249,6 +249,7 @@ type CompactedTaskState struct {
 	InputBytes           int               `json:"-"`
 	OutputBytes          int               `json:"-"`
 	CreatedAt            int64             `json:"created_at"`
+	bareFindingIndices   map[int]bool      `json:"-"`
 }
 
 // UnmarshalJSON implements custom unmarshaling for CompactedTaskState to gracefully accept
@@ -257,6 +258,7 @@ func (s *CompactedTaskState) UnmarshalJSON(data []byte) error {
 	type rawState CompactedTaskState
 	type flexibleState struct {
 		rawState
+		VerifiedFindings     json.RawMessage `json:"verified_findings,omitempty"`
 		ImmutableConstraints json.RawMessage `json:"immutable_constraints,omitempty"`
 		DecisionsAndRejected json.RawMessage `json:"decisions_and_rejected,omitempty"`
 		NextIntendedActions  json.RawMessage `json:"next_intended_actions,omitempty"`
@@ -270,6 +272,27 @@ func (s *CompactedTaskState) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*s = CompactedTaskState(f.rawState)
+	if len(f.VerifiedFindings) > 0 && !bytes.Equal(f.VerifiedFindings, []byte("null")) {
+		var findings []json.RawMessage
+		if err := json.Unmarshal(f.VerifiedFindings, &findings); err != nil {
+			return fmt.Errorf("invalid verified_findings: %w", err)
+		}
+		for _, item := range findings {
+			var finding VerifiedFinding
+			if err := json.Unmarshal(item, &finding); err == nil {
+				s.VerifiedFindings = append(s.VerifiedFindings, finding)
+				continue
+			}
+			if err := json.Unmarshal(item, &finding.Summary); err != nil {
+				return fmt.Errorf("invalid verified_findings element: %w", err)
+			}
+			if s.bareFindingIndices == nil {
+				s.bareFindingIndices = make(map[int]bool)
+			}
+			s.bareFindingIndices[len(s.VerifiedFindings)] = true
+			s.VerifiedFindings = append(s.VerifiedFindings, finding)
+		}
+	}
 	s.ImmutableConstraints = parseFlexibleStringSlice(f.ImmutableConstraints)
 	s.DecisionsAndRejected = parseFlexibleStringSlice(f.DecisionsAndRejected)
 	s.NextIntendedActions = parseFlexibleStringSlice(f.NextIntendedActions)

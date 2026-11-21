@@ -275,6 +275,10 @@ func TestToolLoopRunner_LoopGuardEndToEnd_InterceptThenForceSynthesis(t *testing
 	for _, s := range steps {
 		if s.ErrorText == LoopGuardBlockedErrorText {
 			hasBlockedStep = true
+			assert.Equal(t, StepStatusSkipped, s.Status)
+			assert.Nil(t, s.StartedAt)
+			assert.True(t, isBlockedLoopStep(s))
+			assert.Contains(t, s.ResultJSON, `"loop_guard_blocked":true`)
 			res, _ := DecodeStoredToolResult(s.ResultJSON)
 			assert.Contains(t, res.Content, LoopGuardNoticePrefix)
 		}

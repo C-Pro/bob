@@ -2,6 +2,7 @@ package fsm
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -95,174 +96,186 @@ func DetectLoop(history []FSMStep, candidateCalls []openai.ToolCall, cfg LoopGua
 	if cfg.MaxConsecutiveCalls <= 0 {
 		cfg.MaxConsecutiveCalls = 3
 	}
-	if cfg.MaxCycleRepetitions <= 0 {
+	if cfg.MaxCycleRepetitions < 2 {
 		cfg.MaxCycleRepetitions = 2
 	}
 	if cfg.MaxCycleLength <= 0 {
 		cfg.MaxCycleLength = 5
 	}
 
-	hasPriorStrike, blockedReason, historySigs, candidateSigs := inspectLoopHistory(history, candidateCalls)
-	if blockedReason != "" {
-		return LoopVerdict{
-			Action: LoopActionForceSynthesis,
-			Reason: blockedReason,
-		}
+	evidence := inspectLoopHistory(history, candidateCalls, cfg)
+	if len(evidence.notices) == 0 {
+		return LoopVerdict{Action: LoopActionNone}
 	}
-
-	allSigs := append(historySigs, candidateSigs...)
-	totalCalls := len(allSigs)
-
-	// 1. Check for consecutive identical calls (period p = 1)
-	consecutive, lastSig := trailingConsecutiveCalls(allSigs)
-
-	consecutiveDetected := false
-	if consecutive >= cfg.MaxConsecutiveCalls {
-		consecutiveDetected = true
-	} else if consecutive >= 2 && len(history) >= 2 && hasMatchingUnchangedOutputs(history, historySigs, candidateCalls, lastSig, consecutive) {
-		consecutiveDetected = true
+	if evidence.struck && len(evidence.notices) == len(candidateCalls) {
+		return LoopVerdict{Action: LoopActionForceSynthesis, Reason: evidence.reason}
 	}
-
-	if consecutiveDetected {
-		reason := fmt.Sprintf("tool %q repeated %d consecutive times without state progress", lastSig.name, consecutive)
-		if hasPriorStrike {
-			return LoopVerdict{
-				Action: LoopActionForceSynthesis,
-				Reason: reason,
-			}
-		}
-		notices := make(map[int]string)
-		for i := range candidateCalls {
-			if candidateSigs[i] == lastSig {
-				notices[i] = FormatLoopGuardNotice(candidateCalls[i].Function.Name, candidateCalls[i].Function.Arguments)
-			}
-		}
-		return LoopVerdict{
-			Action:       LoopActionIntercept,
-			Reason:       reason,
-			NoticeByCall: notices,
-		}
-	}
-
-	// 2. Check for cyclic sequence repetitions (period p in [2, cfg.MaxCycleLength])
-	for p := 2; p <= cfg.MaxCycleLength && p*cfg.MaxCycleRepetitions <= totalCalls; p++ {
-		// Check if the last p*MaxCycleRepetitions signatures form an identical repeating sequence
-		repeats := true
-		targetBlock := allSigs[totalCalls-p : totalCalls]
-		for r := 1; r < cfg.MaxCycleRepetitions; r++ {
-			blockStart := totalCalls - (r+1)*p
-			for i := 0; i < p; i++ {
-				if allSigs[blockStart+i] != targetBlock[i] {
-					repeats = false
-					break
-				}
-			}
-			if !repeats {
-				break
-			}
-		}
-
-		if repeats {
-			reason := fmt.Sprintf("cyclic sequence of %d tool calls repeated %d times", p, cfg.MaxCycleRepetitions)
-			if hasPriorStrike {
-				return LoopVerdict{
-					Action: LoopActionForceSynthesis,
-					Reason: reason,
-				}
-			}
-			notices := make(map[int]string)
-			for i := range candidateCalls {
-				notices[i] = FormatLoopGuardNotice(candidateCalls[i].Function.Name, candidateCalls[i].Function.Arguments)
-			}
-			return LoopVerdict{
-				Action:       LoopActionIntercept,
-				Reason:       reason,
-				NoticeByCall: notices,
-			}
-		}
-	}
-
-	return LoopVerdict{Action: LoopActionNone}
+	return LoopVerdict{Action: LoopActionIntercept, Reason: evidence.reason, NoticeByCall: evidence.notices}
 }
 
 func isBlockedLoopStep(s FSMStep) bool {
-	return s.ErrorText == LoopGuardBlockedErrorText || strings.HasPrefix(s.ResultJSON, LoopGuardNoticePrefix)
+	if s.ErrorText == LoopGuardBlockedErrorText || strings.HasPrefix(s.ResultJSON, LoopGuardNoticePrefix) {
+		return true
+	}
+	var marker struct {
+		Blocked bool `json:"loop_guard_blocked"`
+	}
+	return json.Unmarshal([]byte(s.ResultJSON), &marker) == nil && marker.Blocked
 }
 
-func inspectLoopHistory(history []FSMStep, candidateCalls []openai.ToolCall) (hasPriorStrike bool, blockedRepeatReason string, historySigs []toolCallSig, candidateSigs []toolCallSig) {
-	historySigs = make([]toolCallSig, len(history))
-	for i, s := range history {
-		historySigs[i] = makeSig(s.ToolName, s.ArgsJSON)
-		if isBlockedLoopStep(s) {
-			hasPriorStrike = true
-		}
-	}
-
-	candidateSigs = make([]toolCallSig, len(candidateCalls))
-	for i, tc := range candidateCalls {
-		candidateSigs[i] = makeSig(tc.Function.Name, tc.Function.Arguments)
-	}
-
-	if hasPriorStrike {
-		for i, s := range history {
-			if !isBlockedLoopStep(s) {
-				continue
-			}
-			blockedSig := historySigs[i]
-			for _, cSig := range candidateSigs {
-				if cSig == blockedSig {
-					return true, fmt.Sprintf("tool %q repeated after being blocked by loop guard", cSig.name), historySigs, candidateSigs
-				}
-			}
-		}
-	}
-	return hasPriorStrike, "", historySigs, candidateSigs
+type loopHistoryEvidence struct {
+	notices map[int]string
+	reason  string
+	struck  bool
 }
 
-func trailingConsecutiveCalls(allSigs []toolCallSig) (int, toolCallSig) {
-	if len(allSigs) == 0 {
-		return 0, toolCallSig{}
+func loopObservation(s FSMStep) [32]byte {
+	content := strings.TrimSpace(storedResultForProbe(s.ResultJSON))
+	var plain struct {
+		Content string `json:"content"`
 	}
-	lastSig := allSigs[len(allSigs)-1]
-	consecutive := 0
-	for i := len(allSigs) - 1; i >= 0; i-- {
-		if allSigs[i] == lastSig {
-			consecutive++
-		} else {
-			break
-		}
+	if json.Unmarshal([]byte(content), &plain) == nil && plain.Content != "" {
+		content = plain.Content
 	}
-	return consecutive, lastSig
+	return sha256.Sum256([]byte(content + "\x00" + s.ErrorText))
 }
 
-func hasMatchingUnchangedOutputs(history []FSMStep, historySigs []toolCallSig, candidateCalls []openai.ToolCall, targetSig toolCallSig, consecutive int) bool {
-	trailingCount := consecutive - len(candidateCalls)
-	if trailingCount < 2 || len(history) < trailingCount {
+func isStateMutatingStep(s FSMStep) bool {
+	if (s.Status != StepStatusCompleted && s.Status != StepStatusFailed && s.Status != StepStatusTimedOut) || isBlockedLoopStep(s) {
 		return false
 	}
-	var firstOut string
-	firstSet := false
-	start := len(history) - trailingCount
-	for i := start; i < len(history); i++ {
-		if historySigs[i] != targetSig {
-			return false
-		}
-		if !firstSet {
-			firstOut = history[i].ResultJSON
-			firstSet = true
-		} else if history[i].ResultJSON != firstOut {
-			return false
+	name := strings.ToLower(s.ToolName)
+	for _, marker := range []string{"write", "edit", "patch", "delete", "create_file", "save_file"} {
+		if strings.Contains(name, marker) {
+			return true
 		}
 	}
-	return firstSet
+	args := strings.ToLower(s.ArgsJSON)
+	for _, marker := range []string{"apply_patch", "sed -i", " > ", " >> ", "git checkout", "git restore", "git commit", "git add"} {
+		if strings.Contains(args, marker) {
+			return true
+		}
+	}
+	return false
 }
 
-func buildAllCandidateNotices(candidateCalls []openai.ToolCall) map[int]string {
-	notices := make(map[int]string, len(candidateCalls))
-	for i, tc := range candidateCalls {
-		notices[i] = FormatLoopGuardNotice(tc.Function.Name, tc.Function.Arguments)
+func executedLoopSteps(history []FSMStep) []FSMStep {
+	var executed []FSMStep
+	for _, step := range history {
+		if isStateMutatingStep(step) {
+			executed = nil
+			continue
+		}
+		if isBlockedLoopStep(step) || (step.Status != StepStatusCompleted && step.Status != StepStatusFailed && step.Status != StepStatusTimedOut) {
+			continue
+		}
+		executed = append(executed, step)
 	}
-	return notices
+	return executed
+}
+
+func candidateLoopEvidence(executed []FSMStep, candidateCalls []openai.ToolCall, cfg LoopGuardConfig) (map[int]string, string) {
+	if cfg.MaxConsecutiveCalls <= 0 {
+		cfg.MaxConsecutiveCalls = 3
+	}
+	if cfg.MaxCycleRepetitions < 2 {
+		cfg.MaxCycleRepetitions = 2
+	}
+	if cfg.MaxCycleLength <= 0 {
+		cfg.MaxCycleLength = 5
+	}
+	notices := make(map[int]string)
+	reason := ""
+	for index, call := range candidateCalls {
+		sig := makeSig(call.Function.Name, call.Function.Arguments)
+		if isStateMutatingStep(FSMStep{ToolName: call.Function.Name, ArgsJSON: call.Function.Arguments, Status: StepStatusCompleted}) {
+			continue
+		}
+		needed := max(2, cfg.MaxConsecutiveCalls-1)
+		if len(executed) >= needed {
+			last := executed[len(executed)-1]
+			matching := true
+			for i := len(executed) - needed; i < len(executed); i++ {
+				if makeSig(executed[i].ToolName, executed[i].ArgsJSON) != sig || loopObservation(executed[i]) != loopObservation(last) {
+					matching = false
+					break
+				}
+			}
+			if matching {
+				notices[index] = FormatLoopGuardNotice(call.Function.Name, call.Function.Arguments)
+				reason = fmt.Sprintf("tool %q repeated %d consecutive times without state progress", sig.name, needed+1)
+				continue
+			}
+		}
+		for period := 2; period <= cfg.MaxCycleLength && period*cfg.MaxCycleRepetitions <= len(executed); period++ {
+			start := len(executed) - period*cfg.MaxCycleRepetitions
+			matching := true
+			for i := start + period; i < len(executed); i++ {
+				if makeSig(executed[i].ToolName, executed[i].ArgsJSON) != makeSig(executed[i-period].ToolName, executed[i-period].ArgsJSON) || loopObservation(executed[i]) != loopObservation(executed[i-period]) {
+					matching = false
+					break
+				}
+			}
+			if matching && sig == makeSig(executed[len(executed)-period+index%period].ToolName, executed[len(executed)-period+index%period].ArgsJSON) {
+				notices[index] = FormatLoopGuardNotice(call.Function.Name, call.Function.Arguments)
+				reason = fmt.Sprintf("cyclic sequence of %d tool calls repeated %d times", period, cfg.MaxCycleRepetitions)
+				break
+			}
+		}
+	}
+	return notices, reason
+}
+
+func inspectLoopHistory(history []FSMStep, candidateCalls []openai.ToolCall, cfg LoopGuardConfig) loopHistoryEvidence {
+	executed := executedLoopSteps(history)
+	notices, reason := candidateLoopEvidence(executed, candidateCalls, cfg)
+	evidence := loopHistoryEvidence{notices: notices, reason: reason}
+	if len(notices) == 0 {
+		return evidence
+	}
+	for i := len(history) - 1; i >= 0; i-- {
+		step := history[i]
+		if isStateMutatingStep(step) {
+			break
+		}
+		if !isBlockedLoopStep(step) {
+			if step.Status == StepStatusCompleted || step.Status == StepStatusFailed || step.Status == StepStatusTimedOut {
+				break
+			}
+			continue
+		}
+		prior := executedLoopSteps(history[:i])
+		blockedCall := openai.ToolCall{Function: openai.FunctionCall{Name: step.ToolName, Arguments: step.ArgsJSON}}
+		priorNotices, _ := candidateLoopEvidence(prior, []openai.ToolCall{blockedCall}, cfg)
+		if len(priorNotices) == 0 {
+			continue
+		}
+		for index := range notices {
+			if makeSig(candidateCalls[index].Function.Name, candidateCalls[index].Function.Arguments) == makeSig(step.ToolName, step.ArgsJSON) {
+				evidence.struck = true
+				evidence.reason = fmt.Sprintf("tool %q repeated after being blocked by loop guard", step.ToolName)
+				return evidence
+			}
+		}
+	}
+	return evidence
+}
+
+func trailingUnchangedExecuted(history []FSMStep, candidate openai.ToolCall) int {
+	executed := executedLoopSteps(history)
+	if len(executed) == 0 {
+		return 0
+	}
+	sig := makeSig(candidate.Function.Name, candidate.Function.Arguments)
+	last := loopObservation(executed[len(executed)-1])
+	count := 0
+	for i := len(executed) - 1; i >= 0; i-- {
+		if makeSig(executed[i].ToolName, executed[i].ArgsJSON) != sig || loopObservation(executed[i]) != last {
+			break
+		}
+		count++
+	}
+	return count
 }
 
 // EvaluateLoopGuard runs deterministic and optional System-1 semantic loop detection
@@ -281,15 +294,11 @@ func EvaluateLoopGuard(
 		return LoopVerdict{Action: LoopActionNone}, nil, nil
 	}
 
-	hasPriorStrike, blockedReason, historySigs, candidateSigs := inspectLoopHistory(history, candidateCalls)
-	if blockedReason != "" {
-		return LoopVerdict{
-			Action: LoopActionForceSynthesis,
-			Reason: blockedReason,
-		}, nil, nil
-	}
-
+	evidence := inspectLoopHistory(history, candidateCalls, cfg)
 	heuristicVerdict := DetectLoop(history, candidateCalls, cfg)
+	if heuristicVerdict.Action == LoopActionForceSynthesis {
+		return heuristicVerdict, nil, nil
+	}
 	mode := strings.ToLower(strings.TrimSpace(s1Cfg.LoopGuardMode))
 	if s1Client == nil || mode == "" || mode == "off" || len(history) < 2 {
 		return heuristicVerdict, nil, nil
@@ -360,13 +369,13 @@ func EvaluateLoopGuard(
 	switch choice {
 	case string(LoopActionNone):
 		// Enforce deterministic hard backstop ceiling (>= 5 consecutive unchanged calls) against false negatives.
-		allSigs := append(append([]toolCallSig(nil), historySigs...), candidateSigs...)
-		consecutive, lastSig := trailingConsecutiveCalls(allSigs)
-		if consecutive >= loopGuardHybridBackstopCeiling &&
-			len(history) >= 2 &&
-			hasMatchingUnchangedOutputs(history, historySigs, candidateCalls, lastSig, consecutive) {
-			reason := fmt.Sprintf("hard backstop triggered after %d consecutive unchanged calls to %q", consecutive, lastSig.name)
-			if hasPriorStrike {
+		for index := range evidence.notices {
+			consecutive := trailingUnchangedExecuted(history, candidateCalls[index]) + 1
+			if consecutive < loopGuardHybridBackstopCeiling {
+				continue
+			}
+			reason := fmt.Sprintf("hard backstop triggered after %d consecutive unchanged calls to %q", consecutive, candidateCalls[index].Function.Name)
+			if evidence.struck && len(evidence.notices) == len(candidateCalls) {
 				telemetry.AppliedAction = string(LoopActionForceSynthesis)
 				return LoopVerdict{Action: LoopActionForceSynthesis, Reason: reason}, telemetry, nil
 			}
@@ -374,27 +383,35 @@ func EvaluateLoopGuard(
 			return LoopVerdict{
 				Action:       LoopActionIntercept,
 				Reason:       reason,
-				NoticeByCall: buildAllCandidateNotices(candidateCalls),
+				NoticeByCall: evidence.notices,
 			}, telemetry, nil
 		}
 		telemetry.AppliedAction = string(LoopActionNone)
 		return LoopVerdict{Action: LoopActionNone}, telemetry, nil
 
 	case string(LoopActionIntercept):
+		if len(evidence.notices) == 0 {
+			telemetry.AppliedAction = "advisory"
+			return LoopVerdict{Action: LoopActionNone}, telemetry, nil
+		}
 		telemetry.AppliedAction = string(LoopActionIntercept)
 		return LoopVerdict{
 			Action:       LoopActionIntercept,
 			Reason:       "bob-s1 loop_guard intercepted repetitive tool execution",
-			NoticeByCall: buildAllCandidateNotices(candidateCalls),
+			NoticeByCall: evidence.notices,
 		}, telemetry, nil
 
 	case string(LoopActionForceSynthesis):
-		if !hasPriorStrike {
+		if len(evidence.notices) == 0 {
+			telemetry.AppliedAction = "advisory"
+			return LoopVerdict{Action: LoopActionNone}, telemetry, nil
+		}
+		if !evidence.struck || len(evidence.notices) != len(candidateCalls) {
 			telemetry.AppliedAction = string(LoopActionIntercept)
 			return LoopVerdict{
 				Action:       LoopActionIntercept,
 				Reason:       "bob-s1 loop_guard downgraded force_synthesis to intercept before strike 1",
-				NoticeByCall: buildAllCandidateNotices(candidateCalls),
+				NoticeByCall: evidence.notices,
 			}, telemetry, nil
 		}
 		telemetry.AppliedAction = string(LoopActionForceSynthesis)

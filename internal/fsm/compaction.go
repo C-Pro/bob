@@ -3,6 +3,7 @@ package fsm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -24,6 +25,8 @@ const (
 	maxProbeCompletionToks  = 8192
 	maxCompactedStateBytes  = 32768
 )
+
+var errMalformedCompactionJSON = errors.New("malformed compaction JSON")
 
 // SystemOneControlConfig configures System-1 sidecar gating and fallback policies in the FSM.
 type SystemOneControlConfig struct {
@@ -283,12 +286,12 @@ func evaluateCompactionTrigger(
 		return compactionTriggerNone, 0
 	}
 
-	if isStuckRepeatingFailure(allSteps, currentIter) {
-		return compactionTriggerNone, 0
-	}
-
 	if activeBytes >= cfg.HardThresholdBytes {
 		return compactionTriggerForceBackstop, targetIter
+	}
+
+	if isStuckRepeatingFailure(allSteps, currentIter) {
+		return compactionTriggerNone, 0
 	}
 
 	if (currentIter-prevCompactedIter) >= cfg.IntervalIterations || activeBytes >= cfg.SoftThresholdBytes {
@@ -369,6 +372,74 @@ func collectCompactedStepIDs(prev *CompactedTaskState, stepsToCompact []FSMStep)
 		}
 	}
 	return out
+}
+
+func resolveVerifiedFindingProvenance(state *CompactedTaskState, input CompactionProbeInput) error {
+	allowed := make(map[string]bool)
+	if input.PreviousState != nil {
+		for _, id := range input.PreviousState.CompactedStepIDs {
+			allowed[id] = true
+		}
+	}
+	for _, step := range input.StepsToCompact {
+		if step.Status == StepStatusCompleted || step.Status == StepStatusFailed || step.Status == StepStatusTimedOut {
+			if !isBlockedLoopStep(step) {
+				allowed[step.ID] = true
+			}
+		}
+	}
+	resolved := make([]VerifiedFinding, 0, len(state.VerifiedFindings))
+	for index, finding := range state.VerifiedFindings {
+		if len(finding.SourceStepIDs) > 0 {
+			for _, id := range finding.SourceStepIDs {
+				if !allowed[id] {
+					return fmt.Errorf("verified finding %q has invalid source_step_id %q", finding.Summary, id)
+				}
+			}
+			resolved = append(resolved, finding)
+			continue
+		}
+		if !state.bareFindingIndices[index] {
+			resolved = append(resolved, finding)
+			continue
+		}
+		summary := strings.TrimSpace(finding.Summary)
+		if summary == "" {
+			continue
+		}
+		fromPrevious := false
+		if input.PreviousState != nil {
+			for _, previous := range input.PreviousState.VerifiedFindings {
+				if previous.Summary == summary && len(previous.SourceStepIDs) > 0 {
+					valid := true
+					for _, id := range previous.SourceStepIDs {
+						valid = valid && allowed[id]
+					}
+					if valid {
+						finding.SourceStepIDs = append([]string(nil), previous.SourceStepIDs...)
+						fromPrevious = true
+						break
+					}
+				}
+			}
+		}
+		if len(finding.SourceStepIDs) == 0 {
+			for _, step := range input.StepsToCompact {
+				if !allowed[step.ID] {
+					continue
+				}
+				observed := storedResultForProbe(step.ResultJSON)
+				if observed != "" && strings.Contains(strings.ToLower(observed), strings.ToLower(summary)) {
+					finding.SourceStepIDs = append(finding.SourceStepIDs, step.ID)
+				}
+			}
+		}
+		if len(finding.SourceStepIDs) == 1 || fromPrevious {
+			resolved = append(resolved, finding)
+		}
+	}
+	state.VerifiedFindings = resolved
+	return nil
 }
 
 func summarizeStepForState(s FSMStep) string {
@@ -563,7 +634,7 @@ func runCompactionLLMQuery(ctx context.Context, client LLMClient, systemPrompt s
 
 	var result CompactionProbeResult
 	if err := json.Unmarshal([]byte(raw), &result); err != nil {
-		return nil, fmt.Errorf("failed to parse compaction probe JSON (finish_reason=%s, raw_preview=%.512q): %w", finishReason, raw, err)
+		return nil, fmt.Errorf("%w (finish_reason=%s, raw_preview=%.512q): %w", errMalformedCompactionJSON, finishReason, raw, err)
 	}
 	return &result, nil
 }
@@ -717,7 +788,13 @@ func (d *systemOneCompactionDecider) DecideCompaction(ctx context.Context, input
 	}
 
 	sumStart := time.Now()
-	sumRes, sumErr := runCompactionLLMQuery(ctx, d.llmClient, selfCompactSummarizerSystemPrompt, input)
+	sumCtx, cancel := context.WithTimeout(ctx, compactionProbeTimeout)
+	defer cancel()
+	sumRes, sumErr := runCompactionLLMQuery(sumCtx, d.llmClient, selfCompactSummarizerSystemPrompt, input)
+	if errors.Is(sumErr, errMalformedCompactionJSON) && sumCtx.Err() == nil {
+		sumRes, sumErr = runCompactionLLMQuery(sumCtx, d.llmClient,
+			selfCompactSummarizerSystemPrompt+"\nYour previous response was malformed JSON. Repair it and return only valid JSON matching the schema.", input)
+	}
 	sumLatencyMs := time.Since(sumStart).Milliseconds()
 	if sumErr != nil {
 		telemetry.AppliedAction = "probe_error"
@@ -1007,6 +1084,15 @@ func (r *ToolLoopRunner) maybeCompact(ctx context.Context, run *FSMRun, store *S
 	if mode == compactionTriggerNone {
 		return nil
 	}
+	if mode == compactionTriggerProbeRubric {
+		lastProbeIter, probeErr := store.GetLastCompactionProbeIteration(ctx, run.ID)
+		if probeErr != nil {
+			return probeErr
+		}
+		if lastProbeIter > 0 && run.Iteration-lastProbeIter < cfg.IntervalIterations {
+			return nil
+		}
+	}
 
 	var stepsToCompact, tailSteps []FSMStep
 	for _, s := range allSteps {
@@ -1155,6 +1241,11 @@ func (r *ToolLoopRunner) maybeCompact(ctx context.Context, run *FSMRun, store *S
 		state.RubricVerdict = CompactionVerdictProbedCompact
 		state.Model = model
 		state.InputBytes = activeBytes
+	}
+
+	if err := resolveVerifiedFindingProvenance(state, input); err != nil {
+		recordS1Telemetry("probe_error")
+		return recordProbeSkipEvent(ctx, store, run.ID, run.Iteration, prevVersion, prevCompactedIter, model, activeBytes, fmt.Sprintf("probe_error: %v", err), compMeta)
 	}
 
 	skipReason, err := validateCandidateCompaction(state, baseMsgs, allSteps, activeBytes)

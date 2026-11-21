@@ -510,25 +510,18 @@ func (r *ToolLoopRunner) handlePrepareSteps(ctx context.Context, run *FSMRun, st
 		if verdict.Action == LoopActionIntercept {
 			if notice, ok := verdict.NoticeByCall[i]; ok {
 				now := time.Now().Unix()
-				resEnv, _ := EncodeStoredToolResult(agentapi.ToolResult{Content: notice})
-				steps[i].Status = StepStatusCompleted
-				steps[i].ResultJSON = resEnv
+				resEnv, encErr := json.Marshal(struct {
+					Version int                 `json:"bob_tool_result_version"`
+					Result  agentapi.ToolResult `json:"result"`
+					Blocked bool                `json:"loop_guard_blocked"`
+				}{Version: StoredToolResultVersion, Result: agentapi.ToolResult{Content: notice}, Blocked: true})
+				if encErr != nil {
+					return fmt.Errorf("failed to encode loop guard blocked result: %w", encErr)
+				}
+				steps[i].Status = StepStatusSkipped
+				steps[i].ResultJSON = string(resEnv)
 				steps[i].ErrorText = LoopGuardBlockedErrorText
-				steps[i].StartedAt = &now
 				steps[i].CompletedAt = &now
-				zero := 0
-				trajStep := trajectory.Step{
-					Index:       steps[i].StepIndex,
-					Iteration:   steps[i].Iteration,
-					Attempt:     1,
-					Action:      steps[i].ToolName,
-					ActionArgs:  json.RawMessage(steps[i].ArgsJSON),
-					Observation: notice,
-					ExitCode:    &zero,
-				}
-				if ev, evErr := trajectory.MakeToolAttemptEvent(run.ID, run.ID, 1, run.Iteration, "loop", steps[i].ID, 1, trajStep); evErr == nil {
-					_ = store.RecordEvent(ctx, ev)
-				}
 			}
 		}
 		stepPtrs[i] = &steps[i]

@@ -1028,6 +1028,20 @@ func (s *Store) HasCompactionEventForIteration(ctx context.Context, runID string
 	return count > 0, nil
 }
 
+// GetLastCompactionProbeIteration returns the latest recorded probe or backstop iteration for a run.
+func (s *Store) GetLastCompactionProbeIteration(ctx context.Context, runID string) (int, error) {
+	var iteration int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COALESCE(MAX(iteration), 0)
+		FROM agent_trajectory_events
+		WHERE run_id = ? AND event_type = 'compaction'
+	`, runID).Scan(&iteration)
+	if err != nil {
+		return 0, fmt.Errorf("failed to query last compaction probe for run %s: %w", runID, err)
+	}
+	return iteration, nil
+}
+
 // ListTaskHistorySteps implements tools.TaskHistoryStore by verifying that runID belongs to
 // the specified chat/session and returning all durable FSMSteps for that run.
 func (s *Store) ListTaskHistorySteps(ctx context.Context, chatID, userID string, isDM bool, runID string) ([]tools.TaskHistoryStep, error) {

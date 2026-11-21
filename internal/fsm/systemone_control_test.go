@@ -502,22 +502,22 @@ func TestEvaluateLoopGuard_SemanticModesAndTelemetry(t *testing.T) {
 		return outSlice
 	}
 
-	t.Run("0ms blocked repeat short-circuits without sidecar call", func(t *testing.T) {
+	t.Run("unexecuted blocked call cannot establish a strike", func(t *testing.T) {
 		hist := []FSMStep{
-			{Iteration: 1, ToolName: "run_command", ArgsJSON: `{"command":"pytest -q"}`, ErrorText: LoopGuardBlockedErrorText},
-			{Iteration: 2, ToolName: "read_file", ArgsJSON: `{"path":"a.go"}`, ResultJSON: "ok"},
+			{Iteration: 1, ToolName: "run_command", ArgsJSON: `{"command":"pytest -q"}`, ErrorText: LoopGuardBlockedErrorText, Status: StepStatusSkipped},
+			{Iteration: 2, ToolName: "read_file", ArgsJSON: `{"path":"a.go"}`, ResultJSON: "ok", Status: StepStatusCompleted},
 		}
 		s1 := &mockSystemOneDecisionClient{
 			loopGuardFn: func(ctx context.Context, state string, images []string) (*llm.DecisionResultEntry, *llm.DecisionResponse, error) {
-				t.Fatal("sidecar must not be called on repeated blocked call")
-				return nil, nil, nil
+				return &llm.DecisionResultEntry{ID: "loop_guard", Choice: "force_synthesis"}, &llm.DecisionResponse{}, nil
 			},
 		}
 		v, tel, err := EvaluateLoopGuard(ctx, run, "goal", hist, []openai.ToolCall{callSame}, cfg, s1, SystemOneControlConfig{LoopGuardMode: "hybrid"})
 		require.NoError(t, err)
-		assert.Nil(t, tel)
-		assert.Equal(t, LoopActionForceSynthesis, v.Action)
-		assert.Equal(t, int32(0), s1.lgCalls.Load())
+		require.NotNil(t, tel)
+		assert.Equal(t, LoopActionNone, v.Action)
+		assert.Equal(t, "advisory", tel.AppliedAction)
+		assert.Equal(t, int32(1), s1.lgCalls.Load())
 	})
 
 	t.Run("len(history) < 2 skips sidecar", func(t *testing.T) {
@@ -613,13 +613,24 @@ func TestEvaluateLoopGuard_SemanticModesAndTelemetry(t *testing.T) {
 		assert.NotEmpty(t, v.NoticeByCall[0])
 		assert.Equal(t, "intercept", tel.AppliedAction)
 
-		// With prior strike, force_synthesis executes as force_synthesis.
+		// An unrelated blocked call is not evidence for this candidate.
 		hist[0].ErrorText = LoopGuardBlockedErrorText
-		hist[0].ArgsJSON = `{"command":"other"}` // different call so 0ms rule doesn't fire first
+		hist[0].ArgsJSON = `{"command":"other"}`
 		v2, tel2, err := EvaluateLoopGuard(ctx, run, "goal", hist, []openai.ToolCall{callSame}, cfg, s1, SystemOneControlConfig{LoopGuardMode: "hybrid"})
 		require.NoError(t, err)
-		assert.Equal(t, LoopActionForceSynthesis, v2.Action)
-		assert.Equal(t, "force_synthesis", tel2.AppliedAction)
+		assert.Equal(t, LoopActionNone, v2.Action)
+		assert.Equal(t, "advisory", tel2.AppliedAction)
+
+		// A blocked repeat after two identical executed observations is a valid strike.
+		hist = makeSteps(2, "out")
+		hist = append(hist, FSMStep{Iteration: 3, ToolName: "run_command", ArgsJSON: callSame.Function.Arguments,
+			ErrorText: LoopGuardBlockedErrorText, Status: StepStatusSkipped})
+		v3, tel3, err := EvaluateLoopGuard(ctx, run, "goal", hist, []openai.ToolCall{callSame}, cfg, s1, SystemOneControlConfig{LoopGuardMode: "hybrid"})
+		require.NoError(t, err)
+		assert.Equal(t, LoopActionForceSynthesis, v3.Action)
+		if tel3 != nil {
+			assert.Equal(t, "force_synthesis", tel3.AppliedAction)
+		}
 	})
 
 	t.Run("sidecar error respects fallback_on_error false vs true", func(t *testing.T) {
