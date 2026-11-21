@@ -143,21 +143,28 @@ type SystemOneScoreEntry struct {
 
 // SystemOneDecisionPayload records a System-1 sidecar decision probe and control-plane outcome.
 type SystemOneDecisionPayload struct {
-	Task               string                `json:"task"`
-	Choice             string                `json:"choice,omitempty"`
-	ChoiceBasis        string                `json:"choice_basis,omitempty"`
-	Scores             []SystemOneScoreEntry `json:"scores,omitempty"`
-	CalibrationProfile string                `json:"calibration_profile,omitempty"`
-	CalibrationApplied bool                  `json:"calibration_applied"`
-	MismatchReason     string                `json:"mismatch_reason,omitempty"`
-	PrefixTokens       int                   `json:"prefix_tokens"`
-	SuffixTokens       int                   `json:"suffix_tokens"`
-	Truncated          bool                  `json:"truncated"`
-	LatencyMs          int64                 `json:"latency_ms"`
-	AppliedAction      string                `json:"applied_action"`
-	HeuristicAction    string                `json:"heuristic_action,omitempty"`
-	FallbackUsed       bool                  `json:"fallback_used"`
-	ShadowMode         bool                  `json:"shadow_mode"`
-	DeferReason        string                `json:"defer_reason,omitempty"`
-	Error              string                `json:"error,omitempty"`
+	Task                     string                `json:"task"`
+	Choice                   string                `json:"choice,omitempty"`
+	ChoiceBasis              string                `json:"choice_basis,omitempty"`
+	Scores                   []SystemOneScoreEntry `json:"scores,omitempty"`
+	CalibrationProfile       string                `json:"calibration_profile,omitempty"`
+	CalibrationApplied       bool                  `json:"calibration_applied"`
+	MismatchReason           string                `json:"mismatch_reason,omitempty"`
+	PrefixTokens             int                   `json:"prefix_tokens"`
+	SuffixTokens             int                   `json:"suffix_tokens"`
+	Truncated                bool                  `json:"truncated"`
+	RetainedSteps            int                   `json:"retained_steps,omitempty"`
+	OmittedSteps             int                   `json:"omitted_steps,omitempty"`
+	RetainedStepRange        []int                 `json:"retained_step_range,omitempty"`
+	OmittedSections          []string              `json:"omitted_sections,omitempty"`
+	EssentialEvidencePresent bool                  `json:"essential_evidence_present"`
+	ProbeTrigger             string                `json:"probe_trigger,omitempty"`
+	CacheHit                 bool                  `json:"cache_hit,omitempty"`
+	LatencyMs                int64                 `json:"latency_ms"`
+	AppliedAction            string                `json:"applied_action"`
+	HeuristicAction          string                `json:"heuristic_action,omitempty"`
+	FallbackUsed             bool                  `json:"fallback_used"`
+	ShadowMode               bool                  `json:"shadow_mode"`
+	DeferReason              string                `json:"defer_reason,omitempty"`
+	Error                    string                `json:"error,omitempty"`
 }

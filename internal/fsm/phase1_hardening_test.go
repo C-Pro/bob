@@ -82,7 +82,7 @@ func TestSystemOneLoopGuardUnsupportedActionIsAdvisory(t *testing.T) {
 				return &llm.DecisionResultEntry{Choice: choice}, &llm.DecisionResponse{}, nil
 			}}
 			verdict, telemetry, err := EvaluateLoopGuard(context.Background(), &FSMRun{ID: "advisory", Iteration: 3},
-				"goal", history, []openai.ToolCall{call}, cfg, sidecar, SystemOneControlConfig{LoopGuardMode: "hybrid"})
+				"goal", history, []openai.ToolCall{call}, cfg, sidecar, SystemOneControlConfig{LoopGuardMode: "hybrid", LoopGuardProbeAlways: true})
 			require.NoError(t, err)
 			assert.Equal(t, LoopActionNone, verdict.Action)
 			require.NotNil(t, telemetry)
@@ -118,7 +118,7 @@ func TestToolLoopSidecarOnlyForceStillExecutesPendingTool(t *testing.T) {
 	runner := NewToolLoopRunner(nil, nil, "model")
 	runner.SetCompactionConfig(CompactionConfig{Enabled: false})
 	runner.SetSystemOneClient(sidecar)
-	runner.SetSystemOneConfig(SystemOneControlConfig{LoopGuardMode: "hybrid"})
+	runner.SetSystemOneConfig(SystemOneControlConfig{LoopGuardMode: "hybrid", LoopGuardProbeAlways: true})
 	require.NoError(t, runner.handlePrepareSteps(ctx, run, store, toolset))
 	assert.Equal(t, StateExecuteSteps, run.CurrentState)
 	steps, err := store.ListStepsByIteration(ctx, run.ID, run.Iteration)

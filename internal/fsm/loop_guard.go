@@ -1,12 +1,15 @@
 package fsm
 
 import (
+	"container/list"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"bob/internal/llm"
@@ -16,6 +19,55 @@ import (
 )
 
 const loopGuardHybridBackstopCeiling = 5
+const loopGuardDecisionCacheSize = 128
+
+type loopDecisionCacheKey struct {
+	client SystemOneDecisionClient
+	model  string
+	mode   string
+	state  [32]byte
+}
+
+type loopDecisionCacheValue struct {
+	key   loopDecisionCacheKey
+	entry *llm.DecisionResultEntry
+	resp  *llm.DecisionResponse
+}
+
+var loopDecisionCache = struct {
+	sync.Mutex
+	entries map[loopDecisionCacheKey]*list.Element
+	order   *list.List
+}{entries: make(map[loopDecisionCacheKey]*list.Element), order: list.New()}
+
+func cachedLoopDecision(key loopDecisionCacheKey) (*llm.DecisionResultEntry, *llm.DecisionResponse, bool) {
+	loopDecisionCache.Lock()
+	defer loopDecisionCache.Unlock()
+	element := loopDecisionCache.entries[key]
+	if element == nil {
+		return nil, nil, false
+	}
+	loopDecisionCache.order.MoveToFront(element)
+	value := element.Value.(loopDecisionCacheValue)
+	return value.entry, value.resp, true
+}
+
+func cacheLoopDecision(key loopDecisionCacheKey, entry *llm.DecisionResultEntry, resp *llm.DecisionResponse) {
+	loopDecisionCache.Lock()
+	defer loopDecisionCache.Unlock()
+	if element := loopDecisionCache.entries[key]; element != nil {
+		element.Value = loopDecisionCacheValue{key: key, entry: entry, resp: resp}
+		loopDecisionCache.order.MoveToFront(element)
+		return
+	}
+	element := loopDecisionCache.order.PushFront(loopDecisionCacheValue{key: key, entry: entry, resp: resp})
+	loopDecisionCache.entries[key] = element
+	if loopDecisionCache.order.Len() > loopGuardDecisionCacheSize {
+		last := loopDecisionCache.order.Back()
+		delete(loopDecisionCache.entries, last.Value.(loopDecisionCacheValue).key)
+		loopDecisionCache.order.Remove(last)
+	}
+}
 
 // LoopGuardNoticePrefix is the prefix used for step observations intercepted by the loop guard.
 const LoopGuardNoticePrefix = "Loop guard notice:"
@@ -151,7 +203,8 @@ func isStateMutatingStep(s FSMStep) bool {
 		}
 	}
 	args := strings.ToLower(s.ArgsJSON)
-	for _, marker := range []string{"apply_patch", "sed -i", " > ", " >> ", "git checkout", "git restore", "git commit", "git add"} {
+	for _, marker := range []string{"apply_patch", "sed -i", " >", "> ", ">>", ".write_text(", ".write_bytes(",
+		"git checkout", "git restore", "git commit", "git add", "git apply", "mkdir ", "touch ", "tee "} {
 		if strings.Contains(args, marker) {
 			return true
 		}
@@ -278,6 +331,122 @@ func trailingUnchangedExecuted(history []FSMStep, candidate openai.ToolCall) int
 	return count
 }
 
+type loopProgressLedger struct {
+	targets             map[string]bool
+	observations        map[[32]byte]int
+	repeatedObservation bool
+	recentFailure       bool
+	consecutiveFailures int
+	stateMutatingEdits  int
+}
+
+func loopTargetKeys(name, args string) []string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	keys := []string{name + "|args:" + normalizeToolArgs(args)}
+	decoded, ok := decodeJSONBounded(args)
+	if !ok {
+		return keys
+	}
+	obj, ok := decoded.(map[string]any)
+	if !ok {
+		return keys
+	}
+	for _, field := range []string{"path", "file", "url", "query", "resource", "command"} {
+		value, ok := obj[field].(string)
+		if !ok {
+			continue
+		}
+		normalized := strings.Join(strings.Fields(strings.ToLower(value)), " ")
+		if normalized == "" {
+			continue
+		}
+		keys = append(keys, name+"|"+field+":"+normalized)
+		if field == "command" {
+			words := strings.Fields(normalized)
+			if len(words) > 2 {
+				words = words[:2]
+			}
+			keys = append(keys, name+"|command_stem:"+strings.Join(words, " "))
+		}
+	}
+	return keys
+}
+
+func buildLoopProgressLedger(history []FSMStep) loopProgressLedger {
+	ledger := loopProgressLedger{targets: make(map[string]bool), observations: make(map[[32]byte]int)}
+	var sinceEdit []FSMStep
+	for _, step := range history {
+		if isStateMutatingStep(step) {
+			ledger.targets = make(map[string]bool)
+			sinceEdit = nil
+			ledger.stateMutatingEdits++
+			continue
+		}
+		if isBlockedLoopStep(step) || (step.Status != StepStatusCompleted && step.Status != StepStatusFailed && step.Status != StepStatusTimedOut) {
+			continue
+		}
+		for _, key := range loopTargetKeys(step.ToolName, step.ArgsJSON) {
+			ledger.targets[key] = true
+		}
+		sinceEdit = append(sinceEdit, step)
+	}
+	recent := sinceEdit
+	if len(recent) > systemOneLoopGuardHistoryWindow {
+		recent = recent[len(recent)-systemOneLoopGuardHistoryWindow:]
+	}
+	for _, step := range recent {
+		fingerprint := loopObservation(step)
+		ledger.observations[fingerprint]++
+		if ledger.observations[fingerprint] >= 2 {
+			ledger.repeatedObservation = true
+		}
+	}
+	failureWindow := recent
+	if len(failureWindow) > 4 {
+		failureWindow = failureWindow[len(failureWindow)-4:]
+	}
+	for _, step := range failureWindow {
+		if isStepFailure(step) {
+			ledger.recentFailure = true
+			ledger.consecutiveFailures++
+		} else {
+			ledger.consecutiveFailures = 0
+		}
+	}
+	return ledger
+}
+
+func loopGuardProbeTrigger(run *FSMRun, history []FSMStep, candidates []openai.ToolCall, heuristic LoopVerdict, evidence loopHistoryEvidence, cfg SystemOneControlConfig) string {
+	if cfg.LoopGuardProbeAlways {
+		return "forced"
+	}
+	if heuristic.Action != LoopActionNone || len(evidence.notices) > 0 {
+		return "executed_stall"
+	}
+	ledger := buildLoopProgressLedger(history)
+	for _, call := range candidates {
+		for _, key := range loopTargetKeys(call.Function.Name, call.Function.Arguments) {
+			if ledger.targets[key] {
+				return "target_revisit"
+			}
+		}
+	}
+	if ledger.repeatedObservation {
+		return "repeated_observation"
+	}
+	if ledger.recentFailure {
+		return "recent_failure"
+	}
+	interval := cfg.LoopGuardAuditInterval
+	if interval <= 0 {
+		interval = 4
+	}
+	if run != nil && run.Iteration > 0 && run.Iteration%interval == 0 {
+		return "periodic_audit"
+	}
+	return ""
+}
+
 // EvaluateLoopGuard runs deterministic and optional System-1 semantic loop detection
 // according to off/shadow/hybrid policies.
 func EvaluateLoopGuard(
@@ -296,17 +465,33 @@ func EvaluateLoopGuard(
 
 	evidence := inspectLoopHistory(history, candidateCalls, cfg)
 	heuristicVerdict := DetectLoop(history, candidateCalls, cfg)
-	if heuristicVerdict.Action == LoopActionForceSynthesis {
+	mode := strings.ToLower(strings.TrimSpace(s1Cfg.LoopGuardMode))
+	if s1Client == nil || mode == "" || mode == "off" {
 		return heuristicVerdict, nil, nil
 	}
-	mode := strings.ToLower(strings.TrimSpace(s1Cfg.LoopGuardMode))
-	if s1Client == nil || mode == "" || mode == "off" || len(history) < 2 {
+	trigger := loopGuardProbeTrigger(run, history, candidateCalls, heuristicVerdict, evidence, s1Cfg)
+	if trigger == "" {
 		return heuristicVerdict, nil, nil
 	}
 
 	rendered := RenderSystemOneLoopGuardState(run, goal, history, candidateCalls)
 	probeStart := time.Now()
-	entry, resp, s1Err := s1Client.DecideLoopGuard(ctx, rendered.Text, nil)
+	var entry *llm.DecisionResultEntry
+	var resp *llm.DecisionResponse
+	var s1Err error
+	var cacheHit bool
+	if reflect.TypeOf(s1Client).Comparable() {
+		key := loopDecisionCacheKey{client: s1Client, model: s1Client.Model(), mode: mode, state: sha256.Sum256([]byte(rendered.Text))}
+		entry, resp, cacheHit = cachedLoopDecision(key)
+		if !cacheHit {
+			entry, resp, s1Err = s1Client.DecideLoopGuard(ctx, rendered.Text, nil)
+			if s1Err == nil && entry != nil {
+				cacheLoopDecision(key, entry, resp)
+			}
+		}
+	} else {
+		entry, resp, s1Err = s1Client.DecideLoopGuard(ctx, rendered.Text, nil)
+	}
 	elapsedMs := time.Since(probeStart).Milliseconds()
 	if s1Err != nil {
 		latencyMs := elapsedMs
@@ -316,12 +501,17 @@ func EvaluateLoopGuard(
 		telemetry := &trajectory.SystemOneDecisionPayload{
 			Task:            llm.SystemOneTaskLoopGuard,
 			Truncated:       rendered.Truncated,
+			ProbeTrigger:    trigger,
 			LatencyMs:       latencyMs,
 			AppliedAction:   string(heuristicVerdict.Action),
 			HeuristicAction: string(heuristicVerdict.Action),
 			FallbackUsed:    mode == "hybrid" && s1Cfg.FallbackOnError,
 			ShadowMode:      mode == "shadow",
 			Error:           s1Err.Error(),
+		}
+		applySystemOneRenderTelemetry(telemetry, rendered)
+		if heuristicVerdict.Action == LoopActionForceSynthesis {
+			return heuristicVerdict, telemetry, nil
 		}
 		if mode == "shadow" {
 			// Shadow mode never alters deterministic execution; strict policy still logs/surfaces error explicitly.
@@ -340,9 +530,19 @@ func EvaluateLoopGuard(
 		return heuristicVerdict, telemetry, nil
 	}
 
-	telemetry := buildSystemOneDecisionTelemetry(llm.SystemOneTaskLoopGuard, entry, resp, elapsedMs, rendered.Truncated)
+	if cacheHit {
+		resp = nil
+		elapsedMs = 0
+	}
+	telemetry := buildSystemOneDecisionTelemetry(llm.SystemOneTaskLoopGuard, entry, resp, elapsedMs, rendered)
 	telemetry.HeuristicAction = string(heuristicVerdict.Action)
 	telemetry.ShadowMode = mode == "shadow"
+	telemetry.ProbeTrigger = trigger
+	telemetry.CacheHit = cacheHit
+	if heuristicVerdict.Action == LoopActionForceSynthesis {
+		telemetry.AppliedAction = string(LoopActionForceSynthesis)
+		return heuristicVerdict, telemetry, nil
+	}
 
 	if mode == "shadow" {
 		telemetry.AppliedAction = string(heuristicVerdict.Action)

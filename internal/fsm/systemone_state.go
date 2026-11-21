@@ -21,6 +21,8 @@ import (
 const (
 	systemOneLoopGuardHistoryWindow = 12
 	maxSystemOneGoalBytes           = 2048
+	maxProbeCandidateSectionBytes   = 4096
+	maxProbeTailSectionBytes        = 2048
 )
 
 var systemOneSanitizedStateFields = []string{
@@ -36,10 +38,15 @@ var systemOneSanitizedStateFields = []string{
 	"active_memory_versions",
 }
 
-// SystemOneStateRenderResult holds the go-probe-sanitized-v1 prompt text and truncation flag.
+// SystemOneStateRenderResult holds rendered probe text and truncation evidence.
 type SystemOneStateRenderResult struct {
-	Text      string
-	Truncated bool
+	Text                     string
+	Truncated                bool
+	RetainedSteps            int
+	OmittedSteps             int
+	RetainedStepRange        []int
+	OmittedSections          []string
+	EssentialEvidencePresent bool
 }
 
 // SystemOneDecisionClient abstracts the System-1 sidecar probe calls used by FSM control plane.
@@ -49,7 +56,7 @@ type SystemOneDecisionClient interface {
 	DecideLoopGuard(ctx context.Context, state string, images []string) (*llm.DecisionResultEntry, *llm.DecisionResponse, error)
 }
 
-// RenderSystemOneCompactionState renders a compaction probe state using go-probe-sanitized-v1
+// RenderSystemOneCompactionState renders a compaction probe state using go-probe-sanitized-v2
 // semantics matching eval/harness/build_jev_dataset.py.
 func RenderSystemOneCompactionState(input CompactionProbeInput) SystemOneStateRenderResult {
 	execIter := 0
@@ -71,7 +78,7 @@ func RenderSystemOneCompactionState(input CompactionProbeInput) SystemOneStateRe
 	)
 }
 
-// RenderSystemOneLoopGuardState renders a loop-guard probe state using go-probe-sanitized-v1
+// RenderSystemOneLoopGuardState renders a loop-guard probe state using go-probe-sanitized-v2
 // with a trailing window of up to 12 steps and candidate tool calls.
 func RenderSystemOneLoopGuardState(run *FSMRun, goal string, history []FSMStep, candidateCalls []openai.ToolCall) SystemOneStateRenderResult {
 	window := history
@@ -111,69 +118,169 @@ func renderSystemOneProbeState(
 	tail []FSMStep,
 	candidates []openai.ToolCall,
 ) SystemOneStateRenderResult {
-	truncated := false
+	result := SystemOneStateRenderResult{EssentialEvidencePresent: true}
 	clip := func(text string, budget, reserve int, suffix string) string {
 		clipped, didClip := clipUTF8ForSystemOne(text, budget, reserve, suffix)
-		if didClip {
-			truncated = true
-		}
+		result.Truncated = result.Truncated || didClip
 		return clipped
 	}
 
-	var b strings.Builder
-	fmt.Fprintf(&b, "Candidate Compaction Boundary: Iterations 1..%d (Current Run Iteration: %d)\n", cutoffIter, execIter)
-	clippedGoal := clip(goal, maxSystemOneGoalBytes, 15, "...[truncated]")
-	fmt.Fprintf(&b, "Original Objective: %s\n\n", clippedGoal)
-
+	var prefix strings.Builder
+	fmt.Fprintf(&prefix, "Candidate Compaction Boundary: Iterations 1..%d (Current Run Iteration: %d)\n", cutoffIter, execIter)
+	fmt.Fprintf(&prefix, "Original Objective: %s\n\n", clip(goal, maxSystemOneGoalBytes, 15, "...[truncated]"))
 	prevUpper := 0
 	if previous != nil {
 		prevUpper = previous.CompactedUpToIter
-		sanitized := sanitizePreviousStateCompactJSON(previous)
-		clippedPrev := clip(sanitized, maxProbePrevStateBytes, 15, "...[truncated]")
-		fmt.Fprintf(&b, "Previous Compacted State (v%d, up to iter %d):\n%s\n\n", previous.Version, previous.CompactedUpToIter, clippedPrev)
+		prevText, clipped := sanitizePreviousStateCompactJSONBounded(previous, maxProbePrevStateBytes)
+		if clipped {
+			result.Truncated = true
+			result.OmittedSections = append(result.OmittedSections, "previous_state_fields")
+		}
+		fmt.Fprintf(&prefix, "Previous Compacted State (v%d, up to iter %d):\n%s\n\n", previous.Version, previous.CompactedUpToIter, prevText)
 	}
+	prefix.WriteString("Candidate Steps to Compact:\n")
 
-	b.WriteString("Candidate Steps to Compact:\n")
-	for _, s := range steps {
-		if s.Iteration <= prevUpper || s.Iteration > cutoffIter {
+	var selected []FSMStep
+	var stepLines []string
+	for _, step := range steps {
+		if step.Iteration <= prevUpper || step.Iteration > cutoffIter {
 			continue
 		}
-		args := clip(strings.TrimSpace(canonicalArgsText(s.ArgsJSON)), maxProbeStepArgsBytes, 23, "...[truncated for probe]")
-		obs := strings.TrimSpace(storedResultForProbe(s.ResultJSON))
-		if obs == "" {
-			obs = s.ErrorText
+		selected = append(selected, step)
+		args := clip(strings.TrimSpace(canonicalArgsText(step.ArgsJSON)), maxProbeStepArgsBytes, 23, "...[truncated for probe]")
+		output := strings.TrimSpace(storedResultForProbe(step.ResultJSON))
+		if output == "" {
+			output = step.ErrorText
 		}
-		obs = clip(obs, maxProbeStepOutputBytes, 23, "...[truncated for probe]")
-		fmt.Fprintf(&b, "- Iter=%d Tool=%s Status=%s Args=%s\n  Output: %s\n", s.Iteration, s.ToolName, s.Status, args, obs)
-		if b.Len() >= maxProbePromptBytes {
-			b.WriteString("...[additional candidate steps truncated for probe budget]\n")
-			truncated = true
-			break
+		output, clipped := clipMiddleUTF8ForSystemOne(output, maxProbeStepOutputBytes)
+		result.Truncated = result.Truncated || clipped
+		stepLines = append(stepLines, fmt.Sprintf("- Iter=%d Tool=%s Status=%s Args=%s\n  Output: %s\n", step.Iteration, step.ToolName, step.Status, args, output))
+	}
+
+	tailLines := make([]string, 0, len(tail))
+	for _, step := range tail {
+		if step.Iteration > cutoffIter && step.Iteration <= execIter {
+			tailLines = append(tailLines, fmt.Sprintf("- Iter=%d Tool=%s Status=%s\n", step.Iteration, step.ToolName, step.Status))
+		}
+	}
+	tailSection := ""
+	tailKept := []int(nil)
+	if len(tail) > 0 {
+		header := "\nRetained Raw Tail Steps (not compacted in this pass):\n"
+		body, kept, omitted := fitProbeLines(tailLines, maxProbeTailSectionBytes-len(header), "intermediate raw tail steps")
+		tailSection, tailKept = header+body, kept
+		if omitted > 0 {
+			result.Truncated = true
+			result.OmittedSections = append(result.OmittedSections, "raw_tail_steps")
 		}
 	}
 
-	if len(tail) > 0 && b.Len() < maxProbePromptBytes {
-		b.WriteString("\nRetained Raw Tail Steps (not compacted in this pass):\n")
-		for _, s := range tail {
-			if s.Iteration > cutoffIter && s.Iteration <= execIter {
-				fmt.Fprintf(&b, "- Iter=%d Tool=%s Status=%s\n", s.Iteration, s.ToolName, s.Status)
-			}
-		}
-	}
-
+	candidateSection := ""
+	candidateKept := []int(nil)
 	if len(candidates) > 0 {
-		b.WriteString("\nCandidate Tool Calls (not yet executed):\n")
-		for _, tc := range candidates {
-			args := clip(tc.Function.Arguments, maxProbeStepArgsBytes, 23, "...[truncated for probe]")
-			fmt.Fprintf(&b, "- Tool=%s Args=%s\n", tc.Function.Name, args)
+		candidateLines := make([]string, 0, len(candidates))
+		for _, call := range candidates {
+			args := clip(call.Function.Arguments, maxProbeStepArgsBytes, 23, "...[truncated for probe]")
+			candidateLines = append(candidateLines, fmt.Sprintf("- Tool=%s Args=%s\n", call.Function.Name, args))
+		}
+		header := "\nCandidate Tool Calls (not yet executed):\n"
+		body, kept, omitted := fitProbeLines(candidateLines, maxProbeCandidateSectionBytes-len(header), "intermediate candidate tool calls")
+		candidateSection, candidateKept = header+body, kept
+		if omitted > 0 {
+			result.Truncated = true
+			result.OmittedSections = append(result.OmittedSections, "candidate_tool_calls")
 		}
 	}
 
-	finalText := clip(b.String(), maxProbePromptBytes, 16, "\n...[truncated]")
-	return SystemOneStateRenderResult{
-		Text:      finalText,
-		Truncated: truncated,
+	stepBudget := maxProbePromptBytes - prefix.Len() - len(tailSection) - len(candidateSection)
+	stepText, kept, omitted := fitProbeLines(stepLines, stepBudget, "intermediate candidate steps")
+	result.RetainedSteps = len(kept)
+	result.OmittedSteps = omitted
+	if omitted > 0 {
+		result.Truncated = true
+		result.OmittedSections = append(result.OmittedSections, "candidate_steps")
 	}
+	if len(kept) > 0 {
+		result.RetainedStepRange = []int{selected[kept[0]].Iteration, selected[kept[len(kept)-1]].Iteration}
+	}
+	result.EssentialEvidencePresent = (len(selected) == 0 || len(kept) > 0 && kept[len(kept)-1] == len(selected)-1) &&
+		(len(tailLines) == 0 || len(tailKept) > 0 && tailKept[len(tailKept)-1] == len(tailLines)-1) &&
+		(len(candidates) == 0 || len(candidateKept) > 0 && candidateKept[len(candidateKept)-1] == len(candidates)-1)
+	result.Text = prefix.String() + stepText + tailSection + candidateSection
+	return result
+}
+
+func clipMiddleUTF8ForSystemOne(text string, budget int) (string, bool) {
+	if len(text) <= budget {
+		return text, false
+	}
+	const marker = "...[middle truncated for probe]..."
+	available := budget - len(marker)
+	headBytes := available / 2
+	tailBytes := available - headBytes
+	head := strings.ToValidUTF8(text[:headBytes], "")
+	tail := strings.ToValidUTF8(text[len(text)-tailBytes:], "")
+	return head + marker + tail, true
+}
+
+func fitProbeLines(lines []string, budget int, section string) (string, []int, int) {
+	var total int
+	for _, line := range lines {
+		total += len(line)
+	}
+	if total <= budget {
+		indices := make([]int, len(lines))
+		for i := range lines {
+			indices[i] = i
+		}
+		return strings.Join(lines, ""), indices, 0
+	}
+	if budget <= 0 {
+		return "", nil, len(lines)
+	}
+	markerReserve := 96
+	headBudget := max(0, (budget-markerReserve)/3)
+	tailBudget := max(0, budget-markerReserve-headBudget)
+	headEnd, headUsed := 0, 0
+	for headEnd < len(lines) && headUsed+len(lines[headEnd]) <= headBudget {
+		headUsed += len(lines[headEnd])
+		headEnd++
+	}
+	tailStart, tailUsed := len(lines), 0
+	for tailStart > headEnd && tailUsed+len(lines[tailStart-1]) <= tailBudget {
+		tailStart--
+		tailUsed += len(lines[tailStart])
+	}
+	if tailStart == len(lines) && len(lines) > 0 && len(lines[len(lines)-1]) <= budget-markerReserve {
+		tailStart = len(lines) - 1
+		tailUsed = len(lines[tailStart])
+	}
+	omitted := tailStart - headEnd
+	marker := fmt.Sprintf("...[%d %s omitted for probe budget]...\n", omitted, section)
+	for headUsed+tailUsed+len(marker) > budget && headEnd > 0 {
+		headEnd--
+		headUsed -= len(lines[headEnd])
+		omitted++
+		marker = fmt.Sprintf("...[%d %s omitted for probe budget]...\n", omitted, section)
+	}
+	for headUsed+tailUsed+len(marker) > budget && tailStart < len(lines) {
+		tailUsed -= len(lines[tailStart])
+		tailStart++
+		omitted++
+		marker = fmt.Sprintf("...[%d %s omitted for probe budget]...\n", omitted, section)
+	}
+	var text strings.Builder
+	indices := make([]int, 0, len(lines)-omitted)
+	for i := 0; i < headEnd; i++ {
+		text.WriteString(lines[i])
+		indices = append(indices, i)
+	}
+	text.WriteString(marker)
+	for i := tailStart; i < len(lines); i++ {
+		text.WriteString(lines[i])
+		indices = append(indices, i)
+	}
+	return text.String(), indices, omitted
 }
 
 func clipUTF8ForSystemOne(text string, budget, reserve int, suffix string) (string, bool) {
@@ -495,4 +602,63 @@ func sanitizePreviousStateCompactJSON(prev *CompactedTaskState) string {
 		return "{}"
 	}
 	return encoded
+}
+
+func sanitizePreviousStateCompactJSONBounded(prev *CompactedTaskState, budget int) (string, bool) {
+	raw := sanitizePreviousStateCompactJSON(prev)
+	if len(raw) <= budget {
+		return raw, false
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return "{}", true
+	}
+	for _, limit := range []struct{ stringBytes, arrayItems int }{{512, 16}, {256, 8}, {128, 4}, {64, 2}} {
+		bounded := make(map[string]any, len(parsed))
+		for key, value := range parsed {
+			bounded[key] = boundPreviousStateValue(value, limit.stringBytes, limit.arrayItems)
+		}
+		encoded, err := compactJSONString(bounded)
+		if err == nil && len(encoded) <= budget {
+			return encoded, true
+		}
+	}
+	bounded := make(map[string]any, len(parsed))
+	for key, value := range parsed {
+		bounded[key] = boundPreviousStateValue(value, 64, 2)
+	}
+	for i := len(systemOneSanitizedStateFields) - 1; i >= 0; i-- {
+		delete(bounded, systemOneSanitizedStateFields[i])
+		encoded, err := compactJSONString(bounded)
+		if err == nil && len(encoded) <= budget {
+			return encoded, true
+		}
+	}
+	return "{}", true
+}
+
+func boundPreviousStateValue(value any, stringBytes, arrayItems int) any {
+	switch typed := value.(type) {
+	case string:
+		bounded, _ := clipUTF8ForSystemOne(typed, stringBytes, 15, "...[truncated]")
+		return bounded
+	case []any:
+		limit := min(len(typed), arrayItems)
+		out := make([]any, 0, limit+1)
+		for _, item := range typed[:limit] {
+			out = append(out, boundPreviousStateValue(item, stringBytes, arrayItems))
+		}
+		if limit < len(typed) {
+			out = append(out, fmt.Sprintf("...[%d items omitted]...", len(typed)-limit))
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, item := range typed {
+			out[key] = boundPreviousStateValue(item, stringBytes, arrayItems)
+		}
+		return out
+	default:
+		return value
+	}
 }

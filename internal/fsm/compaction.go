@@ -33,6 +33,8 @@ type SystemOneControlConfig struct {
 	CompactionEnabled        bool
 	CompactionDeferThreshold float64 // 0 = use sidecar risk_threshold_5pct; < 0 = disable uncertainty deferral
 	LoopGuardMode            string  // "off", "shadow", "hybrid"
+	LoopGuardProbeAlways     bool
+	LoopGuardAuditInterval   int // 0 = audit every four iterations
 	FallbackOnError          bool
 }
 
@@ -731,10 +733,11 @@ func (d *systemOneCompactionDecider) DecideCompaction(ctx context.Context, input
 			FallbackUsed:  d.cfg.FallbackOnError,
 			Error:         s1Err.Error(),
 		}
+		applySystemOneRenderTelemetry(telemetry, rendered)
 		return d.handleGateError(ctx, input, fallback, telemetry, s1Err)
 	}
 
-	telemetry = buildSystemOneDecisionTelemetry(llm.SystemOneTaskCompaction, entry, resp, s1LatencyMs, rendered.Truncated)
+	telemetry = buildSystemOneDecisionTelemetry(llm.SystemOneTaskCompaction, entry, resp, s1LatencyMs, rendered)
 	if err := validateCompactionCalibration(entry, d.cfg.CompactionDeferThreshold); err != nil {
 		telemetry.AppliedAction = "calibration_error"
 		telemetry.FallbackUsed = d.cfg.FallbackOnError
@@ -909,13 +912,13 @@ func buildSystemOneDecisionTelemetry(
 	entry *llm.DecisionResultEntry,
 	resp *llm.DecisionResponse,
 	fallbackLatencyMs int64,
-	renderTruncated bool,
+	rendered SystemOneStateRenderResult,
 ) *trajectory.SystemOneDecisionPayload {
 	p := &trajectory.SystemOneDecisionPayload{
 		Task:      task,
-		Truncated: renderTruncated,
 		LatencyMs: fallbackLatencyMs,
 	}
+	applySystemOneRenderTelemetry(p, rendered)
 	if resp != nil {
 		if resp.Latency > 0 {
 			p.LatencyMs = resp.Latency.Milliseconds()
@@ -952,6 +955,15 @@ func buildSystemOneDecisionTelemetry(
 		}
 	}
 	return p
+}
+
+func applySystemOneRenderTelemetry(p *trajectory.SystemOneDecisionPayload, rendered SystemOneStateRenderResult) {
+	p.Truncated = p.Truncated || rendered.Truncated
+	p.RetainedSteps = rendered.RetainedSteps
+	p.OmittedSteps = rendered.OmittedSteps
+	p.RetainedStepRange = append([]int(nil), rendered.RetainedStepRange...)
+	p.OmittedSections = append([]string(nil), rendered.OmittedSections...)
+	p.EssentialEvidencePresent = rendered.EssentialEvidencePresent
 }
 
 func stripMarkdownJSONFence(s string) string {

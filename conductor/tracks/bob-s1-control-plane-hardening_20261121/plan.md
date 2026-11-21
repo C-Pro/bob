@@ -9,8 +9,8 @@
 - [x] Task: Harden Stage-2 summarizer parsing in `internal/fsm/models.go` and `internal/fsm/compaction.go` (provenance-checked string-to-`VerifiedFinding` normalization, single shared-deadline repair retry, independent probe cooldown tracking, and hard-byte backstop precedence) with comprehensive unit tests.
 
 ## Phase 2: Event-Triggered Probing & Truncation-Aware State Rendering (`internal/fsm`, `services/bob_s1`)
-- [ ] Task: Implement progress ledger, event-triggered `loop_guard` invocation gating, cooldowns, and exact-state decision cache in `internal/fsm`.
-- [ ] Task: Implement section-aware head/tail state rendering (`internal/fsm/systemone_state.go`) with reserved candidate/recent-step budgets, structured truncation telemetry, and Go/Python parity tests.
+- [x] Task: Implement progress ledger, event-triggered `loop_guard` invocation gating, cooldowns, and exact-state decision cache in `internal/fsm`.
+- [x] Task: Implement section-aware head/tail state rendering (`internal/fsm/systemone_state.go`) with reserved candidate/recent-step budgets, structured truncation telemetry, and Go/Python parity tests.
 
 ## Phase 3: Train-Only Dataset Rebuilding & Action-Policy Calibration (`eval/harness`, `services/bob_s1`)
 - [ ] Task: Mine interval-10 compaction selectivity states and contrastive semantic-stall vs. productive-progression loop states strictly from `train_pool` rollouts.

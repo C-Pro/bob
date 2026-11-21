@@ -10,7 +10,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -26,6 +25,12 @@ type mockUploader struct {
 	mu      sync.Mutex
 	uploads map[string][]byte
 	putHook func(ctx context.Context, key string, r io.Reader, size int64) error
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }
 
 func newMockUploader() *mockUploader {
@@ -669,30 +674,29 @@ func TestExporter_WithRealObjectStoreClient(t *testing.T) {
 	var receivedSha256 string
 	var authHeader string
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	transport := roundTripperFunc(func(r *http.Request) (*http.Response, error) {
 		authHeader = r.Header.Get("Authorization")
 		receivedPath = r.URL.Path
 		receivedSha256 = r.Header.Get("X-Amz-Content-Sha256")
 
 		body, readErr := io.ReadAll(r.Body)
 		if readErr != nil {
-			http.Error(w, readErr.Error(), http.StatusInternalServerError)
-			return
+			return nil, readErr
 		}
 		receivedBody = body
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("")), Request: r}, nil
+	})
 
 	// Configure real objectstore client with trajectory bucket override
 	bucketOverride := "traj-custom-bucket"
 	s3Client, err := objectstore.New(objectstore.Config{
-		Endpoint:  srv.URL,
-		Region:    "us-east-1",
-		Bucket:    bucketOverride,
-		AccessKey: "TRAJ_ACCESS",
-		SecretKey: "TRAJ_SECRET",
-		PathStyle: true,
+		Endpoint:   "http://trajectory.test",
+		Region:     "us-east-1",
+		Bucket:     bucketOverride,
+		AccessKey:  "TRAJ_ACCESS",
+		SecretKey:  "TRAJ_SECRET",
+		PathStyle:  true,
+		HTTPClient: &http.Client{Transport: transport},
 	})
 	require.NoError(t, err)
 	require.NotNil(t, s3Client)

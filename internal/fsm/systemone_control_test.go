@@ -512,7 +512,7 @@ func TestEvaluateLoopGuard_SemanticModesAndTelemetry(t *testing.T) {
 				return &llm.DecisionResultEntry{ID: "loop_guard", Choice: "force_synthesis"}, &llm.DecisionResponse{}, nil
 			},
 		}
-		v, tel, err := EvaluateLoopGuard(ctx, run, "goal", hist, []openai.ToolCall{callSame}, cfg, s1, SystemOneControlConfig{LoopGuardMode: "hybrid"})
+		v, tel, err := EvaluateLoopGuard(ctx, run, "goal", hist, []openai.ToolCall{callSame}, cfg, s1, SystemOneControlConfig{LoopGuardMode: "hybrid", LoopGuardProbeAlways: true})
 		require.NoError(t, err)
 		require.NotNil(t, tel)
 		assert.Equal(t, LoopActionNone, v.Action)
@@ -520,16 +520,17 @@ func TestEvaluateLoopGuard_SemanticModesAndTelemetry(t *testing.T) {
 		assert.Equal(t, int32(1), s1.lgCalls.Load())
 	})
 
-	t.Run("len(history) < 2 skips sidecar", func(t *testing.T) {
+	t.Run("single executed target revisit invokes sidecar", func(t *testing.T) {
 		s1 := &mockSystemOneDecisionClient{
 			loopGuardFn: func(ctx context.Context, state string, images []string) (*llm.DecisionResultEntry, *llm.DecisionResponse, error) {
-				t.Fatal("sidecar must not be called with < 2 history steps")
-				return nil, nil, nil
+				return &llm.DecisionResultEntry{Choice: "none"}, &llm.DecisionResponse{}, nil
 			},
 		}
 		v, tel, err := EvaluateLoopGuard(ctx, run, "goal", makeSteps(1, "Exit Code: 1"), []openai.ToolCall{callSame}, cfg, s1, SystemOneControlConfig{LoopGuardMode: "hybrid"})
 		require.NoError(t, err)
-		assert.Nil(t, tel)
+		require.NotNil(t, tel)
+		assert.Equal(t, "target_revisit", tel.ProbeTrigger)
+		assert.Equal(t, int32(1), s1.lgCalls.Load())
 		assert.Equal(t, LoopActionNone, v.Action)
 	})
 
