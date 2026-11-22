@@ -622,6 +622,13 @@ func (r *recordingExecutor) Execute(ctx context.Context, name string, argsJSON s
 	return res, err
 }
 
+func (r *recordingExecutor) ShouldStopLoop() (string, bool) {
+	if stopper, ok := r.inner.(interface{ ShouldStopLoop() (string, bool) }); ok {
+		return stopper.ShouldStopLoop()
+	}
+	return "", false
+}
+
 // Close gracefully closes the engine.
 func (e *Engine) Close() error {
 	e.closed.Store(true)
@@ -634,6 +641,8 @@ type toolsetExecutor struct {
 	attachments []agentapi.Attachment
 	seenAtts    map[string]bool
 	actions     []agentapi.Action
+	stopReply   string
+	shouldStop  bool
 }
 
 func (e *toolsetExecutor) Execute(ctx context.Context, name string, argsJSON string) (string, error) {
@@ -656,6 +665,12 @@ func (e *toolsetExecutor) Execute(ctx context.Context, name string, argsJSON str
 		}
 		if len(res.Actions) > 0 {
 			e.actions = append(e.actions, res.Actions...)
+			if err == nil && !e.shouldStop {
+				if promptMsg, ok := agentapi.ExtractInteractivePromptMessage(res.Actions); ok {
+					e.stopReply = promptMsg
+					e.shouldStop = true
+				}
+			}
 		}
 		e.mu.Unlock()
 	}
@@ -663,6 +678,12 @@ func (e *toolsetExecutor) Execute(ctx context.Context, name string, argsJSON str
 		return "", err
 	}
 	return res.Content, nil
+}
+
+func (e *toolsetExecutor) ShouldStopLoop() (string, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.stopReply, e.shouldStop
 }
 
 func (e *toolsetExecutor) Attachments() []agentapi.Attachment {

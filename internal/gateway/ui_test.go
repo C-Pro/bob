@@ -674,14 +674,38 @@ func TestBuildDeliveryUIPlan_PrecedenceAndDeduplication(t *testing.T) {
 	assert.Nil(t, mainUI, "interactive prompt with reserved bob: ID must be rejected")
 	assert.Empty(t, followUps)
 
-	// 5. suppressMain turns unrelated approval requests into follow-up cards
+	// 5. suppressMain turns unrelated approval requests and interactive prompts into follow-up cards
 	fallback, mainUI, followUps = buildDeliveryUIPlan([]agentapi.Action{
+		{Type: agentapi.ActionInteractivePrompt, Payload: promptBytes},
 		{Type: agentapi.ActionApprovalRequest, Payload: memBytes},
 	}, true)
 	assert.Empty(t, fallback)
 	assert.Nil(t, mainUI)
-	require.Len(t, followUps, 1)
-	assert.Equal(t, "bob:mem:approve:mem_1@1", followUps[0].UI.Elements[0].ID)
+	require.Len(t, followUps, 2)
+	assert.Equal(t, "Which target should I deploy?", followUps[0].Text)
+	assert.Equal(t, "staging", followUps[0].UI.Elements[0].ID)
+	assert.Equal(t, "bob:mem:approve:mem_1@1", followUps[1].UI.Elements[0].ID)
+
+	// 6. Multiple interactive prompts preserve first as main and additional ones as follow-ups
+	secondPromptBytes, err := json.Marshal(agentapi.InteractivePromptPayload{
+		Message: "Which output format?",
+		Elements: []agentapi.UIElement{
+			{ID: "json", Type: agentapi.UIElementButton, Label: "JSON"},
+		},
+	})
+	require.NoError(t, err)
+	fallback, mainUI, followUps = buildDeliveryUIPlan([]agentapi.Action{
+		{Type: agentapi.ActionInteractivePrompt, Payload: promptBytes},
+		{Type: agentapi.ActionInteractivePrompt, Payload: secondPromptBytes},
+		{Type: agentapi.ActionApprovalRequest, Payload: memBytes},
+	}, false)
+	assert.Equal(t, "Which target should I deploy?", fallback)
+	require.NotNil(t, mainUI)
+	assert.Equal(t, "staging", mainUI.Elements[0].ID)
+	require.Len(t, followUps, 2)
+	assert.Equal(t, "Which output format?", followUps[0].Text)
+	assert.Equal(t, "json", followUps[0].UI.Elements[0].ID)
+	assert.Equal(t, "bob:mem:approve:mem_1@1", followUps[1].UI.Elements[0].ID)
 }
 
 func TestDeliverAgentReply_SingleMultiRunningSandboxSuppressAndFailure(t *testing.T) {
@@ -790,7 +814,65 @@ func TestDeliverAgentReply_SingleMultiRunningSandboxSuppressAndFailure(t *testin
 	require.NotNil(t, mixedFollowUp.UI)
 	assert.Equal(t, "bob:mem:approve:mem_single@1", mixedFollowUp.UI.Elements[0].ID)
 
-	// 1b. Single approval with empty model completion uses formatApprovalCardText fallback
+	// 1a. SuppressReply + ActionInteractivePrompt preserves and delivers the interactive question as a follow-up
+	q1Bytes, err := json.Marshal(agentapi.InteractivePromptPayload{
+		Message: "Pick region:",
+		Elements: []agentapi.UIElement{
+			{ID: "us", Type: agentapi.UIElementButton, Label: "US"},
+		},
+	})
+	require.NoError(t, err)
+	q2Bytes, err := json.Marshal(agentapi.InteractivePromptPayload{
+		Message: "Pick format:",
+		Elements: []agentapi.UIElement{
+			{ID: "json", Type: agentapi.UIElementButton, Label: "JSON"},
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, gw.Deliver(ctx, agentapi.Completion{
+		Run: agentapi.RunDescriptor{
+			Session: agentapi.SessionRef{SessionID: "dm_alice_bot-1", IsDM: true},
+			Actor:   agentapi.Actor{ID: "alice"},
+		},
+		Status: agentapi.RunCompleted,
+		Result: agentapi.Result{
+			Content: "Suppressed main reply",
+			Actions: []agentapi.Action{
+				{Type: agentapi.ActionInteractivePrompt, Content: "Pick region:", Payload: q1Bytes},
+				{Type: agentapi.ActionSuppressReply},
+			},
+		},
+	}))
+	suppressedAskMsg := <-wsCh
+	assert.Equal(t, "Pick region:", suppressedAskMsg.Content)
+	require.NotNil(t, suppressedAskMsg.UI)
+	assert.Equal(t, "us", suppressedAskMsg.UI.Elements[0].ID)
+
+	// 1b. Multiple ask_user prompts deliver both questions separately without overwriting earlier one
+	require.NoError(t, gw.Deliver(ctx, agentapi.Completion{
+		Run: agentapi.RunDescriptor{
+			Session: agentapi.SessionRef{SessionID: "dm_alice_bot-1", IsDM: true},
+			Actor:   agentapi.Actor{ID: "alice"},
+		},
+		Status: agentapi.RunCompleted,
+		Result: agentapi.Result{
+			Content: "Pick region:",
+			Actions: []agentapi.Action{
+				{Type: agentapi.ActionInteractivePrompt, Content: "Pick region:", Payload: q1Bytes},
+				{Type: agentapi.ActionInteractivePrompt, Content: "Pick format:", Payload: q2Bytes},
+			},
+		},
+	}))
+	firstAskMsg := <-wsCh
+	secondAskMsg := <-wsCh
+	assert.Equal(t, "Pick region:", firstAskMsg.Content)
+	require.NotNil(t, firstAskMsg.UI)
+	assert.Equal(t, "us", firstAskMsg.UI.Elements[0].ID)
+	assert.Equal(t, "Pick format:", secondAskMsg.Content)
+	require.NotNil(t, secondAskMsg.UI)
+	assert.Equal(t, "json", secondAskMsg.UI.Elements[0].ID)
+
+	// 1c. Single approval with empty model completion uses formatApprovalCardText fallback
 	require.NoError(t, gw.Deliver(ctx, agentapi.Completion{
 		Run: agentapi.RunDescriptor{
 			Session: agentapi.SessionRef{SessionID: "dm_alice_bot-1", IsDM: true},

@@ -609,6 +609,10 @@ type ToolExecutor interface {
 	Execute(ctx context.Context, name string, argsJSON string) (string, error)
 }
 
+type loopStopper interface {
+	ShouldStopLoop() (string, bool)
+}
+
 // GenerateChatResponseWithToolLoop sends chat completion requests iteratively, executing any requested tool calls until a final text response is returned.
 func (c *Client) GenerateChatResponseWithToolLoop(
 	ctx context.Context,
@@ -667,6 +671,12 @@ func (c *Client) GenerateChatResponseWithToolLoop(
 				Content:    toolResult,
 				ToolCallID: toolCall.ID,
 			})
+		}
+
+		if stopper, ok := executor.(loopStopper); ok {
+			if finalReply, stop := stopper.ShouldStopLoop(); stop {
+				return finalReply, nil
+			}
 		}
 	}
 

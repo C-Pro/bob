@@ -27,6 +27,7 @@ type ChatSessionContext struct {
 	UserID                string
 	IsDM                  bool
 	IsScheduled           bool
+	SupportsInteractiveUI bool
 	SourceMessageSeq      *int64
 	FSMRunID              string
 	Notifier              func(chatID, text string) error
@@ -439,11 +440,11 @@ func (r *Registry) ToolDefinitions() []openai.Tool {
 // so the agent interacts with the active sandbox rather than requesting a redundant one.
 // In Townhall, only base tools (search, fetch, recall) are provided.
 func (r *Registry) ToolDefinitionsForSession(session ChatSessionContext) []openai.Tool {
+	var tools []openai.Tool
 	if session.IsDM {
-		var tools []openai.Tool
 		if r.sandboxManager != nil && session.UserID != "" {
 			if sbx, ok := r.sandboxManager.GetStatus(session.UserID); ok && sbx.Status == sandbox.StatusRunning {
-				tools = make([]openai.Tool, 0, len(r.dmToolDefinitions)+len(r.knowledgeToolDefs)+2)
+				tools = make([]openai.Tool, 0, len(r.dmToolDefinitions)+len(r.knowledgeToolDefs)+3)
 				for _, t := range r.dmToolDefinitions {
 					if t.Function != nil && t.Function.Name == "sandbox_request" {
 						continue
@@ -454,24 +455,24 @@ func (r *Registry) ToolDefinitionsForSession(session ChatSessionContext) []opena
 			}
 		}
 		if tools == nil {
-			tools = make([]openai.Tool, 0, len(r.dmToolDefinitions)+len(r.knowledgeToolDefs))
+			tools = make([]openai.Tool, 0, len(r.dmToolDefinitions)+len(r.knowledgeToolDefs)+2)
 			tools = append(tools, r.dmToolDefinitions...)
 		}
 		if !session.IsScheduled {
 			tools = append(tools, r.knowledgeToolDefs...)
 		}
-		if r.taskHistoryProvider != nil && strings.TrimSpace(session.FSMRunID) != "" {
-			tools = append(tools, RecallTaskHistoryToolDefinition())
-		}
-		return tools
-	}
-	if r.taskHistoryProvider != nil && strings.TrimSpace(session.FSMRunID) != "" {
-		tools := make([]openai.Tool, 0, len(r.toolDefinitions)+1)
+	} else {
+		tools = make([]openai.Tool, 0, len(r.toolDefinitions)+2)
 		tools = append(tools, r.toolDefinitions...)
-		tools = append(tools, RecallTaskHistoryToolDefinition())
-		return tools
 	}
-	return r.toolDefinitions
+
+	if r.taskHistoryProvider != nil && strings.TrimSpace(session.FSMRunID) != "" {
+		tools = append(tools, RecallTaskHistoryToolDefinition())
+	}
+	if session.SupportsInteractiveUI && !session.IsScheduled {
+		tools = append(tools, AskUserToolDefinition())
+	}
+	return tools
 }
 
 // ToolDefinitionsForChat returns tool definitions for a given chat session context.
@@ -550,6 +551,8 @@ func (r *Registry) Execute(ctx context.Context, name string, argsJSON string) (s
 		return r.executeDiscoverSkills(ctx, argsJSON)
 	case "load_skill":
 		return r.executeLoadSkill(ctx, argsJSON)
+	case AskUserToolName:
+		return r.executeAskUser(ctx, argsJSON)
 	case RecallTaskHistoryToolName:
 		return r.executeRecallTaskHistory(ctx, argsJSON)
 	default:

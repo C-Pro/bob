@@ -1,5 +1,10 @@
 package agentapi
 
+import (
+	"encoding/json"
+	"strings"
+)
+
 // UIElementType classifies an interactive UI element rendered by a supporting frontend.
 type UIElementType string
 
@@ -50,4 +55,23 @@ type ApprovalRequestPayload struct {
 	TargetID string       `json:"target_id,omitempty"`
 	Label    string       `json:"label,omitempty"`
 	Summary  string       `json:"summary,omitempty"`
+}
+
+// ExtractInteractivePromptMessage returns the message text from the first interactive prompt action, if non-empty.
+func ExtractInteractivePromptMessage(actions []Action) (string, bool) {
+	for _, act := range actions {
+		if act.Type != ActionInteractivePrompt {
+			continue
+		}
+		var p InteractivePromptPayload
+		if len(act.Payload) > 0 && json.Unmarshal(act.Payload, &p) == nil {
+			if msg := strings.TrimSpace(p.Message); msg != "" {
+				return msg, true
+			}
+		}
+		if msg := strings.TrimSpace(act.Content); msg != "" {
+			return msg, true
+		}
+	}
+	return "", false
 }

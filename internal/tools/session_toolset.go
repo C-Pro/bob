@@ -79,6 +79,9 @@ func (s *SessionToolset) Definitions(ctx context.Context) ([]agentapi.ToolDefini
 			if ctxSess.FSMRunID != "" {
 				callSession.FSMRunID = ctxSess.FSMRunID
 			}
+			if ctxSess.SupportsInteractiveUI && !callSession.SupportsInteractiveUI {
+				callSession.SupportsInteractiveUI = true
+			}
 		}
 	}
 	openaiTools := s.registry.ToolDefinitionsForSession(callSession)
@@ -124,6 +127,9 @@ func (s *SessionToolset) Execute(ctx context.Context, call agentapi.ToolCall) (a
 			}
 			if ctxSess.SandboxRequestCreated != nil && callSession.SandboxRequestCreated == nil {
 				callSession.SandboxRequestCreated = ctxSess.SandboxRequestCreated
+			}
+			if ctxSess.SupportsInteractiveUI && !callSession.SupportsInteractiveUI {
+				callSession.SupportsInteractiveUI = true
 			}
 		}
 	}

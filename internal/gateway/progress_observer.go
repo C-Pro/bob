@@ -77,6 +77,16 @@ func (o *GatewayProgressObserver) OnStepsPrepared(ctx context.Context, steps []f
 	}
 
 	if o.rootSeq == 0 {
+		allAskUser := true
+		for _, s := range steps {
+			if s.ToolName != tools.AskUserToolName {
+				allAskUser = false
+				break
+			}
+		}
+		if allAskUser {
+			return
+		}
 		progress := &models.ProgressData{
 			CardStatus: models.ProgressStatusRunning,
 			Title:      "Working on your request...",

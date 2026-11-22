@@ -384,6 +384,7 @@ func (g *Gateway) ToolDefinitions(ctx context.Context, chatID string, isDM bool)
 			session.IsDM = false
 		}
 	}
+	session.SupportsInteractiveUI = !session.IsScheduled
 
 	return r.ToolDefinitionsForSession(session)
 }
@@ -442,6 +443,7 @@ func (g *Gateway) Bind(ctx context.Context, run agentapi.RunDescriptor) (agentap
 	if run.Kind == agentapi.Scheduled {
 		sessionCtx.IsScheduled = true
 	}
+	sessionCtx.SupportsInteractiveUI = !sessionCtx.IsScheduled
 	if run.Metadata != nil {
 		if s, ok := run.Metadata["source_message_seq"]; ok && s != "" {
 			if seq, err := strconv.ParseInt(s, 10, 64); err == nil && seq > 0 {
@@ -1772,6 +1774,7 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 	}
 
 	sessionCtx := tools.NewChatSessionContext(msg.ChatID, msg.UserID, isAuthorizedDMOwner, budgetLimits)
+	sessionCtx.SupportsInteractiveUI = true
 	sessionCtx.Notifier = func(chatID, text string) error {
 		return g.SendMessage(chatID, text)
 	}
@@ -1828,11 +1831,12 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 					// Context was cancelled or timed out; do not fall back
 				} else {
 					slog.Error("fsm tool loop failed, falling back to volatile loop", "chat_id", msg.ChatID, "error", err)
+					volExec := &sessionToolExecutor{registry: toolsRegistry, session: sessionCtx}
 					reply, err = g.llmClient.GenerateChatResponseWithToolLoop(
 						toolCtx,
 						llmMsgs,
 						toolDefs,
-						toolsRegistry,
+						volExec,
 						maxIterations,
 					)
 				}
@@ -1845,11 +1849,12 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 				}
 			}
 		} else {
+			volExec := &sessionToolExecutor{registry: toolsRegistry, session: sessionCtx}
 			reply, err = g.llmClient.GenerateChatResponseWithToolLoop(
 				toolCtx,
 				llmMsgs,
 				toolDefs,
-				toolsRegistry,
+				volExec,
 				maxIterations,
 			)
 			if initialProgressSeq > 0 {

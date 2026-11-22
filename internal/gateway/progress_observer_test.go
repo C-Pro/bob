@@ -8,6 +8,7 @@ import (
 
 	"bob/internal/fsm"
 	"bob/internal/models"
+	"bob/internal/tools"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -372,4 +373,45 @@ func TestGatewayProgressObserver_WithExistingRoot(t *testing.T) {
 	require.Len(t, msgs, 3)
 	assert.Equal(t, int64(50), msgs[2].ParentSeq)
 	assert.Equal(t, models.ProgressStatusCompleted, msgs[2].CardStatus)
+}
+
+func TestGatewayProgressObserver_SuppressesRootForAskUserOnly(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. All ask_user steps with no existing root -> suppress root progress card
+	sender := &mockProgressSender{nextSeq: 1}
+	obs := NewGatewayProgressObserver(sender, "townhall", false)
+	obs.OnStepsPrepared(ctx, []fsm.FSMStep{
+		{ID: "s1", Iteration: 1, StepIndex: 0, ToolName: tools.AskUserToolName},
+	})
+	assert.Empty(t, sender.getMessages(), "root progress card must be suppressed when all steps are ask_user")
+	assert.Equal(t, int64(0), obs.RootSeq())
+	obs.OnRunFinished(ctx, fsm.RunStatusCompleted, nil)
+	assert.Empty(t, sender.getMessages(), "finished must remain a no-op when root card was suppressed")
+
+	// 2. Mixed steps (ask_user + another tool) -> root progress card IS created
+	mixedSender := &mockProgressSender{nextSeq: 10}
+	mixedObs := NewGatewayProgressObserver(mixedSender, "dm_alice", true)
+	mixedObs.OnStepsPrepared(ctx, []fsm.FSMStep{
+		{ID: "s1", Iteration: 1, StepIndex: 0, ToolName: "web_search"},
+		{ID: "s2", Iteration: 1, StepIndex: 1, ToolName: tools.AskUserToolName},
+	})
+	msgs := mixedSender.getMessages()
+	require.Len(t, msgs, 1)
+	assert.Equal(t, int64(11), mixedObs.RootSeq())
+
+	// 3. Existing rootSeq > 0 still emits child updates for ask_user normally
+	rootSender := &mockProgressSender{nextSeq: 50}
+	rootObs := NewGatewayProgressObserverWithRoot(rootSender, "dm_alice", true, 50)
+	step := fsm.FSMStep{
+		ID:        "s3",
+		Iteration: 1,
+		StepIndex: 0,
+		ToolName:  tools.AskUserToolName,
+		Status:    fsm.StepStatusRunning,
+	}
+	rootObs.OnStepsPrepared(ctx, []fsm.FSMStep{step})
+	rootObs.OnStepUpdate(ctx, &step)
+	require.Len(t, rootSender.getMessages(), 1)
+	assert.Equal(t, "Ask User", rootSender.getMessages()[0].Step.Title)
 }

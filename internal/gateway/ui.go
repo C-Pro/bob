@@ -14,6 +14,7 @@ import (
 	"bob/internal/models"
 	"bob/internal/sandbox"
 	"bob/internal/scheduler"
+	"bob/internal/tools"
 )
 
 // ToBesedkaUIData converts frontend-agnostic agentapi UI elements into a Besedka UIData payload.
@@ -110,6 +111,11 @@ type approvalItem struct {
 	ui      *models.UIData
 }
 
+type promptItem struct {
+	msg string
+	ui  *models.UIData
+}
+
 func buildApprovalUIData(p agentapi.ApprovalRequestPayload) *models.UIData {
 	switch p.Kind {
 	case agentapi.ApprovalKindSandbox:
@@ -179,8 +185,7 @@ func formatApprovalCardText(p agentapi.ApprovalRequestPayload) string {
 }
 
 func buildDeliveryUIPlan(actions []agentapi.Action, suppressMain bool) (fallbackText string, mainUI *models.UIData, followUps []followUpApprovalCard) {
-	var promptUI *models.UIData
-	var promptFallback string
+	var prompts []promptItem
 	var approvals []approvalItem
 	seenApprovals := make(map[string]bool)
 
@@ -210,12 +215,11 @@ func buildDeliveryUIPlan(actions []agentapi.Action, suppressMain bool) (fallback
 				slog.Warn("ignoring interactive prompt containing reserved bob: element ID")
 				continue
 			}
-			promptUI = sanitized
 			msg := strings.TrimSpace(p.Message)
 			if msg == "" {
 				msg = strings.TrimSpace(act.Content)
 			}
-			promptFallback = msg
+			prompts = append(prompts, promptItem{msg: msg, ui: sanitized})
 		case agentapi.ActionApprovalRequest:
 			var p agentapi.ApprovalRequestPayload
 			if err := json.Unmarshal(act.Payload, &p); err != nil {
@@ -239,6 +243,12 @@ func buildDeliveryUIPlan(actions []agentapi.Action, suppressMain bool) (fallback
 	}
 
 	if suppressMain {
+		for _, p := range prompts {
+			followUps = append(followUps, followUpApprovalCard{
+				Text: p.msg,
+				UI:   p.ui,
+			})
+		}
 		for _, item := range approvals {
 			followUps = append(followUps, followUpApprovalCard{
 				Text: formatApprovalCardText(item.payload),
@@ -248,15 +258,21 @@ func buildDeliveryUIPlan(actions []agentapi.Action, suppressMain bool) (fallback
 		return "", nil, followUps
 	}
 
-	if promptUI != nil {
-		mainUI = promptUI
+	if len(prompts) > 0 {
+		mainUI = prompts[0].ui
+		for _, p := range prompts[1:] {
+			followUps = append(followUps, followUpApprovalCard{
+				Text: p.msg,
+				UI:   p.ui,
+			})
+		}
 		for _, item := range approvals {
 			followUps = append(followUps, followUpApprovalCard{
 				Text: formatApprovalCardText(item.payload),
 				UI:   item.ui,
 			})
 		}
-		return promptFallback, mainUI, followUps
+		return prompts[0].msg, mainUI, followUps
 	}
 
 	if len(approvals) == 1 {
@@ -483,4 +499,20 @@ func (g *Gateway) handleUIResponseAction(ctx context.Context, msg models.Message
 	}
 
 	return true, g.SendMessage(msg.ChatID, "⚠️ Unrecognized or invalid UI action.")
+}
+
+type sessionToolExecutor struct {
+	registry *tools.Registry
+	session  tools.ChatSessionContext
+}
+
+func (e *sessionToolExecutor) Execute(ctx context.Context, name string, argsJSON string) (string, error) {
+	return e.registry.Execute(ctx, name, argsJSON)
+}
+
+func (e *sessionToolExecutor) ShouldStopLoop() (string, bool) {
+	if e.session.Actions == nil {
+		return "", false
+	}
+	return agentapi.ExtractInteractivePromptMessage(e.session.Actions.All())
 }
