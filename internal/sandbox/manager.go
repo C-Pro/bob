@@ -14,6 +14,9 @@ import (
 	"time"
 )
 
+// ErrSandboxIDMismatch indicates a sandbox action referenced a stale or non-matching sandbox ID.
+var ErrSandboxIDMismatch = errors.New("this sandbox action is outdated and does not match your current sandbox")
+
 // RequestParams contains the parameters requested by an agent for creating a sandbox.
 type RequestParams struct {
 	Driver          DriverType
@@ -324,8 +327,21 @@ func (m *Manager) RequestSandbox(ctx context.Context, userID, chatID string, par
 // If the sandbox is already creating, it waits for the in-flight creation to complete.
 // If the sandbox is already running, it returns the active instance idempotently.
 func (m *Manager) ApproveSandbox(ctx context.Context, userID string) (*UserSandbox, error) {
+	return m.approveSandbox(ctx, userID, "")
+}
+
+// ApproveSandboxForID transitions a specific pending sandbox request ID to running atomically.
+func (m *Manager) ApproveSandboxForID(ctx context.Context, userID, expectedID string) (*UserSandbox, error) {
+	return m.approveSandbox(ctx, userID, expectedID)
+}
+
+func (m *Manager) approveSandbox(ctx context.Context, userID, expectedID string) (*UserSandbox, error) {
 	m.mu.Lock()
 	sbx, ok := m.sandboxes[userID]
+	if expectedID != "" && (!ok || sbx.ID != expectedID) {
+		m.mu.Unlock()
+		return nil, ErrSandboxIDMismatch
+	}
 	if !ok {
 		m.mu.Unlock()
 		return nil, errors.New("no pending sandbox request found to approve")
@@ -489,10 +505,22 @@ func (m *Manager) runCreation(ctx context.Context, op *creationOp, sbx *UserSand
 
 // DenySandbox rejects and cancels a user's pending sandbox request.
 func (m *Manager) DenySandbox(userID string) error {
+	return m.denySandbox(userID, "")
+}
+
+// DenySandboxForID rejects and cancels a specific pending sandbox request ID atomically.
+func (m *Manager) DenySandboxForID(userID, expectedID string) error {
+	return m.denySandbox(userID, expectedID)
+}
+
+func (m *Manager) denySandbox(userID, expectedID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	sbx, ok := m.sandboxes[userID]
+	if expectedID != "" && (!ok || sbx.ID != expectedID) {
+		return ErrSandboxIDMismatch
+	}
 	if !ok || sbx.GetStatus() != StatusPendingApproval {
 		if ok && sbx.GetStatus() == StatusCreating {
 			return errors.New("sandbox is currently being created and cannot be denied")
@@ -596,8 +624,21 @@ func (m *Manager) Exec(ctx context.Context, userID string, cmd []string, request
 
 // Destroy terminates and removes the user's active sandbox.
 func (m *Manager) Destroy(ctx context.Context, userID string) error {
+	return m.destroy(ctx, userID, "")
+}
+
+// DestroyForID terminates and removes a specific sandbox ID atomically.
+func (m *Manager) DestroyForID(ctx context.Context, userID, expectedID string) error {
+	return m.destroy(ctx, userID, expectedID)
+}
+
+func (m *Manager) destroy(ctx context.Context, userID, expectedID string) error {
 	m.mu.Lock()
 	sbx, ok := m.sandboxes[userID]
+	if expectedID != "" && (!ok || sbx.ID != expectedID) {
+		m.mu.Unlock()
+		return ErrSandboxIDMismatch
+	}
 	if !ok {
 		m.mu.Unlock()
 		return nil // Already destroyed

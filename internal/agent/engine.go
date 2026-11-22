@@ -429,6 +429,7 @@ func (e *Engine) Run(ctx context.Context, turn agentapi.Turn) (agentapi.Result, 
 		}
 
 		var reply string
+		var rawExec *toolsetExecutor
 		if bindings.Tools != nil {
 			defs, defErr := bindings.Tools.Definitions(ctx)
 			if defErr != nil {
@@ -440,9 +441,9 @@ func (e *Engine) Run(ctx context.Context, turn agentapi.Turn) (agentapi.Result, 
 				for _, d := range defs {
 					openaiTools = append(openaiTools, d.Schema)
 				}
-				rawExecutor := &toolsetExecutor{toolset: bindings.Tools}
+				rawExec = &toolsetExecutor{toolset: bindings.Tools}
 				recExecutor := &recordingExecutor{
-					inner:     rawExecutor,
+					inner:     rawExec,
 					trajStore: trajStore,
 					trajID:    trajID,
 					runID:     turn.Run.RunID,
@@ -476,6 +477,10 @@ func (e *Engine) Run(ctx context.Context, turn agentapi.Turn) (agentapi.Result, 
 			RunID:      turn.Run.RunID,
 			Content:    reply,
 			Iterations: 1,
+		}
+		if rawExec != nil {
+			result.Attachments = rawExec.Attachments()
+			result.Actions = rawExec.Actions()
 		}
 
 		if trajStore != nil {
@@ -624,7 +629,11 @@ func (e *Engine) Close() error {
 }
 
 type toolsetExecutor struct {
-	toolset agentapi.Toolset
+	toolset     agentapi.Toolset
+	mu          sync.Mutex
+	attachments []agentapi.Attachment
+	seenAtts    map[string]bool
+	actions     []agentapi.Action
 }
 
 func (e *toolsetExecutor) Execute(ctx context.Context, name string, argsJSON string) (string, error) {
@@ -632,8 +641,48 @@ func (e *toolsetExecutor) Execute(ctx context.Context, name string, argsJSON str
 		Name:      name,
 		Arguments: argsJSON,
 	})
+	if len(res.Attachments) > 0 || len(res.Actions) > 0 {
+		e.mu.Lock()
+		if len(res.Attachments) > 0 {
+			if e.seenAtts == nil {
+				e.seenAtts = make(map[string]bool)
+			}
+			for _, att := range res.Attachments {
+				if !e.seenAtts[att.ID] {
+					e.seenAtts[att.ID] = true
+					e.attachments = append(e.attachments, att)
+				}
+			}
+		}
+		if len(res.Actions) > 0 {
+			e.actions = append(e.actions, res.Actions...)
+		}
+		e.mu.Unlock()
+	}
 	if err != nil {
 		return "", err
 	}
 	return res.Content, nil
+}
+
+func (e *toolsetExecutor) Attachments() []agentapi.Attachment {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.attachments) == 0 {
+		return nil
+	}
+	out := make([]agentapi.Attachment, len(e.attachments))
+	copy(out, e.attachments)
+	return out
+}
+
+func (e *toolsetExecutor) Actions() []agentapi.Action {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.actions) == 0 {
+		return nil
+	}
+	out := make([]agentapi.Action, len(e.actions))
+	copy(out, e.actions)
+	return out
 }

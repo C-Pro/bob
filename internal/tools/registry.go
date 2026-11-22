@@ -30,9 +30,11 @@ type ChatSessionContext struct {
 	SourceMessageSeq      *int64
 	FSMRunID              string
 	Notifier              func(chatID, text string) error
+	UINotifier            func(chatID, text string, ui *models.UIData) error
 	SandboxRequestCreated *bool
 	StagedAttachments     *StagedAttachmentCollector
 	KnowledgeBudget       *KnowledgeBudgetTracker
+	Actions               *ActionCollector
 }
 
 // StageAttachment appends an attachment to the staged attachments collector if configured.
@@ -63,6 +65,7 @@ func NewChatSessionContext(chatID, userID string, isDM bool, limits ...Knowledge
 		IsDM:              isDM,
 		StagedAttachments: NewStagedAttachmentCollector(),
 		KnowledgeBudget:   NewKnowledgeBudgetTracker(lim),
+		Actions:           NewActionCollector(),
 	}
 }
 
@@ -1249,13 +1252,18 @@ func (r *Registry) executeSandboxRequest(ctx context.Context, argsJSON string) (
 		cleanReason = "No reason provided"
 	}
 	fmt.Fprintf(&card, "• **Reason:** %s\n\n", cleanReason)
-	card.WriteString("Reply `/sandbox approve` to approve or `/sandbox deny` to reject.")
+	card.WriteString("Use the buttons below or reply `/sandbox approve` to approve or `/sandbox deny` to reject.")
 
-	if session.Notifier != nil {
-		if err := session.Notifier(session.ChatID, card.String()); err != nil {
-			_ = r.sandboxManager.DenySandbox(session.UserID)
-			return "", fmt.Errorf("failed to send approval card: %w", err)
-		}
+	ui := models.NewSandboxApprovalUI(sbx.ID)
+	var sendErr error
+	if session.UINotifier != nil {
+		sendErr = session.UINotifier(session.ChatID, card.String(), ui)
+	} else if session.Notifier != nil {
+		sendErr = session.Notifier(session.ChatID, card.String())
+	}
+	if sendErr != nil {
+		_ = r.sandboxManager.DenySandboxForID(session.UserID, sbx.ID)
+		return "", fmt.Errorf("failed to send approval card: %w", sendErr)
 	}
 	if session.SandboxRequestCreated != nil {
 		*session.SandboxRequestCreated = true

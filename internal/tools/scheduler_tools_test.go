@@ -3,12 +3,14 @@ package tools
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"bob/internal/agentapi"
 	"bob/internal/scheduler"
 
 	"github.com/stretchr/testify/assert"
@@ -492,4 +494,37 @@ func TestScheduleTask_ExpiresAtDaysParsing(t *testing.T) {
 	_, err = reg.Execute(ctx, "schedule_task", args31d)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "cannot exceed 30 days")
+}
+
+func TestScheduleTask_EmitsApprovalAction(t *testing.T) {
+	reg, prov := setupTestRegistry(t)
+	sess := NewChatSessionContext("dm_user1", "user1", true)
+	ctx := WithChatSession(context.Background(), sess)
+
+	_, err := reg.Execute(ctx, "schedule_task", `{
+		"schedule_name": "ui_sched",
+		"type": "interval",
+		"schedule_spec": "600",
+		"instruction": "Check server health and report summary",
+		"run_timeout_seconds": 60,
+		"max_turns": 10
+	}`)
+	require.NoError(t, err)
+
+	st, err := prov.GetSchedulerStore(ctx, "dm_user1", true)
+	require.NoError(t, err)
+	sched, err := st.GetScheduleByName(ctx, "dm_user1", "ui_sched")
+	require.NoError(t, err)
+
+	acts := sess.Actions.All()
+	require.Len(t, acts, 1)
+	assert.Equal(t, agentapi.ActionApprovalRequest, acts[0].Type)
+	assert.Equal(t, sched.ID, acts[0].Content)
+
+	var p agentapi.ApprovalRequestPayload
+	require.NoError(t, json.Unmarshal(acts[0].Payload, &p))
+	assert.Equal(t, agentapi.ApprovalKindSchedule, p.Kind)
+	assert.Equal(t, sched.ID, p.TargetID)
+	assert.Equal(t, "ui_sched", p.Label)
+	assert.Contains(t, p.Summary, "Check server health")
 }

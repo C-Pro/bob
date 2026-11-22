@@ -434,6 +434,9 @@ func (g *Gateway) Bind(ctx context.Context, run agentapi.RunDescriptor) (agentap
 	sessionCtx.Notifier = func(targetChatID, text string) error {
 		return g.SendMessage(targetChatID, text)
 	}
+	sessionCtx.UINotifier = func(targetChatID, text string, ui *models.UIData) error {
+		return g.SendMessageWithUI(targetChatID, text, ui)
+	}
 	sessionCtx.SandboxRequestCreated = new(bool)
 	sessionCtx.FSMRunID = run.RunID
 	if run.Kind == agentapi.Scheduled {
@@ -495,77 +498,28 @@ func (g *Gateway) Deliver(ctx context.Context, comp agentapi.Completion) error {
 	g.mu.Lock()
 	botID := g.botUserID
 	botName := g.botUser.GetDisplayName()
-	sm := g.sandboxManager
 	g.mu.Unlock()
 	if botName == "" {
 		botName = "Bob"
 	}
 
-	// Check for suppress_reply action (e.g. sandbox approval requests)
-	for _, act := range comp.Result.Actions {
-		if act.Type == agentapi.ActionSuppressReply {
-			g.contextManager.Push(chatID, chatcontext.Entry{
-				Role:       "assistant",
-				SenderID:   botID,
-				SenderName: botName,
-				Content:    "Sandbox approval requested.",
-				Timestamp:  time.Now().Unix(),
-			})
-			return nil
-		}
-	}
-
 	var reply string
+	var actions []agentapi.Action
+	allowSandboxPrompt := false
 	switch comp.Status {
 	case agentapi.RunCompleted:
 		reply = comp.Result.Content
+		actions = comp.Result.Actions
+		allowSandboxPrompt = true
 	case agentapi.RunFailed, agentapi.RunTerminated:
 		reply = "Sorry, I encountered an issue processing your request. Please try again later."
 	default:
 		return nil
 	}
 
-	reply = g.finalizeImageReply(ctx, comp.Run, reply)
-	if reply == "" {
-		return nil
-	}
-
 	isDM := g.isChatDM(ctx, chatID)
-	if comp.Status == agentapi.RunCompleted && isDM && sm != nil {
-		if sbx, ok := sm.GetStatus(comp.Run.Actor.ID); ok && sbx != nil && sbx.Status == sandbox.StatusRunning {
-			if !strings.Contains(reply, "/sandbox destroy") {
-				rem := time.Until(sbx.ExpiresAt).Round(time.Minute)
-				if rem < 0 {
-					rem = 0
-				}
-				reply += fmt.Sprintf("\n\n💡 Would you like to destroy the sandbox (`/sandbox destroy`) or keep it? It will automatically be destroyed in %s.", rem)
-			}
-		}
-	}
-
-	formattedReply := FormatResponse(reply, isDM, g.cfg.TownhallMaxParagraphs, g.cfg.DMMaxParagraphs)
-
 	outgoingAttachments := ToBesedkaAttachments(comp.Result.Attachments)
-
-	if err := g.SendMessageWithAttachments(chatID, formattedReply, outgoingAttachments); err != nil {
-		return fmt.Errorf("failed to deliver reply to chat %s: %w", chatID, err)
-	}
-
-	pushContent := formattedReply
-	if len(outgoingAttachments) > 0 {
-		extraText, _ := g.processAttachments(ctx, outgoingAttachments)
-		pushContent = strings.TrimSpace(formattedReply + extraText)
-	}
-
-	g.contextManager.Push(chatID, chatcontext.Entry{
-		Role:       "assistant",
-		SenderID:   botID,
-		SenderName: botName,
-		Content:    pushContent,
-		Timestamp:  time.Now().Unix(),
-	})
-
-	return nil
+	return g.deliverAgentReply(ctx, chatID, comp.Run.Actor.ID, botID, botName, isDM, comp.Run, reply, outgoingAttachments, actions, allowSandboxPrompt)
 }
 
 // DeliverLegacyFSMRun converts an FSMRun to agentapi.Completion and delivers it to Besedka.
@@ -1625,6 +1579,16 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 		return nil
 	}
 
+	if msg.Type == models.MessageTypeUIResponse {
+		handled, uiErr := g.handleUIResponseAction(ctx, msg, isChatDM, senderName)
+		if uiErr != nil {
+			return uiErr
+		}
+		if handled {
+			return nil
+		}
+	}
+
 	if isChatDM && strings.EqualFold(rootCommand, "/sandbox") {
 		return g.handleSandboxCommand(ctx, msg, cleanText, senderName)
 	}
@@ -1685,7 +1649,6 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 		}
 	}
 	toolsRegistry := g.toolsRegistry
-	sm := g.sandboxManager
 	g.mu.Unlock()
 
 	if runner == nil && g.llmClient == nil {
@@ -1812,6 +1775,9 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 	sessionCtx.Notifier = func(chatID, text string) error {
 		return g.SendMessage(chatID, text)
 	}
+	sessionCtx.UINotifier = func(chatID, text string, ui *models.UIData) error {
+		return g.SendMessageWithUI(chatID, text, ui)
+	}
 	sessionCtx.SandboxRequestCreated = &sandboxRequestCreated
 
 	var toolDefs []openai.Tool
@@ -1915,31 +1881,17 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 		reply = "Sorry, I encountered an issue processing your request. Please try again later."
 	}
 
-	if sandboxRequestCreated {
-		g.contextManager.Push(msg.ChatID, chatcontext.Entry{
-			Role:       "assistant",
-			SenderID:   botID,
-			SenderName: botUser.GetDisplayName(),
-			Content:    "Sandbox approval requested.",
-			Timestamp:  time.Now().Unix(),
-		})
-		return nil
-	}
-
-	if err == nil && isDM && sm != nil {
-		if sbx, ok := sm.GetStatus(msg.UserID); ok && sbx != nil && sbx.Status == sandbox.StatusRunning {
-			if !strings.Contains(reply, "/sandbox destroy") {
-				rem := time.Until(sbx.ExpiresAt).Round(time.Minute)
-				if rem < 0 {
-					rem = 0
-				}
-				reply += fmt.Sprintf("\n\n💡 Would you like to destroy the sandbox (`/sandbox destroy`) or keep it? It will automatically be destroyed in %s.", rem)
-			}
+	var actions []agentapi.Action
+	if err == nil {
+		if fsmRes != nil {
+			actions = fsmRes.Actions
+		} else if sessionCtx.Actions != nil {
+			actions = sessionCtx.Actions.All()
 		}
 	}
-
-	reply = g.finalizeImageReply(ctx, sourceRun, reply)
-	formattedReply := FormatResponse(reply, isDM, g.cfg.TownhallMaxParagraphs, g.cfg.DMMaxParagraphs)
+	if sandboxRequestCreated {
+		actions = append([]agentapi.Action{{Type: agentapi.ActionSuppressReply}}, actions...)
+	}
 
 	var outgoingAttachments []models.Attachment
 	if sessionCtx.StagedAttachments != nil {
@@ -1949,25 +1901,7 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 		outgoingAttachments = fsmRes.Attachments
 	}
 
-	if err := g.SendMessageWithAttachments(msg.ChatID, formattedReply, outgoingAttachments); err != nil {
-		return fmt.Errorf("failed to send reply to chat %s: %w", msg.ChatID, err)
-	}
-
-	pushContent := formattedReply
-	if len(outgoingAttachments) > 0 {
-		extraText, _ := g.processAttachments(ctx, outgoingAttachments)
-		pushContent = strings.TrimSpace(formattedReply + extraText)
-	}
-
-	g.contextManager.Push(msg.ChatID, chatcontext.Entry{
-		Role:       "assistant",
-		SenderID:   botID,
-		SenderName: botUser.GetDisplayName(),
-		Content:    pushContent,
-		Timestamp:  time.Now().Unix(),
-	})
-
-	return nil
+	return g.deliverAgentReply(ctx, msg.ChatID, msg.UserID, botID, botUser.GetDisplayName(), isDM, sourceRun, reply, outgoingAttachments, actions, err == nil)
 }
 
 // Start listens for incoming WebSocket messages and processes them until context is cancelled.
@@ -2321,6 +2255,10 @@ func (g *Gateway) RunMaintenance(ctx context.Context) {
 }
 
 func (g *Gateway) handleSandboxCommand(ctx context.Context, msg models.Message, text, senderName string) error {
+	return g.handleSandboxCommandWithTarget(ctx, msg, text, senderName, "")
+}
+
+func (g *Gateway) handleSandboxCommandWithTarget(ctx context.Context, msg models.Message, text, senderName, targetID string) error {
 	g.mu.Lock()
 	botID := g.botUserID
 	botUser := g.botUser
@@ -2353,6 +2291,7 @@ func (g *Gateway) handleSandboxCommand(ctx context.Context, msg models.Message, 
 		IsDirect:   true,
 		Command:    "sandbox",
 		Subcommand: subcmd,
+		TargetID:   targetID,
 		Args:       args,
 		RawText:    text,
 	}
@@ -2408,17 +2347,7 @@ func (g *Gateway) handleSandboxCommand(ctx context.Context, msg models.Message, 
 		return g.generateAndSendAgentReply(ctx, msg, true, senderName, res.Continuation.Reason, initialProgressSeq)
 	}
 
-	if res.RecordAssistantEntry {
-		g.contextManager.Push(msg.ChatID, chatcontext.Entry{
-			Role:       "assistant",
-			SenderID:   botID,
-			SenderName: botUser.GetDisplayName(),
-			Content:    res.Reply,
-			Timestamp:  time.Now().Unix(),
-		})
-	}
-
-	return g.SendMessage(msg.ChatID, res.Reply)
+	return g.sendCommandReply(msg.ChatID, botID, botUser.GetDisplayName(), res.Reply, res.UI, res.RecordAssistantEntry)
 }
 
 func (g *Gateway) formatSandboxStatus(sbx *sandbox.UserSandbox) string {

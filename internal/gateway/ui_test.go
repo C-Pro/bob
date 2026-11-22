@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,8 +14,11 @@ import (
 	"bob/internal/agentapi"
 	"bob/internal/chatcontext"
 	"bob/internal/config"
+	"bob/internal/knowledge"
 	"bob/internal/llm"
 	"bob/internal/models"
+	"bob/internal/sandbox"
+	"bob/internal/scheduler"
 
 	"github.com/fasthttp/websocket"
 	"github.com/stretchr/testify/assert"
@@ -591,4 +595,667 @@ func TestWarmupChat_PreservesUIAndUIResponse(t *testing.T) {
 	assert.Equal(t, "user", entries[1].Role)
 	assert.Contains(t, entries[1].Content, "@bob Selected: EU")
 	assert.Contains(t, entries[1].Content, "[UI response to seq 1 | selected_ids: eu]")
+}
+
+func TestBuildDeliveryUIPlan_PrecedenceAndDeduplication(t *testing.T) {
+	memBytes, err := json.Marshal(agentapi.ApprovalRequestPayload{
+		Kind:     agentapi.ApprovalKindMemory,
+		TargetID: "mem_1@1",
+		Label:    "fact",
+		Summary:  "User likes dark mode",
+	})
+	require.NoError(t, err)
+
+	skillBytes, err := json.Marshal(agentapi.ApprovalRequestPayload{
+		Kind:     agentapi.ApprovalKindSkill,
+		TargetID: "skill_1@1",
+		Label:    "run-tests",
+		Summary:  "Runs Go test suite",
+	})
+	require.NoError(t, err)
+
+	promptBytes, err := json.Marshal(agentapi.InteractivePromptPayload{
+		Message: "Which target should I deploy?",
+		Elements: []agentapi.UIElement{
+			{ID: "staging", Type: agentapi.UIElementButton, Label: "Staging", Style: agentapi.UIElementStylePrimary},
+			{ID: "prod", Type: agentapi.UIElementButton, Label: "Prod", Style: agentapi.UIElementStyleDanger},
+		},
+	})
+	require.NoError(t, err)
+
+	// 1. Single approval attaches to mainUI directly and provides fallback card description
+	fallback, mainUI, followUps := buildDeliveryUIPlan([]agentapi.Action{
+		{Type: agentapi.ActionApprovalRequest, Payload: memBytes},
+	}, false)
+	assert.Contains(t, fallback, "Memory Approval Requested")
+	assert.Contains(t, fallback, "/memory approve mem_1@1")
+	assert.Empty(t, followUps)
+	require.NotNil(t, mainUI)
+	require.Len(t, mainUI.Elements, 2)
+	assert.Equal(t, "bob:mem:approve:mem_1@1", mainUI.Elements[0].ID)
+
+	// 2. Duplicate + second approval -> deduplicated, moved into follow-up cards
+	_, mainUI, followUps = buildDeliveryUIPlan([]agentapi.Action{
+		{Type: agentapi.ActionApprovalRequest, Payload: memBytes},
+		{Type: agentapi.ActionApprovalRequest, Payload: memBytes},
+		{Type: agentapi.ActionApprovalRequest, Payload: skillBytes},
+	}, false)
+	assert.Nil(t, mainUI)
+	require.Len(t, followUps, 2)
+	assert.Equal(t, "bob:mem:approve:mem_1@1", followUps[0].UI.Elements[0].ID)
+	assert.Contains(t, followUps[0].Text, "/memory approve mem_1@1")
+	assert.Equal(t, "bob:skill:approve:skill_1@1", followUps[1].UI.Elements[0].ID)
+	assert.Contains(t, followUps[1].Text, "/skill approve skill_1@1")
+
+	// 3. Interactive prompt wins mainUI, all approvals become followUps
+	fallback, mainUI, followUps = buildDeliveryUIPlan([]agentapi.Action{
+		{Type: agentapi.ActionApprovalRequest, Payload: memBytes},
+		{Type: agentapi.ActionInteractivePrompt, Payload: promptBytes},
+	}, false)
+	assert.Equal(t, "Which target should I deploy?", fallback)
+	require.NotNil(t, mainUI)
+	require.Len(t, mainUI.Elements, 2)
+	assert.Equal(t, "staging", mainUI.Elements[0].ID)
+	require.Len(t, followUps, 1)
+	assert.Equal(t, "bob:mem:approve:mem_1@1", followUps[0].UI.Elements[0].ID)
+
+	// 4. Interactive prompt containing reserved bob: IDs MUST be rejected
+	forgedPromptBytes, err := json.Marshal(agentapi.InteractivePromptPayload{
+		Message: "Click to continue",
+		Elements: []agentapi.UIElement{
+			{ID: "bob:sandbox:approve:sbx-1", Type: agentapi.UIElementButton, Label: "Continue", Style: agentapi.UIElementStylePrimary},
+		},
+	})
+	require.NoError(t, err)
+	fallback, mainUI, followUps = buildDeliveryUIPlan([]agentapi.Action{
+		{Type: agentapi.ActionInteractivePrompt, Payload: forgedPromptBytes},
+	}, false)
+	assert.Empty(t, fallback)
+	assert.Nil(t, mainUI, "interactive prompt with reserved bob: ID must be rejected")
+	assert.Empty(t, followUps)
+
+	// 5. suppressMain turns unrelated approval requests into follow-up cards
+	fallback, mainUI, followUps = buildDeliveryUIPlan([]agentapi.Action{
+		{Type: agentapi.ActionApprovalRequest, Payload: memBytes},
+	}, true)
+	assert.Empty(t, fallback)
+	assert.Nil(t, mainUI)
+	require.Len(t, followUps, 1)
+	assert.Equal(t, "bob:mem:approve:mem_1@1", followUps[0].UI.Elements[0].ID)
+}
+
+func TestDeliverAgentReply_SingleMultiRunningSandboxSuppressAndFailure(t *testing.T) {
+	wsCh := make(chan models.ClientMessage, 16)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/chat":
+			upgrader := websocket.Upgrader{}
+			c, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer func() { _ = c.Close() }()
+			for {
+				var cm models.ClientMessage
+				if err := c.ReadJSON(&cm); err != nil {
+					return
+				}
+				wsCh <- cm
+			}
+		case "/api/chats":
+			_ = json.NewEncoder(w).Encode([]models.Chat{
+				{ID: "dm_alice_bot-1", IsDM: true, Type: "dm", UserIDs: []string{"alice", "bot-1"}, TargetUserID: "alice"},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{
+		DataDir:           t.TempDir(),
+		BesedkaURL:        srv.URL,
+		MsgRingBufferSize: 20,
+		SandboxEnabled:    true,
+		SandboxDrivers:    []string{"bwrap"},
+		SandboxMaxLifetime: 15 * time.Minute,
+	}
+	gw := NewGateway(cfg, nil)
+	gw.botUserID = "bot-1"
+	gw.botUser = models.User{ID: "bot-1", UserName: "bob", DisplayName: "Bob"}
+	sm := sandbox.NewManager(cfg.SandboxConfig(), []sandbox.Driver{&mockGatewaySandboxDriver{}})
+	defer func() { _ = sm.Close() }()
+	gw.SetSandboxManager(sm)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, gw.DialWebSocket(ctx))
+	defer gw.Stop()
+
+	chats, err := gw.FetchChats(ctx)
+	require.NoError(t, err)
+	gw.chatCache.SetAll(chats)
+
+	memBytes, err := json.Marshal(agentapi.ApprovalRequestPayload{
+		Kind:     agentapi.ApprovalKindMemory,
+		TargetID: "mem_single@1",
+		Label:    "fact",
+		Summary:  "Remember X",
+	})
+	require.NoError(t, err)
+	schedBytes, err := json.Marshal(agentapi.ApprovalRequestPayload{
+		Kind:     agentapi.ApprovalKindSchedule,
+		TargetID: "sched_multi",
+		Label:    "daily_sync",
+		Summary:  "Run sync",
+	})
+	require.NoError(t, err)
+
+	// 1. SuppressReply alone skips WS send and records short entry;
+	// mixed SuppressReply + unrelated ActionApprovalRequest still delivers the unrelated follow-up approval card!
+	require.NoError(t, gw.Deliver(ctx, agentapi.Completion{
+		Run: agentapi.RunDescriptor{
+			Session: agentapi.SessionRef{SessionID: "dm_alice_bot-1", IsDM: true},
+			Actor:   agentapi.Actor{ID: "alice"},
+		},
+		Status: agentapi.RunCompleted,
+		Result: agentapi.Result{
+			Content: "Should not send",
+			Actions: []agentapi.Action{{Type: agentapi.ActionSuppressReply}},
+		},
+	}))
+	select {
+	case unexpected := <-wsCh:
+		t.Fatalf("unexpected WS message on SuppressReply: %+v", unexpected)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	require.NoError(t, gw.Deliver(ctx, agentapi.Completion{
+		Run: agentapi.RunDescriptor{
+			Session: agentapi.SessionRef{SessionID: "dm_alice_bot-1", IsDM: true},
+			Actor:   agentapi.Actor{ID: "alice"},
+		},
+		Status: agentapi.RunCompleted,
+		Result: agentapi.Result{
+			Content: "Suppressed main reply",
+			Actions: []agentapi.Action{
+				{Type: agentapi.ActionApprovalRequest, Payload: memBytes},
+				{Type: agentapi.ActionSuppressReply},
+			},
+		},
+	}))
+	mixedFollowUp := <-wsCh
+	assert.NotContains(t, mixedFollowUp.Content, "Suppressed main reply")
+	assert.Contains(t, mixedFollowUp.Content, "Memory Approval Requested")
+	require.NotNil(t, mixedFollowUp.UI)
+	assert.Equal(t, "bob:mem:approve:mem_single@1", mixedFollowUp.UI.Elements[0].ID)
+
+	// 1b. Single approval with empty model completion uses formatApprovalCardText fallback
+	require.NoError(t, gw.Deliver(ctx, agentapi.Completion{
+		Run: agentapi.RunDescriptor{
+			Session: agentapi.SessionRef{SessionID: "dm_alice_bot-1", IsDM: true},
+			Actor:   agentapi.Actor{ID: "alice"},
+		},
+		Status: agentapi.RunCompleted,
+		Result: agentapi.Result{
+			Content: "",
+			Actions: []agentapi.Action{{Type: agentapi.ActionApprovalRequest, Payload: memBytes}},
+		},
+	}))
+	emptyCompMsg := <-wsCh
+	assert.Contains(t, emptyCompMsg.Content, "Memory Approval Requested")
+	assert.Contains(t, emptyCompMsg.Content, "Remember X")
+	assert.Contains(t, emptyCompMsg.Content, "/memory approve mem_single@1")
+	require.NotNil(t, emptyCompMsg.UI)
+	assert.Equal(t, "bob:mem:approve:mem_single@1", emptyCompMsg.UI.Elements[0].ID)
+
+	// 2. RunFailed must NOT attach any approval UI or running-sandbox buttons
+	sbx, err := sm.RequestSandbox(ctx, "alice", "dm_alice_bot-1", sandbox.RequestParams{
+		Driver: sandbox.DriverBwrap, NetworkMode: sandbox.NetworkNone, Reason: "test",
+	})
+	require.NoError(t, err)
+	_, err = sm.ApproveSandbox(ctx, "alice")
+	require.NoError(t, err)
+
+	require.NoError(t, gw.Deliver(ctx, agentapi.Completion{
+		Run: agentapi.RunDescriptor{
+			Session: agentapi.SessionRef{SessionID: "dm_alice_bot-1", IsDM: true},
+			Actor:   agentapi.Actor{ID: "alice"},
+		},
+		Status: agentapi.RunFailed,
+		Result: agentapi.Result{
+			Actions: []agentapi.Action{{Type: agentapi.ActionApprovalRequest, Payload: memBytes}},
+		},
+	}))
+	failedMsg := <-wsCh
+	assert.Contains(t, failedMsg.Content, "encountered an issue")
+	assert.Nil(t, failedMsg.UI, "failed runs must not attach interactive UI")
+
+	// 3. Running sandbox + single approval -> approval UI keeps precedence (does NOT clobber mainUI)
+	require.NoError(t, gw.Deliver(ctx, agentapi.Completion{
+		Run: agentapi.RunDescriptor{
+			Session: agentapi.SessionRef{SessionID: "dm_alice_bot-1", IsDM: true},
+			Actor:   agentapi.Actor{ID: "alice"},
+		},
+		Status: agentapi.RunCompleted,
+		Result: agentapi.Result{
+			Content: "Done analyzing.",
+			Actions: []agentapi.Action{{Type: agentapi.ActionApprovalRequest, Payload: memBytes}},
+		},
+	}))
+	singleMsg := <-wsCh
+	assert.Contains(t, singleMsg.Content, "/sandbox destroy")
+	require.NotNil(t, singleMsg.UI)
+	assert.Equal(t, "bob:mem:approve:mem_single@1", singleMsg.UI.Elements[0].ID)
+
+	// 4. Running sandbox + multi-approval -> main gets NewSandboxRunningUI, plus 2 follow-up cards
+	require.NoError(t, gw.Deliver(ctx, agentapi.Completion{
+		Run: agentapi.RunDescriptor{
+			Session: agentapi.SessionRef{SessionID: "dm_alice_bot-1", IsDM: true},
+			Actor:   agentapi.Actor{ID: "alice"},
+		},
+		Status: agentapi.RunCompleted,
+		Result: agentapi.Result{
+			Content: "Queued two proposals.",
+			Actions: []agentapi.Action{
+				{Type: agentapi.ActionApprovalRequest, Payload: memBytes},
+				{Type: agentapi.ActionApprovalRequest, Payload: schedBytes},
+			},
+		},
+	}))
+	mainMsg := <-wsCh
+	require.NotNil(t, mainMsg.UI)
+	require.Len(t, mainMsg.UI.Elements, 2)
+	assert.Equal(t, "bob:sandbox:destroy:"+sbx.ID, mainMsg.UI.Elements[0].ID)
+	assert.Equal(t, "bob:sandbox:keep:"+sbx.ID, mainMsg.UI.Elements[1].ID)
+
+	card1 := <-wsCh
+	card2 := <-wsCh
+	require.NotNil(t, card1.UI)
+	require.NotNil(t, card2.UI)
+	assert.Equal(t, "bob:mem:approve:mem_single@1", card1.UI.Elements[0].ID)
+	assert.Equal(t, "bob:sched:approve:sched_multi", card2.UI.Elements[0].ID)
+
+	// 5. Follow-up card delivery errors are aggregated and returned (never swallowed as nil)
+	require.NoError(t, sm.DestroyForID(ctx, "alice", sbx.ID))
+	gw.Stop()
+	delivErr := gw.Deliver(ctx, agentapi.Completion{
+		Run: agentapi.RunDescriptor{
+			Session: agentapi.SessionRef{SessionID: "dm_alice_bot-1", IsDM: true},
+			Actor:   agentapi.Actor{ID: "alice"},
+		},
+		Status: agentapi.RunCompleted,
+		Result: agentapi.Result{
+			Actions: []agentapi.Action{
+				{Type: agentapi.ActionApprovalRequest, Payload: memBytes},
+				{Type: agentapi.ActionApprovalRequest, Payload: schedBytes},
+			},
+		},
+	})
+	require.Error(t, delivErr)
+	assert.Contains(t, delivErr.Error(), "follow-up approval card 1")
+	assert.Contains(t, delivErr.Error(), "follow-up approval card 2")
+}
+
+func TestHandleUIResponseAction_ApprovalsAndSecurity(t *testing.T) {
+	var llmMu sync.Mutex
+	var llmCalls int
+
+	llmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		llmMu.Lock()
+		llmCalls++
+		llmMu.Unlock()
+		resp := map[string]interface{}{
+			"id":      "chatcmpl-ui-action",
+			"object":  "chat.completion",
+			"created": time.Now().Unix(),
+			"model":   "test-model",
+			"choices": []map[string]interface{}{
+				{
+					"index":         0,
+					"finish_reason": "stop",
+					"message": map[string]interface{}{
+						"role":    "assistant",
+						"content": "Sandbox task continued!",
+					},
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer llmSrv.Close()
+
+	wsCh := make(chan models.ClientMessage, 32)
+	besedkaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/users":
+			_ = json.NewEncoder(w).Encode([]models.User{
+				{ID: "alice", UserName: "alice", DisplayName: "Alice"},
+				{ID: "mallory", UserName: "mallory", DisplayName: "Mallory"},
+				{ID: "bot-1", UserName: "bob", DisplayName: "Bob"},
+			})
+		case "/api/chats":
+			_ = json.NewEncoder(w).Encode([]models.Chat{
+				{ID: "townhall", Name: "Townhall", Type: "townhall"},
+				{ID: "dm_alice_bot-1", IsDM: true, Type: "dm", UserIDs: []string{"alice", "bot-1"}, TargetUserID: "alice"},
+				{ID: "dm_mallory_bot-1", IsDM: true, Type: "dm", UserIDs: []string{"mallory", "bot-1"}, TargetUserID: "mallory"},
+			})
+		case "/api/chat":
+			upgrader := websocket.Upgrader{}
+			c, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer func() { _ = c.Close() }()
+			for {
+				var cm models.ClientMessage
+				if err := c.ReadJSON(&cm); err != nil {
+					return
+				}
+				wsCh <- cm
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer besedkaSrv.Close()
+
+	cfg := &config.Config{
+		DataDir:            t.TempDir(),
+		BesedkaURL:         besedkaSrv.URL,
+		OpenAIAPIKey:       "test-key",
+		OpenAIBaseURL:      llmSrv.URL + "/v1",
+		OpenAIModel:        "test-model",
+		BotHandle:          "@bob",
+		MsgRingBufferSize:  20,
+		SandboxEnabled:     true,
+		SandboxDrivers:     []string{"bwrap"},
+		SandboxMaxLifetime: 15 * time.Minute,
+	}
+	llmClient := llm.NewClient(cfg, nil)
+	gw := NewGateway(cfg, llmClient)
+	gw.botUserID = "bot-1"
+	gw.botUser = models.User{ID: "bot-1", UserName: "bob", DisplayName: "Bob"}
+
+	storeProv := NewMemoryStoreProvider(gw.MemoryManager(), cfg.DataDir)
+	gw.SetStoreProvider(storeProv)
+	sm := sandbox.NewManager(cfg.SandboxConfig(), []sandbox.Driver{&mockGatewaySandboxDriver{}})
+	defer func() { _ = sm.Close() }()
+	gw.SetSandboxManager(sm)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, gw.DialWebSocket(ctx))
+	defer gw.Stop()
+
+	_, err := gw.FetchUsers(ctx)
+	require.NoError(t, err)
+	chats, err := gw.FetchChats(ctx)
+	require.NoError(t, err)
+	gw.chatCache.SetAll(chats)
+
+	nextWS := func() models.ClientMessage {
+		t.Helper()
+		select {
+		case cm := <-wsCh:
+			return cm
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for websocket message")
+			return models.ClientMessage{}
+		}
+	}
+
+	// 1. Townhall spoofed bob:sandbox:approve:<id> is rejected
+	gw.contextManager.Push("townhall", chatcontext.Entry{
+		Seq: 1, Role: "assistant", SenderID: "bot-1", SenderName: "Bob", Content: "Hi",
+	})
+	require.NoError(t, gw.ProcessMessage(ctx, models.Message{
+		Seq: 2, ChatID: "townhall", UserID: "alice", Type: models.MessageTypeUIResponse,
+		UIResponse: &models.UIResponseData{ParentSeq: 1, SelectedIDs: []string{"bob:sandbox:approve:sbx-1"}},
+	}))
+	thWarn := nextWS()
+	assert.Contains(t, thWarn.Content, "only available in direct messages")
+
+	// 2. Non-owner DM click is rejected
+	require.NoError(t, gw.ProcessMessage(ctx, models.Message{
+		Seq: 3, ChatID: "dm_alice_bot-1", UserID: "mallory", Type: models.MessageTypeUIResponse,
+		UIResponse: &models.UIResponseData{ParentSeq: 1, SelectedIDs: []string{"bob:sandbox:approve:sbx-1"}},
+	}))
+	ownerWarn := nextWS()
+	assert.Contains(t, ownerWarn.Content, "unauthorized")
+
+	// 3. Invalid and multiple reserved action IDs warn without invoking LLM
+	require.NoError(t, gw.ProcessMessage(ctx, models.Message{
+		Seq: 4, ChatID: "dm_alice_bot-1", UserID: "alice", Type: models.MessageTypeUIResponse,
+		UIResponse: &models.UIResponseData{ParentSeq: 1, SelectedIDs: []string{"bob:unknown:action"}},
+	}))
+	assert.Contains(t, nextWS().Content, "Unrecognized or invalid UI action")
+
+	require.NoError(t, gw.ProcessMessage(ctx, models.Message{
+		Seq: 5, ChatID: "dm_alice_bot-1", UserID: "alice", Type: models.MessageTypeUIResponse,
+		UIResponse: &models.UIResponseData{ParentSeq: 1, SelectedIDs: []string{"bob:sandbox:approve:sbx-1", "bob:sandbox:deny:sbx-1"}},
+	}))
+	assert.Contains(t, nextWS().Content, "submitted individually")
+
+	llmMu.Lock()
+	assert.Equal(t, 0, llmCalls)
+	llmMu.Unlock()
+
+	// 4. Stale sandbox card reproduction: restricted sandbox A denied, replacement sandbox B requested;
+	// clicking old sandbox A's Approve button must NOT approve sandbox B.
+	sbxA, err := sm.RequestSandbox(ctx, "alice", "dm_alice_bot-1", sandbox.RequestParams{
+		Driver: sandbox.DriverBwrap, NetworkMode: sandbox.NetworkNone, Reason: "Restricted A",
+	})
+	require.NoError(t, err)
+	require.NoError(t, sm.DenySandboxForID("alice", sbxA.ID))
+
+	sbxB, err := sm.RequestSandbox(ctx, "alice", "dm_alice_bot-1", sandbox.RequestParams{
+		Driver: sandbox.DriverBwrap, NetworkMode: sandbox.NetworkNone, Reason: "Replacement B",
+	})
+	require.NoError(t, err)
+	require.NotEqual(t, sbxA.ID, sbxB.ID)
+
+	require.NoError(t, gw.ProcessMessage(ctx, models.Message{
+		Seq: 55, ChatID: "dm_alice_bot-1", UserID: "alice", Type: models.MessageTypeUIResponse,
+		UIResponse: &models.UIResponseData{ParentSeq: 5, SelectedIDs: []string{"bob:sandbox:approve:" + sbxA.ID}},
+	}))
+	assert.Contains(t, nextWS().Content, "outdated")
+	curB, ok := sm.GetStatus("alice")
+	require.True(t, ok)
+	assert.Equal(t, sbxB.ID, curB.ID)
+	assert.Equal(t, sandbox.StatusPendingApproval, curB.Status)
+
+	// Approve B via its own bound button triggers continuation & attaches Keep/Destroy UI bound to B;
+	// Keep does NOT invoke LLM; Destroy terminates B.
+	require.NoError(t, gw.ProcessMessage(ctx, models.Message{
+		Seq: 6, ChatID: "dm_alice_bot-1", UserID: "alice", Type: models.MessageTypeUIResponse,
+		UIResponse: &models.UIResponseData{ParentSeq: 5, SelectedIDs: []string{"bob:sandbox:approve:" + sbxB.ID}},
+	}))
+	var contReply models.ClientMessage
+	for {
+		cm := nextWS()
+		if cm.Type == models.ClientMessageTypeSend && strings.Contains(cm.Content, "Sandbox task continued!") {
+			contReply = cm
+			break
+		}
+	}
+	require.NotNil(t, contReply.UI)
+	assert.Equal(t, "bob:sandbox:destroy:"+sbxB.ID, contReply.UI.Elements[0].ID)
+	assert.Equal(t, "bob:sandbox:keep:"+sbxB.ID, contReply.UI.Elements[1].ID)
+
+	llmMu.Lock()
+	callsBeforeKeep := llmCalls
+	llmMu.Unlock()
+	assert.Equal(t, 1, callsBeforeKeep)
+
+	require.NoError(t, gw.ProcessMessage(ctx, models.Message{
+		Seq: 7, ChatID: "dm_alice_bot-1", UserID: "alice", Type: models.MessageTypeUIResponse,
+		UIResponse: &models.UIResponseData{ParentSeq: 6, SelectedIDs: []string{"bob:sandbox:keep:" + sbxB.ID}},
+	}))
+	keepMsg := nextWS()
+	assert.Contains(t, keepMsg.Content, "Keeping your sandbox running")
+	llmMu.Lock()
+	assert.Equal(t, callsBeforeKeep, llmCalls, "sandbox keep must not invoke LLM")
+	llmMu.Unlock()
+
+	require.NoError(t, gw.ProcessMessage(ctx, models.Message{
+		Seq: 8, ChatID: "dm_alice_bot-1", UserID: "alice", Type: models.MessageTypeUIResponse,
+		UIResponse: &models.UIResponseData{ParentSeq: 6, SelectedIDs: []string{"bob:sandbox:destroy:" + sbxB.ID}},
+	}))
+	destroyMsg := nextWS()
+	assert.Contains(t, destroyMsg.Content, "Sandbox terminated")
+
+	// Replacement sandbox C cannot be destroyed or kept via stale sandbox B card IDs
+	sbxC, err := sm.RequestSandbox(ctx, "alice", "dm_alice_bot-1", sandbox.RequestParams{
+		Driver: sandbox.DriverBwrap, NetworkMode: sandbox.NetworkNone, Reason: "Replacement C",
+	})
+	require.NoError(t, err)
+	_, err = sm.ApproveSandboxForID(ctx, "alice", sbxC.ID)
+	require.NoError(t, err)
+
+	require.NoError(t, gw.ProcessMessage(ctx, models.Message{
+		Seq: 81, ChatID: "dm_alice_bot-1", UserID: "alice", Type: models.MessageTypeUIResponse,
+		UIResponse: &models.UIResponseData{ParentSeq: 6, SelectedIDs: []string{"bob:sandbox:destroy:" + sbxB.ID}},
+	}))
+	assert.Contains(t, nextWS().Content, "outdated")
+	require.NoError(t, gw.ProcessMessage(ctx, models.Message{
+		Seq: 82, ChatID: "dm_alice_bot-1", UserID: "alice", Type: models.MessageTypeUIResponse,
+		UIResponse: &models.UIResponseData{ParentSeq: 6, SelectedIDs: []string{"bob:sandbox:keep:" + sbxB.ID}},
+	}))
+	assert.Contains(t, nextWS().Content, "outdated")
+	curC, ok := sm.GetStatus("alice")
+	require.True(t, ok)
+	assert.Equal(t, sbxC.ID, curC.ID)
+	assert.Equal(t, sandbox.StatusRunning, curC.Status)
+	require.NoError(t, sm.DestroyForID(ctx, "alice", sbxC.ID))
+
+	// 5. Sandbox Deny button click denies pending request without invoking LLM
+	sbxDeny, err := sm.RequestSandbox(ctx, "alice", "dm_alice_bot-1", sandbox.RequestParams{
+		Driver: sandbox.DriverBwrap, NetworkMode: sandbox.NetworkNone, Reason: "Deny check",
+	})
+	require.NoError(t, err)
+	require.NoError(t, gw.ProcessMessage(ctx, models.Message{
+		Seq: 9, ChatID: "dm_alice_bot-1", UserID: "alice", Type: models.MessageTypeUIResponse,
+		UIResponse: &models.UIResponseData{ParentSeq: 8, SelectedIDs: []string{"bob:sandbox:deny:" + sbxDeny.ID}},
+	}))
+	denyMsg := nextWS()
+	assert.Contains(t, denyMsg.Content, "Sandbox request denied")
+
+	// 6. Memory and Skill Approve/Reject clicks update knowledge store
+	kStore, err := storeProv.GetKnowledgeStore(ctx, "dm_alice_bot-1", true)
+	require.NoError(t, err)
+
+	_, memVer1, err := kStore.ProposeMemory(ctx, &knowledge.KnowledgeItem{
+		ChatID: "dm_alice_bot-1", UserID: "alice",
+	}, &knowledge.MemoryVersion{
+		Type: knowledge.MemoryTypeFact, Content: "Likes Go", Confidence: 0.9,
+		Provenance: knowledge.Provenance{ChatID: "dm_alice_bot-1", UserID: "alice"},
+	})
+	require.NoError(t, err)
+	_, memVer2, err := kStore.ProposeMemory(ctx, &knowledge.KnowledgeItem{
+		ChatID: "dm_alice_bot-1", UserID: "alice",
+	}, &knowledge.MemoryVersion{
+		Type: knowledge.MemoryTypeFact, Content: "Bad fact", Confidence: 0.3,
+		Provenance: knowledge.Provenance{ChatID: "dm_alice_bot-1", UserID: "alice"},
+	})
+	require.NoError(t, err)
+	_, skillVer1, err := kStore.ProposeSkill(ctx, &knowledge.KnowledgeItem{
+		ChatID: "dm_alice_bot-1", UserID: "alice",
+	}, &knowledge.SkillVersion{
+		Name: "lint-code", Description: "Runs linter", InstructionsMarkdown: "# Lint",
+		Provenance: knowledge.Provenance{ChatID: "dm_alice_bot-1", UserID: "alice"},
+	})
+	require.NoError(t, err)
+
+	// Unicode NBSP / vertical-tab smuggled suffix must fail closed and NEVER approve memVer1
+	require.NoError(t, gw.ProcessMessage(ctx, models.Message{
+		Seq: 95, ChatID: "dm_alice_bot-1", UserID: "alice", Type: models.MessageTypeUIResponse,
+		UIResponse: &models.UIResponseData{ParentSeq: 9, SelectedIDs: []string{"bob:mem:approve:" + memVer1.ID + "\u00a0extra"}},
+	}))
+	assert.Contains(t, nextWS().Content, "Unrecognized or invalid UI action")
+	unchangedMem, err := kStore.GetMemoryVersion(ctx, memVer1.ID)
+	require.NoError(t, err)
+	assert.Equal(t, knowledge.VersionStatusProposed, unchangedMem.Status)
+
+	require.NoError(t, gw.ProcessMessage(ctx, models.Message{
+		Seq: 10, ChatID: "dm_alice_bot-1", UserID: "alice", Type: models.MessageTypeUIResponse,
+		UIResponse: &models.UIResponseData{ParentSeq: 9, SelectedIDs: []string{"bob:mem:approve:" + memVer1.ID}},
+	}))
+	assert.Contains(t, nextWS().Content, "approved and activated")
+
+	require.NoError(t, gw.ProcessMessage(ctx, models.Message{
+		Seq: 11, ChatID: "dm_alice_bot-1", UserID: "alice", Type: models.MessageTypeUIResponse,
+		UIResponse: &models.UIResponseData{ParentSeq: 9, SelectedIDs: []string{"bob:mem:reject:" + memVer2.ID}},
+	}))
+	assert.Contains(t, nextWS().Content, "has been rejected")
+
+	require.NoError(t, gw.ProcessMessage(ctx, models.Message{
+		Seq: 12, ChatID: "dm_alice_bot-1", UserID: "alice", Type: models.MessageTypeUIResponse,
+		UIResponse: &models.UIResponseData{ParentSeq: 9, SelectedIDs: []string{"bob:skill:approve:" + skillVer1.ID}},
+	}))
+	assert.Contains(t, nextWS().Content, "approved and activated")
+
+	gotMem1, err := kStore.GetMemoryVersion(ctx, memVer1.ID)
+	require.NoError(t, err)
+	assert.Equal(t, knowledge.VersionStatusApproved, gotMem1.Status)
+	gotMem2, err := kStore.GetMemoryVersion(ctx, memVer2.ID)
+	require.NoError(t, err)
+	assert.Equal(t, knowledge.VersionStatusRejected, gotMem2.Status)
+	gotSkill1, err := kStore.GetSkillVersion(ctx, skillVer1.ID)
+	require.NoError(t, err)
+	assert.Equal(t, knowledge.VersionStatusApproved, gotSkill1.Status)
+
+	// 7. Schedule Approve + cross-chat guard
+	aliceSchedStore, err := storeProv.GetSchedulerStore(ctx, "dm_alice_bot-1", true)
+	require.NoError(t, err)
+	now := time.Now().Unix()
+	aliceSched := &scheduler.Schedule{
+		ID: "sched_alice_1", Name: "alice_job", ChatID: "dm_alice_bot-1", UserID: "alice",
+		ScheduleType: scheduler.ScheduleTypeInterval, IntervalSeconds: 600,
+		Instruction: "Ping", Status: scheduler.ScheduleStatusPendingApproval,
+		RunTimeoutSeconds: 60, MaxTurns: 5, NextRunAt: now + 600, CreatedAt: now, UpdatedAt: now,
+	}
+	require.NoError(t, aliceSchedStore.CreateSchedule(ctx, aliceSched, nil))
+
+	mallorySchedStore, err := storeProv.GetSchedulerStore(ctx, "dm_mallory_bot-1", true)
+	require.NoError(t, err)
+	mallorySched := &scheduler.Schedule{
+		ID: "sched_mallory_1", Name: "mallory_job", ChatID: "dm_mallory_bot-1", UserID: "mallory",
+		ScheduleType: scheduler.ScheduleTypeInterval, IntervalSeconds: 600,
+		Instruction: "Evil", Status: scheduler.ScheduleStatusPendingApproval,
+		RunTimeoutSeconds: 60, MaxTurns: 5, NextRunAt: now + 600, CreatedAt: now, UpdatedAt: now,
+	}
+	require.NoError(t, mallorySchedStore.CreateSchedule(ctx, mallorySched, nil))
+
+	// Forged cross-chat schedule approval in alice's chat using mallory's schedule ID fails closed
+	require.NoError(t, gw.ProcessMessage(ctx, models.Message{
+		Seq: 13, ChatID: "dm_alice_bot-1", UserID: "alice", Type: models.MessageTypeUIResponse,
+		UIResponse: &models.UIResponseData{ParentSeq: 12, SelectedIDs: []string{fmt.Sprintf("bob:sched:approve:%s", mallorySched.ID)}},
+	}))
+	assert.Contains(t, nextWS().Content, "Schedule not found")
+	stillPending, err := mallorySchedStore.GetSchedule(ctx, mallorySched.ID)
+	require.NoError(t, err)
+	assert.Equal(t, scheduler.ScheduleStatusPendingApproval, stillPending.Status)
+
+	// Legitimate schedule approval succeeds
+	require.NoError(t, gw.ProcessMessage(ctx, models.Message{
+		Seq: 14, ChatID: "dm_alice_bot-1", UserID: "alice", Type: models.MessageTypeUIResponse,
+		UIResponse: &models.UIResponseData{ParentSeq: 12, SelectedIDs: []string{fmt.Sprintf("bob:sched:approve:%s", aliceSched.ID)}},
+	}))
+	assert.Contains(t, nextWS().Content, "Schedule approved and activated")
+	approvedSched, err := aliceSchedStore.GetSchedule(ctx, aliceSched.ID)
+	require.NoError(t, err)
+	assert.Equal(t, scheduler.ScheduleStatusActive, approvedSched.Status)
+
+	// 8. Non-reserved SelectedIDs return handled=false and fall through to normal LLM handling
+	handled, err := gw.handleUIResponseAction(ctx, models.Message{
+		ChatID: "dm_alice_bot-1", UserID: "alice", Type: models.MessageTypeUIResponse,
+		UIResponse: &models.UIResponseData{ParentSeq: 14, SelectedIDs: []string{"opt_a", "opt_b"}},
+	}, true, "Alice")
+	require.NoError(t, err)
+	assert.False(t, handled)
+
+	llmMu.Lock()
+	assert.Equal(t, 1, llmCalls, fmt.Sprintf("expected only 1 LLM call (for sandbox continuation), got %d", llmCalls))
+	llmMu.Unlock()
 }

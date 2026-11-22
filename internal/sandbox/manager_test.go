@@ -751,3 +751,58 @@ func TestManager_Destroy_WhileCreating(t *testing.T) {
 	assert.Equal(t, 1, blockingDriver.destroyedCount)
 	blockingDriver.mu.Unlock()
 }
+
+func TestManager_InstanceIDValidation(t *testing.T) {
+	cfg := Config{
+		Enabled:       true,
+		Drivers:       []string{"bwrap", "docker"},
+		AllowedImages: []string{"alpine:latest"},
+		DataDir:       t.TempDir(),
+		MaxLifetime:   10 * time.Minute,
+	}
+	bwrapDriver := &mockDriver{driverType: DriverBwrap, available: true}
+	dockerDriver := &mockDriver{driverType: DriverDocker, available: true}
+	mgr := NewManager(cfg, []Driver{bwrapDriver, dockerDriver})
+	defer func() { _ = mgr.Close() }()
+
+	ctx := context.Background()
+	sbxA, err := mgr.RequestSandbox(ctx, "user1", "dm_1", RequestParams{
+		Driver:      DriverBwrap,
+		NetworkMode: NetworkNone,
+		Reason:      "Restricted sandbox A",
+	})
+	require.NoError(t, err)
+	require.NoError(t, mgr.DenySandboxForID("user1", sbxA.ID))
+
+	// Request replacement sandbox B with different driver/image
+	sbxB, err := mgr.RequestSandbox(ctx, "user1", "dm_1", RequestParams{
+		Driver:      DriverDocker,
+		DockerImage: "alpine:latest",
+		NetworkMode: NetworkNone,
+		Reason:      "Replacement sandbox B",
+	})
+	require.NoError(t, err)
+	require.NotEqual(t, sbxA.ID, sbxB.ID)
+
+	// Stale Approve/Deny/Destroy with sandbox A's ID must fail with ErrSandboxIDMismatch and keep B intact
+	_, err = mgr.ApproveSandboxForID(ctx, "user1", sbxA.ID)
+	require.ErrorIs(t, err, ErrSandboxIDMismatch)
+	require.ErrorIs(t, mgr.DenySandboxForID("user1", sbxA.ID), ErrSandboxIDMismatch)
+	require.ErrorIs(t, mgr.DestroyForID(ctx, "user1", sbxA.ID), ErrSandboxIDMismatch)
+
+	curB, ok := mgr.GetStatus("user1")
+	require.True(t, ok)
+	assert.Equal(t, sbxB.ID, curB.ID)
+	assert.Equal(t, StatusPendingApproval, curB.Status)
+
+	// Valid ID approves and destroys B
+	approved, err := mgr.ApproveSandboxForID(ctx, "user1", sbxB.ID)
+	require.NoError(t, err)
+	assert.Equal(t, sbxB.ID, approved.ID)
+	assert.Equal(t, StatusRunning, approved.GetStatus())
+
+	require.NoError(t, mgr.DestroyForID(ctx, "user1", sbxB.ID))
+	_, exists := mgr.GetStatus("user1")
+	assert.False(t, exists)
+	require.ErrorIs(t, mgr.DestroyForID(ctx, "user1", sbxB.ID), ErrSandboxIDMismatch)
+}

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"bob/internal/agentapi"
 	"bob/internal/knowledge"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -1193,4 +1194,58 @@ func TestKnowledgeTools_RecoveryRevalidation_ForgottenAndExpired(t *testing.T) {
 
 	_, _, _, ok = tracker.GetCached(item2.ID)
 	assert.False(t, ok, "expired memory must be evicted from budget tracker cache")
+}
+
+func TestKnowledgeTools_ProposeEmitsApprovalAction(t *testing.T) {
+	reg, _ := setupKnowledgeTestRegistry(t)
+	validSeq := int64(5)
+	sessionCtx := NewChatSessionContext("dm_alice", "alice", true)
+	sessionCtx.SourceMessageSeq = &validSeq
+	sessionCtx.FSMRunID = "run_action_1"
+	ctx := WithChatSession(context.Background(), sessionCtx)
+
+	memResJSON, err := reg.Execute(ctx, "propose_memory", `{
+		"type": "preference",
+		"content": "Prefer concise tables",
+		"confidence": 0.9
+	}`)
+	require.NoError(t, err)
+
+	var memRes struct {
+		VersionID string `json:"version_id"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(memResJSON), &memRes))
+
+	skillResJSON, err := reg.Execute(ctx, "propose_skill", `{
+		"name": "deploy_check",
+		"description": "Runs release verification checks",
+		"triggers": ["release check"],
+		"tags": ["testing"],
+		"instructions_markdown": "# Steps\n1. Run make check"
+	}`)
+	require.NoError(t, err)
+
+	var skillRes struct {
+		VersionID string `json:"version_id"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(skillResJSON), &skillRes))
+
+	acts := sessionCtx.Actions.All()
+	require.Len(t, acts, 2)
+
+	var memPayload agentapi.ApprovalRequestPayload
+	require.Equal(t, agentapi.ActionApprovalRequest, acts[0].Type)
+	require.NoError(t, json.Unmarshal(acts[0].Payload, &memPayload))
+	assert.Equal(t, agentapi.ApprovalKindMemory, memPayload.Kind)
+	assert.Equal(t, memRes.VersionID, memPayload.TargetID)
+	assert.Equal(t, "preference", memPayload.Label)
+	assert.Contains(t, memPayload.Summary, "Prefer concise tables")
+
+	var skillPayload agentapi.ApprovalRequestPayload
+	require.Equal(t, agentapi.ActionApprovalRequest, acts[1].Type)
+	require.NoError(t, json.Unmarshal(acts[1].Payload, &skillPayload))
+	assert.Equal(t, agentapi.ApprovalKindSkill, skillPayload.Kind)
+	assert.Equal(t, skillRes.VersionID, skillPayload.TargetID)
+	assert.Equal(t, "deploy_check", skillPayload.Label)
+	assert.Contains(t, skillPayload.Summary, "Runs release verification checks")
 }

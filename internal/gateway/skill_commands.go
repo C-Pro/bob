@@ -28,6 +28,12 @@ func (g *Gateway) handleSkillCommand(ctx context.Context, msg models.Message, te
 
 	g.mu.Lock()
 	botID := g.botUserID
+	botUser := g.botUser
+	if botUser.ID == "" && botID != "" {
+		if u, ok := g.userCache.Get(botID); ok {
+			botUser = u
+		}
+	}
 	g.mu.Unlock()
 
 	parts := strings.Fields(strings.TrimSpace(text))
@@ -67,5 +73,5 @@ func (g *Gateway) handleSkillCommand(ctx context.Context, msg models.Message, te
 	if res.IsIgnored {
 		return nil
 	}
-	return g.SendMessage(msg.ChatID, res.Reply)
+	return g.sendCommandReply(msg.ChatID, botID, botUser.GetDisplayName(), res.Reply, res.UI, res.RecordAssistantEntry)
 }

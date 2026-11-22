@@ -184,7 +184,7 @@ func TestSkillHandler_ShowApproveReject(t *testing.T) {
 	assert.Contains(t, res.Reply, item.ID)
 	assert.Contains(t, res.Reply, "Skill Item:")
 
-	// Show version
+	// Show version (proposed -> attaches approval UI)
 	res, err = h.Handle(ctx, commands.Request{
 		Session:    session,
 		Actor:      actor,
@@ -195,6 +195,10 @@ func TestSkillHandler_ShowApproveReject(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, res.Reply, ver.ID)
 	assert.Contains(t, res.Reply, "Skill Version:")
+	require.NotNil(t, res.UI)
+	require.Len(t, res.UI.Elements, 2)
+	assert.Equal(t, "bob:skill:approve:"+ver.ID, res.UI.Elements[0].ID)
+	assert.Equal(t, "bob:skill:reject:"+ver.ID, res.UI.Elements[1].ID)
 
 	// Approve
 	res, err = h.Handle(ctx, commands.Request{
@@ -206,6 +210,17 @@ func TestSkillHandler_ShowApproveReject(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Contains(t, res.Reply, "has been approved and activated")
+
+	// Show approved version -> no approval UI
+	res, err = h.Handle(ctx, commands.Request{
+		Session:    session,
+		Actor:      actor,
+		Command:    "skill",
+		Subcommand: "show",
+		Args:       []string{ver.ID},
+	})
+	require.NoError(t, err)
+	assert.Nil(t, res.UI)
 
 	// Propose revision 2 and reject
 	_, ver2, err := store.ProposeSkill(ctx, &knowledge.KnowledgeItem{

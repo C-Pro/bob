@@ -152,6 +152,19 @@ func TestScheduleHandler_ApproveAndInfo(t *testing.T) {
 	assert.Contains(t, res.Reply, "Schedule: `daily_news`")
 	assert.Contains(t, res.Reply, "Alice")
 	assert.Contains(t, res.Reply, "PENDING_APPROVAL")
+	require.NotNil(t, res.UI)
+	require.Len(t, res.UI.Elements, 2)
+	assert.Equal(t, "bob:sched:approve:sched_1", res.UI.Elements[0].ID)
+	assert.Equal(t, "bob:sched:deny:sched_1", res.UI.Elements[1].ID)
+
+	// List should NOT attach per-schedule approval buttons
+	listRes, listErr := h.Handle(ctx, commands.Request{
+		Session:    session,
+		Actor:      agentapi.Actor{ID: "user_alice"},
+		Subcommand: "list",
+	})
+	require.NoError(t, listErr)
+	assert.Nil(t, listRes.UI)
 
 	// 4. Creator approves successfully
 	res, err = h.Handle(ctx, commands.Request{
@@ -164,6 +177,16 @@ func TestScheduleHandler_ApproveAndInfo(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, res.RecordAssistantEntry)
 	assert.Contains(t, res.Reply, "Schedule approved and activated")
+
+	// Info after approval attaches no UI
+	resAfter, infoErr := h.Handle(ctx, commands.Request{
+		Session:    session,
+		Actor:      agentapi.Actor{ID: "user_alice"},
+		Subcommand: "info",
+		Args:       []string{"daily_news"},
+	})
+	require.NoError(t, infoErr)
+	assert.Nil(t, resAfter.UI)
 
 	// Check status updated in DB
 	updated, err := store.GetScheduleByName(ctx, "chat_dm_1", "daily_news")

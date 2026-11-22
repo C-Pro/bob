@@ -9,6 +9,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"bob/internal/agentapi"
 	"bob/internal/knowledge"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -394,6 +395,21 @@ func (r *Registry) executeProposeMemory(ctx context.Context, argsJSON string) (s
 		return "", fmt.Errorf("failed to propose memory: %w", err)
 	}
 
+	if session.Actions != nil {
+		if payloadBytes, pErr := json.Marshal(agentapi.ApprovalRequestPayload{
+			Kind:     agentapi.ApprovalKindMemory,
+			TargetID: createdVer.ID,
+			Label:    string(createdVer.Type),
+			Summary:  knowledge.TruncateRunes(createdVer.Content, 120),
+		}); pErr == nil {
+			session.Actions.Add(agentapi.Action{
+				Type:    agentapi.ActionApprovalRequest,
+				Content: createdVer.ID,
+				Payload: payloadBytes,
+			})
+		}
+	}
+
 	resp := map[string]interface{}{
 		"item_id":           createdItem.ID,
 		"version_id":        createdVer.ID,
@@ -734,6 +750,21 @@ func (r *Registry) executeProposeSkill(ctx context.Context, argsJSON string) (st
 	createdItem, createdVer, err := store.ProposeSkill(ctx, item, ver)
 	if err != nil {
 		return "", fmt.Errorf("failed to propose skill: %w", err)
+	}
+
+	if session.Actions != nil {
+		if payloadBytes, pErr := json.Marshal(agentapi.ApprovalRequestPayload{
+			Kind:     agentapi.ApprovalKindSkill,
+			TargetID: createdVer.ID,
+			Label:    createdVer.Name,
+			Summary:  knowledge.TruncateRunes(createdVer.Description, 120),
+		}); pErr == nil {
+			session.Actions.Add(agentapi.Action{
+				Type:    agentapi.ActionApprovalRequest,
+				Content: createdVer.ID,
+				Payload: payloadBytes,
+			})
+		}
 	}
 
 	resp := map[string]interface{}{

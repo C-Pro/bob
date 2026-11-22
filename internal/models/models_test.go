@@ -498,4 +498,115 @@ func TestUIContextHelpers(t *testing.T) {
 	)
 }
 
+func TestUIActionBuildersAndParsing(t *testing.T) {
+	const sbxID = "sbx-1234567890abcdef"
+	builders := []struct {
+		name string
+		ui   *UIData
+		want []ParsedUIAction
+	}{
+		{
+			name: "sandbox approval",
+			ui:   NewSandboxApprovalUI(sbxID),
+			want: []ParsedUIAction{
+				{Kind: UIActionSandboxApprove, TargetID: sbxID},
+				{Kind: UIActionSandboxDeny, TargetID: sbxID},
+			},
+		},
+		{
+			name: "sandbox running",
+			ui:   NewSandboxRunningUI(sbxID),
+			want: []ParsedUIAction{
+				{Kind: UIActionSandboxDestroy, TargetID: sbxID},
+				{Kind: UIActionSandboxKeep, TargetID: sbxID},
+			},
+		},
+		{
+			name: "sandbox destroy only",
+			ui:   NewSandboxDestroyOnlyUI(sbxID),
+			want: []ParsedUIAction{{Kind: UIActionSandboxDestroy, TargetID: sbxID}},
+		},
+		{
+			name: "memory approval",
+			ui:   NewMemoryApprovalUI("mem_1234567890abcdef@1"),
+			want: []ParsedUIAction{
+				{Kind: UIActionMemoryApprove, TargetID: "mem_1234567890abcdef@1"},
+				{Kind: UIActionMemoryReject, TargetID: "mem_1234567890abcdef@1"},
+			},
+		},
+		{
+			name: "skill approval",
+			ui:   NewSkillApprovalUI("skill_1234567890abcdef@2"),
+			want: []ParsedUIAction{
+				{Kind: UIActionSkillApprove, TargetID: "skill_1234567890abcdef@2"},
+				{Kind: UIActionSkillReject, TargetID: "skill_1234567890abcdef@2"},
+			},
+		},
+		{
+			name: "schedule approval",
+			ui:   NewScheduleApprovalUI("sched_1700000000000000000"),
+			want: []ParsedUIAction{
+				{Kind: UIActionScheduleApprove, TargetID: "sched_1700000000000000000"},
+				{Kind: UIActionScheduleDeny, TargetID: "sched_1700000000000000000"},
+			},
+		},
+	}
+
+	for _, tc := range builders {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NotNil(t, tc.ui)
+			require.NoError(t, ValidateUIData(tc.ui))
+			require.Len(t, tc.ui.Elements, len(tc.want))
+			for i, el := range tc.ui.Elements {
+				assert.True(t, HasReservedUIActionPrefix(el.ID))
+				parsed, ok := ParseReservedUIAction(el.ID)
+				require.True(t, ok, "expected valid reserved action for %q", el.ID)
+				assert.Equal(t, tc.want[i], parsed)
+			}
+		})
+	}
+
+	// Whitespace (ASCII + Unicode), empty, unknown, and >64-byte guards
+	assert.Nil(t, NewSandboxApprovalUI(""))
+	assert.Nil(t, NewSandboxApprovalUI("sbx 1"))
+	assert.Nil(t, NewSandboxApprovalUI("sbx\u00a01"))
+	assert.Nil(t, NewSandboxRunningUI(""))
+	assert.Nil(t, NewSandboxDestroyOnlyUI(""))
+	assert.Nil(t, NewSandboxApprovalUI(strings.Repeat("x", MaxUIElementIDBytes)))
+	assert.Nil(t, NewSandboxRunningUI(strings.Repeat("x", MaxUIElementIDBytes)))
+	assert.Nil(t, NewSandboxDestroyOnlyUI(strings.Repeat("x", MaxUIElementIDBytes)))
+	assert.Nil(t, NewMemoryApprovalUI(""))
+	assert.Nil(t, NewMemoryApprovalUI("mem_1@1 extra"))
+	assert.Nil(t, NewMemoryApprovalUI("mem_1@1\u00a0junk"))
+	assert.Nil(t, NewMemoryApprovalUI("mem_1@1\vjunk"))
+	assert.Nil(t, NewSkillApprovalUI("skill_1\t2"))
+	assert.Nil(t, NewSkillApprovalUI("skill_1\u20032"))
+	assert.Nil(t, NewScheduleApprovalUI("sched_1\n2"))
+	assert.Nil(t, NewMemoryApprovalUI(strings.Repeat("x", MaxUIElementIDBytes)))
+	assert.Nil(t, NewSkillApprovalUI(strings.Repeat("x", MaxUIElementIDBytes)))
+	assert.Nil(t, NewScheduleApprovalUI(strings.Repeat("x", MaxUIElementIDBytes)))
+
+	for _, bad := range []string{
+		"",
+		"approve",
+		"bob:unknown",
+		"bob:sandbox:approve",
+		"bob:sandbox:approve:",
+		"bob:sandbox:deny:sbx 1",
+		"bob:sandbox:deny:sbx\u00a01",
+		"bob:sandbox:destroy:",
+		"bob:sandbox:keep:",
+		"bob:mem:approve:",
+		"bob:mem:approve:mem_1@1 extra",
+		"bob:mem:approve:mem_1@1\u00a0junk",
+		"bob:mem:approve:mem_1@1\u00a0",
+		"bob:skill:reject:skill_1\n2",
+		"bob:skill:reject:skill_1\fjunk",
+		"bob:sched:approve:\t",
+	} {
+		_, ok := ParseReservedUIAction(bad)
+		assert.False(t, ok, "expected ParseReservedUIAction(%q) to fail", bad)
+	}
+}
+
 

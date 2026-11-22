@@ -119,11 +119,17 @@ func (s *SessionToolset) Execute(ctx context.Context, call agentapi.ToolCall) (a
 			if ctxSess.Notifier != nil && callSession.Notifier == nil {
 				callSession.Notifier = ctxSess.Notifier
 			}
+			if ctxSess.UINotifier != nil && callSession.UINotifier == nil {
+				callSession.UINotifier = ctxSess.UINotifier
+			}
 			if ctxSess.SandboxRequestCreated != nil && callSession.SandboxRequestCreated == nil {
 				callSession.SandboxRequestCreated = ctxSess.SandboxRequestCreated
 			}
 		}
 	}
+
+	callActions := NewActionCollector()
+	callSession.Actions = callActions
 
 	callCtx := WithChatSession(ctx, callSession)
 	content, err := s.registry.Execute(callCtx, call.Name, call.Arguments)
@@ -149,6 +155,7 @@ func (s *SessionToolset) Execute(ctx context.Context, call agentapi.ToolCall) (a
 	}
 
 	var actions []agentapi.Action
+	actions = append(actions, callActions.All()...)
 	if s.session.SandboxRequestCreated != nil && *s.session.SandboxRequestCreated {
 		actions = append(actions, agentapi.Action{
 			Type: agentapi.ActionSuppressReply,

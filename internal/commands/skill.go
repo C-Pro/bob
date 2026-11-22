@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"bob/internal/knowledge"
+	"bob/internal/models"
 )
 
 // SkillHandler handles /skill slash commands.
@@ -213,7 +214,11 @@ func (h *SkillHandler) handleShow(ctx context.Context, req Request) (Result, err
 		if ver.Provenance.ChatID != req.Session.ScopeID || ver.Provenance.UserID != req.Actor.ID {
 			return Result{Reply: fmt.Sprintf("⚠️ Skill version `%s` not found.", verID)}, nil
 		}
-		return Result{Reply: h.formatSkillVersionDetails(ver)}, nil
+		var ui *models.UIData
+		if ver.Status == knowledge.VersionStatusProposed {
+			ui = models.NewSkillApprovalUI(ver.ID)
+		}
+		return Result{Reply: h.formatSkillVersionDetails(ver), UI: ui}, nil
 	}
 
 	item, err := h.Store.GetItem(ctx, itemID)

@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"bob/internal/agentapi"
+	"bob/internal/models"
 )
 
 // Authorizer checks whether an actor is authorized to execute a command.
@@ -47,6 +48,7 @@ type Request struct {
 	IsDirect   bool
 	Command    string
 	Subcommand string
+	TargetID   string
 	Args       []string
 	RawText    string
 }
@@ -54,6 +56,7 @@ type Request struct {
 // Result encapsulates the outcome of a slash command.
 type Result struct {
 	Reply                string
+	UI                   *models.UIData
 	IsIgnored            bool
 	RecordAssistantEntry bool
 	Continuation         *SandboxContinuation
