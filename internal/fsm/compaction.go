@@ -547,6 +547,8 @@ DO-NOT-COMPACT CRITERIA (should_compact = false):
 2. The candidate steps have not yet reached a coherent checkpoint.
 3. The agent is repeating identical failing calls.
 
+For each item in "verified_findings", "source_step_ids" MUST cite the exact short StepID aliases (e.g. "S1", "S2") listed in the prompt. Do not abbreviate, invent, or cite compaction snapshot IDs or tail step references.
+
 Respond ONLY with valid JSON matching this schema:
 {
   "should_compact": true,
@@ -554,7 +556,7 @@ Respond ONLY with valid JSON matching this schema:
   "state": {
     "original_objective": "string",
     "immutable_constraints": ["string"],
-    "verified_findings": [{"summary": "string", "source_step_ids": ["step_id"]}],
+    "verified_findings": [{"summary": "string", "source_step_ids": ["S1"]}],
     "decisions_and_rejected": ["string"],
     "current_subgoal": "string",
     "next_intended_actions": ["string"],
@@ -566,6 +568,7 @@ Respond ONLY with valid JSON matching this schema:
 const selfCompactSummarizerSystemPrompt = `You are evaluating Stage 2 of the SelfCompact trajectory summarizer for an autonomous tool-using agent.
 A calibrated compaction gate has ALREADY approved compacting the candidate iterations into a durable task state snapshot.
 Distill ONLY verified facts, constraints, decisions/rejected paths, exact artifact paths, current subgoal, next intended actions, and unresolved blockers strictly grounded in the candidate steps and prior compacted state. Do not invent outcomes or claim unverified checks passed.
+For each item in "verified_findings", "source_step_ids" MUST cite the exact short StepID aliases (e.g. "S1", "S2") listed in the prompt. Do not abbreviate, invent, or cite compaction snapshot IDs or tail step references.
 
 Respond ONLY with valid JSON matching this schema:
 {
@@ -574,7 +577,7 @@ Respond ONLY with valid JSON matching this schema:
   "state": {
     "original_objective": "string",
     "immutable_constraints": ["string"],
-    "verified_findings": [{"summary": "string", "source_step_ids": ["step_id"]}],
+    "verified_findings": [{"summary": "string", "source_step_ids": ["S1"]}],
     "decisions_and_rejected": ["string"],
     "current_subgoal": "string",
     "next_intended_actions": ["string"],
@@ -582,6 +585,133 @@ Respond ONLY with valid JSON matching this schema:
     "produced_artifacts": ["string"]
   }
 }`
+
+type compactionStepAliases struct {
+	idToAlias map[string]string
+	aliasToID map[string]string
+}
+
+func isEligibleCompactionSourceStep(step FSMStep) bool {
+	if step.ID == "" {
+		return false
+	}
+	if step.Status != StepStatusCompleted && step.Status != StepStatusFailed && step.Status != StepStatusTimedOut {
+		return false
+	}
+	return !isBlockedLoopStep(step)
+}
+
+func buildCompactionStepAliases(input CompactionProbeInput) compactionStepAliases {
+	aliases := compactionStepAliases{
+		idToAlias: make(map[string]string),
+		aliasToID: make(map[string]string),
+	}
+	register := func(stepID string) {
+		if stepID == "" {
+			return
+		}
+		if _, exists := aliases.idToAlias[stepID]; exists {
+			return
+		}
+		alias := fmt.Sprintf("S%d", len(aliases.idToAlias)+1)
+		aliases.idToAlias[stepID] = alias
+		aliases.aliasToID[alias] = stepID
+	}
+
+	if input.PreviousState != nil {
+		for _, id := range input.PreviousState.CompactedStepIDs {
+			register(id)
+		}
+	}
+	for _, step := range input.StepsToCompact {
+		if isEligibleCompactionSourceStep(step) {
+			register(step.ID)
+		}
+	}
+	return aliases
+}
+
+func (a compactionStepAliases) formatStepID(stepID string) string {
+	if alias, ok := a.idToAlias[stepID]; ok {
+		return alias
+	}
+	return "ineligible"
+}
+
+func (a compactionStepAliases) resolve(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	if canonical, ok := a.aliasToID[trimmed]; ok {
+		return canonical
+	}
+	if canonical, ok := a.aliasToID[strings.ToUpper(trimmed)]; ok {
+		return canonical
+	}
+	return trimmed
+}
+
+func (a compactionStepAliases) clonePreviousStateWithAliases(prev *CompactedTaskState) *CompactedTaskState {
+	if prev == nil {
+		return nil
+	}
+	cloned := *prev
+	cloned.ID = ""
+
+	if len(prev.CompactedStepIDs) > 0 {
+		cloned.CompactedStepIDs = make([]string, 0, len(prev.CompactedStepIDs))
+		for _, id := range prev.CompactedStepIDs {
+			if alias, ok := a.idToAlias[id]; ok {
+				cloned.CompactedStepIDs = append(cloned.CompactedStepIDs, alias)
+			} else if id != "" {
+				cloned.CompactedStepIDs = append(cloned.CompactedStepIDs, id)
+			}
+		}
+	}
+
+	if len(prev.VerifiedFindings) > 0 {
+		cloned.VerifiedFindings = make([]VerifiedFinding, len(prev.VerifiedFindings))
+		for i, f := range prev.VerifiedFindings {
+			copiedIDs := make([]string, 0, len(f.SourceStepIDs))
+			for _, id := range f.SourceStepIDs {
+				if alias, ok := a.idToAlias[id]; ok {
+					copiedIDs = append(copiedIDs, alias)
+				} else if id != "" {
+					copiedIDs = append(copiedIDs, id)
+				}
+			}
+			cloned.VerifiedFindings[i] = VerifiedFinding{
+				Summary:       f.Summary,
+				SourceStepIDs: copiedIDs,
+			}
+		}
+	}
+	return &cloned
+}
+
+func (a compactionStepAliases) remapStateSourceStepIDs(state *CompactedTaskState) {
+	if state == nil || len(state.VerifiedFindings) == 0 {
+		return
+	}
+	for i := range state.VerifiedFindings {
+		rawIDs := state.VerifiedFindings[i].SourceStepIDs
+		if len(rawIDs) == 0 {
+			continue
+		}
+		seen := make(map[string]bool, len(rawIDs))
+		resolved := make([]string, 0, len(rawIDs))
+		for _, raw := range rawIDs {
+			id := a.resolve(raw)
+			if id == "" || seen[id] {
+				continue
+			}
+			seen[id] = true
+			resolved = append(resolved, id)
+		}
+		state.VerifiedFindings[i].SourceStepIDs = resolved
+	}
+}
 
 type llmCompactionDecider struct {
 	client LLMClient
@@ -599,7 +729,7 @@ func runCompactionLLMQuery(ctx context.Context, client LLMClient, systemPrompt s
 	probeCtx, cancel := context.WithTimeout(ctx, compactionProbeTimeout)
 	defer cancel()
 
-	userPrompt := renderFullCompactionPrompt(input)
+	userPrompt, aliases := renderFullCompactionPromptWithAliases(input)
 
 	req := openai.ChatCompletionRequest{
 		Model:               input.Model,
@@ -638,10 +768,15 @@ func runCompactionLLMQuery(ctx context.Context, client LLMClient, systemPrompt s
 	if err := json.Unmarshal([]byte(raw), &result); err != nil {
 		return nil, fmt.Errorf("%w (finish_reason=%s, raw_preview=%.512q): %w", errMalformedCompactionJSON, finishReason, raw, err)
 	}
+	if result.State != nil {
+		aliases.remapStateSourceStepIDs(result.State)
+	}
 	return &result, nil
 }
 
-func renderFullCompactionPrompt(input CompactionProbeInput) string {
+func renderFullCompactionPromptWithAliases(input CompactionProbeInput) (string, compactionStepAliases) {
+	aliases := buildCompactionStepAliases(input)
+
 	var b strings.Builder
 	fmt.Fprintf(&b, "Run ID: %s\n", input.Run.ID)
 	fmt.Fprintf(&b, "Candidate Compaction Boundary: Iterations 1..%d (Current Run Iteration: %d)\n", input.TargetIter, input.Run.Iteration)
@@ -651,8 +786,8 @@ func renderFullCompactionPrompt(input CompactionProbeInput) string {
 	}
 	fmt.Fprintf(&b, "Original Objective: %s\n\n", goal)
 
-	if input.PreviousState != nil {
-		prevJSON, _ := json.Marshal(input.PreviousState)
+	if aliasedPrev := aliases.clonePreviousStateWithAliases(input.PreviousState); aliasedPrev != nil {
+		prevJSON, _ := json.Marshal(aliasedPrev)
 		prevStr := string(prevJSON)
 		if len(prevStr) > maxProbePrevStateBytes {
 			prevStr = truncateUTF8Bytes(prevStr, maxProbePrevStateBytes-15) + "...[truncated]"
@@ -674,7 +809,7 @@ func renderFullCompactionPrompt(input CompactionProbeInput) string {
 		if len(obs) > maxProbeStepOutputBytes {
 			obs = truncateUTF8Bytes(obs, maxProbeStepOutputBytes-23) + "...[truncated for probe]"
 		}
-		fmt.Fprintf(&b, "- StepID=%s Iter=%d Tool=%s Status=%s Args=%s\n  Output: %s\n", s.ID, s.Iteration, s.ToolName, s.Status, args, obs)
+		fmt.Fprintf(&b, "- StepID=%s Iter=%d Tool=%s Status=%s Args=%s\n  Output: %s\n", aliases.formatStepID(s.ID), s.Iteration, s.ToolName, s.Status, args, obs)
 		if b.Len() >= maxProbePromptBytes {
 			b.WriteString("...[additional candidate steps truncated for probe budget]\n")
 			break
@@ -683,8 +818,8 @@ func renderFullCompactionPrompt(input CompactionProbeInput) string {
 
 	if len(input.TailSteps) > 0 && b.Len() < maxProbePromptBytes {
 		b.WriteString("\nRetained Raw Tail Steps (not compacted in this pass):\n")
-		for _, s := range input.TailSteps {
-			fmt.Fprintf(&b, "- StepID=%s Iter=%d Tool=%s Status=%s\n", s.ID, s.Iteration, s.ToolName, s.Status)
+		for idx, s := range input.TailSteps {
+			fmt.Fprintf(&b, "- TailRef=T%d Iter=%d Tool=%s Status=%s\n", idx+1, s.Iteration, s.ToolName, s.Status)
 		}
 	}
 
@@ -692,7 +827,7 @@ func renderFullCompactionPrompt(input CompactionProbeInput) string {
 	if len(userPrompt) > maxProbePromptBytes {
 		userPrompt = truncateUTF8Bytes(userPrompt, maxProbePromptBytes-16) + "\n...[truncated]"
 	}
-	return userPrompt
+	return userPrompt, aliases
 }
 
 type systemOneCompactionDecider struct {
