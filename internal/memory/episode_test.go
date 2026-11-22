@@ -586,4 +586,3 @@ func TestUTF8SafeEpisodeSummaryTruncation(t *testing.T) {
 	assert.True(t, utf8.ValidString(ep.Summary), "episode summary must remain valid UTF-8 after truncation")
 	assert.True(t, utf8.ValidString(ep.FormatNavigationEntry()), "formatted navigation entry must remain valid UTF-8")
 }
-

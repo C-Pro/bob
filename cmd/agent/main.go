@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -50,26 +52,15 @@ func main() {
 
 	if *regenerateFlag || *reembedFlag {
 		slog.Info("running vector regeneration tool")
-		var embedder cortexdb.Embedder
-		if cfg.EmbeddingModel != "" {
-			llmClient := llm.NewClient(cfg, nil)
-			embedder = llm.NewEmbedder(llmClient, cfg.EmbeddingModel)
-		} else {
-			localEmb, err := llm.NewLocalEmbedder(cfg)
-			if err != nil {
-				slog.Error("failed to initialize local embedder for vector regeneration", "error", err)
-				os.Exit(1)
-			}
-			defer func() { _ = localEmb.Close() }()
-			embedder = localEmb
+		embedder, modelName, cleanup, embErr := resolveRegenerateEmbedder(cfg, nil)
+		if embErr != nil {
+			slog.Error("failed to initialize embedder for vector regeneration", "error", embErr)
+			os.Exit(1)
 		}
+		defer cleanup()
 
-		modelName := cfg.EmbeddingModel
-		if modelName == "" {
-			modelName = llm.DefaultLocalModel
-		}
 		slog.Info("starting vector regeneration", "dataDir", cfg.DataDir, "model", modelName, "dim", embedder.Dim())
-		report, err := memory.RegenerateAllVectors(ctx, cfg, embedder, 16)
+		report, err := memory.RegenerateAllVectors(ctx, cfg, embedder, llm.SystemOneMaxBatchSize)
 		if err != nil {
 			slog.Error("vector regeneration failed", "error", err)
 			os.Exit(1)
@@ -294,4 +285,35 @@ func main() {
 	}
 
 	slog.Info("agent service stopped gracefully")
+}
+
+func resolveRegenerateEmbedder(cfg *config.Config, httpClient *http.Client) (cortexdb.Embedder, string, func(), error) {
+	if cfg == nil {
+		return nil, "", func() {}, errors.New("configuration is required")
+	}
+
+	modelSetting := strings.ToLower(strings.TrimSpace(cfg.EmbeddingModel))
+	switch {
+	case modelSetting == "none" || modelSetting == "disabled" || modelSetting == "off":
+		return nil, "", func() {}, fmt.Errorf("cannot regenerate vectors when embedding_model is disabled (%q)", cfg.EmbeddingModel)
+	case modelSetting != "":
+		llmClient := llm.NewClient(cfg, httpClient)
+		return llm.NewEmbedder(llmClient, cfg.EmbeddingModel), cfg.EmbeddingModel, func() {}, nil
+	case cfg.SystemOneEnabled() && cfg.SystemOneEmbeddingsEnabled:
+		sysClient, err := llm.NewSystemOneClient(cfg, httpClient)
+		if err != nil {
+			return nil, "", func() {}, err
+		}
+		sysEmb, err := llm.NewSystemOneEmbedder(sysClient, cfg.SystemOneEmbeddingDims, cfg.SystemOneMaxSeqLen, cfg.SystemOneFallbackOnError)
+		if err != nil {
+			return nil, "", func() {}, err
+		}
+		return sysEmb, sysEmb.Model(), func() {}, nil
+	default:
+		localEmb, err := llm.NewLocalEmbedder(cfg)
+		if err != nil {
+			return nil, "", func() {}, err
+		}
+		return localEmb, llm.DefaultLocalModel, func() { _ = localEmb.Close() }, nil
+	}
 }

@@ -45,8 +45,11 @@ class SidecarConfig:
     device: str = "auto"
     dtype: str = "auto"
     attn_implementation: str = "eager"
+    merge_lora: bool = False
+    cpu_threads: int | None = None
     max_seq_len: int = DEFAULT_MAX_SEQ_LEN
     max_queue_depth: int = 16
+    max_cache_entries: int = 256
     max_batch_size: int = 16
     max_decisions: int = 16
     max_options: int = 255
@@ -97,6 +100,15 @@ class SidecarConfig:
         if api_key is not None:
             api_key = api_key.strip() or None
 
+        merge_lora_raw = (src.get("BOB_S1_MERGE_LORA") or "").strip().lower()
+        merge_lora = merge_lora_raw in ("1", "true", "yes", "on")
+        cpu_threads_raw = src.get("BOB_S1_CPU_THREADS")
+        cpu_threads = (
+            _parse_int("BOB_S1_CPU_THREADS", cpu_threads_raw, 1, 1, 512)
+            if cpu_threads_raw is not None and cpu_threads_raw.strip() != ""
+            else None
+        )
+
         return cls(
             host=(src.get("BOB_S1_HOST") or "127.0.0.1").strip(),
             port=_parse_int("BOB_S1_PORT", src.get("BOB_S1_PORT"), 8090, 1, 65535),
@@ -110,6 +122,8 @@ class SidecarConfig:
             device=device,
             dtype=dtype,
             attn_implementation=attn,
+            merge_lora=merge_lora,
+            cpu_threads=cpu_threads,
             max_seq_len=_parse_int(
                 "BOB_S1_MAX_SEQ_LEN",
                 src.get("BOB_S1_MAX_SEQ_LEN"),
@@ -118,6 +132,7 @@ class SidecarConfig:
                 MODEL_MAX_POSITION_EMBEDDINGS,
             ),
             max_queue_depth=_parse_int("BOB_S1_MAX_QUEUE_DEPTH", src.get("BOB_S1_MAX_QUEUE_DEPTH"), 16, 1, 1024),
+            max_cache_entries=_parse_int("BOB_S1_MAX_CACHE_ENTRIES", src.get("BOB_S1_MAX_CACHE_ENTRIES"), 256, 0, 65536),
             max_batch_size=_parse_int("BOB_S1_MAX_BATCH_SIZE", src.get("BOB_S1_MAX_BATCH_SIZE"), 16, 1, 256),
             max_decisions=_parse_int("BOB_S1_MAX_DECISIONS", src.get("BOB_S1_MAX_DECISIONS"), 16, 1, 128),
             max_options=_parse_int("BOB_S1_MAX_OPTIONS", src.get("BOB_S1_MAX_OPTIONS"), 255, 2, 255),

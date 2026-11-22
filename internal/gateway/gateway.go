@@ -1169,6 +1169,12 @@ func (g *Gateway) handleEvictedBatch(chatID string, evicted []chatcontext.Entry)
 		if e.Role == "system" || e.Seq <= 0 {
 			continue
 		}
+		var imgs []string
+		for _, img := range e.Images {
+			if u := strings.TrimSpace(img.URL); u != "" {
+				imgs = append(imgs, u)
+			}
+		}
 		msgs = append(msgs, memory.MessageToStore{
 			Seq:        e.Seq,
 			Timestamp:  e.Timestamp,
@@ -1177,6 +1183,7 @@ func (g *Gateway) handleEvictedBatch(chatID string, evicted []chatcontext.Entry)
 			SenderName: e.SenderName,
 			Role:       e.Role,
 			Content:    e.Content,
+			Images:     imgs,
 		})
 	}
 
@@ -1238,10 +1245,19 @@ func (g *Gateway) CatchupChatMemory(ctx context.Context, chatID string, isDM boo
 				continue
 			}
 			cleanContent := ExtractMessageText(m)
-			extraText, _ := g.processAttachments(ctx, m.Attachments)
+			extraText, imgAttachments := g.processAttachments(ctx, m.Attachments)
+			var imgs []string
+			for _, att := range imgAttachments {
+				if u := strings.TrimSpace(att.URL); u != "" {
+					imgs = append(imgs, u)
+				}
+			}
 			fullContent := strings.TrimSpace(cleanContent + extraText)
-			if fullContent == "" || (botID != "" && m.UserID == botID && isLegacyProgressMessage(fullContent)) {
+			if (fullContent == "" && len(imgs) == 0) || (botID != "" && m.UserID == botID && isLegacyProgressMessage(fullContent)) {
 				continue
+			}
+			if fullContent == "" && len(imgs) > 0 {
+				fullContent = "[Image attachment]"
 			}
 
 			senderName := g.userCache.GetDisplayName(m.UserID)
@@ -1259,6 +1275,7 @@ func (g *Gateway) CatchupChatMemory(ctx context.Context, chatID string, isDM boo
 				SenderName: senderName,
 				Role:       role,
 				Content:    fullContent,
+				Images:     imgs,
 			})
 		}
 

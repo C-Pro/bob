@@ -25,3 +25,17 @@ sandbox:
 
 fsm:
   compaction_interval_iterations: 10
+
+system1:
+  # Optional external bob-s1 inference sidecar URL (e.g. "http://127.0.0.1:8090/v1").
+  # Leave empty to keep System-1 integration disabled (or override via BOB_EVAL_SYSTEM1_URL / --system1-url).
+  base_url: ""
+  model: "bob-s1-0.8b"
+  timeout: "30s"
+  embedding_dims: 384
+  embeddings_enabled: true
+  compaction_enabled: true
+  compaction_defer_threshold: 0.0
+  loop_guard_mode: "hybrid"
+  episodes_enabled: true
+  fallback_on_error: true

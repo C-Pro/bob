@@ -130,6 +130,20 @@ type fileConfig struct {
 		CompactionSoftThresholdBytes *int  `yaml:"compaction_soft_threshold_bytes"`
 		CompactionHardThresholdBytes *int  `yaml:"compaction_hard_threshold_bytes"`
 	} `yaml:"fsm"`
+	SystemOne struct {
+		BaseURL                  *string        `yaml:"base_url"`
+		APIKey                   *string        `yaml:"api_key"`
+		Model                    *string        `yaml:"model"`
+		Timeout                  *time.Duration `yaml:"timeout"`
+		MaxSeqLen                *int           `yaml:"max_seq_len"`
+		EmbeddingDims            *int           `yaml:"embedding_dims"`
+		EmbeddingsEnabled        *bool          `yaml:"embeddings_enabled"`
+		CompactionEnabled        *bool          `yaml:"compaction_enabled"`
+		CompactionDeferThreshold *float64       `yaml:"compaction_defer_threshold"`
+		LoopGuardMode            *string        `yaml:"loop_guard_mode"`
+		EpisodesEnabled          *bool          `yaml:"episodes_enabled"`
+		FallbackOnError          *bool          `yaml:"fallback_on_error"`
+	} `yaml:"system1"`
 }
 
 // checkFileSecurity verifies that a file is regular, has safe permissions, and is owned by expectedUID.
@@ -385,6 +399,53 @@ func LoadFromFile(path string) (*Config, error) {
 		cfg.FSMCompactionHardThresholdBytes = *fc.FSM.CompactionHardThresholdBytes
 	}
 
+	// 8. System-1 Settings
+	if fc.SystemOne.BaseURL != nil {
+		cfg.SystemOneBaseURL = strings.TrimSpace(*fc.SystemOne.BaseURL)
+	}
+	if fc.SystemOne.APIKey != nil {
+		cfg.SystemOneAPIKey = strings.TrimSpace(*fc.SystemOne.APIKey)
+	}
+	if fc.SystemOne.Model != nil {
+		cfg.SystemOneModel = strings.TrimSpace(*fc.SystemOne.Model)
+	}
+	if fc.SystemOne.Timeout != nil {
+		cfg.SystemOneTimeout = *fc.SystemOne.Timeout
+		if *fc.SystemOne.Timeout <= 0 {
+			cfg.systemOneTimeoutExplicitInvalid = true
+		}
+	}
+	if fc.SystemOne.MaxSeqLen != nil {
+		cfg.SystemOneMaxSeqLen = *fc.SystemOne.MaxSeqLen
+	}
+	if fc.SystemOne.EmbeddingDims != nil {
+		cfg.SystemOneEmbeddingDims = *fc.SystemOne.EmbeddingDims
+		if *fc.SystemOne.EmbeddingDims <= 0 {
+			cfg.systemOneDimsExplicitInvalid = true
+		}
+	}
+	if fc.SystemOne.EmbeddingsEnabled != nil {
+		cfg.SystemOneEmbeddingsEnabled = *fc.SystemOne.EmbeddingsEnabled
+	}
+	if fc.SystemOne.CompactionEnabled != nil {
+		cfg.SystemOneCompactionEnabled = *fc.SystemOne.CompactionEnabled
+	}
+	if fc.SystemOne.CompactionDeferThreshold != nil {
+		cfg.SystemOneCompactionDeferThreshold = *fc.SystemOne.CompactionDeferThreshold
+	}
+	if fc.SystemOne.LoopGuardMode != nil {
+		cfg.SystemOneLoopGuardMode = strings.ToLower(strings.TrimSpace(*fc.SystemOne.LoopGuardMode))
+		if cfg.SystemOneLoopGuardMode == "" {
+			cfg.systemOneLoopGuardExplicitInvalid = true
+		}
+	}
+	if fc.SystemOne.EpisodesEnabled != nil {
+		cfg.SystemOneEpisodesEnabled = *fc.SystemOne.EpisodesEnabled
+	}
+	if fc.SystemOne.FallbackOnError != nil {
+		cfg.SystemOneFallbackOnError = *fc.SystemOne.FallbackOnError
+	}
+
 	return cfg, nil
 }
 
@@ -461,6 +522,9 @@ func (c *Config) ValidateCLI() error {
 	if c.KnowledgeMaxDiscoveryLimit < c.KnowledgeDefaultDiscoveryLimit {
 		return fmt.Errorf("knowledge.max_discovery_limit (%d) cannot be less than default_discovery_limit (%d)", c.KnowledgeMaxDiscoveryLimit, c.KnowledgeDefaultDiscoveryLimit)
 	}
+	if err := c.validateSystemOne(); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -477,6 +541,20 @@ llm:
   # first_byte_timeout: "1m" # LLM API initial response header timeout (default: 1m)
   # embedding_model: "" # Local model by default; "none" to disable
   # embedding_precision: "bf16"
+
+# system1:
+#   base_url: "http://127.0.0.1:8090/v1" # External bob-s1 OpenAI-compatible System-1 server
+#   api_key: "" # Optional Bearer token
+#   model: "bob-s1-0.8b"
+#   timeout: "30s"
+#   max_seq_len: 0 # 0 uses server default (4096; calibration applies at 4096)
+#   embedding_dims: 384 # Supported Matryoshka dims: 128, 256, 384
+#   embeddings_enabled: true
+#   compaction_enabled: true
+#   compaction_defer_threshold: 0 # 0 uses server risk_threshold_5pct (~0.8394); <0 disables deferral
+#   loop_guard_mode: "hybrid" # "off", "shadow", or "hybrid"
+#   episodes_enabled: true
+#   fallback_on_error: true
 
 web:
   # tavily_api_key: "" # Optional: enables web_search tool (web_fetch is always available)

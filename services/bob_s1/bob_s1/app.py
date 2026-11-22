@@ -279,7 +279,7 @@ def create_app(
 
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
-        active_bundle, _ = _require_worker()
+        active_bundle, active_worker = _require_worker()
         return JSONResponse(
             status_code=200,
             content={
@@ -290,6 +290,7 @@ def create_app(
                 "dtype": active_bundle.dtype,
                 "attn_implementation": active_bundle.attn_implementation,
                 "max_seq_len": resolved_cfg.max_seq_len,
+                **active_worker.telemetry_snapshot(),
             },
         )
 

@@ -20,6 +20,9 @@ import string
 import unicodedata
 import hashlib
 import tempfile
+import importlib.util
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent.resolve()
@@ -27,9 +30,12 @@ REPO_ROOT = BASE_DIR.parent.parent
 BOB_BIN = REPO_ROOT / "bin" / "bob"
 TEMPLATE_CONFIG = BASE_DIR / "config_template.yaml"
 RESULTS_DIR = BASE_DIR.parent / "results"
+ROLLOUTS_DIR = RESULTS_DIR / "rollouts"
 CTF_ASSETS_DIR = BASE_DIR / "ctf_assets"
 BASH_FIXTURES_DIR = BASE_DIR / "bash_fixtures"
 REPOS_DIR = BASE_DIR / "repos"
+
+VALID_LOOP_GUARD_MODES = ("off", "shadow", "warn", "hybrid", "enforce")
 
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -114,6 +120,31 @@ def grade_frames(task: dict, workspace: Path, stdout_output: str) -> dict:
         "grading_status": "graded"
     }
 
+def resolve_swebench_python() -> str:
+    override = os.environ.get("BOB_EVAL_SWEBENCH_PYTHON", "").strip()
+    if override:
+        return override
+    if importlib.util.find_spec("swebench") is not None:
+        return sys.executable
+    candidates = sorted(
+        (Path.home() / ".local" / "share" / "mise" / "installs" / "python").glob("*/bin/python"),
+        reverse=True,
+    )
+    for cand in candidates:
+        try:
+            res = subprocess.run(
+                [str(cand), "-c", "import swebench"],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            if res.returncode == 0:
+                return str(cand)
+        except Exception:
+            continue
+    return sys.executable
+
+
 def evaluate_swe_patch_docker(task_id: str, patch_content: str, timeout_sec: int = 600) -> tuple:
     inst_id = task_id.replace("swe_", "")
     pred = [{
@@ -128,7 +159,7 @@ def evaluate_swe_patch_docker(task_id: str, patch_content: str, timeout_sec: int
         
     run_id = f"eval_{inst_id}_{int(time.time())}"
     cmd = [
-        sys.executable, "-m", "swebench.harness.run_evaluation",
+        resolve_swebench_python(), "-m", "swebench.harness.run_evaluation",
         "-d", "SWE-bench/SWE-bench_Lite",
         "-p", str(pred_path),
         "-i", inst_id,
@@ -644,6 +675,261 @@ def resolve_llm_config(model: str = None, base_url: str = None, api_key: str = N
 
     return model, base_url, api_key
 
+
+def parse_bool_flag(value, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    raw = str(value).strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"Invalid boolean flag value: {value!r}")
+
+
+def resolve_system1_config(
+    system1_url: str = None,
+    system1_model: str = None,
+    system1_loop_guard_mode: str = None,
+    system1_fallback_on_error=None,
+    system1_timeout: str = None,
+) -> dict:
+    url = (
+        system1_url
+        if system1_url is not None
+        else (os.environ.get("BOB_EVAL_SYSTEM1_URL") or os.environ.get("SYSTEM1_BASE_URL") or "")
+    ).strip()
+
+    model = (
+        system1_model
+        if system1_model is not None
+        else (os.environ.get("BOB_EVAL_SYSTEM1_MODEL") or os.environ.get("SYSTEM1_MODEL") or "bob-s1-0.8b")
+    ).strip() or "bob-s1-0.8b"
+
+    loop_guard_mode = (
+        system1_loop_guard_mode
+        if system1_loop_guard_mode is not None
+        else (os.environ.get("BOB_EVAL_SYSTEM1_LOOP_GUARD_MODE") or os.environ.get("SYSTEM1_LOOP_GUARD_MODE") or "hybrid")
+    ).strip().lower() or "hybrid"
+    if loop_guard_mode not in VALID_LOOP_GUARD_MODES:
+        raise ValueError(
+            f"Invalid --system1-loop-guard-mode {loop_guard_mode!r}; expected one of {', '.join(VALID_LOOP_GUARD_MODES)}"
+        )
+
+    env_fallback = os.environ.get("BOB_EVAL_SYSTEM1_FALLBACK_ON_ERROR")
+    if env_fallback is None:
+        env_fallback = os.environ.get("SYSTEM1_FALLBACK_ON_ERROR")
+    fallback_on_error = (
+        parse_bool_flag(system1_fallback_on_error, default=True)
+        if system1_fallback_on_error is not None
+        else parse_bool_flag(env_fallback, default=True)
+    )
+
+    timeout = (
+        system1_timeout
+        if system1_timeout is not None
+        else (os.environ.get("BOB_EVAL_SYSTEM1_TIMEOUT") or os.environ.get("SYSTEM1_TIMEOUT") or "60s")
+    ).strip() or "60s"
+
+    return {
+        "enabled": bool(url),
+        "url": url,
+        "model": model,
+        "loop_guard_mode": loop_guard_mode,
+        "fallback_on_error": fallback_on_error,
+        "timeout": timeout,
+    }
+
+
+def derive_system1_health_url(base_url: str) -> str:
+    raw = (base_url or "").strip().rstrip("/")
+    if not (raw.startswith("http://") or raw.startswith("https://")):
+        raise ValueError(f"Invalid System-1 URL scheme: {base_url!r}")
+    if raw.endswith("/v1"):
+        raw = raw[:-3].rstrip("/")
+    return f"{raw}/healthz"
+
+
+def check_system1_health(base_url: str, timeout_sec: float = 5.0) -> dict:
+    health_url = derive_system1_health_url(base_url)
+    req = urllib.request.Request(health_url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
+        status_code = getattr(resp, "status", 200)
+        body = resp.read().decode("utf-8", errors="replace")
+    if status_code != 200:
+        raise RuntimeError(f"System-1 healthz returned HTTP {status_code}: {body[:200]}")
+    payload = json.loads(body) if body.strip() else {}
+    status_val = str(payload.get("status", "")).strip().lower()
+    ready_val = payload.get("ready")
+    if ready_val is False or (status_val and status_val not in ("ok", "ready", "healthy")):
+        raise RuntimeError(f"System-1 sidecar not ready at {health_url}: {payload}")
+    return payload
+
+
+def _yaml_quote(val: str) -> str:
+    return json.dumps(str(val))
+
+
+def build_config_yaml(
+    resolved_api_key: str,
+    resolved_base_url: str,
+    resolved_model: str,
+    tavily_key: str,
+    data_dir: Path,
+    max_iterations: int,
+    system1_cfg: dict = None,
+) -> str:
+    cfg = f"""llm:
+  api_key: {_yaml_quote(resolved_api_key)}
+  base_url: {_yaml_quote(resolved_base_url)}
+  model: {_yaml_quote(resolved_model)}
+  first_byte_timeout: "5m"
+  request_timeout: "10m"
+
+web:
+  tavily_api_key: {_yaml_quote(tavily_key)}
+  tavily_base_url: "https://api.tavily.com"
+
+data_dir: {_yaml_quote(str(data_dir))}
+
+cli:
+  max_iterations: {int(max_iterations)}
+
+sandbox:
+  default_driver: "bwrap"
+  allowed_network_modes: ["none", "restricted", "full"]
+  default_exec_timeout: "2m"
+  max_exec_timeout: "1h"
+  max_lifetime: "2h"
+
+fsm:
+  compaction_interval_iterations: 10
+"""
+    if system1_cfg and system1_cfg.get("url"):
+        fallback_literal = "true" if system1_cfg.get("fallback_on_error", True) else "false"
+        timeout_val = system1_cfg.get("timeout", "60s")
+        cfg += f"""
+system1:
+  base_url: {_yaml_quote(system1_cfg["url"])}
+  model: {_yaml_quote(system1_cfg.get("model", "bob-s1-0.8b"))}
+  timeout: {_yaml_quote(timeout_val)}
+  loop_guard_mode: {_yaml_quote(system1_cfg.get("loop_guard_mode", "hybrid"))}
+  fallback_on_error: {fallback_literal}
+"""
+    return cfg
+
+
+def extract_task_system1_metrics(traj: dict) -> dict:
+    metrics = {
+        "decision_events": 0,
+        "compaction_gate_calls": 0,
+        "compaction_calibration_applied": 0,
+        "compaction_calibration_unapplied": 0,
+        "compaction_skipped_probes": 0,
+        "compaction_system1_skipped_probes": 0,
+        "compaction_deferred_to_system2": 0,
+        "compaction_gate_latency_ms": 0,
+        "compaction_summarizer_latency_ms": 0,
+        "compaction_total_latency_ms": 0,
+        "loop_guard_calls": 0,
+        "loop_guard_interventions": 0,
+        "fallback_count": 0,
+        "error_count": 0,
+    }
+    if not isinstance(traj, dict):
+        return metrics
+
+    for ev in traj.get("events", []) or []:
+        if not isinstance(ev, dict):
+            continue
+        ev_type = ev.get("event_type")
+        payload = ev.get("payload")
+        if not isinstance(payload, dict):
+            continue
+
+        if ev_type == "system1_decision":
+            metrics["decision_events"] += 1
+            task_name = payload.get("task", "")
+            action = str(payload.get("applied_action", "")).lower()
+            latency_ms = int(payload.get("latency_ms", 0) or 0)
+
+            if payload.get("fallback_used"):
+                metrics["fallback_count"] += 1
+            if payload.get("error") or action in ("error", "probe_error"):
+                metrics["error_count"] += 1
+
+            if task_name == "compaction":
+                metrics["compaction_gate_calls"] += 1
+                metrics["compaction_gate_latency_ms"] += latency_ms
+                if payload.get("calibration_applied"):
+                    metrics["compaction_calibration_applied"] += 1
+                else:
+                    metrics["compaction_calibration_unapplied"] += 1
+                if action == "defer_to_system2":
+                    metrics["compaction_deferred_to_system2"] += 1
+            elif task_name == "loop_guard":
+                metrics["loop_guard_calls"] += 1
+                if action in ("warn", "block", "intervene"):
+                    metrics["loop_guard_interventions"] += 1
+
+        elif ev_type == "compaction":
+            decision_source = str(payload.get("decision_source", "")).lower()
+            should_compact = payload.get("should_compact")
+            metrics["compaction_summarizer_latency_ms"] += int(payload.get("summarizer_latency_ms", 0) or 0)
+            if decision_source == "system1_skip":
+                metrics["compaction_system1_skipped_probes"] += 1
+                metrics["compaction_skipped_probes"] += 1
+            elif should_compact is False and decision_source:
+                metrics["compaction_skipped_probes"] += 1
+
+    metrics["compaction_total_latency_ms"] = (
+        metrics["compaction_gate_latency_ms"] + metrics["compaction_summarizer_latency_ms"]
+    )
+    return metrics
+
+
+def summarize_batch_metrics(results: list) -> dict:
+    per_benchmark = {}
+    s1_totals = extract_task_system1_metrics({})
+
+    for r in results:
+        bmark = r.get("benchmark") or "unknown"
+        bucket = per_benchmark.setdefault(bmark, {
+            "total": 0,
+            "graded": 0,
+            "passed": 0,
+            "pass_rate": 0.0,
+            "swe_patched": 0,
+            "swe_resolved": 0,
+        })
+        bucket["total"] += 1
+        if r.get("grading_status") == "graded":
+            bucket["graded"] += 1
+            if r.get("benchmark_reward") == 1.0:
+                bucket["passed"] += 1
+        if bmark == "swe-bench-lite":
+            if r.get("patch_generated"):
+                bucket["swe_patched"] += 1
+            if r.get("resolved"):
+                bucket["swe_resolved"] += 1
+
+        task_s1 = r.get("system1_metrics")
+        if not isinstance(task_s1, dict):
+            task_s1 = extract_task_system1_metrics(r.get("trajectory", {}))
+        for k in s1_totals:
+            s1_totals[k] += int(task_s1.get(k, 0) or 0)
+
+    for bucket in per_benchmark.values():
+        denom = bucket["graded"] or bucket["total"]
+        bucket["pass_rate"] = (bucket["passed"] / denom) if denom else 0.0
+
+    return {
+        "per_benchmark": per_benchmark,
+        "system1_metrics": s1_totals,
+    }
+
 def resolve_swe_repo(task: dict) -> Path:
     repo = task.get("repo", "django/django")
     repo_slug = repo.split("/")[-1]
@@ -667,7 +953,8 @@ def resolve_swe_repo(task: dict) -> Path:
     return target_dir
 
 def run_single_task(task: dict, max_iterations: int = 500, timeout_sec: int = 900, batch_dir: Path = None,
-                    model: str = None, base_url: str = None, api_key: str = None) -> dict:
+                    model: str = None, base_url: str = None, api_key: str = None,
+                    system1_cfg: dict = None) -> dict:
     if batch_dir is None:
         batch_dir = ROLLOUTS_DIR
     batch_dir.mkdir(parents=True, exist_ok=True)
@@ -690,32 +977,16 @@ def run_single_task(task: dict, max_iterations: int = 500, timeout_sec: int = 90
     cfg_file = host_dir / "config.yaml"
     tavily_key = resolve_tavily_key()
     resolved_model, resolved_base_url, resolved_api_key = resolve_llm_config(model, base_url, api_key)
-    cfg_content = f"""llm:
-  api_key: "{resolved_api_key}"
-  base_url: "{resolved_base_url}"
-  model: "{resolved_model}"
-  first_byte_timeout: "5m"
-  request_timeout: "10m"
-
-web:
-  tavily_api_key: "{tavily_key}"
-  tavily_base_url: "https://api.tavily.com"
-
-data_dir: "{data_dir}"
-
-cli:
-  max_iterations: {max_iterations}
-
-sandbox:
-  default_driver: "bwrap"
-  allowed_network_modes: ["none", "restricted", "full"]
-  default_exec_timeout: "2m"
-  max_exec_timeout: "1h"
-  max_lifetime: "2h"
-
-fsm:
-  compaction_interval_iterations: 10
-"""
+    resolved_s1 = system1_cfg if system1_cfg is not None else resolve_system1_config()
+    cfg_content = build_config_yaml(
+        resolved_api_key=resolved_api_key,
+        resolved_base_url=resolved_base_url,
+        resolved_model=resolved_model,
+        tavily_key=tavily_key,
+        data_dir=data_dir,
+        max_iterations=max_iterations,
+        system1_cfg=resolved_s1,
+    )
     cfg_file.write_text(cfg_content)
     cfg_file.chmod(0o600)
     
@@ -869,6 +1140,7 @@ fsm:
             "patch_generated": grade_res.get("patch_generated"),
             "grading_status": grade_res.get("grading_status", "graded"),
             "resolved": grade_res.get("resolved"),
+            "system1_metrics": extract_task_system1_metrics(traj),
             "stdout": stdout_output,
             "stderr": stderr_output,
             "trajectory": traj
@@ -891,9 +1163,35 @@ fsm:
                 pass
         shutil.rmtree(run_root, ignore_errors=True)
 
+def _extract_cli_value(argv: list, flag: str, default=None):
+    prefix = f"{flag}="
+    for i, arg in enumerate(argv):
+        if arg == flag and i + 1 < len(argv):
+            return argv[i + 1]
+        if arg.startswith(prefix):
+            return arg[len(prefix):]
+    return default
+
+
+def _extract_cli_bool(argv: list, flag: str, default=None):
+    prefix = f"{flag}="
+    for i, arg in enumerate(argv):
+        if arg == flag:
+            if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                return argv[i + 1]
+            return "true"
+        if arg.startswith(prefix):
+            return arg[len(prefix):]
+    return default
+
+
 def main():
     if len(sys.argv) < 2:
-        print("Usage: runner.py <manifest.json> [--limit N] [--timeout SEC]")
+        print(
+            "Usage: runner.py <manifest.json> [--limit N] [--timeout SEC] "
+            "[--max-iterations N] [--system1-url URL] [--system1-model NAME] "
+            "[--system1-loop-guard-mode MODE] [--system1-fallback-on-error BOOL]"
+        )
         sys.exit(1)
         
     manifest_file = Path(sys.argv[1])
@@ -906,48 +1204,44 @@ def main():
         
     tasks = manifest.get("tasks", []) if isinstance(manifest, dict) else manifest
     
-    limit = None
-    if "--limit" in sys.argv:
-        idx = sys.argv.index("--limit")
-        limit = int(sys.argv[idx + 1])
-        tasks = tasks[:limit]
+    limit_val = _extract_cli_value(sys.argv, "--limit")
+    if limit_val is not None:
+        tasks = tasks[:int(limit_val)]
         
-    timeout_sec = 900
-    if "--timeout" in sys.argv:
-        idx = sys.argv.index("--timeout")
-        timeout_sec = int(sys.argv[idx + 1])
-        
-    max_iterations = 30
-    if "--max-iterations" in sys.argv:
-        idx = sys.argv.index("--max-iterations")
-        max_iterations = int(sys.argv[idx + 1])
-    elif "-m" in sys.argv:
-        idx = sys.argv.index("-m")
-        max_iterations = int(sys.argv[idx + 1])
+    timeout_sec = int(_extract_cli_value(sys.argv, "--timeout", 900))
+    max_iter_val = _extract_cli_value(sys.argv, "--max-iterations")
+    if max_iter_val is None:
+        max_iter_val = _extract_cli_value(sys.argv, "-m", 30)
+    max_iterations = int(max_iter_val)
 
-    model = None
-    if "--model" in sys.argv:
-        model = sys.argv[sys.argv.index("--model") + 1]
+    model = _extract_cli_value(sys.argv, "--model")
+    base_url = _extract_cli_value(sys.argv, "--base-url")
+    api_key = _extract_cli_value(sys.argv, "--api-key")
 
-    base_url = None
-    if "--base-url" in sys.argv:
-        base_url = sys.argv[sys.argv.index("--base-url") + 1]
+    system1_url = _extract_cli_value(sys.argv, "--system1-url")
+    system1_model = _extract_cli_value(sys.argv, "--system1-model")
+    system1_loop_guard_mode = _extract_cli_value(sys.argv, "--system1-loop-guard-mode")
+    system1_fallback_on_error = _extract_cli_bool(sys.argv, "--system1-fallback-on-error")
+    system1_timeout = _extract_cli_value(sys.argv, "--system1-timeout")
+    system1_cfg = resolve_system1_config(
+        system1_url=system1_url,
+        system1_model=system1_model,
+        system1_loop_guard_mode=system1_loop_guard_mode,
+        system1_fallback_on_error=system1_fallback_on_error,
+        system1_timeout=system1_timeout,
+    )
 
-    api_key = None
-    if "--api-key" in sys.argv:
-        api_key = sys.argv[sys.argv.index("--api-key") + 1]
-
-    split = None
-    if "--split" in sys.argv:
-        split = sys.argv[sys.argv.index("--split") + 1]
-    elif "train" in manifest_file.parts:
-        split = "train"
-    elif "heldout" in manifest_file.parts:
-        split = "heldout"
+    split = _extract_cli_value(sys.argv, "--split")
+    if split is None:
+        if "train" in manifest_file.parts:
+            split = "train"
+        elif "heldout" in manifest_file.parts:
+            split = "heldout"
 
     batch_timestamp = int(time.time())
-    if "--output-dir" in sys.argv:
-        batch_dir = Path(sys.argv[sys.argv.index("--output-dir") + 1])
+    output_dir_val = _extract_cli_value(sys.argv, "--output-dir")
+    if output_dir_val:
+        batch_dir = Path(output_dir_val)
     elif split:
         batch_dir = RESULTS_DIR / split / f"batch_{manifest_file.stem}_{batch_timestamp}"
     else:
@@ -957,6 +1251,21 @@ def main():
     resolved_model, resolved_base_url, _ = resolve_llm_config(model, base_url, api_key)
     print(f"[+] Loaded {len(tasks)} tasks from {manifest_file} (Timeout: {timeout_sec}s, Max iterations: {max_iterations})")
     print(f"[+] Model: {resolved_model} (Base URL: {resolved_base_url})")
+    healthz_info = None
+    if system1_cfg["enabled"]:
+        print(
+            f"[+] System-1: {system1_cfg['url']} (model={system1_cfg['model']}, "
+            f"loop_guard_mode={system1_cfg['loop_guard_mode']}, "
+            f"fallback_on_error={system1_cfg['fallback_on_error']})"
+        )
+        try:
+            healthz_info = check_system1_health(system1_cfg["url"])
+            print(f"[+] System-1 /healthz OK: {healthz_info}")
+        except Exception as e:
+            if not system1_cfg["fallback_on_error"]:
+                print(f"[!] System-1 /healthz failed with fallback_on_error=false: {e}")
+                sys.exit(2)
+            print(f"[-] Warning: System-1 /healthz check failed (fallback_on_error=true): {e}")
     print(f"[+] Batch output directory: {batch_dir}")
     
     results = []
@@ -991,7 +1300,8 @@ def main():
         print(f"\n[{i+1}/{len(tasks)}]")
         try:
             r = run_single_task(t, max_iterations=max_iterations, timeout_sec=timeout_sec, batch_dir=batch_dir,
-                                model=resolved_model, base_url=resolved_base_url, api_key=api_key)
+                                model=resolved_model, base_url=resolved_base_url, api_key=api_key,
+                                system1_cfg=system1_cfg)
         except Exception as e:
             print(f"[-] Task {t_id} failed with unhandled exception: {e}")
             r = {
@@ -999,6 +1309,8 @@ def main():
                 "benchmark": t.get("benchmark"),
                 "status": "error",
                 "error": str(e),
+                "duration_seconds": 0.0,
+                "exit_code": -1,
                 "grading_status": "graded",
                 "benchmark_reward": 0.0,
                 "resolved": False,
@@ -1018,14 +1330,32 @@ def main():
             if r.get("resolved"):
                 swe_resolved_count += 1
                 
+    batch_agg = summarize_batch_metrics(results)
+    s1_agg = batch_agg["system1_metrics"]
+    per_bench = batch_agg["per_benchmark"]
+
     print(f"\n========================================================")
     print(f"[+] Batch execution complete.")
     if graded_count > 0:
         print(f"    Graded Tasks Passed: {passed_count}/{graded_count} ({passed_count/graded_count*100:.1f}%)")
+    for b_name, b_stats in sorted(per_bench.items()):
+        print(f"    - {b_name}: {b_stats['passed']}/{b_stats['graded']} ({b_stats['pass_rate']*100:.1f}%)")
     swe_total = len([t for t in tasks if t.get("benchmark") == "swe-bench-lite"])
     if swe_total > 0:
         print(f"    SWE-bench Patch Generation Rate: {swe_patch_count}/{swe_total} ({swe_patch_count/swe_total*100:.1f}%)")
         print(f"    SWE-bench Resolved Rate: {swe_resolved_count}/{swe_total} ({swe_resolved_count/swe_total*100:.1f}%) [Docker Validated]")
+    if system1_cfg["enabled"] or s1_agg["decision_events"] > 0:
+        print(
+            f"    System-1 Telemetry: decisions={s1_agg['decision_events']}, "
+            f"compaction_probes={s1_agg['compaction_gate_calls']} "
+            f"(calibrated={s1_agg['compaction_calibration_applied']}, "
+            f"uncalibrated={s1_agg['compaction_calibration_unapplied']}, "
+            f"skipped={s1_agg['compaction_system1_skipped_probes']}), "
+            f"compaction_ms={s1_agg['compaction_total_latency_ms']} "
+            f"(gate={s1_agg['compaction_gate_latency_ms']}, summarizer={s1_agg['compaction_summarizer_latency_ms']}), "
+            f"loop_guard_interventions={s1_agg['loop_guard_interventions']}/{s1_agg['loop_guard_calls']}, "
+            f"fallbacks={s1_agg['fallback_count']}, errors={s1_agg['error_count']}"
+        )
     
     summary_file = batch_dir / f"summary.json"
     with open(summary_file, "w") as f:
@@ -1033,11 +1363,17 @@ def main():
             "manifest": str(manifest_file),
             "model": resolved_model,
             "base_url": resolved_base_url,
+            "system1": {
+                **system1_cfg,
+                "healthz": healthz_info,
+            },
             "batch_timestamp": batch_timestamp,
             "total_tasks": len(tasks),
             "graded_tasks": graded_count,
             "passed_graded": passed_count,
             "graded_pass_rate": passed_count / graded_count if graded_count else 0,
+            "per_benchmark": per_bench,
+            "system1_metrics": s1_agg,
             "swe_total": swe_total,
             "swe_patches_generated": swe_patch_count,
             "swe_patch_rate": swe_patch_count / swe_total if swe_total else 0,
@@ -1046,13 +1382,14 @@ def main():
             "results": [{
                 "task_id": r["task_id"],
                 "benchmark": r["benchmark"],
-                "reward": r["benchmark_reward"],
+                "reward": r.get("benchmark_reward"),
                 "patch_generated": r.get("patch_generated"),
                 "resolved": r.get("resolved"),
                 "grading_status": r.get("grading_status"),
-                "duration": r["duration_seconds"],
-                "exit_code": r["exit_code"],
-                "eval_details": r["eval_details"]
+                "duration": r.get("duration_seconds", 0.0),
+                "exit_code": r.get("exit_code", -1),
+                "system1_metrics": r.get("system1_metrics"),
+                "eval_details": r.get("eval_details"),
             } for r in results]
         }, f, indent=2)
     print(f"    Saved batch summary to {summary_file}")

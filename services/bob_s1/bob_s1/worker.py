@@ -3,10 +3,14 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
+import copy
 from concurrent.futures import Future
 from dataclasses import dataclass, field
+import hashlib
+import json
 import queue
 import threading
+import time
 from typing import Any, Callable
 
 from PIL import Image
@@ -123,7 +127,9 @@ def _prepare_prefix_checked(
             code="context_length_exceeded",
         )
 
-    ids, truncated, pv, grid = model.prepare_state(state_text, budget, images=images or None)
+    ids, truncated, pv, grid = model.prepare_state(
+        state_text, budget, images=images or None, raw_text_ids=raw_text_ids
+    )
     return _PreparedPrefix(
         prefix_ids=ids,
         truncated=truncated,
@@ -164,6 +170,12 @@ class InferenceWorker:
         self.cfg = cfg
         self.registry = registry
         self._state_lock = threading.Lock()
+        self._cache_lock = threading.Lock()
+        self._cache: OrderedDict[str, Any] = OrderedDict()
+        self._completed_requests = 0
+        self._cache_hits = 0
+        self._last_latency_ms = 0.0
+        self._last_completed_unix = 0.0
         self._closing = False
         self._pending_admission = 0  # decoding + queued (not yet running on GPU)
         self._queue: queue.Queue[QueuedJob | None] = queue.Queue()
@@ -249,6 +261,10 @@ class InferenceWorker:
 
     def _run_loop(self) -> None:
         while True:
+            started_at = time.perf_counter()
+            result: Any = None
+            error: BaseException | None = None
+            completed = False
             try:
                 job = self._queue.get(timeout=0.1)
             except queue.Empty:
@@ -279,13 +295,79 @@ class InferenceWorker:
                     continue
                 with torch.inference_mode():
                     result = job.fn()
-                if not job.future.done():
-                    job.future.set_result(result)
+                completed = True
             except BaseException as exc:  # noqa: BLE001 - propagate any worker exception to caller future
-                if not job.future.done():
-                    job.future.set_exception(exc)
+                error = exc
             finally:
+                elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+                with self._state_lock:
+                    self._completed_requests += 1
+                    self._last_latency_ms = elapsed_ms
+                    self._last_completed_unix = time.time()
+                if error is not None and not job.future.done():
+                    job.future.set_exception(error)
+                elif completed and not job.future.done():
+                    job.future.set_result(result)
                 self._queue.task_done()
+
+    def telemetry_snapshot(self) -> dict[str, int | float]:
+        with self._state_lock:
+            completed_requests = self._completed_requests
+            last_latency_ms = self._last_latency_ms
+            last_completed_unix = self._last_completed_unix
+            queue_depth = self._pending_admission
+        with self._cache_lock:
+            cache_hits = self._cache_hits
+        return {
+            "completed_requests": completed_requests,
+            "cache_hits": cache_hits,
+            "queue_depth": queue_depth,
+            "last_latency_ms": last_latency_ms,
+            "last_completed_unix": last_completed_unix,
+        }
+
+    @staticmethod
+    def _image_digest(image: Image.Image) -> str:
+        digest = hashlib.sha256()
+        digest.update(image.mode.encode("utf-8"))
+        digest.update(str(image.size).encode("ascii"))
+        digest.update(image.tobytes())
+        return digest.hexdigest()
+
+    def _request_cache_key(self, operation: str, req: Any, payload: Any) -> str:
+        key_payload = {
+            "operation": operation,
+            "model": req.model,
+            "checkpoint_id": self.bundle.checkpoint_id,
+            "checkpoint_sha256": self.bundle.checkpoint_sha256,
+            "effective_max_seq_len": req.effective_max_seq_len,
+            "prefix_mode": getattr(req, "prefix_mode", None),
+            "truncation_policy": req.truncation,
+            "images": [self._image_digest(image) for image in req.images] if hasattr(req, "images") else [],
+            "payload": payload,
+        }
+        encoded = json.dumps(key_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _cache_get(self, key: str) -> Any | None:
+        if self.cfg.max_cache_entries <= 0:
+            return None
+        with self._cache_lock:
+            value = self._cache.get(key)
+            if value is None:
+                return None
+            self._cache.move_to_end(key)
+            self._cache_hits += 1
+            return copy.deepcopy(value)
+
+    def _cache_put(self, key: str, value: Any) -> None:
+        if self.cfg.max_cache_entries <= 0:
+            return
+        with self._cache_lock:
+            self._cache[key] = copy.deepcopy(value)
+            self._cache.move_to_end(key)
+            while len(self._cache) > self.cfg.max_cache_entries:
+                self._cache.popitem(last=False)
 
     async def submit(self, fn: Callable[[], Any]) -> Any:
         lease = self.reserve_slot()
@@ -302,6 +384,15 @@ class InferenceWorker:
             raise
 
     def run_embeddings(self, req: ParsedEmbeddingsRequest) -> dict[str, Any]:
+        cache_key = self._request_cache_key(
+            "embeddings", req,
+            {"items": [{"text": item.text,
+                        "images": [self._image_digest(image) for image in item.images]} for item in req.items],
+             "dimensions": req.dimensions, "encoding_format": req.encoding_format},
+        )
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
         model = self.bundle.model
         model.eval()
 
@@ -337,7 +428,7 @@ class InferenceWorker:
             )
             total_tokens += len(prep.prefix_ids)
 
-        return {
+        result = {
             "object": "list",
             "data": data,
             "model": req.model,
@@ -346,8 +437,24 @@ class InferenceWorker:
                 "total_tokens": total_tokens,
             },
         }
+        self._cache_put(cache_key, result)
+        return result
 
     def run_chat_decisions(self, req: ParsedChatDecisionsRequest) -> tuple[dict[str, Any], int]:
+        cache_key = self._request_cache_key(
+            "chat_decisions", req,
+            {"state": req.state,
+             "decisions": [{"id": dec.id, "task": dec.task, "question": dec.question,
+                            "options": dec.options, "option_ids": dec.option_ids,
+                            "option_values": dec.option_values, "scoring_mode": dec.scoring_mode,
+                            "apply_calibration": dec.apply_calibration,
+                            "require_calibrated": dec.require_calibrated} for dec in req.decisions],
+             "embedding_dimensions": req.embedding_dimensions,
+             "embedding_encoding_format": req.embedding_encoding_format},
+        )
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
         model = self.bundle.model
         model.eval()
 
@@ -495,7 +602,9 @@ class InferenceWorker:
                 "truncated": any_truncated,
             },
         }
-        return body, prompt_tokens
+        result = body, prompt_tokens
+        self._cache_put(cache_key, result)
+        return result
 
     def _score_from_prefix(self, model: Any, prefix: Any, dec: ResolvedDecision) -> tuple[list[float], int]:
         if dec.scoring_mode == "joint":

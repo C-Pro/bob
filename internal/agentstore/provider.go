@@ -18,6 +18,8 @@ import (
 	"bob/internal/scheduler"
 	"bob/internal/tools"
 	"bob/internal/trajectory"
+
+	"github.com/liliang-cn/cortexdb/v2/pkg/cortexdb"
 )
 
 type storeEntry struct {
@@ -329,6 +331,11 @@ func (p *MemoryStoreProvider) GetKnowledgeIndexer(ctx context.Context, chatID st
 	}
 
 	entry.indexer = knowledge.NewIndexer(entry.store, cortexDB)
+	if p.memMgr != nil {
+		entry.indexer.SetVectorSaveFunc(func(saveCtx context.Context, req cortexdb.MemorySaveRequest) error {
+			return p.memMgr.SaveMemoryWithGuard(saveCtx, cortexDB, req)
+		})
+	}
 	return entry.indexer, nil
 }
 
@@ -386,10 +393,19 @@ func (p *MemoryStoreProvider) GetKnowledgeSearcher(ctx context.Context, chatID s
 		maxLimit = 10
 	}
 
-	return knowledge.NewSearcher(kStore, cortexDB, knowledge.SessionIdentity{
+	searcher, err := knowledge.NewSearcher(kStore, cortexDB, knowledge.SessionIdentity{
 		ChatID: chatID,
 		UserID: userID,
 	}, maxLimit)
+	if err != nil {
+		return nil, err
+	}
+	if p.memMgr != nil {
+		searcher.SetVectorSearchPreparer(func(searchCtx context.Context) (context.Context, func() error, bool, error) {
+			return p.memMgr.PrepareVectorSearch(searchCtx, cortexDB)
+		}, p.memMgr.FallbackOnError())
+	}
+	return searcher, nil
 }
 
 func hasActiveRuns(dbPath string) (bool, error) {

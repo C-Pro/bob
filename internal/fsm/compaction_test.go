@@ -831,7 +831,9 @@ func TestCompaction_ProbeBoundsAndOversizedStateRejection(t *testing.T) {
 	}))
 
 	runner := NewToolLoopRunner(llm, nil, "test-model")
-	runner.SetCompactionConfig(DefaultCompactionConfig())
+	fastProbeCfg := DefaultCompactionConfig()
+	fastProbeCfg.IntervalIterations = 1
+	runner.SetCompactionConfig(fastProbeCfg)
 
 	require.NoError(t, runner.maybeCompact(ctx, run, store, "test-model"))
 
@@ -1065,7 +1067,9 @@ func TestCompaction_ProbeErrorEventAndReplayIdempotency(t *testing.T) {
 
 	var deciderCalls int32
 	runner := NewToolLoopRunner(nil, nil, "test-model")
-	runner.SetCompactionConfig(DefaultCompactionConfig())
+	fastProbeCfg := DefaultCompactionConfig()
+	fastProbeCfg.IntervalIterations = 1
+	runner.SetCompactionConfig(fastProbeCfg)
 	runner.SetCompactionDecider(CompactionDeciderFunc(func(ctx context.Context, input CompactionProbeInput) (*CompactionProbeResult, error) {
 		atomic.AddInt32(&deciderCalls, 1)
 		return nil, fmt.Errorf("simulated LLM timeout")

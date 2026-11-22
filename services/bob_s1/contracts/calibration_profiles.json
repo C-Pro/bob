@@ -39,6 +39,7 @@
       "bias": 4.25,
       "balanced_threshold": 0.8964872561924658,
       "balanced_threshold_target": "positive_class_probability",
+      "selective_policy": true,
       "risk_policy": {
         "threshold": 0.8393841862136965,
         "threshold_target": "max_class_probability",

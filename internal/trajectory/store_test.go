@@ -1234,5 +1234,3 @@ func TestTaskStateProvenance_LiteralMarkerInBasePromptRoundTrip(t *testing.T) {
 	assert.Equal(t, []string{"mem_1@1", "mem_2@3"}, mems2)
 	assert.Equal(t, []string{"skill_1@2", "skill_2@1"}, skills2)
 }
-
-

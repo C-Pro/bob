@@ -30,26 +30,28 @@ import (
 
 // Options configures runtime initialization and optional subsystem overrides.
 type Options struct {
-	LLMClient     *llm.Client
-	HTTPClient    *http.Client
-	SessionLocker *agent.SessionLocker
-	EnableSandbox *bool // If set, explicitly overrides cfg.SandboxEnabled
-	Frontends     map[string]agentapi.Frontend
-	Embedder      cortexdb.Embedder // Optional custom embedder (e.g. for testing)
+	LLMClient       *llm.Client
+	SystemOneClient *llm.SystemOneClient
+	HTTPClient      *http.Client
+	SessionLocker   *agent.SessionLocker
+	EnableSandbox   *bool // If set, explicitly overrides cfg.SandboxEnabled
+	Frontends       map[string]agentapi.Frontend
+	Embedder        cortexdb.Embedder // Optional custom embedder (e.g. for testing)
 }
 
 // Runtime contains the shared core agent subsystems instantiated and wired together.
 type Runtime struct {
-	Config         *config.Config
-	HTTPClient     *http.Client
-	LLMClient      *llm.Client
-	MemoryManager  *memory.Manager
-	StoreProvider  *agentstore.MemoryStoreProvider
-	ToolsRegistry  *tools.Registry
-	SandboxManager *sandbox.Manager
-	FSMEngine      *fsm.Engine
-	AgentEngine    *agent.Engine
-	SessionLocker  *agent.SessionLocker
+	Config          *config.Config
+	HTTPClient      *http.Client
+	LLMClient       *llm.Client
+	SystemOneClient *llm.SystemOneClient
+	MemoryManager   *memory.Manager
+	StoreProvider   *agentstore.MemoryStoreProvider
+	ToolsRegistry   *tools.Registry
+	SandboxManager  *sandbox.Manager
+	FSMEngine       *fsm.Engine
+	AgentEngine     *agent.Engine
+	SessionLocker   *agent.SessionLocker
 
 	closeOnce sync.Once
 	closeErr  error
@@ -77,6 +79,15 @@ func New(cfg *config.Config, opts Options) (*Runtime, error) {
 		llmClient = llm.NewClient(cfg, httpClient)
 	}
 
+	systemOneClient := opts.SystemOneClient
+	if systemOneClient == nil && cfg.SystemOneEnabled() {
+		var err error
+		systemOneClient, err = llm.NewSystemOneClient(cfg, opts.HTTPClient)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize system1 client: %w", err)
+		}
+	}
+
 	// Determine embedder
 	embedder := opts.Embedder
 	if embedder == nil {
@@ -88,6 +99,12 @@ func New(cfg *config.Config, opts Options) (*Runtime, error) {
 			if llmClient != nil {
 				embedder = llm.NewEmbedder(llmClient, cfg.EmbeddingModel)
 			}
+		case systemOneClient != nil && cfg.SystemOneEmbeddingsEnabled:
+			sysEmb, err := llm.NewSystemOneEmbedder(systemOneClient, cfg.SystemOneEmbeddingDims, cfg.SystemOneMaxSeqLen, cfg.SystemOneFallbackOnError)
+			if err != nil {
+				return nil, fmt.Errorf("failed to initialize system1 embedder: %w", err)
+			}
+			embedder = sysEmb
 		default:
 			// Default empty string uses lazy local embedder
 			if flag.Lookup("test.v") != nil && os.Getenv("BOB_MODELS_DIR") == "" && !memory.HasLocalModelInDir(cfg.DataDir) {
@@ -99,6 +116,9 @@ func New(cfg *config.Config, opts Options) (*Runtime, error) {
 	}
 
 	memoryManager := memory.NewManager(cfg, embedder)
+	if systemOneClient != nil {
+		memoryManager.SetSystemOneConfig(systemOneClient, cfg.SystemOneEpisodesEnabled, cfg.SystemOneFallbackOnError)
+	}
 	storeProvider := agentstore.NewMemoryStoreProvider(memoryManager, cfg.DataDir)
 	if cfg.KnowledgeMaxDiscoveryLimit > 0 {
 		storeProvider.SetMaxDiscoveryLimit(cfg.KnowledgeMaxDiscoveryLimit)
@@ -175,12 +195,9 @@ func New(cfg *config.Config, opts Options) (*Runtime, error) {
 	var agentEngine *agent.Engine
 
 	if llmClient != nil {
-		fsmEngine = fsm.NewEngine(
-			storeProvider,
-			llmClient,
-			toolsRegistry,
+		fsmOpts := []fsm.EngineOption{
 			fsm.WithDefaultModel(cfg.OpenAIModel),
-			fsm.WithPollInterval(2*time.Second),
+			fsm.WithPollInterval(2 * time.Second),
 			fsm.WithKnowledgeBudgetLimits(tools.KnowledgeBudgetLimits{
 				MaxLoadedMemories:    cfg.KnowledgeMaxLoadedMemories,
 				MaxLoadedMemoryBytes: cfg.KnowledgeMaxLoadedMemoryBytes,
@@ -215,7 +232,19 @@ func New(cfg *config.Config, opts Options) (*Runtime, error) {
 				}
 				return errors.Join(errs...)
 			}),
-		)
+		}
+		if systemOneClient != nil {
+			fsmOpts = append(fsmOpts,
+				fsm.WithSystemOneClient(systemOneClient),
+				fsm.WithSystemOneConfig(fsm.SystemOneControlConfig{
+					CompactionEnabled:        cfg.SystemOneCompactionEnabled,
+					CompactionDeferThreshold: cfg.SystemOneCompactionDeferThreshold,
+					LoopGuardMode:            cfg.SystemOneLoopGuardMode,
+					FallbackOnError:          cfg.SystemOneFallbackOnError,
+				}),
+			)
+		}
+		fsmEngine = fsm.NewEngine(storeProvider, llmClient, toolsRegistry, fsmOpts...)
 
 		var err error
 		agentEngine, err = agent.NewEngine(agent.Dependencies{
@@ -269,16 +298,17 @@ func New(cfg *config.Config, opts Options) (*Runtime, error) {
 	}
 
 	return &Runtime{
-		Config:         cfg,
-		HTTPClient:     httpClient,
-		LLMClient:      llmClient,
-		MemoryManager:  memoryManager,
-		StoreProvider:  storeProvider,
-		ToolsRegistry:  toolsRegistry,
-		SandboxManager: sandboxManager,
-		FSMEngine:      fsmEngine,
-		AgentEngine:    agentEngine,
-		SessionLocker:  sessionLocker,
+		Config:          cfg,
+		HTTPClient:      httpClient,
+		LLMClient:       llmClient,
+		SystemOneClient: systemOneClient,
+		MemoryManager:   memoryManager,
+		StoreProvider:   storeProvider,
+		ToolsRegistry:   toolsRegistry,
+		SandboxManager:  sandboxManager,
+		FSMEngine:       fsmEngine,
+		AgentEngine:     agentEngine,
+		SessionLocker:   sessionLocker,
 	}, nil
 }
 

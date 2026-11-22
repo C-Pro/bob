@@ -219,8 +219,50 @@ def test_utf8_go_probe_budgets_and_truncation(counter):
     assert truncated
     assert len(text.encode()) <= 32768
     assert "...[truncated for probe]" in text
-    assert text.endswith("\n...[truncated]")
+    assert "intermediate candidate steps omitted for probe budget" in text
+    assert "- Iter=100 Tool=execute" in text
+    assert "...[middle truncated for probe]..." in text
     assert "�" not in text
+
+
+def test_section_aware_probe_keeps_recent_steps_tail_candidates_and_valid_previous_json():
+    r = record(count=100)
+    for i, s in enumerate(r["trajectory"]["steps"], 1):
+        s["result_json"] = f"START_{i} " + "x" * 2300 + f" END_ERROR_{i}"
+    previous = {"payload": {"version": 1, "compacted_up_to_iter": 0, "state_json": {
+        "original_objective": "goal", "current_subgoal": "long state text " * 1200,
+        "verified_findings": [{"summary": "finding" * 1500, "source_step_ids": ["secret_step"]}],
+    }}}
+    tail = [{"iteration": 101, "tool_name": "tail_read", "status": "COMPLETED"}]
+    candidates = [{"tool_name": "candidate_tool", "args_json": '{"path":"important.go"}'}]
+    text, meta = b.render_state(r, b.ordered_steps(r), 100, 101, previous=previous,
+                                tail=tail, candidates=candidates, return_metadata=True)
+    assert len(text.encode()) <= b.MAX_BYTES
+    assert meta["truncated"] and meta["essential_evidence_present"]
+    assert meta["omitted_steps"] > 0
+    assert meta["retained_step_range"] == [1, 100]
+    assert "- Iter=1 Tool=execute" in text
+    assert "- Iter=100 Tool=execute" in text
+    assert "END_ERROR_100" in text
+    assert "...[middle truncated for probe]..." in text
+    assert "intermediate candidate steps omitted for probe budget" in text
+    assert "- Iter=101 Tool=tail_read" in text
+    assert "- Tool=candidate_tool Args=" in text
+    previous_json = text.split("Previous Compacted State (v1, up to iter 0):\n", 1)[1].split("\n", 1)[0]
+    parsed = json.loads(previous_json)
+    assert "current_subgoal" in parsed
+    assert "secret_step" not in previous_json
+    assert len(previous_json.encode()) <= 8192
+
+
+def test_middle_clip_preserves_utf8_head_and_error_tail():
+    output = "начало " + "x" * 2200 + " КОНЕЦ: exit status 137"
+    clipped, truncated = b.clip_middle_utf8(output)
+    assert truncated
+    assert clipped.startswith("начало ")
+    assert clipped.endswith("КОНЕЦ: exit status 137")
+    assert "�" not in clipped
+    assert len(clipped.encode()) <= 1024
 
 
 def test_prefix_caps_and_batch_boundaries(counter):
@@ -279,6 +321,19 @@ def test_constructive_nonzero_and_unexecuted_force_synthesis(counter):
     assert row["strike_count"] == 1
     assert row["event_id"] == "force_event"
     assert row["cutoff_step"] == 2
+
+
+def test_interval10_compaction_mining_uses_train_skip_evidence(counter):
+    r = record(count=12)
+    for s in r["trajectory"]["steps"]:
+        s["result_json"] = "small output"
+    rows = b.interval10_compaction_rows(r, counter, [])
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["interval"] == 10 and row["label"] == 0
+    assert row["decision_reason"] == "low_byte_growth_or_utility"
+    assert row["partition"] == r["split"]
+    assert row["renderer_version"] == b.RENDERER_VERSION
 
 
 def test_same_iteration_candidates_do_not_observe_one_another(counter):

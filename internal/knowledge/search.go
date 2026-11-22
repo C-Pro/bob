@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -38,13 +39,19 @@ type SkillSearchResult struct {
 	Score     float64  `json:"score"`
 }
 
+// VectorSearchPreparer prepares a vector search context and post-search validator.
+type VectorSearchPreparer func(ctx context.Context) (searchCtx context.Context, postCheck func() error, lexicalOnly bool, err error)
+
 // Searcher coordinates vector and lexical candidate discovery with strict relational revalidation.
 type Searcher struct {
-	store    *Store
-	vector   VectorDB
-	session  SessionIdentity
-	now      func() time.Time
-	maxLimit int
+	store           *Store
+	vector          VectorDB
+	session         SessionIdentity
+	now             func() time.Time
+	maxLimit        int
+	vectorGuard     func(context.Context) error
+	searchPreparer  VectorSearchPreparer
+	fallbackOnError bool
 }
 
 // NewSearcher creates a new Searcher bound to a session identity.
@@ -64,12 +71,31 @@ func NewSearcher(store *Store, vector VectorDB, session SessionIdentity, maxLimi
 		maxLimit = 10
 	}
 	return &Searcher{
-		store:    store,
-		vector:   vector,
-		session:  session,
-		now:      time.Now,
-		maxLimit: maxLimit,
+		store:           store,
+		vector:          vector,
+		session:         session,
+		now:             time.Now,
+		maxLimit:        maxLimit,
+		fallbackOnError: true,
 	}, nil
+}
+
+// SetVectorSpaceGuard configures an optional vector-space compatibility check invoked before semantic search.
+func (s *Searcher) SetVectorSpaceGuard(guard func(context.Context) error, fallbackOnError bool) {
+	if s == nil {
+		return
+	}
+	s.vectorGuard = guard
+	s.fallbackOnError = fallbackOnError
+}
+
+// SetVectorSearchPreparer configures a pre-search guard and strict post-search error verifier.
+func (s *Searcher) SetVectorSearchPreparer(preparer VectorSearchPreparer, fallbackOnError bool) {
+	if s == nil {
+		return
+	}
+	s.searchPreparer = preparer
+	s.fallbackOnError = fallbackOnError
 }
 
 // SearchMemories searches memories in the dm_memories namespace and validates results against the relational store.
@@ -343,10 +369,48 @@ func (s *Searcher) searchVector(ctx context.Context, query string, namespace str
 		TopK:      topK,
 	}
 
-	resp, err := s.vector.SearchMemory(ctx, req)
+	searchCtx := ctx
+	var postCheck func() error
+	lexicalOnly := false
+
+	if s.searchPreparer != nil {
+		var prepErr error
+		searchCtx, postCheck, lexicalOnly, prepErr = s.searchPreparer(ctx)
+		if prepErr != nil {
+			return nil, prepErr
+		}
+	} else if s.vectorGuard != nil {
+		if compatErr := s.vectorGuard(ctx); compatErr != nil {
+			slog.Warn("vector space mismatch in knowledge DB, gating semantic search", "namespace", namespace, "error", compatErr)
+			if !s.fallbackOnError {
+				return nil, compatErr
+			}
+			lexicalOnly = true
+		}
+	}
+
+	if lexicalOnly {
+		req.RetrievalMode = cortexdb.RetrievalModeLexical
+		lexResp, lexErr := s.vector.SearchMemory(ctx, req)
+		if lexErr != nil {
+			return nil, lexErr
+		}
+		if lexResp != nil {
+			return lexResp.Results, nil
+		}
+		return nil, nil
+	}
+
+	resp, err := s.vector.SearchMemory(searchCtx, req)
+	if err == nil && postCheck != nil {
+		err = postCheck()
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
+		}
+		if !s.fallbackOnError {
+			return nil, err
 		}
 		req.RetrievalMode = cortexdb.RetrievalModeLexical
 		lexResp, lexErr := s.vector.SearchMemory(ctx, req)

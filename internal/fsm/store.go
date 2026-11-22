@@ -600,6 +600,122 @@ func (s *Store) RecordEventTx(ctx context.Context, tx *sql.Tx, event *trajectory
 	return trajectory.RecordEventTx(ctx, tx, event)
 }
 
+// RecordSystemOneDecision appends a System-1 probe decision event with a monotonic attempt
+// number per (run_id, generation, iteration, phase, step_id) so crash-recovery replays never
+// conflict on immutable payload identity. Uses BEGIN IMMEDIATE + busy retries to prevent WAL
+// SQLITE_BUSY_SNAPSHOT upgrade errors under multi-connection concurrency.
+func (s *Store) RecordSystemOneDecision(ctx context.Context, runID string, iteration int, phase, stepID string, payload trajectory.SystemOneDecisionPayload) error {
+	if s == nil || s.db == nil || strings.TrimSpace(runID) == "" {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	ev, err := trajectory.MakeSystemOneDecisionEvent(runID, runID, 1, iteration, phase, stepID, 1, payload)
+	if err != nil {
+		return err
+	}
+
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire sqlite conn for system1_decision: %w", err)
+	}
+	defer func() {
+		_ = conn.Close()
+	}()
+
+	var lastErr error
+	for retry := 0; retry < 5; retry++ {
+		if retry > 0 {
+			timer := time.NewTimer(time.Duration(10*retry*retry) * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+
+		if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+			lastErr = fmt.Errorf("begin immediate system1_decision tx: %w", err)
+			if isSQLiteBusyError(err) {
+				continue
+			}
+			return lastErr
+		}
+
+		txErr := func() error {
+			var maxAttempt int
+			if err := conn.QueryRowContext(ctx, `
+				SELECT COALESCE(MAX(attempt), 0)
+				FROM agent_trajectory_events
+				WHERE run_id = ? AND generation = ? AND iteration = ? AND phase = ? AND step_id = ? AND event_type = ?
+			`, ev.RunID, ev.Generation, ev.Iteration, ev.Phase, ev.StepID, ev.EventType).Scan(&maxAttempt); err != nil {
+				return fmt.Errorf("query next system1_decision attempt: %w", err)
+			}
+			attempt := maxAttempt + 1
+
+			evBytes := ev.Payload
+			if len(evBytes) == 0 {
+				evBytes = json.RawMessage("{}")
+			}
+			createdAt := ev.CreatedAt
+			if createdAt.IsZero() {
+				createdAt = time.Now().UTC()
+			}
+			_, err := conn.ExecContext(ctx, `
+				INSERT INTO agent_trajectory_events (
+					id, trajectory_id, run_id, generation, iteration, phase, step_id, attempt, event_type, payload, created_at
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			`,
+				ev.ID,
+				ev.TrajectoryID,
+				ev.RunID,
+				ev.Generation,
+				ev.Iteration,
+				ev.Phase,
+				ev.StepID,
+				attempt,
+				ev.EventType,
+				[]byte(evBytes),
+				createdAt.UTC().Format(time.RFC3339Nano),
+			)
+			if err != nil {
+				return fmt.Errorf("insert system1_decision event: %w", err)
+			}
+			return nil
+		}()
+		if txErr != nil {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+			lastErr = txErr
+			if isSQLiteBusyError(txErr) {
+				continue
+			}
+			return lastErr
+		}
+
+		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+			lastErr = fmt.Errorf("commit system1_decision tx: %w", err)
+			if isSQLiteBusyError(err) {
+				continue
+			}
+			return lastErr
+		}
+		return nil
+	}
+	return lastErr
+}
+
+func isSQLiteBusyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "busy") || strings.Contains(msg, "locked")
+}
+
 // NormalizeCompactionState validates and normalizes a CompactedTaskState prior to persistence or event creation,
 // returning its canonical JSON serialization whose byte length unconditionally matches c.OutputBytes.
 func NormalizeCompactionState(c *CompactedTaskState) ([]byte, error) {
@@ -642,9 +758,21 @@ func NormalizeCompactionState(c *CompactedTaskState) ([]byte, error) {
 	return stateBytes, nil
 }
 
+// CompactionEventMeta carries optional System-1 control-plane timing and routing fields for compaction telemetry.
+type CompactionEventMeta struct {
+	DecisionSource      string
+	SystemOneLatencyMs  int64
+	SummarizerLatencyMs int64
+}
+
 // MakeSnapshotCompactionEvent normalizes a CompactedTaskState and builds a matching trajectory compaction event.
 // execIteration is the FSM iteration at which compaction ran (must be >= c.CompactedUpToIter when > 0; defaults to c.CompactedUpToIter when <= 0).
 func MakeSnapshotCompactionEvent(c *CompactedTaskState, trajID string, gen, execIteration int, reason string) (*trajectory.Event, error) {
+	return MakeSnapshotCompactionEventWithMeta(c, trajID, gen, execIteration, reason, CompactionEventMeta{})
+}
+
+// MakeSnapshotCompactionEventWithMeta normalizes a CompactedTaskState and builds a matching trajectory compaction event with metadata.
+func MakeSnapshotCompactionEventWithMeta(c *CompactedTaskState, trajID string, gen, execIteration int, reason string, meta CompactionEventMeta) (*trajectory.Event, error) {
 	stateBytes, err := NormalizeCompactionState(c)
 	if err != nil {
 		return nil, err
@@ -659,16 +787,19 @@ func MakeSnapshotCompactionEvent(c *CompactedTaskState, trajID string, gen, exec
 		trajID = c.RunID
 	}
 	return trajectory.MakeCompactionEvent(trajID, c.RunID, gen, execIteration, "", trajectory.CompactionEventPayload{
-		Version:           c.Version,
-		ParentVersion:     c.ParentVersion,
-		CompactedUpToIter: c.CompactedUpToIter,
-		ShouldCompact:     true,
-		RubricVerdict:     c.RubricVerdict,
-		Reason:            reason,
-		Model:             c.Model,
-		InputBytes:        c.InputBytes,
-		OutputBytes:       c.OutputBytes,
-		StateJSON:         json.RawMessage(stateBytes),
+		Version:             c.Version,
+		ParentVersion:       c.ParentVersion,
+		CompactedUpToIter:   c.CompactedUpToIter,
+		ShouldCompact:       true,
+		RubricVerdict:       c.RubricVerdict,
+		Reason:              reason,
+		Model:               c.Model,
+		InputBytes:          c.InputBytes,
+		OutputBytes:         c.OutputBytes,
+		StateJSON:           json.RawMessage(stateBytes),
+		DecisionSource:      meta.DecisionSource,
+		SystemOneLatencyMs:  meta.SystemOneLatencyMs,
+		SummarizerLatencyMs: meta.SummarizerLatencyMs,
 	})
 }
 
@@ -895,6 +1026,20 @@ func (s *Store) HasCompactionEventForIteration(ctx context.Context, runID string
 		return false, fmt.Errorf("failed to query compaction events for run %s iter %d: %w", runID, iteration, err)
 	}
 	return count > 0, nil
+}
+
+// GetLastCompactionProbeIteration returns the latest recorded probe or backstop iteration for a run.
+func (s *Store) GetLastCompactionProbeIteration(ctx context.Context, runID string) (int, error) {
+	var iteration int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COALESCE(MAX(iteration), 0)
+		FROM agent_trajectory_events
+		WHERE run_id = ? AND event_type = 'compaction'
+	`, runID).Scan(&iteration)
+	if err != nil {
+		return 0, fmt.Errorf("failed to query last compaction probe for run %s: %w", runID, err)
+	}
+	return iteration, nil
 }
 
 // ListTaskHistorySteps implements tools.TaskHistoryStore by verifying that runID belongs to

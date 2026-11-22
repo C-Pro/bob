@@ -22,6 +22,10 @@ import re
 import unicodedata
 
 from PIL import Image, ImageDraw, ImageFont
+try:
+    from eval.harness import train_provenance
+except ModuleNotFoundError:
+    import train_provenance
 
 ROOT = Path(__file__).resolve().parents[2]
 MODEL = "Qwen/Qwen3.5-0.8B-Base"
@@ -101,14 +105,14 @@ def _wrap_lines(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> l
     return lines
 
 
-def load_existing_assignments(output_dir: Path) -> tuple[dict[str, str], dict[str, str], dict[str, list[dict]]]:
+def load_existing_assignments(output_dir: Path, splits=SPLITS, certificate=None) -> tuple[dict[str, str], dict[str, str], dict[str, list[dict]]]:
     """Load authoritative existing task_group->split assignments and v1 loop_guard rows."""
     group_splits: dict[str, str] = {}
     file_hashes: dict[str, str] = {}
-    original_loop_rows: dict[str, list[dict]] = {s: [] for s in SPLITS}
+    original_loop_rows: dict[str, list[dict]] = {s: [] for s in splits}
 
     for family in V1_FAMILIES:
-        for split in SPLITS:
+        for split in splits:
             path = output_dir / f"{family}_{split}.jsonl"
             if not path.exists():
                 continue
@@ -121,6 +125,16 @@ def load_existing_assignments(output_dir: Path) -> tuple[dict[str, str], dict[st
                     row = json.loads(line)
                     if row.get("schema_version") == SCHEMA_VERSION:
                         continue
+                    if certificate is not None:
+                        task_id = row.get("source_task_id", row.get("task_id"))
+                        entry = train_provenance.certify_task(task_id, certificate)
+                        if row.get("task_group") != entry["group_id"] or split != entry["partition"]:
+                            raise ValueError(f"Certified lineage mismatch for {task_id}")
+                        negative_id = row.get("hard_negative_task_id")
+                        if negative_id is not None:
+                            negative = train_provenance.certify_task(negative_id, certificate)
+                            if row.get("hard_negative_task_group") != negative["group_id"] or split != negative["partition"]:
+                                raise ValueError(f"Certified negative lineage mismatch for {negative_id}")
                     row_split = row["split"]
                     if row_split != split:
                         raise ValueError(f"Split mismatch in {path.name}: row split {row_split} != {split}")
@@ -155,6 +169,7 @@ def assign_split_groups(
     rows: list[dict],
     existing_group_splits: dict[str, str],
     seed: int = 42,
+    certified: bool = False,
 ) -> dict[str, str]:
     """Deterministically assign split_groups across train/cal/dev (~70/15/15) stratified by stratum."""
     by_sg: dict[str, list[dict]] = defaultdict(list)
@@ -174,6 +189,9 @@ def assign_split_groups(
             raise ValueError(f"split_group {sg} touches conflicting existing splits: {sorted(inherited)}")
         if inherited:
             sg_split[sg] = next(iter(inherited))
+        elif certified:
+            bucket = int(sha256_text(sg)[:16], 16) % 100
+            sg_split[sg] = train_provenance.PARTITIONS[0 if bucket < 70 else 1 if bucket < 80 else 2 if bucket < 90 else 3]
         else:
             row_types = sorted({r["row_type"] for r in members})
             subfamilies = sorted({r["subfamily"] for r in members})
@@ -1693,18 +1711,87 @@ def build_multimodal_datasets(
     return mm_decisions, mm_emb_pairs
 
 
+def mine_train_control_rows(rollout_dir: Path, certificate: dict, counter: TokenCounter) -> list[dict]:
+    """Adapt certified train rollout decisions into extension rows with preserved lineage."""
+    from eval.harness import build_jev_dataset as source_builder
+
+    rows = []
+    for path in sorted(Path(rollout_dir).glob("*.json")):
+        if path.name == "summary.json":
+            continue
+        raw = path.read_bytes()
+        record = json.loads(raw)
+        entry = train_provenance.certify_task(record.get("task_id", ""), certificate, record)
+        record.update(task_group=entry["group_id"], partition=entry["partition"], split=entry["partition"],
+                      source_sha256=sha256_bytes(raw))
+        excluded: list[dict] = []
+        compact_rows = source_builder.compaction_rows(record, counter, excluded)
+        loop_rows = source_builder.loop_rows(record, counter)
+        for source_row in compact_rows + loop_rows:
+            label = source_row["label"]
+            if source_row["row_type"] == "compaction":
+                subfamily = "interval10_compaction" if source_row.get("interval") == 10 else "recorded_compaction"
+                label = "compact" if label else "skip"
+            else:
+                subfamily = "train_loop_guard"
+                label = label if label in {"none", "intercept", "force_synthesis"} else "none"
+            if source_row["row_type"] == "loop_guard":
+                if label == "none" and source_row.get("productive_progress"):
+                    contrast = "productive_progression"
+                elif label in {"intercept", "force_synthesis"}:
+                    contrast = "semantic_stall"
+                else:
+                    contrast = "uncertain"
+            else:
+                contrast = ""
+            task_id = source_row["source_task_id"]
+            task_entry = certificate["assignments"][task_id]
+            row = {
+                "schema_version": SCHEMA_VERSION,
+                "row_type": source_row["row_type"], "task_id": task_id,
+                "source_task_id": task_id, "task_group": task_entry["group_id"],
+                "group_id": task_entry["group_id"], "partition": task_entry["partition"],
+                "split": task_entry["partition"], "split_group": task_entry["group_id"],
+                "event_id": source_row["event_id"], "benchmark": record["benchmark"],
+                "subfamily": subfamily, "language": "en", "template_id": source_row["label_source"],
+                "state_text": source_row["state_text"], "label": label,
+                "label_source": source_row["label_source"], "label_policy": source_row["label_policy"],
+                "label_quality": source_row["label_quality"], "renderer_version": source_row["renderer_version"],
+                "rollout_sha256": source_row["rollout_sha256"], "source_sha256": source_row["rollout_sha256"],
+                "token_count": source_row["token_count"], "rendered_bytes": source_row["rendered_bytes"],
+                "truncated": source_row["truncated"], "contrastive_class": contrast,
+                "interval": source_row.get("interval"), "decision_reason": source_row.get("decision_reason"),
+            }
+            if row["row_type"] == "loop_guard":
+                row.update(raw_detect_loop_action=source_row.get("raw_detect_loop_action"),
+                           productive_progress=source_row.get("productive_progress"),
+                           candidates=source_row.get("candidates", []))
+            rows.append(row)
+    return rows
+
+
 def build_extension_dataset(
     output_dir: Path,
-    heldout_path: Path,
+    heldout_path: Path | None,
     counter: TokenCounter,
     seed: int = 42,
+    *,
+    train_manifest_path: Path | None = None,
+    certificate_path: Path | None = None,
+    train_rollout_dir: Path | None = None,
 ) -> dict:
+    certified = train_manifest_path is not None or certificate_path is not None or heldout_path is None
+    certificate = (train_provenance.load_certificate(
+        certificate_path=certificate_path,
+        train_manifest_path=train_manifest_path or (ROOT / "eval/tasks/train/train_pool.json" if heldout_path is None and certificate_path is None else None),
+    ) if certified else None)
+    splits = train_provenance.PARTITIONS if certified else SPLITS
     output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
     assets_dir = output_dir / "multimodal_assets"
 
-    existing_group_splits, v1_hashes, original_loop_rows = load_existing_assignments(output_dir)
-    heldout_forbidden = load_heldout_identities(heldout_path)
+    existing_group_splits, v1_hashes, original_loop_rows = load_existing_assignments(output_dir, splits, certificate)
+    heldout_forbidden = load_heldout_identities(heldout_path) if not certified else set()
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     gen_rows = build_generic_decisions(counter, seed=seed)
     loop_syn_rows = build_synthetic_loop_guard(counter, seed=seed + 1)
@@ -1712,6 +1799,13 @@ def build_extension_dataset(
     mm_dec_rows, mm_emb_rows = build_multimodal_datasets(assets_dir, counter, seed=seed + 3)
 
     all_new_rows = gen_rows + loop_syn_rows + bi_rows + mm_dec_rows + mm_emb_rows
+    train_control_rows = mine_train_control_rows(train_rollout_dir, certificate, counter) if certified and train_rollout_dir is not None else []
+    all_new_rows.extend(train_control_rows)
+    for row in train_control_rows:
+        prior = existing_group_splits.get(row["task_group"])
+        if prior is not None and prior != row["partition"]:
+            raise ValueError(f"certified group {row['task_group']} conflicts with existing partition {prior}")
+        existing_group_splits[row["task_group"]] = row["partition"]
 
     # Held-out collision check on substantive normalized state/anchor text + task_id
     for row in all_new_rows:
@@ -1723,14 +1817,30 @@ def build_extension_dataset(
         if norm_body in heldout_forbidden:
             raise ValueError(f"Held-out instruction collision in {row['event_id']}")
 
-    sg_assignments = assign_split_groups(all_new_rows, existing_group_splits, seed=seed)
+    sg_assignments = assign_split_groups(all_new_rows, existing_group_splits, seed=seed, certified=certified)
+    train_control_row_ids = {id(row) for row in train_control_rows}
+    for row in all_new_rows:
+        if id(row) in train_control_row_ids:
+            if row["split"] != row["partition"]:
+                raise AssertionError(f"certified row {row['event_id']} moved across partitions")
+            continue
+        row.update(source_task_id=None, group_id=row["task_group"], partition=row["split"],
+                   rollout_sha256=None, label_policy=f"synthetic:{row['template_id']}")
+    for split in splits:
+        for row in original_loop_rows[split]:
+            row.setdefault("source_task_id", row.get("task_id"))
+            row.setdefault("group_id", row["task_group"])
+            row.setdefault("partition", row["split"])
+            row.setdefault("rollout_sha256", row.get("source_sha256"))
+            row.setdefault("renderer_version", "go-probe-sanitized-v1")
+            row.setdefault("label_policy", f"jev-v1:{row.get('label_source', 'unknown')}")
 
     # Verify zero split_group overlap across train / cal / dev
     sgs_by_split: dict[str, set[str]] = defaultdict(set)
     for row in all_new_rows:
         sgs_by_split[row["split"]].add(row["split_group"])
-    for a in SPLITS:
-        for b in SPLITS:
+    for a in splits:
+        for b in splits:
             if a < b and (sgs_by_split[a] & sgs_by_split[b]):
                 raise AssertionError(f"split_group overlap between {a} and {b}")
 
@@ -1746,9 +1856,10 @@ def build_extension_dataset(
         "emb_pairs_bilingual": bi_rows,
         "multimodal_emb_pairs": mm_emb_rows,
         "multimodal_decisions": mm_dec_rows,
+        "train_control_mining": train_control_rows,
     }
     for family, fam_rows in family_map.items():
-        for split in SPLITS:
+        for split in splits:
             path = output_dir / f"{family}_{split}.jsonl"
             with path.open("w") as handle:
                 for row in fam_rows:
@@ -1758,7 +1869,7 @@ def build_extension_dataset(
 
     # Write loop_guard_{train,cal,dev}.jsonl idempotently: all v1 rows + synthetic v2 rows
     loop_all_by_split: dict[str, list[dict]] = {}
-    for split in SPLITS:
+    for split in splits:
         path = output_dir / f"loop_guard_{split}.jsonl"
         combined = list(original_loop_rows[split]) + [r for r in loop_syn_rows if r["split"] == split]
         loop_all_by_split[split] = combined
@@ -1775,19 +1886,21 @@ def build_extension_dataset(
         "split_group_count": len(sg_assignments),
         "split_group_overlap_count": 0,
         "heldout_overlap_count": 0,
+        "train_certificate_sha256": certificate["certificate_sha256"] if certificate else None,
         "families": {},
     }
     for name, fam_rows in (
         ("generic_decisions", gen_rows),
         ("loop_guard_synthetic", loop_syn_rows),
-        ("loop_guard_combined", [r for s in SPLITS for r in loop_all_by_split[s]]),
+        ("loop_guard_combined", [r for s in splits for r in loop_all_by_split[s]]),
         ("emb_pairs_bilingual", bi_rows),
         ("multimodal_emb_pairs", mm_emb_rows),
         ("multimodal_decisions", mm_dec_rows),
+        ("train_control_mining", train_control_rows),
     ):
         stats["families"][name] = {
             "rows": len(fam_rows),
-            "splits": {s: sum(1 for r in fam_rows if r["split"] == s) for s in SPLITS},
+            "splits": {s: sum(1 for r in fam_rows if r["split"] == s) for s in splits},
             "labels": dict(sorted(Counter(str(r.get("label", "pair")) for r in fam_rows).items())),
             "subfamilies": dict(sorted(Counter(r["subfamily"] for r in fam_rows if "subfamily" in r).items())),
             "languages": dict(sorted(Counter(r.get("language", "en") for r in fam_rows).items())),
@@ -1802,6 +1915,7 @@ def build_extension_dataset(
         "generated_loop_event_ids": sorted(r["event_id"] for r in loop_syn_rows),
         "split_group_assignments": sg_assignments,
         "multimodal_asset_count": len(list(assets_dir.glob("*.png"))) if assets_dir.exists() else 0,
+        "train_certificate_sha256": certificate["certificate_sha256"] if certificate else None,
     }
     (output_dir / "extension_stats.json").write_text(json.dumps(stats, indent=2, sort_keys=True) + "\n")
     (output_dir / "extension_manifest_v2.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
@@ -1811,13 +1925,21 @@ def build_extension_dataset(
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output-dir", type=Path, default=ROOT / "eval/results/jev_dataset")
-    p.add_argument("--heldout", type=Path, default=ROOT / "eval/tasks/heldout/heldout_100.json")
+    p.add_argument("--heldout", type=Path, help="Legacy held-out audit mode only")
+    p.add_argument("--train-manifest", type=Path)
+    p.add_argument("--train-certificate", type=Path)
+    p.add_argument("--train-rollout-dir", type=Path)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--char-fallback", action="store_true")
     p.add_argument("--tokenizer-cache", type=Path, default=None)
     args = p.parse_args()
+    if args.heldout and (args.train_manifest or args.train_certificate):
+        p.error("--heldout cannot be combined with certified train inputs")
     counter = TokenCounter(args.char_fallback, args.tokenizer_cache)
-    stats = build_extension_dataset(args.output_dir, args.heldout, counter, seed=args.seed)
+    stats = build_extension_dataset(args.output_dir, args.heldout, counter, seed=args.seed,
+                                    train_manifest_path=args.train_manifest,
+                                    certificate_path=args.train_certificate,
+                                    train_rollout_dir=args.train_rollout_dir)
     print(json.dumps(stats, indent=2, sort_keys=True))
 
 

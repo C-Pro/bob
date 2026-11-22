@@ -36,6 +36,12 @@ Bob includes a partitioned benchmarking and trajectory generation dataset infras
 - When implementing a new feature or fixing a bug, always write thorough unit and integration tests (`go test -race ./...`).
 - When adding or changing dependencies, always run `go mod tidy` and `go mod vendor` to keep the vendor directory up to date.
 - Validate configuration changes against `internal/config`.
+- **Self-contained documentation with mnemonics:** Whenever referencing numbered items in docs, specs, backlogs, or reports (e.g., phases, steps, gaps, findings, backlog IDs), always include a descriptive mnemonic inline (for example, `Hardening Phase 0 (train-only provenance)`, `Roadmap Phase 4 (local bob-s1 decision model)`, `Gap #1 (Stage-2 short step aliases)`) AND ensure every referenced item either has its definition in the same file or a concrete, non-stale link to where it is defined.
+
+## Backlog & Roadmap
+
+- Project phases live in `ROADMAP.md`, active/completed implementation specs live in `conductor/`, and concrete queued tasks/sidequests live in [`BACKLOG.md`](BACKLOG.md).
+- **Capture sidequests instead of detouring:** When you notice an out-of-scope bug, performance opportunity, cleanup task, or follow-up improvement during work, suggest adding (or log) it as a sidequest item in `BACKLOG.md` rather than derailing the active task or leaving it undocumented.
 
 ## Default operation mode
 - Implement changes in separate steps, try to keep steps small while keeping the tests green. Skipping tests for the sake of keeping build green is not a good option. Prefer finish the step with failing test and mentioning this to the user if e.g. fixing everything in one step will make the step/commit too big.

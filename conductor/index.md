@@ -85,3 +85,8 @@
 
 - [x] **Track: Temporary `bob-s1` Python Inference Sidecar (OpenAI-Compatible)**
 *Link: [./tracks/bob-s1-inference-sidecar_20261118/](./tracks/bob-s1-inference-sidecar_20261118/) (Multimodal `/v1/embeddings`, `bob-s1.decision.v1` over `/v1/chat/completions`, single-pass joint output, elastic `max_seq_len`)*
+
+---
+
+- [ ] **Track: Bob Go Integration for `bob-s1` System-1 Inference Sidecar**
+*Link: [./tracks/bob-s1-go-integration_20261119/](./tracks/bob-s1-go-integration_20261119/) (Go config, `SystemOneClient`, multimodal embeddings, 3-way compaction gate, hybrid loop guard, bilingual episodes, and held-out eval)*

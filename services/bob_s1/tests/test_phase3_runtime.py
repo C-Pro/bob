@@ -18,7 +18,13 @@ from bob_s1.calibration import CalibrationRegistry
 from bob_s1.config import SidecarConfig
 from bob_s1.images import ImageValidationError, decode_data_uri_images_batch
 from bob_s1.loader import LoadedModelBundle, import_jev_model_module, verify_model_runtime
-from bob_s1.schemas import APIError
+from bob_s1.schemas import (
+    APIError,
+    ParsedChatDecisionsRequest,
+    ParsedEmbeddingItem,
+    ParsedEmbeddingsRequest,
+    ResolvedDecision,
+)
 from bob_s1.worker import InferenceWorker
 
 
@@ -139,6 +145,100 @@ def test_malformed_inputs_and_auth_return_400_401_never_500():
                 json={"model": "bob-s1-0.8b", "input": "hi", "encoding_format": bad_enc},
             )
             assert r_enc.status_code == 400
+
+
+def test_worker_tokenizes_prefix_once_and_caches_embeddings_with_isolation(monkeypatch):
+    bundle, reg = _make_bundle()
+    cfg = SidecarConfig.from_env({"BOB_S1_MAX_CACHE_ENTRIES": "2"})
+    worker = InferenceWorker(bundle, cfg, reg)
+    try:
+        model = bundle.model
+        original_text_ids = model._text_ids
+        tokenizations = 0
+
+        def counting_text_ids(text):
+            nonlocal tokenizations
+            tokenizations += 1
+            return original_text_ids(text)
+
+        monkeypatch.setattr(model, "_text_ids", counting_text_ids)
+
+        def request(text: str, dimensions: int = 128):
+            return ParsedEmbeddingsRequest(
+                model=bundle.model_id,
+                items=[ParsedEmbeddingItem(text=text, images=[])],
+                dimensions=dimensions,
+                encoding_format="float",
+                truncation="head_tail",
+                effective_max_seq_len=4096,
+            )
+
+        first = worker.run_embeddings(request("same probe"))
+        expected = first["data"][0]["embedding"][0]
+        first["data"][0]["embedding"][0] = 999.0
+        second = worker.run_embeddings(request("same probe"))
+        assert second["data"][0]["embedding"][0] == expected
+        assert tokenizations == 1
+        assert worker.telemetry_snapshot()["cache_hits"] == 1
+
+        worker.run_embeddings(request("same probe", dimensions=256))
+        worker.run_embeddings(request("different probe"))
+        assert tokenizations == 3
+        assert len(worker._cache) == 2
+
+        def chat_request(question: str):
+            decision = ResolvedDecision(
+                id="branch", task=None, question=question,
+                options=[("yes", "yes"), ("no", "no")],
+                option_ids=["yes", "no"], option_values=None,
+                scoring_mode="joint", apply_calibration=False, require_calibrated=False,
+            )
+            return ParsedChatDecisionsRequest(
+                model=bundle.model_id, state="decision state", images=[], decisions=[decision],
+                embedding_dimensions=None, embedding_encoding_format=None,
+                prefix_mode="per_question", truncation="head_tail", effective_max_seq_len=4096,
+            )
+
+        chat_first = worker.run_chat_decisions(chat_request("first question"))
+        before_repeat = tokenizations
+        chat_second = worker.run_chat_decisions(chat_request("first question"))
+        assert chat_second == chat_first
+        assert tokenizations == before_repeat
+        worker.run_chat_decisions(chat_request("different question"))
+        assert tokenizations > before_repeat
+        assert worker.telemetry_snapshot()["cache_hits"] == 2
+        assert len(worker._cache) == 2
+    finally:
+        worker.close()
+
+
+def test_healthz_includes_worker_telemetry():
+    bundle, reg = _make_bundle()
+    cfg = SidecarConfig.from_env({})
+
+    async def exercise():
+        import httpx
+
+        app = create_app(cfg, bundle=bundle, registry=reg)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                before = (await client.get("/healthz")).json()
+                response = await client.post(
+                    "/v1/embeddings", json={"model": bundle.model_id, "input": "health probe"}
+                )
+                assert response.status_code == 200
+                after = (await client.get("/healthz")).json()
+                assert after["status"] == before["status"] == "ok"
+                assert after["model_id"] == before["model_id"]
+                assert after["completed_requests"] == 1
+                assert after["cache_hits"] == 0
+                assert after["queue_depth"] == 0
+                assert after["last_latency_ms"] >= 0
+                assert after["last_completed_unix"] > 0
+
+    asyncio.run(exercise())
 
 
 def test_strict_schema_rejects_coercion_and_explicit_nulls():

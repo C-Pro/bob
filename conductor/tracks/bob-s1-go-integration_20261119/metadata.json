@@ -1,0 +1,8 @@
+{
+  "track_id": "bob-s1-go-integration_20261119",
+  "type": "feature",
+  "status": "in_progress",
+  "created_at": "2026-11-19T07:38:00Z",
+  "updated_at": "2026-11-19T11:40:00Z",
+  "description": "Integrate Bob's Go runtime (config, llm, fsm, trajectory, memory, gateway, eval harness) with the externally hosted bob-s1 OpenAI-compatible System-1 inference server."
+}
