@@ -4,9 +4,52 @@ package models
 type MessageType string
 
 const (
-	MessageTypeText     MessageType = "text"
-	MessageTypeProgress MessageType = "progress"
+	MessageTypeText       MessageType = "text"
+	MessageTypeProgress   MessageType = "progress"
+	MessageTypeUIResponse MessageType = "ui_response"
 )
+
+// UIElementType defines the kind of interactive UI control in a bot message.
+type UIElementType string
+
+const (
+	UIElementTypeButton   UIElementType = "button"
+	UIElementTypeCheckbox UIElementType = "checkbox"
+	UIElementTypeRadio    UIElementType = "radio"
+)
+
+// UIElementStyle defines the visual button style in a Besedka interactive UI prompt.
+type UIElementStyle string
+
+const (
+	UIElementStyleDefault UIElementStyle = "default"
+	UIElementStylePrimary UIElementStyle = "primary"
+	UIElementStyleDanger  UIElementStyle = "danger"
+)
+
+// UIElement describes a single interactive button, checkbox, or radio control.
+type UIElement struct {
+	ID          string         `json:"id"`
+	Type        UIElementType  `json:"type"`
+	Label       string         `json:"label"`
+	Description string         `json:"description,omitempty"`
+	Style       UIElementStyle `json:"style,omitempty"`
+	Default     bool           `json:"default,omitempty"`
+}
+
+// UIData represents interactive UI elements attached to a bot message and its answer state.
+type UIData struct {
+	Elements    []UIElement `json:"elements"`
+	Answered    bool        `json:"answered,omitempty"`
+	SelectedIDs []string    `json:"selectedIds,omitempty"`
+	ResponderID string      `json:"responderId,omitempty"`
+}
+
+// UIResponseData represents a human user's submission against an interactive UI message.
+type UIResponseData struct {
+	ParentSeq   int64    `json:"parentSeq"`
+	SelectedIDs []string `json:"selectedIds"`
+}
 
 // ProgressStatus represents the execution status of a progress card or individual step.
 type ProgressStatus string
@@ -36,15 +79,17 @@ type ProgressData struct {
 
 // Message represents a chat message.
 type Message struct {
-	Seq         int64         `json:"seq"`
-	Timestamp   int64         `json:"timestamp"` // Unix timestamp (seconds)
-	ChatID      string        `json:"chatId"`
-	UserID      string        `json:"userId"`
-	Content     string        `json:"content"`
-	RawContent  string        `json:"rawContent,omitempty"`
-	Attachments []Attachment  `json:"attachments,omitempty"`
-	Type        MessageType   `json:"type,omitempty"`
-	Progress    *ProgressData `json:"progress,omitempty"`
+	Seq         int64           `json:"seq"`
+	Timestamp   int64           `json:"timestamp"` // Unix timestamp (seconds)
+	ChatID      string          `json:"chatId"`
+	UserID      string          `json:"userId"`
+	Content     string          `json:"content"`
+	RawContent  string          `json:"rawContent,omitempty"`
+	Attachments []Attachment    `json:"attachments,omitempty"`
+	Type        MessageType     `json:"type,omitempty"`
+	Progress    *ProgressData   `json:"progress,omitempty"`
+	UI          *UIData         `json:"ui,omitempty"`
+	UIResponse  *UIResponseData `json:"uiResponse,omitempty"`
 }
 
 // Location represents geographical coordinates.
@@ -62,6 +107,8 @@ type ClientMessage struct {
 	Location    *Location         `json:"location,omitempty"`
 	MessageType MessageType       `json:"messageType,omitempty"`
 	Progress    *ProgressData     `json:"progress,omitempty"`
+	UI          *UIData           `json:"ui,omitempty"`
+	UIResponse  *UIResponseData   `json:"uiResponse,omitempty"`
 }
 
 // ServerMessage represents an incoming event frame from the Besedka server.

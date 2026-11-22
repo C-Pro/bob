@@ -53,30 +53,87 @@ func (rb *RingBuffer) SetOnEvict(hook EvictionHook) {
 	rb.onEvict = hook
 }
 
+func (rb *RingBuffer) pushLocked(entry Entry) ([]Entry, EvictionHook) {
+	rb.entries = append(rb.entries, entry)
+	if len(rb.entries) <= rb.capacity {
+		return nil, nil
+	}
+	evictCount := rb.capacity / 3
+	if evictCount < 1 {
+		evictCount = 1
+	}
+	evicted := make([]Entry, evictCount)
+	copy(evicted, rb.entries[:evictCount])
+	rb.entries = rb.entries[evictCount:]
+	return evicted, rb.onEvict
+}
+
+func normalizeSpaces(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
 // Push adds an entry to the ring buffer. When capacity is exceeded, it evicts
 // a chunk of the oldest messages (1/3 of capacity) at once to keep the conversation
 // prefix stable and maximize LLM prefix caching.
 func (rb *RingBuffer) Push(entry Entry) {
-	var evicted []Entry
-	var hook EvictionHook
-
 	rb.mu.Lock()
-	rb.entries = append(rb.entries, entry)
-	if len(rb.entries) > rb.capacity {
-		evictCount := rb.capacity / 3
-		if evictCount < 1 {
-			evictCount = 1
-		}
-		evicted = make([]Entry, evictCount)
-		copy(evicted, rb.entries[:evictCount])
-		rb.entries = rb.entries[evictCount:]
-		hook = rb.onEvict
-	}
+	evicted, hook := rb.pushLocked(entry)
 	rb.mu.Unlock()
 
 	if hook != nil && len(evicted) > 0 {
 		hook(evicted)
 	}
+}
+
+// ReconcileAssistantEcho atomically reconciles an incoming assistant self-echo against existing
+// ring buffer entries:
+//  1. If entry.Seq > 0 matches an existing assistant entry, it is ignored as an exact duplicate.
+//  2. Otherwise, if a pending assistant entry (Seq == 0) has matching normalized content, its Seq
+//     is updated to entry.Seq (when > 0) without appending a duplicate.
+//  3. Otherwise, entry is appended to the ring buffer (evicting oldest entries if over capacity).
+//
+// Returns true if a new entry was appended, false if it matched or reconciled an existing entry.
+func (rb *RingBuffer) ReconcileAssistantEcho(entry Entry) bool {
+	rb.mu.Lock()
+
+	if entry.Seq > 0 {
+		for i := len(rb.entries) - 1; i >= 0; i-- {
+			e := rb.entries[i]
+			if e.Role == "assistant" && e.Seq == entry.Seq {
+				rb.mu.Unlock()
+				return false
+			}
+		}
+	}
+
+	normIncoming := normalizeSpaces(entry.Content)
+	for i := 0; i < len(rb.entries); i++ {
+		e := &rb.entries[i]
+		if e.Role != "assistant" || e.Seq != 0 {
+			continue
+		}
+		if e.SenderID != "" && entry.SenderID != "" && e.SenderID != entry.SenderID {
+			continue
+		}
+		if normalizeSpaces(e.Content) == normIncoming {
+			if entry.Seq > 0 {
+				e.Seq = entry.Seq
+				if e.Timestamp == 0 && entry.Timestamp > 0 {
+					e.Timestamp = entry.Timestamp
+				}
+			}
+			rb.mu.Unlock()
+			return false
+		}
+	}
+
+	evicted, hook := rb.pushLocked(entry)
+	rb.mu.Unlock()
+
+	if hook != nil && len(evicted) > 0 {
+		hook(evicted)
+	}
+	return true
 }
 
 // Entries returns a copy of all entries in chronological order (oldest first).

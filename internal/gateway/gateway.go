@@ -756,10 +756,6 @@ func StripHTML(input string) string {
 	return strings.TrimSpace(text)
 }
 
-func normalizeForDedup(s string) string {
-	return strings.Join(strings.Fields(s), " ")
-}
-
 var textExtensions = map[string]bool{
 	".txt":  true,
 	".md":   true,
@@ -957,11 +953,29 @@ func (g *Gateway) SendMessage(chatID, content string) error {
 
 // SendMessageWithAttachments sends a response message with optional attachments back to Besedka.
 func (g *Gateway) SendMessageWithAttachments(chatID, content string, attachments []models.Attachment) error {
-	g.mu.Lock()
-	conn := g.conn
-	g.mu.Unlock()
+	return g.SendMessageWithAttachmentsAndUI(chatID, content, attachments, nil)
+}
 
-	if conn == nil {
+// SendMessageWithUI sends a response message with interactive UI elements back to Besedka.
+func (g *Gateway) SendMessageWithUI(chatID, content string, ui *models.UIData) error {
+	return g.SendMessageWithAttachmentsAndUI(chatID, content, nil, ui)
+}
+
+// SendMessageWithAttachmentsAndUI sends a response message with optional attachments and interactive UI elements back to Besedka.
+func (g *Gateway) SendMessageWithAttachmentsAndUI(chatID, content string, attachments []models.Attachment, ui *models.UIData) error {
+	var sanitizedUI *models.UIData
+	if ui != nil {
+		var err error
+		sanitizedUI, err = models.SanitizeUIDataForSend(ui)
+		if err != nil {
+			return err
+		}
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.conn == nil {
 		return errors.New("websocket connection is not established")
 	}
 
@@ -971,10 +985,12 @@ func (g *Gateway) SendMessageWithAttachments(chatID, content string, attachments
 		Content:     content,
 		Attachments: attachments,
 	}
+	if sanitizedUI != nil {
+		clientMsg.MessageType = models.MessageTypeText
+		clientMsg.UI = sanitizedUI
+	}
 
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return conn.WriteJSON(clientMsg)
+	return g.conn.WriteJSON(clientMsg)
 }
 
 func isLegacyProgressMessage(content string) bool {
@@ -1244,7 +1260,6 @@ func (g *Gateway) CatchupChatMemory(ctx context.Context, chatID string, isDM boo
 			if m.Type == models.MessageTypeProgress {
 				continue
 			}
-			cleanContent := ExtractMessageText(m)
 			extraText, imgAttachments := g.processAttachments(ctx, m.Attachments)
 			var imgs []string
 			for _, att := range imgAttachments {
@@ -1252,8 +1267,8 @@ func (g *Gateway) CatchupChatMemory(ctx context.Context, chatID string, isDM boo
 					imgs = append(imgs, u)
 				}
 			}
-			fullContent := strings.TrimSpace(cleanContent + extraText)
-			if (fullContent == "" && len(imgs) == 0) || (botID != "" && m.UserID == botID && isLegacyProgressMessage(fullContent)) {
+			fullContent := formatIncomingMessageContent(m, extraText)
+			if (fullContent == "" && len(imgs) == 0) || (botID != "" && m.UserID == botID && m.UI == nil && isLegacyProgressMessage(fullContent)) {
 				continue
 			}
 			if fullContent == "" && len(imgs) > 0 {
@@ -1347,10 +1362,9 @@ func (g *Gateway) WarmupChat(ctx context.Context, chatID string, lastSeq int64) 
 		if m.Type == models.MessageTypeProgress {
 			continue
 		}
-		cleanContent := ExtractMessageText(m)
 		extraText, images := g.processAttachments(ctx, m.Attachments)
-		fullContent := strings.TrimSpace(cleanContent + extraText)
-		if (fullContent == "" && len(images) == 0) || (botID != "" && m.UserID == botID && isLegacyProgressMessage(fullContent)) {
+		fullContent := formatIncomingMessageContent(m, extraText)
+		if (fullContent == "" && len(images) == 0) || (botID != "" && m.UserID == botID && m.UI == nil && isLegacyProgressMessage(fullContent)) {
 			continue
 		}
 
@@ -1444,12 +1458,14 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 	}
 
 	cleanContent := ExtractMessageText(msg)
-	if cleanContent == "" && len(msg.Attachments) == 0 {
+	hasUI := msg.UI != nil && len(msg.UI.Elements) > 0
+	hasUIResponse := msg.Type == models.MessageTypeUIResponse && msg.UIResponse != nil
+	if cleanContent == "" && len(msg.Attachments) == 0 && !hasUI && !hasUIResponse {
 		return nil
 	}
 
 	extraText, images := g.processAttachments(ctx, msg.Attachments)
-	fullContent := strings.TrimSpace(cleanContent + extraText)
+	fullContent := formatIncomingMessageContent(msg, extraText)
 	if fullContent == "" && len(images) == 0 {
 		return nil
 	}
@@ -1472,29 +1488,18 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 
 	// 1. Handle self-messages from the bot itself (Townhall and DM)
 	if botID != "" && msg.UserID == botID {
-		if isLegacyProgressMessage(fullContent) {
+		if msg.UI == nil && isLegacyProgressMessage(fullContent) {
 			return nil
 		}
-		entries := g.contextManager.GetOrCreate(msg.ChatID).Entries()
-		// Deduplicate if already appended on outgoing SendMessage
-		isDuplicate := false
-		if len(entries) > 0 {
-			lastEntry := entries[len(entries)-1]
-			if lastEntry.Role == "assistant" && normalizeForDedup(lastEntry.Content) == normalizeForDedup(fullContent) {
-				isDuplicate = true
-			}
-		}
-		if !isDuplicate {
-			g.contextManager.Push(msg.ChatID, chatcontext.Entry{
-				Seq:        msg.Seq,
-				Role:       "assistant",
-				SenderID:   msg.UserID,
-				SenderName: botUser.GetDisplayName(),
-				Content:    fullContent,
-				Images:     images,
-				Timestamp:  msg.Timestamp,
-			})
-		}
+		g.contextManager.GetOrCreate(msg.ChatID).ReconcileAssistantEcho(chatcontext.Entry{
+			Seq:        msg.Seq,
+			Role:       "assistant",
+			SenderID:   msg.UserID,
+			SenderName: botUser.GetDisplayName(),
+			Content:    fullContent,
+			Images:     images,
+			Timestamp:  msg.Timestamp,
+		})
 		return nil // Never trigger LLM response for self-messages
 	}
 
@@ -1538,12 +1543,22 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 		botHandle = g.cfg.BotHandle
 	}
 
-	shouldProcess, promptText := IsMentionedOrDM(botHandle, isChatDM, msg.Content)
+	mentionText := cleanContent
+	if mentionText == "" {
+		mentionText = msg.Content
+	}
+
+	shouldProcess, promptText := IsMentionedOrDM(botHandle, isChatDM, mentionText)
 	if !shouldProcess && msg.ChatID == "townhall" {
 		if strings.EqualFold(botHandle, "@bob") {
-			shouldProcess, promptText = IsMentionedOrDM("@bot", isChatDM, msg.Content)
+			shouldProcess, promptText = IsMentionedOrDM("@bot", isChatDM, mentionText)
 		} else if strings.EqualFold(botHandle, "@bot") {
-			shouldProcess, promptText = IsMentionedOrDM("@bob", isChatDM, msg.Content)
+			shouldProcess, promptText = IsMentionedOrDM("@bob", isChatDM, mentionText)
+		}
+	}
+	if !shouldProcess {
+		if userName := strings.TrimPrefix(strings.TrimSpace(botUser.GetUserName()), "@"); userName != "" {
+			shouldProcess, promptText = IsMentionedOrDM("@"+userName, isChatDM, mentionText)
 		}
 	}
 
@@ -1580,6 +1595,16 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 	rb := g.contextManager.GetOrCreate(msg.ChatID)
 	if rb.Len() == 0 && msg.Seq > 1 {
 		g.WarmupChat(ctx, msg.ChatID, msg.Seq-1)
+	}
+
+	if msg.Type == models.MessageTypeUIResponse && !isChatDM {
+		if msg.UIResponse == nil || msg.UIResponse.ParentSeq <= 0 || botID == "" {
+			shouldProcess = false
+		} else if known, isForBot := g.resolveUIResponseTarget(ctx, rb.Entries(), msg.ChatID, msg.UIResponse.ParentSeq, botID); known {
+			shouldProcess = isForBot
+		} else {
+			shouldProcess = false
+		}
 	}
 
 	if shouldProcess {

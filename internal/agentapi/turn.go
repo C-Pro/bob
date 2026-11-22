@@ -11,8 +11,9 @@ import (
 type ActionType string
 
 const (
-	ActionApprovalRequest ActionType = "approval_request"
-	ActionSuppressReply   ActionType = "suppress_reply"
+	ActionApprovalRequest   ActionType = "approval_request"
+	ActionSuppressReply     ActionType = "suppress_reply"
+	ActionInteractivePrompt ActionType = "interactive_prompt"
 )
 
 // Action represents a control signal, intent, or side effect produced during execution or tool calls.

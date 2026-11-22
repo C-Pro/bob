@@ -3,7 +3,7 @@
 coverage.out
 scratch
 data/
-models/
+/models/
 *.db
 *.db-journal
 *.db-wal
