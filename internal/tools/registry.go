@@ -27,12 +27,15 @@ type ChatSessionContext struct {
 	UserID                string
 	IsDM                  bool
 	IsScheduled           bool
+	SupportsInteractiveUI bool
 	SourceMessageSeq      *int64
 	FSMRunID              string
 	Notifier              func(chatID, text string) error
+	UINotifier            func(chatID, text string, ui *models.UIData) error
 	SandboxRequestCreated *bool
 	StagedAttachments     *StagedAttachmentCollector
 	KnowledgeBudget       *KnowledgeBudgetTracker
+	Actions               *ActionCollector
 }
 
 // StageAttachment appends an attachment to the staged attachments collector if configured.
@@ -63,6 +66,7 @@ func NewChatSessionContext(chatID, userID string, isDM bool, limits ...Knowledge
 		IsDM:              isDM,
 		StagedAttachments: NewStagedAttachmentCollector(),
 		KnowledgeBudget:   NewKnowledgeBudgetTracker(lim),
+		Actions:           NewActionCollector(),
 	}
 }
 
@@ -436,11 +440,11 @@ func (r *Registry) ToolDefinitions() []openai.Tool {
 // so the agent interacts with the active sandbox rather than requesting a redundant one.
 // In Townhall, only base tools (search, fetch, recall) are provided.
 func (r *Registry) ToolDefinitionsForSession(session ChatSessionContext) []openai.Tool {
+	var tools []openai.Tool
 	if session.IsDM {
-		var tools []openai.Tool
 		if r.sandboxManager != nil && session.UserID != "" {
 			if sbx, ok := r.sandboxManager.GetStatus(session.UserID); ok && sbx.Status == sandbox.StatusRunning {
-				tools = make([]openai.Tool, 0, len(r.dmToolDefinitions)+len(r.knowledgeToolDefs)+2)
+				tools = make([]openai.Tool, 0, len(r.dmToolDefinitions)+len(r.knowledgeToolDefs)+3)
 				for _, t := range r.dmToolDefinitions {
 					if t.Function != nil && t.Function.Name == "sandbox_request" {
 						continue
@@ -451,24 +455,24 @@ func (r *Registry) ToolDefinitionsForSession(session ChatSessionContext) []opena
 			}
 		}
 		if tools == nil {
-			tools = make([]openai.Tool, 0, len(r.dmToolDefinitions)+len(r.knowledgeToolDefs))
+			tools = make([]openai.Tool, 0, len(r.dmToolDefinitions)+len(r.knowledgeToolDefs)+2)
 			tools = append(tools, r.dmToolDefinitions...)
 		}
 		if !session.IsScheduled {
 			tools = append(tools, r.knowledgeToolDefs...)
 		}
-		if r.taskHistoryProvider != nil && strings.TrimSpace(session.FSMRunID) != "" {
-			tools = append(tools, RecallTaskHistoryToolDefinition())
-		}
-		return tools
-	}
-	if r.taskHistoryProvider != nil && strings.TrimSpace(session.FSMRunID) != "" {
-		tools := make([]openai.Tool, 0, len(r.toolDefinitions)+1)
+	} else {
+		tools = make([]openai.Tool, 0, len(r.toolDefinitions)+2)
 		tools = append(tools, r.toolDefinitions...)
-		tools = append(tools, RecallTaskHistoryToolDefinition())
-		return tools
 	}
-	return r.toolDefinitions
+
+	if r.taskHistoryProvider != nil && strings.TrimSpace(session.FSMRunID) != "" {
+		tools = append(tools, RecallTaskHistoryToolDefinition())
+	}
+	if session.SupportsInteractiveUI && !session.IsScheduled {
+		tools = append(tools, AskUserToolDefinition())
+	}
+	return tools
 }
 
 // ToolDefinitionsForChat returns tool definitions for a given chat session context.
@@ -547,6 +551,8 @@ func (r *Registry) Execute(ctx context.Context, name string, argsJSON string) (s
 		return r.executeDiscoverSkills(ctx, argsJSON)
 	case "load_skill":
 		return r.executeLoadSkill(ctx, argsJSON)
+	case AskUserToolName:
+		return r.executeAskUser(ctx, argsJSON)
 	case RecallTaskHistoryToolName:
 		return r.executeRecallTaskHistory(ctx, argsJSON)
 	default:
@@ -1249,13 +1255,18 @@ func (r *Registry) executeSandboxRequest(ctx context.Context, argsJSON string) (
 		cleanReason = "No reason provided"
 	}
 	fmt.Fprintf(&card, "• **Reason:** %s\n\n", cleanReason)
-	card.WriteString("Reply `/sandbox approve` to approve or `/sandbox deny` to reject.")
+	card.WriteString("Use the buttons below or reply `/sandbox approve` to approve or `/sandbox deny` to reject.")
 
-	if session.Notifier != nil {
-		if err := session.Notifier(session.ChatID, card.String()); err != nil {
-			_ = r.sandboxManager.DenySandbox(session.UserID)
-			return "", fmt.Errorf("failed to send approval card: %w", err)
-		}
+	ui := models.NewSandboxApprovalUI(sbx.ID)
+	var sendErr error
+	if session.UINotifier != nil {
+		sendErr = session.UINotifier(session.ChatID, card.String(), ui)
+	} else if session.Notifier != nil {
+		sendErr = session.Notifier(session.ChatID, card.String())
+	}
+	if sendErr != nil {
+		_ = r.sandboxManager.DenySandboxForID(session.UserID, sbx.ID)
+		return "", fmt.Errorf("failed to send approval card: %w", sendErr)
 	}
 	if session.SandboxRequestCreated != nil {
 		*session.SandboxRequestCreated = true

@@ -4,10 +4,8 @@ import (
 	"context"
 	"errors"
 	"strings"
-	"time"
 
 	"bob/internal/agentapi"
-	"bob/internal/chatcontext"
 	"bob/internal/commands"
 	"bob/internal/models"
 	"bob/internal/scheduler"
@@ -74,15 +72,5 @@ func (g *Gateway) handleScheduleCommand(ctx context.Context, msg models.Message,
 		return err
 	}
 
-	if res.RecordAssistantEntry {
-		g.contextManager.Push(msg.ChatID, chatcontext.Entry{
-			Role:       "assistant",
-			SenderID:   botID,
-			SenderName: botUser.GetDisplayName(),
-			Content:    res.Reply,
-			Timestamp:  time.Now().Unix(),
-		})
-	}
-
-	return g.SendMessage(msg.ChatID, res.Reply)
+	return g.sendCommandReply(msg.ChatID, botID, botUser.GetDisplayName(), res.Reply, res.UI, res.RecordAssistantEntry)
 }

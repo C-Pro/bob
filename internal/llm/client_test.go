@@ -869,3 +869,69 @@ func TestGeminiTransport_ReasoningNormalization(t *testing.T) {
 	assert.Equal(t, "Let's think carefully step by step.", resp.Choices[0].Message.ReasoningContent)
 	assert.Equal(t, "Hello world", resp.Choices[0].Message.Content)
 }
+
+type mockStopperExecutor struct {
+	execCalls int32
+	stopReply string
+	stop      bool
+}
+
+func (m *mockStopperExecutor) Execute(_ context.Context, _ string, _ string) (string, error) {
+	atomic.AddInt32(&m.execCalls, 1)
+	return `{"status":"prompt_queued"}`, nil
+}
+
+func (m *mockStopperExecutor) ShouldStopLoop() (string, bool) {
+	return m.stopReply, m.stop
+}
+
+func TestGenerateChatResponseWithToolLoop_StopsEarlyOnLoopStopper(t *testing.T) {
+	var llmCalls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&llmCalls, 1)
+		if n > 1 {
+			t.Fatal("LLM must not be called a second time when loopStopper requests early stop")
+		}
+		resp := openai.ChatCompletionResponse{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Message: openai.ChatCompletionMessage{
+						Role: openai.ChatMessageRoleAssistant,
+						ToolCalls: []openai.ToolCall{
+							{
+								ID:   "call_ask_1",
+								Type: openai.ToolTypeFunction,
+								Function: openai.FunctionCall{
+									Name:      "ask_user",
+									Arguments: `{"message":"Choose deployment mode:"}`,
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		OpenAIAPIKey:  "test-key",
+		OpenAIModel:   "test-model",
+		OpenAIBaseURL: server.URL,
+	}
+	client := NewClient(cfg, nil)
+	exec := &mockStopperExecutor{stopReply: "Choose deployment mode:", stop: true}
+
+	reply, err := client.GenerateChatResponseWithToolLoop(
+		context.Background(),
+		[]openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleUser, Content: "Deploy"}},
+		nil,
+		exec,
+		5,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "Choose deployment mode:", reply)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&llmCalls))
+	assert.Equal(t, int32(1), atomic.LoadInt32(&exec.execCalls))
+}

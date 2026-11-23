@@ -643,6 +643,22 @@ func (r *ToolLoopRunner) handleExecuteSteps(ctx context.Context, run *FSMRun, st
 		slog.Info("fsm step finished", "tool", s.ToolName, "status", s.Status, "run_id", run.ID)
 	}
 
+	for _, s := range stepPtrs {
+		if s.Status != StepStatusCompleted {
+			continue
+		}
+		decoded, decErr := DecodeStoredToolResult(s.ResultJSON)
+		if decErr != nil {
+			continue
+		}
+		if promptMsg, ok := agentapi.ExtractInteractivePromptMessage(decoded.Actions); ok {
+			run.ResultJSON = promptMsg
+			run.Status = RunStatusCompleted
+			run.CurrentState = StateCompleted
+			return false, store.UpdateRun(ctx, run)
+		}
+	}
+
 	if err := r.maybeCompact(ctx, run, store, model); err != nil {
 		run.Status = RunStatusFailed
 		run.CurrentState = StateFailed

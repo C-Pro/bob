@@ -414,3 +414,71 @@ func TestManager_EvictionHook(t *testing.T) {
 	assert.Equal(t, "User1 Msg 1", calls[0].entries[0].Content)
 	mu.Unlock()
 }
+
+func TestRingBuffer_ReconcileAssistantEcho(t *testing.T) {
+	t.Run("reconciles pending outgoing entry even across interleaved user messages", func(t *testing.T) {
+		rb := NewRingBuffer(10)
+		rb.Push(Entry{Role: "assistant", SenderID: "bot-1", Content: "Proceed?"})
+		rb.Push(Entry{Role: "user", SenderID: "alice", Seq: 11, Content: "Wait a sec"})
+
+		appended := rb.ReconcileAssistantEcho(Entry{
+			Seq:       10,
+			Role:      "assistant",
+			SenderID:  "bot-1",
+			Content:   "  Proceed?  ",
+			Timestamp: 1700000010,
+		})
+		assert.False(t, appended)
+		entries := rb.Entries()
+		require.Len(t, entries, 2)
+		assert.Equal(t, int64(10), entries[0].Seq)
+		assert.Equal(t, int64(11), entries[1].Seq)
+
+		// Exact same Seq echo again is deduplicated
+		assert.False(t, rb.ReconcileAssistantEcho(Entry{
+			Seq:      10,
+			Role:     "assistant",
+			SenderID: "bot-1",
+			Content:  "Proceed?",
+		}))
+		assert.Equal(t, 2, rb.Len())
+	})
+
+	t.Run("preserves repeated identical prompts with distinct sequences", func(t *testing.T) {
+		rb := NewRingBuffer(10)
+		assert.True(t, rb.ReconcileAssistantEcho(Entry{
+			Seq:      21,
+			Role:     "assistant",
+			SenderID: "bot-1",
+			Content:  "Deploy now?",
+		}))
+		assert.True(t, rb.ReconcileAssistantEcho(Entry{
+			Seq:      22,
+			Role:     "assistant",
+			SenderID: "bot-1",
+			Content:  "Deploy now?",
+		}))
+		entries := rb.Entries()
+		require.Len(t, entries, 2)
+		assert.Equal(t, int64(21), entries[0].Seq)
+		assert.Equal(t, int64(22), entries[1].Seq)
+	})
+
+	t.Run("appends echo when pending outgoing entry was already evicted", func(t *testing.T) {
+		rb := NewRingBuffer(3)
+		rb.Push(Entry{Role: "assistant", SenderID: "bot-1", Content: "Proceed?"})
+		rb.Push(Entry{Seq: 2, Role: "user", Content: "u2"})
+		rb.Push(Entry{Seq: 3, Role: "user", Content: "u3"})
+		rb.Push(Entry{Seq: 4, Role: "user", Content: "u4"}) // evicts pending Seq=0 entry
+
+		appended := rb.ReconcileAssistantEcho(Entry{
+			Seq:      1,
+			Role:     "assistant",
+			SenderID: "bot-1",
+			Content:  "Proceed?",
+		})
+		assert.True(t, appended)
+		entries := rb.Entries()
+		assert.Equal(t, int64(1), entries[len(entries)-1].Seq)
+	})
+}

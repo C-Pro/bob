@@ -151,3 +151,72 @@ func TestProgressEvent_Serialization(t *testing.T) {
 	require.NotNil(t, decoded.Step)
 	assert.Equal(t, "sandbox_exec", decoded.Step.Call.Name)
 }
+
+func TestUIAndApprovalActions_Serialization(t *testing.T) {
+	promptPayload := agentapi.InteractivePromptPayload{
+		Message: "Choose deployment target:",
+		Elements: []agentapi.UIElement{
+			{
+				ID:          "us_east",
+				Type:        agentapi.UIElementRadio,
+				Label:       "US East",
+				Description: "Primary region",
+				Default:     true,
+			},
+			{
+				ID:    "deploy",
+				Type:  agentapi.UIElementButton,
+				Label: "Deploy",
+				Style: agentapi.UIElementStylePrimary,
+			},
+		},
+	}
+	promptBytes, err := json.Marshal(promptPayload)
+	require.NoError(t, err)
+
+	approvalPayload := agentapi.ApprovalRequestPayload{
+		Kind:     agentapi.ApprovalKindSandbox,
+		TargetID: "sbx_1",
+		Label:    "Approve Sandbox",
+		Summary:  "Run unit tests in bwrap",
+	}
+	approvalBytes, err := json.Marshal(approvalPayload)
+	require.NoError(t, err)
+
+	res := agentapi.Result{
+		RunID:      "run-ui-1",
+		Content:    promptPayload.Message,
+		Iterations: 1,
+		Actions: []agentapi.Action{
+			{
+				ID:      "act-prompt",
+				Type:    agentapi.ActionInteractivePrompt,
+				Content: promptPayload.Message,
+				Payload: promptBytes,
+			},
+			{
+				ID:      "act-approval",
+				Type:    agentapi.ActionApprovalRequest,
+				Content: "Sandbox requested",
+				Payload: approvalBytes,
+			},
+		},
+	}
+
+	raw, err := json.Marshal(res)
+	require.NoError(t, err)
+
+	var decoded agentapi.Result
+	require.NoError(t, json.Unmarshal(raw, &decoded))
+	require.Len(t, decoded.Actions, 2)
+	assert.Equal(t, agentapi.ActionInteractivePrompt, decoded.Actions[0].Type)
+	assert.Equal(t, agentapi.ActionApprovalRequest, decoded.Actions[1].Type)
+
+	var decodedPrompt agentapi.InteractivePromptPayload
+	require.NoError(t, json.Unmarshal(decoded.Actions[0].Payload, &decodedPrompt))
+	assert.Equal(t, promptPayload, decodedPrompt)
+
+	var decodedApproval agentapi.ApprovalRequestPayload
+	require.NoError(t, json.Unmarshal(decoded.Actions[1].Payload, &decodedApproval))
+	assert.Equal(t, approvalPayload, decodedApproval)
+}

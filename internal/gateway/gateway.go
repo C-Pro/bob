@@ -384,6 +384,7 @@ func (g *Gateway) ToolDefinitions(ctx context.Context, chatID string, isDM bool)
 			session.IsDM = false
 		}
 	}
+	session.SupportsInteractiveUI = !session.IsScheduled
 
 	return r.ToolDefinitionsForSession(session)
 }
@@ -434,11 +435,15 @@ func (g *Gateway) Bind(ctx context.Context, run agentapi.RunDescriptor) (agentap
 	sessionCtx.Notifier = func(targetChatID, text string) error {
 		return g.SendMessage(targetChatID, text)
 	}
+	sessionCtx.UINotifier = func(targetChatID, text string, ui *models.UIData) error {
+		return g.SendMessageWithUI(targetChatID, text, ui)
+	}
 	sessionCtx.SandboxRequestCreated = new(bool)
 	sessionCtx.FSMRunID = run.RunID
 	if run.Kind == agentapi.Scheduled {
 		sessionCtx.IsScheduled = true
 	}
+	sessionCtx.SupportsInteractiveUI = !sessionCtx.IsScheduled
 	if run.Metadata != nil {
 		if s, ok := run.Metadata["source_message_seq"]; ok && s != "" {
 			if seq, err := strconv.ParseInt(s, 10, 64); err == nil && seq > 0 {
@@ -495,77 +500,28 @@ func (g *Gateway) Deliver(ctx context.Context, comp agentapi.Completion) error {
 	g.mu.Lock()
 	botID := g.botUserID
 	botName := g.botUser.GetDisplayName()
-	sm := g.sandboxManager
 	g.mu.Unlock()
 	if botName == "" {
 		botName = "Bob"
 	}
 
-	// Check for suppress_reply action (e.g. sandbox approval requests)
-	for _, act := range comp.Result.Actions {
-		if act.Type == agentapi.ActionSuppressReply {
-			g.contextManager.Push(chatID, chatcontext.Entry{
-				Role:       "assistant",
-				SenderID:   botID,
-				SenderName: botName,
-				Content:    "Sandbox approval requested.",
-				Timestamp:  time.Now().Unix(),
-			})
-			return nil
-		}
-	}
-
 	var reply string
+	var actions []agentapi.Action
+	allowSandboxPrompt := false
 	switch comp.Status {
 	case agentapi.RunCompleted:
 		reply = comp.Result.Content
+		actions = comp.Result.Actions
+		allowSandboxPrompt = true
 	case agentapi.RunFailed, agentapi.RunTerminated:
 		reply = "Sorry, I encountered an issue processing your request. Please try again later."
 	default:
 		return nil
 	}
 
-	reply = g.finalizeImageReply(ctx, comp.Run, reply)
-	if reply == "" {
-		return nil
-	}
-
 	isDM := g.isChatDM(ctx, chatID)
-	if comp.Status == agentapi.RunCompleted && isDM && sm != nil {
-		if sbx, ok := sm.GetStatus(comp.Run.Actor.ID); ok && sbx != nil && sbx.Status == sandbox.StatusRunning {
-			if !strings.Contains(reply, "/sandbox destroy") {
-				rem := time.Until(sbx.ExpiresAt).Round(time.Minute)
-				if rem < 0 {
-					rem = 0
-				}
-				reply += fmt.Sprintf("\n\n💡 Would you like to destroy the sandbox (`/sandbox destroy`) or keep it? It will automatically be destroyed in %s.", rem)
-			}
-		}
-	}
-
-	formattedReply := FormatResponse(reply, isDM, g.cfg.TownhallMaxParagraphs, g.cfg.DMMaxParagraphs)
-
 	outgoingAttachments := ToBesedkaAttachments(comp.Result.Attachments)
-
-	if err := g.SendMessageWithAttachments(chatID, formattedReply, outgoingAttachments); err != nil {
-		return fmt.Errorf("failed to deliver reply to chat %s: %w", chatID, err)
-	}
-
-	pushContent := formattedReply
-	if len(outgoingAttachments) > 0 {
-		extraText, _ := g.processAttachments(ctx, outgoingAttachments)
-		pushContent = strings.TrimSpace(formattedReply + extraText)
-	}
-
-	g.contextManager.Push(chatID, chatcontext.Entry{
-		Role:       "assistant",
-		SenderID:   botID,
-		SenderName: botName,
-		Content:    pushContent,
-		Timestamp:  time.Now().Unix(),
-	})
-
-	return nil
+	return g.deliverAgentReply(ctx, chatID, comp.Run.Actor.ID, botID, botName, isDM, comp.Run, reply, outgoingAttachments, actions, allowSandboxPrompt)
 }
 
 // DeliverLegacyFSMRun converts an FSMRun to agentapi.Completion and delivers it to Besedka.
@@ -754,10 +710,6 @@ func StripHTML(input string) string {
 	// 5. Normalize consecutive newlines
 	text = multiNewlineRe.ReplaceAllString(text, "\n\n")
 	return strings.TrimSpace(text)
-}
-
-func normalizeForDedup(s string) string {
-	return strings.Join(strings.Fields(s), " ")
 }
 
 var textExtensions = map[string]bool{
@@ -957,11 +909,29 @@ func (g *Gateway) SendMessage(chatID, content string) error {
 
 // SendMessageWithAttachments sends a response message with optional attachments back to Besedka.
 func (g *Gateway) SendMessageWithAttachments(chatID, content string, attachments []models.Attachment) error {
-	g.mu.Lock()
-	conn := g.conn
-	g.mu.Unlock()
+	return g.SendMessageWithAttachmentsAndUI(chatID, content, attachments, nil)
+}
 
-	if conn == nil {
+// SendMessageWithUI sends a response message with interactive UI elements back to Besedka.
+func (g *Gateway) SendMessageWithUI(chatID, content string, ui *models.UIData) error {
+	return g.SendMessageWithAttachmentsAndUI(chatID, content, nil, ui)
+}
+
+// SendMessageWithAttachmentsAndUI sends a response message with optional attachments and interactive UI elements back to Besedka.
+func (g *Gateway) SendMessageWithAttachmentsAndUI(chatID, content string, attachments []models.Attachment, ui *models.UIData) error {
+	var sanitizedUI *models.UIData
+	if ui != nil {
+		var err error
+		sanitizedUI, err = models.SanitizeUIDataForSend(ui)
+		if err != nil {
+			return err
+		}
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.conn == nil {
 		return errors.New("websocket connection is not established")
 	}
 
@@ -971,10 +941,12 @@ func (g *Gateway) SendMessageWithAttachments(chatID, content string, attachments
 		Content:     content,
 		Attachments: attachments,
 	}
+	if sanitizedUI != nil {
+		clientMsg.MessageType = models.MessageTypeText
+		clientMsg.UI = sanitizedUI
+	}
 
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return conn.WriteJSON(clientMsg)
+	return g.conn.WriteJSON(clientMsg)
 }
 
 func isLegacyProgressMessage(content string) bool {
@@ -1244,7 +1216,6 @@ func (g *Gateway) CatchupChatMemory(ctx context.Context, chatID string, isDM boo
 			if m.Type == models.MessageTypeProgress {
 				continue
 			}
-			cleanContent := ExtractMessageText(m)
 			extraText, imgAttachments := g.processAttachments(ctx, m.Attachments)
 			var imgs []string
 			for _, att := range imgAttachments {
@@ -1252,8 +1223,8 @@ func (g *Gateway) CatchupChatMemory(ctx context.Context, chatID string, isDM boo
 					imgs = append(imgs, u)
 				}
 			}
-			fullContent := strings.TrimSpace(cleanContent + extraText)
-			if (fullContent == "" && len(imgs) == 0) || (botID != "" && m.UserID == botID && isLegacyProgressMessage(fullContent)) {
+			fullContent := formatIncomingMessageContent(m, extraText)
+			if (fullContent == "" && len(imgs) == 0) || (botID != "" && m.UserID == botID && m.UI == nil && isLegacyProgressMessage(fullContent)) {
 				continue
 			}
 			if fullContent == "" && len(imgs) > 0 {
@@ -1347,10 +1318,9 @@ func (g *Gateway) WarmupChat(ctx context.Context, chatID string, lastSeq int64) 
 		if m.Type == models.MessageTypeProgress {
 			continue
 		}
-		cleanContent := ExtractMessageText(m)
 		extraText, images := g.processAttachments(ctx, m.Attachments)
-		fullContent := strings.TrimSpace(cleanContent + extraText)
-		if (fullContent == "" && len(images) == 0) || (botID != "" && m.UserID == botID && isLegacyProgressMessage(fullContent)) {
+		fullContent := formatIncomingMessageContent(m, extraText)
+		if (fullContent == "" && len(images) == 0) || (botID != "" && m.UserID == botID && m.UI == nil && isLegacyProgressMessage(fullContent)) {
 			continue
 		}
 
@@ -1444,12 +1414,14 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 	}
 
 	cleanContent := ExtractMessageText(msg)
-	if cleanContent == "" && len(msg.Attachments) == 0 {
+	hasUI := msg.UI != nil && len(msg.UI.Elements) > 0
+	hasUIResponse := msg.Type == models.MessageTypeUIResponse && msg.UIResponse != nil
+	if cleanContent == "" && len(msg.Attachments) == 0 && !hasUI && !hasUIResponse {
 		return nil
 	}
 
 	extraText, images := g.processAttachments(ctx, msg.Attachments)
-	fullContent := strings.TrimSpace(cleanContent + extraText)
+	fullContent := formatIncomingMessageContent(msg, extraText)
 	if fullContent == "" && len(images) == 0 {
 		return nil
 	}
@@ -1472,29 +1444,18 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 
 	// 1. Handle self-messages from the bot itself (Townhall and DM)
 	if botID != "" && msg.UserID == botID {
-		if isLegacyProgressMessage(fullContent) {
+		if msg.UI == nil && isLegacyProgressMessage(fullContent) {
 			return nil
 		}
-		entries := g.contextManager.GetOrCreate(msg.ChatID).Entries()
-		// Deduplicate if already appended on outgoing SendMessage
-		isDuplicate := false
-		if len(entries) > 0 {
-			lastEntry := entries[len(entries)-1]
-			if lastEntry.Role == "assistant" && normalizeForDedup(lastEntry.Content) == normalizeForDedup(fullContent) {
-				isDuplicate = true
-			}
-		}
-		if !isDuplicate {
-			g.contextManager.Push(msg.ChatID, chatcontext.Entry{
-				Seq:        msg.Seq,
-				Role:       "assistant",
-				SenderID:   msg.UserID,
-				SenderName: botUser.GetDisplayName(),
-				Content:    fullContent,
-				Images:     images,
-				Timestamp:  msg.Timestamp,
-			})
-		}
+		g.contextManager.GetOrCreate(msg.ChatID).ReconcileAssistantEcho(chatcontext.Entry{
+			Seq:        msg.Seq,
+			Role:       "assistant",
+			SenderID:   msg.UserID,
+			SenderName: botUser.GetDisplayName(),
+			Content:    fullContent,
+			Images:     images,
+			Timestamp:  msg.Timestamp,
+		})
 		return nil // Never trigger LLM response for self-messages
 	}
 
@@ -1538,12 +1499,22 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 		botHandle = g.cfg.BotHandle
 	}
 
-	shouldProcess, promptText := IsMentionedOrDM(botHandle, isChatDM, msg.Content)
+	mentionText := cleanContent
+	if mentionText == "" {
+		mentionText = msg.Content
+	}
+
+	shouldProcess, promptText := IsMentionedOrDM(botHandle, isChatDM, mentionText)
 	if !shouldProcess && msg.ChatID == "townhall" {
 		if strings.EqualFold(botHandle, "@bob") {
-			shouldProcess, promptText = IsMentionedOrDM("@bot", isChatDM, msg.Content)
+			shouldProcess, promptText = IsMentionedOrDM("@bot", isChatDM, mentionText)
 		} else if strings.EqualFold(botHandle, "@bot") {
-			shouldProcess, promptText = IsMentionedOrDM("@bob", isChatDM, msg.Content)
+			shouldProcess, promptText = IsMentionedOrDM("@bob", isChatDM, mentionText)
+		}
+	}
+	if !shouldProcess {
+		if userName := strings.TrimPrefix(strings.TrimSpace(botUser.GetUserName()), "@"); userName != "" {
+			shouldProcess, promptText = IsMentionedOrDM("@"+userName, isChatDM, mentionText)
 		}
 	}
 
@@ -1582,6 +1553,16 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 		g.WarmupChat(ctx, msg.ChatID, msg.Seq-1)
 	}
 
+	if msg.Type == models.MessageTypeUIResponse && !isChatDM {
+		if msg.UIResponse == nil || msg.UIResponse.ParentSeq <= 0 || botID == "" {
+			shouldProcess = false
+		} else if known, isForBot := g.resolveUIResponseTarget(ctx, rb.Entries(), msg.ChatID, msg.UIResponse.ParentSeq, botID); known {
+			shouldProcess = isForBot
+		} else {
+			shouldProcess = false
+		}
+	}
+
 	if shouldProcess {
 		g.injectUserContextOnce(ctx, msg.ChatID, msg.UserID, rb, isChatDM)
 	}
@@ -1598,6 +1579,16 @@ func (g *Gateway) ProcessMessage(ctx context.Context, msg models.Message) error 
 
 	if !shouldProcess {
 		return nil
+	}
+
+	if msg.Type == models.MessageTypeUIResponse {
+		handled, uiErr := g.handleUIResponseAction(ctx, msg, isChatDM, senderName)
+		if uiErr != nil {
+			return uiErr
+		}
+		if handled {
+			return nil
+		}
 	}
 
 	if isChatDM && strings.EqualFold(rootCommand, "/sandbox") {
@@ -1660,7 +1651,6 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 		}
 	}
 	toolsRegistry := g.toolsRegistry
-	sm := g.sandboxManager
 	g.mu.Unlock()
 
 	if runner == nil && g.llmClient == nil {
@@ -1784,8 +1774,12 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 	}
 
 	sessionCtx := tools.NewChatSessionContext(msg.ChatID, msg.UserID, isAuthorizedDMOwner, budgetLimits)
+	sessionCtx.SupportsInteractiveUI = true
 	sessionCtx.Notifier = func(chatID, text string) error {
 		return g.SendMessage(chatID, text)
+	}
+	sessionCtx.UINotifier = func(chatID, text string, ui *models.UIData) error {
+		return g.SendMessageWithUI(chatID, text, ui)
 	}
 	sessionCtx.SandboxRequestCreated = &sandboxRequestCreated
 
@@ -1837,11 +1831,12 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 					// Context was cancelled or timed out; do not fall back
 				} else {
 					slog.Error("fsm tool loop failed, falling back to volatile loop", "chat_id", msg.ChatID, "error", err)
+					volExec := &sessionToolExecutor{registry: toolsRegistry, session: sessionCtx}
 					reply, err = g.llmClient.GenerateChatResponseWithToolLoop(
 						toolCtx,
 						llmMsgs,
 						toolDefs,
-						toolsRegistry,
+						volExec,
 						maxIterations,
 					)
 				}
@@ -1854,11 +1849,12 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 				}
 			}
 		} else {
+			volExec := &sessionToolExecutor{registry: toolsRegistry, session: sessionCtx}
 			reply, err = g.llmClient.GenerateChatResponseWithToolLoop(
 				toolCtx,
 				llmMsgs,
 				toolDefs,
-				toolsRegistry,
+				volExec,
 				maxIterations,
 			)
 			if initialProgressSeq > 0 {
@@ -1890,31 +1886,17 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 		reply = "Sorry, I encountered an issue processing your request. Please try again later."
 	}
 
-	if sandboxRequestCreated {
-		g.contextManager.Push(msg.ChatID, chatcontext.Entry{
-			Role:       "assistant",
-			SenderID:   botID,
-			SenderName: botUser.GetDisplayName(),
-			Content:    "Sandbox approval requested.",
-			Timestamp:  time.Now().Unix(),
-		})
-		return nil
-	}
-
-	if err == nil && isDM && sm != nil {
-		if sbx, ok := sm.GetStatus(msg.UserID); ok && sbx != nil && sbx.Status == sandbox.StatusRunning {
-			if !strings.Contains(reply, "/sandbox destroy") {
-				rem := time.Until(sbx.ExpiresAt).Round(time.Minute)
-				if rem < 0 {
-					rem = 0
-				}
-				reply += fmt.Sprintf("\n\n💡 Would you like to destroy the sandbox (`/sandbox destroy`) or keep it? It will automatically be destroyed in %s.", rem)
-			}
+	var actions []agentapi.Action
+	if err == nil {
+		if fsmRes != nil {
+			actions = fsmRes.Actions
+		} else if sessionCtx.Actions != nil {
+			actions = sessionCtx.Actions.All()
 		}
 	}
-
-	reply = g.finalizeImageReply(ctx, sourceRun, reply)
-	formattedReply := FormatResponse(reply, isDM, g.cfg.TownhallMaxParagraphs, g.cfg.DMMaxParagraphs)
+	if sandboxRequestCreated {
+		actions = append([]agentapi.Action{{Type: agentapi.ActionSuppressReply}}, actions...)
+	}
 
 	var outgoingAttachments []models.Attachment
 	if sessionCtx.StagedAttachments != nil {
@@ -1924,25 +1906,7 @@ func (g *Gateway) generateAndSendAgentReply(ctx context.Context, msg models.Mess
 		outgoingAttachments = fsmRes.Attachments
 	}
 
-	if err := g.SendMessageWithAttachments(msg.ChatID, formattedReply, outgoingAttachments); err != nil {
-		return fmt.Errorf("failed to send reply to chat %s: %w", msg.ChatID, err)
-	}
-
-	pushContent := formattedReply
-	if len(outgoingAttachments) > 0 {
-		extraText, _ := g.processAttachments(ctx, outgoingAttachments)
-		pushContent = strings.TrimSpace(formattedReply + extraText)
-	}
-
-	g.contextManager.Push(msg.ChatID, chatcontext.Entry{
-		Role:       "assistant",
-		SenderID:   botID,
-		SenderName: botUser.GetDisplayName(),
-		Content:    pushContent,
-		Timestamp:  time.Now().Unix(),
-	})
-
-	return nil
+	return g.deliverAgentReply(ctx, msg.ChatID, msg.UserID, botID, botUser.GetDisplayName(), isDM, sourceRun, reply, outgoingAttachments, actions, err == nil)
 }
 
 // Start listens for incoming WebSocket messages and processes them until context is cancelled.
@@ -2296,6 +2260,10 @@ func (g *Gateway) RunMaintenance(ctx context.Context) {
 }
 
 func (g *Gateway) handleSandboxCommand(ctx context.Context, msg models.Message, text, senderName string) error {
+	return g.handleSandboxCommandWithTarget(ctx, msg, text, senderName, "")
+}
+
+func (g *Gateway) handleSandboxCommandWithTarget(ctx context.Context, msg models.Message, text, senderName, targetID string) error {
 	g.mu.Lock()
 	botID := g.botUserID
 	botUser := g.botUser
@@ -2328,6 +2296,7 @@ func (g *Gateway) handleSandboxCommand(ctx context.Context, msg models.Message, 
 		IsDirect:   true,
 		Command:    "sandbox",
 		Subcommand: subcmd,
+		TargetID:   targetID,
 		Args:       args,
 		RawText:    text,
 	}
@@ -2383,17 +2352,7 @@ func (g *Gateway) handleSandboxCommand(ctx context.Context, msg models.Message, 
 		return g.generateAndSendAgentReply(ctx, msg, true, senderName, res.Continuation.Reason, initialProgressSeq)
 	}
 
-	if res.RecordAssistantEntry {
-		g.contextManager.Push(msg.ChatID, chatcontext.Entry{
-			Role:       "assistant",
-			SenderID:   botID,
-			SenderName: botUser.GetDisplayName(),
-			Content:    res.Reply,
-			Timestamp:  time.Now().Unix(),
-		})
-	}
-
-	return g.SendMessage(msg.ChatID, res.Reply)
+	return g.sendCommandReply(msg.ChatID, botID, botUser.GetDisplayName(), res.Reply, res.UI, res.RecordAssistantEntry)
 }
 
 func (g *Gateway) formatSandboxStatus(sbx *sandbox.UserSandbox) string {

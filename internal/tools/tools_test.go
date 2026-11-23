@@ -7,11 +7,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"bob/internal/agentapi"
 	"bob/internal/config"
 	"bob/internal/memory"
+	"bob/internal/models"
 	"bob/internal/sandbox"
 	"bob/internal/tools/tavily"
 
@@ -924,4 +927,99 @@ func TestSandboxToolDefinitions_Descriptions(t *testing.T) {
 
 	// Verify sandbox_destroy description includes reconfiguration guidance
 	assert.Contains(t, sbxDestroy.Function.Description, "permissions/domains need to be reconfigured with sandbox_request")
+}
+
+func TestActionCollector_ConcurrentAndSnapshot(t *testing.T) {
+	var nilCol *ActionCollector
+	nilCol.Add(agentapi.Action{Type: agentapi.ActionSuppressReply})
+	assert.Nil(t, nilCol.All())
+
+	col := NewActionCollector()
+	const workers = 16
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			col.Add(agentapi.Action{
+				ID:   string(rune('a' + idx)),
+				Type: agentapi.ActionApprovalRequest,
+			})
+		}(i)
+	}
+	wg.Wait()
+
+	snap := col.All()
+	require.Len(t, snap, workers)
+	snap[0].Type = "mutated"
+	assert.Equal(t, agentapi.ActionApprovalRequest, col.All()[0].Type)
+}
+
+func TestExecuteSandboxRequest_UINotifierAndFallback(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &config.Config{
+		DataDir:        tempDir,
+		SandboxEnabled: true,
+		SandboxDrivers: []string{"bwrap"},
+	}
+	mockDriver := &mockSandboxDriver{available: true}
+	sandboxMgr := sandbox.NewManager(cfg.SandboxConfig(), []sandbox.Driver{mockDriver})
+	defer func() { _ = sandboxMgr.Close() }()
+
+	reg := NewRegistry(nil, nil, sandboxMgr)
+	ctx := context.Background()
+
+	var gotText string
+	var gotUI *models.UIData
+	var legacyCalled bool
+	var created bool
+
+	uiCtx := WithChatSession(ctx, ChatSessionContext{
+		ChatID: "dm_user1",
+		UserID: "user1",
+		IsDM:   true,
+		Notifier: func(_, _ string) error {
+			legacyCalled = true
+			return nil
+		},
+		UINotifier: func(chatID, text string, ui *models.UIData) error {
+			assert.Equal(t, "dm_user1", chatID)
+			gotText = text
+			gotUI = ui
+			return nil
+		},
+		SandboxRequestCreated: &created,
+	})
+
+	_, err := reg.Execute(uiCtx, "sandbox_request", `{"driver":"bwrap","network":"none","reason":"Run unit tests"}`)
+	require.NoError(t, err)
+	assert.False(t, legacyCalled, "UINotifier should take precedence over Notifier")
+	assert.True(t, created)
+	assert.Contains(t, gotText, "Sandbox Approval Requested")
+	assert.Contains(t, gotText, "/sandbox approve")
+	assert.Contains(t, gotText, "/sandbox deny")
+	sbx, exists := sandboxMgr.GetStatus("user1")
+	require.True(t, exists)
+	require.NotNil(t, gotUI)
+	require.Len(t, gotUI.Elements, 2)
+	assert.Equal(t, "bob:sandbox:approve:"+sbx.ID, gotUI.Elements[0].ID)
+	assert.Equal(t, "bob:sandbox:deny:"+sbx.ID, gotUI.Elements[1].ID)
+
+	// Deny and retry with nil UINotifier to confirm Notifier fallback works
+	require.NoError(t, sandboxMgr.DenySandbox("user1"))
+	var fallbackText string
+	created = false
+	fallbackCtx := WithChatSession(ctx, ChatSessionContext{
+		ChatID: "dm_user1",
+		UserID: "user1",
+		IsDM:   true,
+		Notifier: func(_, text string) error {
+			fallbackText = text
+			return nil
+		},
+		SandboxRequestCreated: &created,
+	})
+	_, err = reg.Execute(fallbackCtx, "sandbox_request", `{"driver":"bwrap","network":"none","reason":"Retry fallback"}`)
+	require.NoError(t, err)
+	assert.Contains(t, fallbackText, "Sandbox Approval Requested")
 }

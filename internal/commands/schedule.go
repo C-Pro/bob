@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"bob/internal/models"
 	"bob/internal/scheduler"
 )
 
@@ -231,7 +232,12 @@ func (h *ScheduleHandler) handleInfo(ctx context.Context, req Request) (Result, 
 		}
 	}
 
-	return Result{Reply: b.String()}, nil
+	var ui *models.UIData
+	if sched.Status == scheduler.ScheduleStatusPendingApproval {
+		ui = models.NewScheduleApprovalUI(sched.ID)
+	}
+
+	return Result{Reply: b.String(), UI: ui}, nil
 }
 
 func (h *ScheduleHandler) handleApprove(ctx context.Context, req Request) (Result, error) {

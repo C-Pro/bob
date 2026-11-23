@@ -3,9 +3,13 @@ package agent
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +19,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"bob/internal/agentapi"
+	"bob/internal/config"
 	"bob/internal/fsm"
 	"bob/internal/llm"
 	"bob/internal/tools"
@@ -930,6 +935,151 @@ func TestEngine_TrajectoryRecording_ProvenanceManifestAndLoadedKnowledge(t *test
 	assert.JSONEq(t, manifestJSON, string(parsedManifest))
 	assert.Equal(t, []string{"mem_assembled@1", "mem_dynamic@2"}, parsedMem)
 	assert.Equal(t, []string{"skill_assembled@1", "skill_dynamic@3"}, parsedSkills)
+}
+
+func TestEngine_VolatileFastFinishOnInteractivePrompt(t *testing.T) {
+	ctx := context.Background()
+
+	var llmCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&llmCalls, 1)
+		if n > 1 {
+			t.Fatal("LLM must only be called once when ask_user triggers volatile fast-finish")
+		}
+		resp := openai.ChatCompletionResponse{
+			Choices: []openai.ChatCompletionChoice{
+				{
+					Message: openai.ChatCompletionMessage{
+						Role: openai.ChatMessageRoleAssistant,
+						ToolCalls: []openai.ToolCall{
+							{
+								ID:   "call_ask_vol",
+								Type: openai.ToolTypeFunction,
+								Function: openai.FunctionCall{
+									Name:      tools.AskUserToolName,
+									Arguments: `{"message":"Pick a format:","elements":[{"id":"json","type":"button","label":"JSON","style":"primary"}]}`,
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	llmClient := llm.NewClient(&config.Config{
+		OpenAIAPIKey:  "test-key",
+		OpenAIModel:   "test-model",
+		OpenAIBaseURL: srv.URL,
+	}, nil)
+
+	reg := tools.NewRegistry(nil, nil)
+	ts := reg.SessionToolset(tools.ChatSessionContext{
+		ChatID:                "townhall",
+		UserID:                "alice",
+		IsDM:                  false,
+		SupportsInteractiveUI: true,
+	})
+	fe := &mockFrontend{
+		bindings: agentapi.Bindings{Tools: ts},
+	}
+
+	eng, err := NewEngine(Dependencies{
+		LLMClient: llmClient,
+		Frontends: map[string]agentapi.Frontend{"besedka": fe},
+	})
+	require.NoError(t, err)
+
+	res, err := eng.Run(ctx, agentapi.Turn{
+		Deliver:      true,
+		SystemPrompt: "You are Bob.",
+		Run: agentapi.RunDescriptor{
+			RunID:   "run_vol_ui",
+			Session: agentapi.SessionRef{FrontendID: "besedka", SessionID: "townhall", ScopeID: "townhall"},
+			Actor:   agentapi.Actor{ID: "alice"},
+			Kind:    agentapi.Interactive,
+			Model:   "test-model",
+		},
+		Messages: []openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleUser, Content: "Export report"}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&llmCalls))
+	assert.Equal(t, "Pick a format:", res.Content)
+	require.Len(t, res.Actions, 1)
+	assert.Equal(t, agentapi.ActionInteractivePrompt, res.Actions[0].Type)
+
+	// Confirm failed ask_user does not trigger ShouldStopLoop
+	rawExecErr := &toolsetExecutor{toolset: ts}
+	_, err = rawExecErr.Execute(ctx, tools.AskUserToolName, `{"message":"","elements":[]}`)
+	require.Error(t, err)
+	_, stopAfterErr := rawExecErr.ShouldStopLoop()
+	assert.False(t, stopAfterErr)
+
+	// Confirm multiple ask_user calls in a single volatile turn preserve both prompts and stop on first
+	var multiCalls int32
+	multiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&multiCalls, 1) > 1 {
+			t.Fatal("LLM must only be called once on multi-ask_user volatile batch")
+		}
+		resp := openai.ChatCompletionResponse{
+			Choices: []openai.ChatCompletionChoice{{
+				Message: openai.ChatCompletionMessage{
+					Role: openai.ChatMessageRoleAssistant,
+					ToolCalls: []openai.ToolCall{
+						{
+							ID:   "call_q1",
+							Type: openai.ToolTypeFunction,
+							Function: openai.FunctionCall{
+								Name:      tools.AskUserToolName,
+								Arguments: `{"message":"Which region?","elements":[{"id":"us","type":"button","label":"US"}]}`,
+							},
+						},
+						{
+							ID:   "call_q2",
+							Type: openai.ToolTypeFunction,
+							Function: openai.FunctionCall{
+								Name:      tools.AskUserToolName,
+								Arguments: `{"message":"Which format?","elements":[{"id":"json","type":"button","label":"JSON"}]}`,
+							},
+						},
+					},
+				},
+			}},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer multiSrv.Close()
+
+	multiClient := llm.NewClient(&config.Config{
+		OpenAIAPIKey:  "test-key",
+		OpenAIModel:   "test-model",
+		OpenAIBaseURL: multiSrv.URL,
+	}, nil)
+	multiEng, err := NewEngine(Dependencies{
+		LLMClient: multiClient,
+		Frontends: map[string]agentapi.Frontend{"besedka": fe},
+	})
+	require.NoError(t, err)
+	multiRes, err := multiEng.Run(ctx, agentapi.Turn{
+		Deliver:      true,
+		SystemPrompt: "You are Bob.",
+		Run: agentapi.RunDescriptor{
+			RunID:   "run_vol_multi_ui",
+			Session: agentapi.SessionRef{FrontendID: "besedka", SessionID: "townhall", ScopeID: "townhall"},
+			Actor:   agentapi.Actor{ID: "alice"},
+			Kind:    agentapi.Interactive,
+			Model:   "test-model",
+		},
+		Messages: []openai.ChatCompletionMessage{{Role: openai.ChatMessageRoleUser, Content: "Ask both"}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&multiCalls))
+	assert.Equal(t, "Which region?", multiRes.Content)
+	require.Len(t, multiRes.Actions, 2)
+	assert.Equal(t, "Which region?", multiRes.Actions[0].Content)
+	assert.Equal(t, "Which format?", multiRes.Actions[1].Content)
 }
 
 

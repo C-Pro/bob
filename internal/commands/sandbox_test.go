@@ -7,6 +7,7 @@ import (
 
 	"bob/internal/agentapi"
 	"bob/internal/commands"
+	"bob/internal/models"
 	"bob/internal/sandbox"
 
 	"github.com/stretchr/testify/assert"
@@ -176,4 +177,61 @@ func TestSandboxHandler_StatusAndLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, res.RecordAssistantEntry)
 	assert.Contains(t, res.Reply, "Sandbox request denied")
+}
+
+func TestSandboxHandler_StatusAttachesUI(t *testing.T) {
+	ctx := context.Background()
+	mgr := setupTestSandboxManager(t)
+	h := commands.NewSandboxHandler(mgr)
+
+	session := agentapi.SessionRef{FrontendID: "besedka", SessionID: "chat_dm_1", ScopeID: "chat_dm_1"}
+	actor := agentapi.Actor{ID: "user_alice"}
+
+	// No sandbox -> UI is nil
+	res, err := h.Handle(ctx, commands.Request{Session: session, Actor: actor, Subcommand: "status"})
+	require.NoError(t, err)
+	assert.Nil(t, res.UI)
+
+	// Pending approval -> Approve/Deny UI bound to sandbox ID
+	sbxPending, err := mgr.RequestSandbox(ctx, "user_alice", "chat_dm_1", sandbox.RequestParams{
+		Driver:      sandbox.DriverBwrap,
+		NetworkMode: sandbox.NetworkNone,
+		Reason:      "Pending test",
+	})
+	require.NoError(t, err)
+
+	res, err = h.Handle(ctx, commands.Request{Session: session, Actor: actor, Subcommand: "status"})
+	require.NoError(t, err)
+	require.NotNil(t, res.UI)
+	require.Len(t, res.UI.Elements, 2)
+	assert.Equal(t, "bob:sandbox:approve:"+sbxPending.ID, res.UI.Elements[0].ID)
+	assert.Equal(t, "bob:sandbox:deny:"+sbxPending.ID, res.UI.Elements[1].ID)
+
+	// Stale TargetID approve is rejected and leaves pending sandbox untouched
+	staleRes, err := h.Handle(ctx, commands.Request{
+		Session:    session,
+		Actor:      actor,
+		Subcommand: "approve",
+		TargetID:   "sbx-stale",
+	})
+	require.NoError(t, err)
+	assert.Contains(t, staleRes.Reply, "outdated")
+	assert.Nil(t, staleRes.Continuation)
+
+	// Running -> Destroy-only UI bound to sandbox ID
+	approveRes, err := h.Handle(ctx, commands.Request{
+		Session:    session,
+		Actor:      actor,
+		Subcommand: "approve",
+		TargetID:   sbxPending.ID,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, approveRes.Continuation)
+
+	res, err = h.Handle(ctx, commands.Request{Session: session, Actor: actor, Subcommand: "status"})
+	require.NoError(t, err)
+	require.NotNil(t, res.UI)
+	require.Len(t, res.UI.Elements, 1)
+	assert.Equal(t, models.UIElementTypeButton, res.UI.Elements[0].Type)
+	assert.Equal(t, "bob:sandbox:destroy:"+sbxPending.ID, res.UI.Elements[0].ID)
 }

@@ -162,7 +162,7 @@ func DecodeMessages(data string) ([]openai.ChatCompletionMessage, error) {
 // NewStepFromToolCall constructs an FSMStep from an OpenAI ToolCall.
 func NewStepFromToolCall(runID string, iteration, stepIndex int, tc openai.ToolCall, mode ExecutionMode) FSMStep {
 	maxAttempts := 3
-	if tc.Function.Name == "propose_memory" || tc.Function.Name == "propose_skill" {
+	if tc.Function.Name == "propose_memory" || tc.Function.Name == "propose_skill" || tc.Function.Name == "ask_user" {
 		maxAttempts = 1
 	}
 	timeoutSeconds := 30

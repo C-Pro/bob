@@ -178,6 +178,10 @@ func FormatProgressStep(toolCall openai.ToolCall) (title, desc string) {
 		title = "List Schedules"
 		desc = "Listing scheduled tasks"
 
+	case AskUserToolName:
+		title = "Ask User"
+		desc = "Preparing interactive question"
+
 	default:
 		if name == "" {
 			title = "Tool"

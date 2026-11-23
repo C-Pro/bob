@@ -2,6 +2,7 @@ package models
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -210,6 +211,402 @@ func TestProgressMessageSerialization(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(clientData), `"messageType":"progress"`)
 	assert.Contains(t, string(clientData), `"title":"Initial work"`)
+}
+
+func TestUIMessageSerialization(t *testing.T) {
+	legacyMsg := Message{
+		Seq:       1,
+		Timestamp: 1700000000,
+		ChatID:    "townhall",
+		UserID:    "user-1",
+		Content:   "Plain message",
+	}
+	legacyBytes, err := json.Marshal(legacyMsg)
+	require.NoError(t, err)
+	assert.NotContains(t, string(legacyBytes), `"ui"`)
+	assert.NotContains(t, string(legacyBytes), `"uiResponse"`)
+
+	promptMsgJSON := `{
+		"seq": 10,
+		"timestamp": 1700000010,
+		"chatId": "townhall",
+		"userId": "bot-1",
+		"type": "text",
+		"content": "Deploy **v1.2.3**?",
+		"ui": {
+			"elements": [
+				{
+					"id": "notify",
+					"type": "checkbox",
+					"label": "Notify team",
+					"description": "Post in #ops",
+					"default": true
+				},
+				{
+					"id": "approve",
+					"type": "button",
+					"label": "Approve",
+					"style": "primary"
+				},
+				{
+					"id": "deny",
+					"type": "button",
+					"label": "Deny",
+					"style": "danger"
+				}
+			],
+			"answered": true,
+			"selectedIds": ["notify", "approve"],
+			"responderId": "alice"
+		}
+	}`
+
+	var promptMsg Message
+	require.NoError(t, json.Unmarshal([]byte(promptMsgJSON), &promptMsg))
+	assert.Equal(t, MessageTypeText, promptMsg.Type)
+	require.NotNil(t, promptMsg.UI)
+	assert.True(t, promptMsg.UI.Answered)
+	assert.Equal(t, []string{"notify", "approve"}, promptMsg.UI.SelectedIDs)
+	assert.Equal(t, "alice", promptMsg.UI.ResponderID)
+	require.Len(t, promptMsg.UI.Elements, 3)
+	assert.Equal(t, UIElementTypeCheckbox, promptMsg.UI.Elements[0].Type)
+	assert.True(t, promptMsg.UI.Elements[0].Default)
+	assert.Equal(t, UIElementStylePrimary, promptMsg.UI.Elements[1].Style)
+	assert.Equal(t, UIElementStyleDanger, promptMsg.UI.Elements[2].Style)
+
+	respMsgJSON := `{
+		"seq": 11,
+		"timestamp": 1700000015,
+		"chatId": "townhall",
+		"userId": "alice",
+		"type": "ui_response",
+		"content": "@bob Selected: Approve",
+		"uiResponse": {
+			"parentSeq": 10,
+			"selectedIds": ["notify", "approve"]
+		}
+	}`
+
+	var respMsg Message
+	require.NoError(t, json.Unmarshal([]byte(respMsgJSON), &respMsg))
+	assert.Equal(t, MessageTypeUIResponse, respMsg.Type)
+	require.NotNil(t, respMsg.UIResponse)
+	assert.Equal(t, int64(10), respMsg.UIResponse.ParentSeq)
+	assert.Equal(t, []string{"notify", "approve"}, respMsg.UIResponse.SelectedIDs)
+
+	clientPrompt := ClientMessage{
+		Type:        ClientMessageTypeSend,
+		ChatID:      "dm_1",
+		Content:     "Choose region:",
+		MessageType: MessageTypeText,
+		UI: &UIData{
+			Elements: []UIElement{
+				{ID: "us", Type: UIElementTypeRadio, Label: "US", Default: true},
+				{ID: "eu", Type: UIElementTypeRadio, Label: "EU"},
+			},
+		},
+	}
+	clientBytes, err := json.Marshal(clientPrompt)
+	require.NoError(t, err)
+	var decodedClient ClientMessage
+	require.NoError(t, json.Unmarshal(clientBytes, &decodedClient))
+	assert.Equal(t, MessageTypeText, decodedClient.MessageType)
+	require.NotNil(t, decodedClient.UI)
+	require.Len(t, decodedClient.UI.Elements, 2)
+	assert.True(t, decodedClient.UI.Elements[0].Default)
+}
+
+func TestValidateAndSanitizeUIData(t *testing.T) {
+	tooMany := make([]UIElement, MaxUIElements+1)
+	for i := range tooMany {
+		tooMany[i] = UIElement{
+			ID:    strings.Repeat("a", 2) + string(rune('a'+i%26)) + string(rune('0'+i/26)),
+			Type:  UIElementTypeButton,
+			Label: "Opt",
+		}
+	}
+
+	tests := []struct {
+		name    string
+		ui      *UIData
+		wantErr string
+	}{
+		{
+			name:    "nil ui",
+			ui:      nil,
+			wantErr: "cannot be nil",
+		},
+		{
+			name:    "empty elements",
+			ui:      &UIData{Elements: []UIElement{}},
+			wantErr: "invalid ui elements count",
+		},
+		{
+			name:    "too many elements",
+			ui:      &UIData{Elements: tooMany},
+			wantErr: "invalid ui elements count",
+		},
+		{
+			name: "empty id",
+			ui: &UIData{Elements: []UIElement{
+				{ID: "   ", Type: UIElementTypeButton, Label: "OK"},
+			}},
+			wantErr: "ID cannot be empty",
+		},
+		{
+			name: "id too long",
+			ui: &UIData{Elements: []UIElement{
+				{ID: strings.Repeat("x", MaxUIElementIDBytes+1), Type: UIElementTypeButton, Label: "OK"},
+			}},
+			wantErr: "exceeds 64 bytes",
+		},
+		{
+			name: "duplicate id after trim",
+			ui: &UIData{Elements: []UIElement{
+				{ID: "ok", Type: UIElementTypeButton, Label: "OK"},
+				{ID: " ok ", Type: UIElementTypeButton, Label: "Also OK"},
+			}},
+			wantErr: "duplicate ui element ID",
+		},
+		{
+			name: "empty label",
+			ui: &UIData{Elements: []UIElement{
+				{ID: "ok", Type: UIElementTypeButton, Label: " \t "},
+			}},
+			wantErr: "label cannot be empty",
+		},
+		{
+			name: "label too long",
+			ui: &UIData{Elements: []UIElement{
+				{ID: "ok", Type: UIElementTypeButton, Label: strings.Repeat("a", MaxUIElementLabelBytes+1)},
+			}},
+			wantErr: "label exceeds 255 bytes",
+		},
+		{
+			name: "description too long",
+			ui: &UIData{Elements: []UIElement{
+				{ID: "ok", Type: UIElementTypeButton, Label: "OK", Description: strings.Repeat("d", MaxUIElementDescBytes+1)},
+			}},
+			wantErr: "description exceeds 1024 bytes",
+		},
+		{
+			name: "invalid type",
+			ui: &UIData{Elements: []UIElement{
+				{ID: "ok", Type: UIElementType("slider"), Label: "Slide"},
+			}},
+			wantErr: "invalid ui element type",
+		},
+		{
+			name: "invalid style",
+			ui: &UIData{Elements: []UIElement{
+				{ID: "ok", Type: UIElementTypeButton, Label: "OK", Style: UIElementStyle("neon")},
+			}},
+			wantErr: "invalid ui element style",
+		},
+		{
+			name: "button with default true",
+			ui: &UIData{Elements: []UIElement{
+				{ID: "ok", Type: UIElementTypeButton, Label: "OK", Default: true},
+			}},
+			wantErr: "button element cannot have default state",
+		},
+		{
+			name: "multiple default radios",
+			ui: &UIData{Elements: []UIElement{
+				{ID: "r1", Type: UIElementTypeRadio, Label: "One", Default: true},
+				{ID: "r2", Type: UIElementTypeRadio, Label: "Two", Default: true},
+			}},
+			wantErr: "at most one radio element can have default state",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateUIData(tt.ui)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+
+			sanitized, sErr := SanitizeUIDataForSend(tt.ui)
+			assert.Error(t, sErr)
+			assert.Nil(t, sanitized)
+		})
+	}
+
+	input := &UIData{
+		Elements: []UIElement{
+			{ID: " cb1 ", Type: UIElementTypeCheckbox, Label: " Notify ", Description: " Send alert ", Default: true},
+			{ID: " r1 ", Type: UIElementTypeRadio, Label: " US ", Default: true},
+			{ID: " btn ", Type: UIElementTypeButton, Label: " Go ", Style: UIElementStylePrimary},
+		},
+		Answered:    true,
+		SelectedIDs: []string{"cb1"},
+		ResponderID: "alice",
+	}
+
+	sanitized, err := SanitizeUIDataForSend(input)
+	require.NoError(t, err)
+	require.NotNil(t, sanitized)
+
+	assert.False(t, sanitized.Answered)
+	assert.Nil(t, sanitized.SelectedIDs)
+	assert.Empty(t, sanitized.ResponderID)
+	assert.Equal(t, "cb1", sanitized.Elements[0].ID)
+	assert.Equal(t, "Notify", sanitized.Elements[0].Label)
+	assert.Equal(t, "Send alert", sanitized.Elements[0].Description)
+	assert.Equal(t, "btn", sanitized.Elements[2].ID)
+
+	// Input must remain unmutated
+	assert.True(t, input.Answered)
+	assert.Equal(t, []string{"cb1"}, input.SelectedIDs)
+	assert.Equal(t, "alice", input.ResponderID)
+	assert.Equal(t, " cb1 ", input.Elements[0].ID)
+}
+
+func TestUIContextHelpers(t *testing.T) {
+	assert.True(t, HasReservedUIActionPrefix("bob:sandbox_approve"))
+	assert.True(t, HasReservedUIActionPrefix("  BOB:memory_reject:mem_1@1 "))
+	assert.False(t, HasReservedUIActionPrefix("approve"))
+	assert.False(t, HasReservedUIActionPrefix("custom_bob:test"))
+
+	assert.Equal(t, "", FormatUIForContext(nil))
+	assert.Equal(t, "", FormatUIForContext(&UIData{}))
+
+	unanswered := &UIData{
+		Elements: []UIElement{
+			{ID: "notify", Type: UIElementTypeCheckbox, Label: "Notify Slack", Default: true},
+			{ID: "approve", Type: UIElementTypeButton, Label: "Approve", Description: "Deploy now", Style: UIElementStylePrimary},
+		},
+	}
+	answeredCopy := &UIData{
+		Elements:    unanswered.Elements,
+		Answered:    true,
+		SelectedIDs: []string{"notify", "approve"},
+		ResponderID: "alice",
+	}
+
+	formattedUnanswered := FormatUIForContext(unanswered)
+	formattedAnswered := FormatUIForContext(answeredCopy)
+	assert.Equal(t, formattedUnanswered, formattedAnswered)
+	assert.Equal(t, `[Interactive UI options: checkbox "Notify Slack" (id=notify, default); button "Approve" (id=approve): Deploy now]`, formattedUnanswered)
+
+	assert.Equal(t, "hello", FormatUIResponseForContext(" hello ", nil))
+	assert.Equal(t, "[UI response to seq 42 | selected_ids: none]", FormatUIResponseForContext("", &UIResponseData{ParentSeq: 42}))
+	assert.Equal(
+		t,
+		"@bob Selected: Approve\n[UI response to seq 42 | selected_ids: notify, approve]",
+		FormatUIResponseForContext(" @bob Selected: Approve ", &UIResponseData{ParentSeq: 42, SelectedIDs: []string{"notify", "approve"}}),
+	)
+}
+
+func TestUIActionBuildersAndParsing(t *testing.T) {
+	const sbxID = "sbx-1234567890abcdef"
+	builders := []struct {
+		name string
+		ui   *UIData
+		want []ParsedUIAction
+	}{
+		{
+			name: "sandbox approval",
+			ui:   NewSandboxApprovalUI(sbxID),
+			want: []ParsedUIAction{
+				{Kind: UIActionSandboxApprove, TargetID: sbxID},
+				{Kind: UIActionSandboxDeny, TargetID: sbxID},
+			},
+		},
+		{
+			name: "sandbox running",
+			ui:   NewSandboxRunningUI(sbxID),
+			want: []ParsedUIAction{
+				{Kind: UIActionSandboxDestroy, TargetID: sbxID},
+				{Kind: UIActionSandboxKeep, TargetID: sbxID},
+			},
+		},
+		{
+			name: "sandbox destroy only",
+			ui:   NewSandboxDestroyOnlyUI(sbxID),
+			want: []ParsedUIAction{{Kind: UIActionSandboxDestroy, TargetID: sbxID}},
+		},
+		{
+			name: "memory approval",
+			ui:   NewMemoryApprovalUI("mem_1234567890abcdef@1"),
+			want: []ParsedUIAction{
+				{Kind: UIActionMemoryApprove, TargetID: "mem_1234567890abcdef@1"},
+				{Kind: UIActionMemoryReject, TargetID: "mem_1234567890abcdef@1"},
+			},
+		},
+		{
+			name: "skill approval",
+			ui:   NewSkillApprovalUI("skill_1234567890abcdef@2"),
+			want: []ParsedUIAction{
+				{Kind: UIActionSkillApprove, TargetID: "skill_1234567890abcdef@2"},
+				{Kind: UIActionSkillReject, TargetID: "skill_1234567890abcdef@2"},
+			},
+		},
+		{
+			name: "schedule approval",
+			ui:   NewScheduleApprovalUI("sched_1700000000000000000"),
+			want: []ParsedUIAction{
+				{Kind: UIActionScheduleApprove, TargetID: "sched_1700000000000000000"},
+				{Kind: UIActionScheduleDeny, TargetID: "sched_1700000000000000000"},
+			},
+		},
+	}
+
+	for _, tc := range builders {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NotNil(t, tc.ui)
+			require.NoError(t, ValidateUIData(tc.ui))
+			require.Len(t, tc.ui.Elements, len(tc.want))
+			for i, el := range tc.ui.Elements {
+				assert.True(t, HasReservedUIActionPrefix(el.ID))
+				parsed, ok := ParseReservedUIAction(el.ID)
+				require.True(t, ok, "expected valid reserved action for %q", el.ID)
+				assert.Equal(t, tc.want[i], parsed)
+			}
+		})
+	}
+
+	// Whitespace (ASCII + Unicode), empty, unknown, and >64-byte guards
+	assert.Nil(t, NewSandboxApprovalUI(""))
+	assert.Nil(t, NewSandboxApprovalUI("sbx 1"))
+	assert.Nil(t, NewSandboxApprovalUI("sbx\u00a01"))
+	assert.Nil(t, NewSandboxRunningUI(""))
+	assert.Nil(t, NewSandboxDestroyOnlyUI(""))
+	assert.Nil(t, NewSandboxApprovalUI(strings.Repeat("x", MaxUIElementIDBytes)))
+	assert.Nil(t, NewSandboxRunningUI(strings.Repeat("x", MaxUIElementIDBytes)))
+	assert.Nil(t, NewSandboxDestroyOnlyUI(strings.Repeat("x", MaxUIElementIDBytes)))
+	assert.Nil(t, NewMemoryApprovalUI(""))
+	assert.Nil(t, NewMemoryApprovalUI("mem_1@1 extra"))
+	assert.Nil(t, NewMemoryApprovalUI("mem_1@1\u00a0junk"))
+	assert.Nil(t, NewMemoryApprovalUI("mem_1@1\vjunk"))
+	assert.Nil(t, NewSkillApprovalUI("skill_1\t2"))
+	assert.Nil(t, NewSkillApprovalUI("skill_1\u20032"))
+	assert.Nil(t, NewScheduleApprovalUI("sched_1\n2"))
+	assert.Nil(t, NewMemoryApprovalUI(strings.Repeat("x", MaxUIElementIDBytes)))
+	assert.Nil(t, NewSkillApprovalUI(strings.Repeat("x", MaxUIElementIDBytes)))
+	assert.Nil(t, NewScheduleApprovalUI(strings.Repeat("x", MaxUIElementIDBytes)))
+
+	for _, bad := range []string{
+		"",
+		"approve",
+		"bob:unknown",
+		"bob:sandbox:approve",
+		"bob:sandbox:approve:",
+		"bob:sandbox:deny:sbx 1",
+		"bob:sandbox:deny:sbx\u00a01",
+		"bob:sandbox:destroy:",
+		"bob:sandbox:keep:",
+		"bob:mem:approve:",
+		"bob:mem:approve:mem_1@1 extra",
+		"bob:mem:approve:mem_1@1\u00a0junk",
+		"bob:mem:approve:mem_1@1\u00a0",
+		"bob:skill:reject:skill_1\n2",
+		"bob:skill:reject:skill_1\fjunk",
+		"bob:sched:approve:\t",
+	} {
+		_, ok := ParseReservedUIAction(bad)
+		assert.False(t, ok, "expected ParseReservedUIAction(%q) to fail", bad)
+	}
 }
 
 

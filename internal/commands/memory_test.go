@@ -210,7 +210,7 @@ func TestMemoryHandler_ShowApproveRejectForget(t *testing.T) {
 	assert.Contains(t, res.Reply, item.ID)
 	assert.Contains(t, res.Reply, "Memory Item:")
 
-	// 4. Show version
+	// 4. Show version (proposed -> attaches approval UI)
 	res, err = h.Handle(ctx, commands.Request{
 		Session:    session,
 		Actor:      actor,
@@ -222,6 +222,10 @@ func TestMemoryHandler_ShowApproveRejectForget(t *testing.T) {
 	assert.Contains(t, res.Reply, ver.ID)
 	assert.Contains(t, res.Reply, "Memory Version:")
 	assert.Contains(t, res.Reply, "Alice prefers Go")
+	require.NotNil(t, res.UI)
+	require.Len(t, res.UI.Elements, 2)
+	assert.Equal(t, "bob:mem:approve:"+ver.ID, res.UI.Elements[0].ID)
+	assert.Equal(t, "bob:mem:reject:"+ver.ID, res.UI.Elements[1].ID)
 
 	// 5. Approve
 	res, err = h.Handle(ctx, commands.Request{
@@ -233,6 +237,17 @@ func TestMemoryHandler_ShowApproveRejectForget(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Contains(t, res.Reply, "has been approved and activated")
+
+	// 5b. Show approved version -> no approval UI
+	res, err = h.Handle(ctx, commands.Request{
+		Session:    session,
+		Actor:      actor,
+		Command:    "memory",
+		Subcommand: "show",
+		Args:       []string{ver.ID},
+	})
+	require.NoError(t, err)
+	assert.Nil(t, res.UI)
 
 	// 6. Propose revision 2 and reject
 	_, ver2, err := store.ProposeMemory(ctx, &knowledge.KnowledgeItem{

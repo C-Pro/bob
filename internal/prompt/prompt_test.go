@@ -134,3 +134,20 @@ func TestPromptsImageDescriptionsAndScopedRecall(t *testing.T) {
 		})
 	}
 }
+
+func TestPrompt_InteractiveUIGuidanceScope(t *testing.T) {
+	bot := models.User{ID: "bot-1", DisplayName: "Bob AI"}
+	user := models.User{ID: "user-1", DisplayName: "Alice"}
+
+	townhall := RenderTownhallPrompt(bot, "@bot", 2)
+	dm := RenderDMPrompt(bot, "@bot", user, 5)
+	cliPrompt := RenderCLI(CLIPromptContext{})
+
+	for _, interactive := range []string{townhall, dm} {
+		assert.Contains(t, interactive, "ask_user")
+		assert.Contains(t, interactive, "Never use 'bob:'")
+		assert.Contains(t, interactive, "sandbox_request, propose_memory, propose_skill, or schedule_task")
+	}
+
+	assert.NotContains(t, cliPrompt, "ask_user")
+}

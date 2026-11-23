@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"bob/internal/models"
 	"bob/internal/sandbox"
 )
 
@@ -48,7 +49,13 @@ func (h *SandboxHandler) Handle(ctx context.Context, req Request) (Result, error
 }
 
 func (h *SandboxHandler) handleApprove(ctx context.Context, req Request) (Result, error) {
-	sbx, err := h.Manager.ApproveSandbox(ctx, req.Actor.ID)
+	var sbx *sandbox.UserSandbox
+	var err error
+	if req.TargetID != "" {
+		sbx, err = h.Manager.ApproveSandboxForID(ctx, req.Actor.ID, req.TargetID)
+	} else {
+		sbx, err = h.Manager.ApproveSandbox(ctx, req.Actor.ID)
+	}
 	if err != nil {
 		return Result{Reply: fmt.Sprintf("⚠️ Failed to approve sandbox: %v", err)}, nil
 	}
@@ -65,7 +72,12 @@ func (h *SandboxHandler) handleApprove(ctx context.Context, req Request) (Result
 }
 
 func (h *SandboxHandler) handleDeny(ctx context.Context, req Request) (Result, error) {
-	err := h.Manager.DenySandbox(req.Actor.ID)
+	var err error
+	if req.TargetID != "" {
+		err = h.Manager.DenySandboxForID(req.Actor.ID, req.TargetID)
+	} else {
+		err = h.Manager.DenySandbox(req.Actor.ID)
+	}
 	if err != nil {
 		return Result{Reply: fmt.Sprintf("⚠️ Failed to deny sandbox: %v", err)}, nil
 	}
@@ -73,7 +85,12 @@ func (h *SandboxHandler) handleDeny(ctx context.Context, req Request) (Result, e
 }
 
 func (h *SandboxHandler) handleDestroy(ctx context.Context, req Request) (Result, error) {
-	err := h.Manager.Destroy(ctx, req.Actor.ID)
+	var err error
+	if req.TargetID != "" {
+		err = h.Manager.DestroyForID(ctx, req.Actor.ID, req.TargetID)
+	} else {
+		err = h.Manager.Destroy(ctx, req.Actor.ID)
+	}
 	if err != nil {
 		return Result{Reply: fmt.Sprintf("⚠️ Failed to destroy sandbox: %v", err)}, nil
 	}
@@ -82,7 +99,16 @@ func (h *SandboxHandler) handleDestroy(ctx context.Context, req Request) (Result
 
 func (h *SandboxHandler) handleStatus(_ context.Context, req Request) (Result, error) {
 	sbx, _ := h.Manager.GetStatus(req.Actor.ID)
-	return Result{Reply: FormatSandboxStatus(sbx)}, nil
+	var ui *models.UIData
+	if sbx != nil {
+		switch sbx.Status {
+		case sandbox.StatusPendingApproval:
+			ui = models.NewSandboxApprovalUI(sbx.ID)
+		case sandbox.StatusRunning:
+			ui = models.NewSandboxDestroyOnlyUI(sbx.ID)
+		}
+	}
+	return Result{Reply: FormatSandboxStatus(sbx), UI: ui}, nil
 }
 
 // FormatSandboxStatus formats user sandbox details into a status markdown string.

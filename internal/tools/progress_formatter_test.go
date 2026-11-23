@@ -199,6 +199,13 @@ func TestFormatProgressStep_RegisteredTools(t *testing.T) {
 			expectedDesc:  "Listing scheduled tasks",
 		},
 		{
+			name:          "ask_user",
+			toolName:      AskUserToolName,
+			args:          `{"message":"Which region?","elements":[{"id":"us","type":"button","label":"US"}]}`,
+			expectedTitle: "Ask User",
+			expectedDesc:  "Preparing interactive question",
+		},
+		{
 			name:          "fallback unknown tool",
 			toolName:      "custom_analysis_tool",
 			args:          `{"target":"dataset.csv"}`,

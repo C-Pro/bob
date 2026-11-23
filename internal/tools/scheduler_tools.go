@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"bob/internal/agentapi"
 	"bob/internal/scheduler"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -351,6 +352,25 @@ func (r *Registry) executeScheduleTask(ctx context.Context, argsJSON string) (st
 			return "", fmt.Errorf("a schedule named %q already exists in this chat. Please use a different name or cancel the existing one", args.ScheduleName)
 		}
 		return "", fmt.Errorf("failed to create schedule: %w", err)
+	}
+
+	if session.Actions != nil {
+		summary := strings.Join(strings.Fields(instruction), " ")
+		if runes := []rune(summary); len(runes) > 120 {
+			summary = string(runes[:117]) + "..."
+		}
+		if payloadBytes, pErr := json.Marshal(agentapi.ApprovalRequestPayload{
+			Kind:     agentapi.ApprovalKindSchedule,
+			TargetID: sched.ID,
+			Label:    sched.Name,
+			Summary:  summary,
+		}); pErr == nil {
+			session.Actions.Add(agentapi.Action{
+				Type:    agentapi.ActionApprovalRequest,
+				Content: sched.ID,
+				Payload: payloadBytes,
+			})
+		}
 	}
 
 	var reason string
