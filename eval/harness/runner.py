@@ -123,6 +123,8 @@ def grade_frames(task: dict, workspace: Path, stdout_output: str) -> dict:
 def resolve_swebench_python() -> str:
     override = os.environ.get("BOB_EVAL_SWEBENCH_PYTHON", "").strip()
     if override:
+        if os.sep in override or "/" in override:
+            return os.path.abspath(os.path.expanduser(override))
         return override
     if importlib.util.find_spec("swebench") is not None:
         return sys.executable
@@ -152,44 +154,42 @@ def evaluate_swe_patch_docker(task_id: str, patch_content: str, timeout_sec: int
         "model_patch": patch_content,
         "model_name_or_path": "bob"
     }]
-    
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-        json.dump(pred, f)
-        pred_path = Path(f.name)
-        
+
     run_id = f"eval_{inst_id}_{int(time.time())}"
-    cmd = [
-        resolve_swebench_python(), "-m", "swebench.harness.run_evaluation",
-        "-d", "SWE-bench/SWE-bench_Lite",
-        "-p", str(pred_path),
-        "-i", inst_id,
-        "-id", run_id,
-        "--max_workers", "1",
-        "--timeout", str(timeout_sec)
-    ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec + 300)
-        report_dir = Path("logs/run_evaluation") / run_id / "bob" / inst_id
-        report_json = report_dir / "report.json"
-        if report_json.exists():
-            with open(report_json) as rf:
-                rep = json.load(rf)
-                inst_rep = rep.get(inst_id, {})
-                resolved = inst_rep.get("resolved", False)
-                tests_status = inst_rep.get("tests_status", {})
-                f2p_fail = tests_status.get("FAIL_TO_PASS", {}).get("failure", [])
-                f2p_succ = tests_status.get("FAIL_TO_PASS", {}).get("success", [])
-                p2p_fail = tests_status.get("PASS_TO_PASS", {}).get("failure", [])
-                p2p_succ = tests_status.get("PASS_TO_PASS", {}).get("success", [])
-                if resolved:
-                    return True, f"Resolved: All FAIL_TO_PASS ({len(f2p_succ)}) and PASS_TO_PASS ({len(p2p_succ)}) tests passed in Docker testbed"
-                else:
-                    return False, f"Unresolved in Docker: {len(f2p_fail)} fail_to_pass failure(s) (passed {len(f2p_succ)}), {len(p2p_fail)} pass_to_pass regression(s)"
-        return False, f"Docker eval failed to produce report.json (Exit code {proc.returncode})"
+        with tempfile.TemporaryDirectory(prefix=f"swebench_{inst_id}_") as work_dir_str:
+            work_dir = Path(work_dir_str)
+            pred_path = work_dir / "pred.json"
+            pred_path.write_text(json.dumps(pred))
+            cmd = [
+                resolve_swebench_python(), "-m", "swebench.harness.run_evaluation",
+                "-d", "SWE-bench/SWE-bench_Lite",
+                "-p", str(pred_path),
+                "-i", inst_id,
+                "-id", run_id,
+                "--max_workers", "1",
+                "--timeout", str(timeout_sec)
+            ]
+            proc = subprocess.run(cmd, cwd=work_dir, capture_output=True, text=True, timeout=timeout_sec + 300)
+            report_dir = work_dir / "logs" / "run_evaluation" / run_id / "bob" / inst_id
+            report_json = report_dir / "report.json"
+            if report_json.exists():
+                with open(report_json) as rf:
+                    rep = json.load(rf)
+                    inst_rep = rep.get(inst_id, {})
+                    resolved = inst_rep.get("resolved", False)
+                    tests_status = inst_rep.get("tests_status", {})
+                    f2p_fail = tests_status.get("FAIL_TO_PASS", {}).get("failure", [])
+                    f2p_succ = tests_status.get("FAIL_TO_PASS", {}).get("success", [])
+                    p2p_fail = tests_status.get("PASS_TO_PASS", {}).get("failure", [])
+                    p2p_succ = tests_status.get("PASS_TO_PASS", {}).get("success", [])
+                    if resolved:
+                        return True, f"Resolved: All FAIL_TO_PASS ({len(f2p_succ)}) and PASS_TO_PASS ({len(p2p_succ)}) tests passed in Docker testbed"
+                    else:
+                        return False, f"Unresolved in Docker: {len(f2p_fail)} fail_to_pass failure(s) (passed {len(f2p_succ)}), {len(p2p_fail)} pass_to_pass regression(s)"
+            return False, f"Docker eval failed to produce report.json (Exit code {proc.returncode})"
     except Exception as e:
         return False, f"Docker eval error: {e}"
-    finally:
-        pred_path.unlink(missing_ok=True)
 
 def grade_swe(task: dict, workspace: Path, base_sha: str = "HEAD", run_docker: bool = True) -> dict:
     patch = ""

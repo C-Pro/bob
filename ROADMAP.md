@@ -15,10 +15,10 @@ updates—before consolidating recurring patterns into model weights.
 |                     User-Validated Skills & Structured Memory, Docker & Bwrap     |
 |                     Sandboxes, Durable FSM, Cron Scheduler, S3 Backups,           |
 |                     Trajectory Logging, Reward Engine (`/feedback`), S3 Exporter  |
-| [NEXT] Phase 1      Context Assembly, Episodic Index & Adaptive Task Compaction   |
+| [DONE] Phase 1      Context Assembly, Episodic Index & Adaptive Task Compaction   |
 | [NEXT] Phase 2      Non-Parametric "Sleep": GEPA Skill & Memory Consolidation     |
 | [DONE] Phase 3      Evaluation Dataset & Deterministic CLI Gatekeeper Harness     |
-| [NEXT] Phase 4      Lightweight Local Control-Plane / Decision Model (Fast/Slow)  |
+| [DONE] Phase 4      Lightweight Local Control-Plane / Decision Model (Fast/Slow)  |
 | [NEXT] Phase 5      Local Open-Weights Actor Backend & Tiered Model Router        |
 | [NEXT] Phase 6      Offline Shared-Path PESO & Knowledge Seeding Pipeline         |
 | [NEXT] Phase 7      SafeMERGE, Dynamic LoRA Hot-Reload & Adapter Lifecycle        |

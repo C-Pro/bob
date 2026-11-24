@@ -655,8 +655,8 @@ func TestProcessMessage_OnDemandBackfill(t *testing.T) {
 			assert.Equal(t, "1", r.URL.Query().Get("fromSeq"))
 			assert.Equal(t, "12", r.URL.Query().Get("toSeq"))
 			_ = json.NewEncoder(w).Encode([]models.Message{
-				{Seq: 1, ChatID: "dm_user_bot", UserID: "user-1", Content: "Where to buy fins in Kuta?", Timestamp: 100},
-				{Seq: 2, ChatID: "dm_user_bot", UserID: "bot-1", Content: "Aquamaster on Sunset Road", Timestamp: 101},
+				{Seq: 1, ChatID: "dm_user_bot", UserID: "user-1", Content: "Where to buy fins in Kuta?", Timestamp: time.Now().Unix() - 60},
+				{Seq: 2, ChatID: "dm_user_bot", UserID: "bot-1", Content: "Aquamaster on Sunset Road", Timestamp: time.Now().Unix() - 59},
 			})
 			return
 		}

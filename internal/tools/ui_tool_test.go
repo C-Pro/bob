@@ -30,8 +30,8 @@ func hasOpenAIToolNamed(defs []agentapi.ToolDefinition, name string) bool {
 func TestAskUser_ToolDefinitionAndExposure(t *testing.T) {
 	reg := NewRegistry(nil, nil)
 
-	// Static ToolDefinitions() remains 3 (CLI/default scope must never gain ask_user)
-	assert.Len(t, reg.ToolDefinitions(), 3)
+	// Static ToolDefinitions() remains 4 (CLI/default scope must never gain ask_user)
+	assert.Len(t, reg.ToolDefinitions(), 4)
 	assert.False(t, IsReadOnlyTool(AskUserToolName))
 
 	// Non-interactive sessions (Townhall & DM) must NOT expose ask_user
@@ -41,7 +41,7 @@ func TestAskUser_ToolDefinitionAndExposure(t *testing.T) {
 		IsDM:                  false,
 		SupportsInteractiveUI: false,
 	})
-	assert.Len(t, thNonInteractive, 3)
+	assert.Len(t, thNonInteractive, 4)
 
 	dmNonInteractive := reg.ToolDefinitionsForSession(ChatSessionContext{
 		ChatID:                "dm_alice",
@@ -82,7 +82,7 @@ func TestAskUser_ToolDefinitionAndExposure(t *testing.T) {
 	}
 
 	// Verify static slice was not mutated by appending
-	assert.Len(t, reg.ToolDefinitions(), 3)
+	assert.Len(t, reg.ToolDefinitions(), 4)
 
 	// Verify SessionToolset.Definitions propagates SupportsInteractiveUI cleanly
 	ts := reg.SessionToolset(ChatSessionContext{

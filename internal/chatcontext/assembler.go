@@ -487,11 +487,14 @@ func (a *Assembler) Assemble(input AssemblyInput) AssemblyResult {
 	}
 	assembledSystemPrompt := promptBuilder.String()
 
-	// Build conversation messages from retained ring-buffer entries
-	msgs := make([]openai.ChatCompletionMessage, 0, len(retainedEntries)+1)
-	for _, e := range retainedEntries {
-		msgs = append(msgs, entryToLLMMessage(e))
+	// Build conversation messages from retained ring-buffer entries, preserving the
+	// immediate predecessor from input.RecentEntries so >1h timestamp injection
+	// matches the selection byte accounting even when older entries were dropped.
+	var firstPrev *Entry
+	if droppedEntries > 0 && droppedEntries <= len(input.RecentEntries) {
+		firstPrev = &input.RecentEntries[droppedEntries-1]
 	}
+	msgs := entriesToLLMMessagesWithFirstPrev(retainedEntries, firstPrev)
 	if len(msgs) > 0 && msgs[len(msgs)-1].Role == openai.ChatMessageRoleAssistant && continuationText != "" {
 		msgs = append(msgs, openai.ChatCompletionMessage{
 			Role:    openai.ChatMessageRoleUser,
@@ -542,12 +545,16 @@ func selectRecentEntriesWithinBudget(entries []Entry, budgetBytes int) (retained
 		if i != len(entries)-1 {
 			e.Images = nil
 		}
-		cost := entryFormattedBytes(e)
+		var prev *Entry
+		if i > 0 {
+			prev = &entries[i-1]
+		}
+		cost := entryFormattedBytesWithPrev(e, prev)
 		if len(reversed) == 0 && cost > budgetBytes {
 			// Ensure the latest turn is always retained by truncating its text content to fit budgetBytes.
-			e = truncateEntryToFit(e, budgetBytes)
+			e = truncateEntryToFitWithPrev(e, prev, budgetBytes)
 			reversed = append(reversed, e)
-			usedBytes = entryFormattedBytes(e)
+			usedBytes = entryFormattedBytesWithPrev(e, prev)
 			dropped = i
 			truncated = true
 			break
@@ -568,7 +575,11 @@ func selectRecentEntriesWithinBudget(entries []Entry, budgetBytes int) (retained
 }
 
 func entryFormattedBytes(e Entry) int {
-	msg := entryToLLMMessage(e)
+	return entryFormattedBytesWithPrev(e, nil)
+}
+
+func entryFormattedBytesWithPrev(e Entry, prev *Entry) int {
+	msg := entryToLLMMessageWithPrev(e, prev)
 	if len(msg.MultiContent) > 0 {
 		total := 0
 		for _, part := range msg.MultiContent {
@@ -583,14 +594,13 @@ func entryFormattedBytes(e Entry) int {
 }
 
 func truncateEntryToFit(e Entry, budgetBytes int) Entry {
+	return truncateEntryToFitWithPrev(e, nil, budgetBytes)
+}
+
+func truncateEntryToFitWithPrev(e Entry, prev *Entry, budgetBytes int) Entry {
 	role := e.Role
 	if role == "" {
 		role = openai.ChatMessageRoleUser
-	}
-	prefixLen := 0
-	senderName := strings.TrimSpace(e.SenderName)
-	if role == openai.ChatMessageRoleUser && senderName != "" && senderName != e.SenderID {
-		prefixLen = len(senderName) + 2 // "<SenderName>: "
 	}
 	imageBytes := 0
 	if role == openai.ChatMessageRoleUser {
@@ -600,10 +610,31 @@ func truncateEntryToFit(e Entry, budgetBytes int) Entry {
 		e.Images = nil
 		imageBytes = 0
 	}
-	avail := budgetBytes - imageBytes - prefixLen
+
+	tsLen := 0
+	if role == openai.ChatMessageRoleUser && shouldInjectUserTimestamp(e, prev) {
+		tsPrefix := formatUserTimestampPrefix(e.Timestamp)
+		remaining := budgetBytes - imageBytes
+		if remaining < len(tsPrefix) {
+			e.Timestamp = 0
+		} else if remaining == len(tsPrefix) {
+			e.SenderName = ""
+			e.Content = ""
+			return e
+		} else {
+			tsLen = len(tsPrefix) + 1 // "<tsPrefix> "
+		}
+	}
+
+	prefixLen := 0
+	senderName := strings.TrimSpace(e.SenderName)
+	if role == openai.ChatMessageRoleUser && senderName != "" && senderName != e.SenderID {
+		prefixLen = len(senderName) + 2 // "<SenderName>: "
+	}
+	avail := budgetBytes - imageBytes - tsLen - prefixLen
 	if avail < 0 {
 		e.SenderName = ""
-		avail = budgetBytes - imageBytes
+		avail = budgetBytes - imageBytes - tsLen
 	}
 	e.Content = truncateUTF8Bytes(e.Content, avail)
 	return e

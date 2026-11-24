@@ -2337,16 +2337,18 @@ func (g *Gateway) handleSandboxCommandWithTarget(ctx context.Context, msg models
 		} else {
 			slog.Warn("could not emit initial progress card for sandbox approval, falling back to chat message", "chat_id", msg.ChatID, "error", pErr)
 			ackMsg := fmt.Sprintf("Sandbox created successfully, proceeding with %s...", res.Continuation.Reason)
-			if err := g.SendMessage(msg.ChatID, ackMsg); err != nil {
-				return fmt.Errorf("failed to send approval message: %w", err)
-			}
-			g.contextManager.Push(msg.ChatID, chatcontext.Entry{
+			entry := chatcontext.Entry{
 				Role:       "assistant",
 				SenderID:   botID,
 				SenderName: botUser.GetDisplayName(),
 				Content:    ackMsg,
 				Timestamp:  time.Now().Unix(),
-			})
+			}
+			if err := g.pushPendingAndSend(msg.ChatID, entry, func() error {
+				return g.SendMessage(msg.ChatID, ackMsg)
+			}); err != nil {
+				return fmt.Errorf("failed to send approval message: %w", err)
+			}
 		}
 
 		return g.generateAndSendAgentReply(ctx, msg, true, senderName, res.Continuation.Reason, initialProgressSeq)

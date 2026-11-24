@@ -74,7 +74,7 @@
 ---
 
 - [~] **Track: Phase 4 — Unified 0.8B Multimodal Decision & Embedding Model (`bob-s1`, dev codename `Jev`)**
-*Link: [./tracks/jev-multimodal-decision-embedder_20261114/](./tracks/jev-multimodal-decision-embedder_20261114/) (Steps 1–2 complete; Go integration Steps 3–6 pending)*
+*Link: [./tracks/jev-multimodal-decision-embedder_20261114/](./tracks/jev-multimodal-decision-embedder_20261114/) (Steps 1–2 complete; Steps 3–5 shipped in `bob-s1-go-integration_20261119`; Step 6 `llama.cpp` fork deferred per `bob-s1-go-integration_20261119/spec.md`)*
 
 ---
 
@@ -88,5 +88,10 @@
 
 ---
 
-- [ ] **Track: Bob Go Integration for `bob-s1` System-1 Inference Sidecar**
+- [x] **Track: Bob Go Integration for `bob-s1` System-1 Inference Sidecar**
 *Link: [./tracks/bob-s1-go-integration_20261119/](./tracks/bob-s1-go-integration_20261119/) (Go config, `SystemOneClient`, multimodal embeddings, 3-way compaction gate, hybrid loop guard, bilingual episodes, and held-out eval)*
+
+---
+
+- [x] **Track: Phase 4c — System-1 Control-Plane Hardening, Train-Only Calibration & Runtime Optimization (`bob-s1`)**
+*Link: [./tracks/bob-s1-control-plane-hardening_20261121/](./tracks/bob-s1-control-plane-hardening_20261121/) (Train-only provenance & 4-fold partitioning, FSM/Stage-2 hardening, section-aware rendering, train-calibration policy, and sidecar prefix cache)*

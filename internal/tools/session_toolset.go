@@ -12,7 +12,7 @@ import (
 // IsReadOnlyTool reports whether a tool provided by this registry is read-only and side-effect free.
 func IsReadOnlyTool(name string) bool {
 	switch strings.TrimSpace(name) {
-	case "web_search", "web_fetch", "recall_memory", "discover_memories", "discover_skills", RecallTaskHistoryToolName:
+	case "web_search", "web_fetch", "recall_memory", "discover_memories", "discover_skills", RecallTaskHistoryToolName, UTCTimeToolName:
 		return true
 	default:
 		return false

@@ -47,6 +47,7 @@ func (f *Frontend) Bind(ctx context.Context, run agentapi.RunDescriptor) (agenta
 	allowedTools := []string{
 		"discover_memories", "load_memory",
 		"discover_skills", "load_skill",
+		"utc_now",
 	}
 
 	// Host web tools (web_search, web_fetch) are enabled when:

@@ -25,6 +25,7 @@ func TestClassifier(t *testing.T) {
 	assert.True(t, IsReadOnlyTool("recall_memory"))
 	assert.True(t, IsReadOnlyTool("discover_memories"))
 	assert.True(t, IsReadOnlyTool("discover_skills"))
+	assert.True(t, IsReadOnlyTool("utc_now"))
 	assert.False(t, IsReadOnlyTool("propose_memory"))
 	assert.False(t, IsReadOnlyTool("load_memory"))
 	assert.False(t, IsReadOnlyTool("propose_skill"))
