@@ -362,6 +362,11 @@ func (r *Registry) initToolDefinitions() {
 		"properties": map[string]interface{}{},
 	}
 
+	utcNowSchema := map[string]interface{}{
+		"type":       "object",
+		"properties": map[string]interface{}{},
+	}
+
 	r.toolDefinitions = []openai.Tool{
 		{
 			Type: openai.ToolTypeFunction,
@@ -385,6 +390,14 @@ func (r *Registry) initToolDefinitions() {
 				Name:        "recall_memory",
 				Description: "Recall relevant past conversation history, discussions, topics, and episode navigation summaries from long-term memory. Provide 'query' for search, or 'chunk_id' / 'start_seq' / 'end_seq' to retrieve exact raw chunks. Episode summaries labeled [Model-Derived Episode Summary | seq <start>-<end>] are navigation indexes only; only when a summary is relevant and you need exact details, inspect its raw chunks (skip irrelevant summaries).",
 				Parameters:  recallMemorySchema,
+			},
+		},
+		{
+			Type: openai.ToolTypeFunction,
+			Function: &openai.FunctionDefinition{
+				Name:        UTCTimeToolName,
+				Description: "Return the current UTC date and time (RFC3339, Unix timestamp, and weekday). Use this when you need to know the current date or time.",
+				Parameters:  utcNowSchema,
 			},
 		},
 	}
@@ -555,9 +568,32 @@ func (r *Registry) Execute(ctx context.Context, name string, argsJSON string) (s
 		return r.executeAskUser(ctx, argsJSON)
 	case RecallTaskHistoryToolName:
 		return r.executeRecallTaskHistory(ctx, argsJSON)
+	case UTCTimeToolName:
+		return r.executeUTCNow(ctx, argsJSON)
 	default:
 		return "", fmt.Errorf("unknown tool: %s", name)
 	}
+}
+
+// UTCTimeToolName is the registered tool name for querying the current UTC time.
+const UTCTimeToolName = "utc_now"
+
+func (r *Registry) executeUTCNow(_ context.Context, _ string) (string, error) {
+	now := time.Now().UTC()
+	payload := struct {
+		UTC     string `json:"utc"`
+		Unix    int64  `json:"unix"`
+		Weekday string `json:"weekday"`
+	}{
+		UTC:     now.Format(time.RFC3339),
+		Unix:    now.Unix(),
+		Weekday: now.Weekday().String(),
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal utc_now response: %w", err)
+	}
+	return string(b), nil
 }
 
 // MaxRecallMemoryResponseBytes caps the total serialized JSON response of recall_memory to 16 KiB.

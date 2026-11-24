@@ -4,9 +4,14 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	openai "github.com/sashabaranov/go-openai"
 )
+
+// UserTimestampGapSeconds is the minimum elapsed seconds since the previous message
+// before an RFC3339 UTC timestamp is automatically prepended to a user message.
+const UserTimestampGapSeconds int64 = 3600
 
 // ImageAttachment represents an image attached to a chat entry as a data URL.
 type ImageAttachment struct {
@@ -180,6 +185,23 @@ func (rb *RingBuffer) Clear() {
 
 // entryToLLMMessage converts a single chatcontext Entry into an openai.ChatCompletionMessage.
 func entryToLLMMessage(e Entry) openai.ChatCompletionMessage {
+	return entryToLLMMessageWithPrev(e, nil)
+}
+
+func shouldInjectUserTimestamp(e Entry, prev *Entry) bool {
+	if prev == nil || prev.Timestamp <= 0 || e.Timestamp <= 0 {
+		return false
+	}
+	return e.Timestamp-prev.Timestamp > UserTimestampGapSeconds
+}
+
+func formatUserTimestampPrefix(ts int64) string {
+	return fmt.Sprintf("[%s]", time.Unix(ts, 0).UTC().Format(time.RFC3339))
+}
+
+// entryToLLMMessageWithPrev converts a single chatcontext Entry into an openai.ChatCompletionMessage,
+// prepending an RFC3339 UTC timestamp when a user message arrives more than 1 hour after prev.
+func entryToLLMMessageWithPrev(e Entry, prev *Entry) openai.ChatCompletionMessage {
 	role := e.Role
 	switch role {
 	case "", "user":
@@ -196,6 +218,15 @@ func entryToLLMMessage(e Entry) openai.ChatCompletionMessage {
 		content = fmt.Sprintf("%s: %s", senderName, e.Content)
 	} else {
 		content = e.Content
+	}
+
+	if role == openai.ChatMessageRoleUser && shouldInjectUserTimestamp(e, prev) {
+		tsPrefix := formatUserTimestampPrefix(e.Timestamp)
+		if content != "" {
+			content = tsPrefix + " " + content
+		} else {
+			content = tsPrefix
+		}
 	}
 
 	if len(e.Images) > 0 && role == openai.ChatMessageRoleUser {
@@ -227,17 +258,30 @@ func entryToLLMMessage(e Entry) openai.ChatCompletionMessage {
 	}
 }
 
+func entriesToLLMMessages(entries []Entry) []openai.ChatCompletionMessage {
+	return entriesToLLMMessagesWithFirstPrev(entries, nil)
+}
+
+func entriesToLLMMessagesWithFirstPrev(entries []Entry, firstPrev *Entry) []openai.ChatCompletionMessage {
+	msgs := make([]openai.ChatCompletionMessage, 0, len(entries))
+	for i, e := range entries {
+		prev := firstPrev
+		if i > 0 {
+			prev = &entries[i-1]
+		}
+		msgs = append(msgs, entryToLLMMessageWithPrev(e, prev))
+	}
+	return msgs
+}
+
 // ToLLMMessages converts the buffered entries into openai.ChatCompletionMessage objects.
-// User messages are formatted with "<SenderName>: <Content>" if SenderName is present.
+// User messages are formatted with "<SenderName>: <Content>" if SenderName is present,
+// and include an RFC3339 UTC timestamp prefix when the previous message was > 1 hour earlier.
 func (rb *RingBuffer) ToLLMMessages() []openai.ChatCompletionMessage {
 	rb.mu.RLock()
 	defer rb.mu.RUnlock()
 
-	msgs := make([]openai.ChatCompletionMessage, 0, len(rb.entries))
-	for _, e := range rb.entries {
-		msgs = append(msgs, entryToLLMMessage(e))
-	}
-	return msgs
+	return entriesToLLMMessages(rb.entries)
 }
 
 // Manager manages per-chat RingBuffers.

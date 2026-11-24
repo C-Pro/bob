@@ -330,8 +330,8 @@ func TestAgentIntegration_DMContextAndNameResolution(t *testing.T) {
 			assert.Equal(t, "1", r.URL.Query().Get("fromSeq"))
 			assert.Equal(t, "2", r.URL.Query().Get("toSeq"))
 			_ = json.NewEncoder(w).Encode([]models.Message{
-				{Seq: 1, ChatID: "dm_bot_user", UserID: "user-uuid-1234", Content: "<p>Where to buy freediving fins?</p>", Timestamp: 100},
-				{Seq: 2, ChatID: "dm_bot_user", UserID: "bot-id", Content: "<p>Aquamaster in Kuta</p>", Timestamp: 101},
+				{Seq: 1, ChatID: "dm_bot_user", UserID: "user-uuid-1234", Content: "<p>Where to buy freediving fins?</p>", Timestamp: time.Now().Unix() - 60},
+				{Seq: 2, ChatID: "dm_bot_user", UserID: "bot-id", Content: "<p>Aquamaster in Kuta</p>", Timestamp: time.Now().Unix() - 59},
 			})
 			return
 		}

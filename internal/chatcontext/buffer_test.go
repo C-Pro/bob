@@ -2,6 +2,7 @@ package chatcontext
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -481,4 +482,140 @@ func TestRingBuffer_ReconcileAssistantEcho(t *testing.T) {
 		entries := rb.Entries()
 		assert.Equal(t, int64(1), entries[len(entries)-1].Seq)
 	})
+}
+
+func TestRingBuffer_ToLLMMessages_TimestampGapInjection(t *testing.T) {
+	baseTS := int64(1700000000) // 2023-11-14T22:13:20Z
+
+	rb := NewRingBuffer(10)
+	// First message: no previous message -> no timestamp injected
+	rb.Push(Entry{Role: "user", SenderID: "u1", SenderName: "Alice", Content: "First", Timestamp: baseTS})
+	// Within 1 hour (exactly 3600s, not > 1h) -> no timestamp injected
+	rb.Push(Entry{Role: "user", SenderID: "u1", SenderName: "Alice", Content: "Within hour", Timestamp: baseTS + 3600})
+	// Assistant reply > 1h later -> assistant messages never get timestamp injected
+	rb.Push(Entry{Role: "assistant", SenderID: "bot-1", Content: "Bot reply", Timestamp: baseTS + 10000})
+	// User reply > 1h after assistant reply (3601s) -> RFC3339 UTC timestamp injected
+	userAfterGapTS := baseTS + 10000 + 3601
+	rb.Push(Entry{Role: "user", SenderID: "u1", SenderName: "Alice", Content: "Back again", Timestamp: userAfterGapTS})
+	// User reply with missing SenderName and > 1h gap
+	userNoSenderTS := userAfterGapTS + 7200
+	rb.Push(Entry{Role: "user", SenderID: "u1", Content: "Ping", Timestamp: userNoSenderTS})
+	// Multimodal user message with empty text and > 1h gap
+	imgGapTS := userNoSenderTS + 4000
+	rb.Push(Entry{
+		Role:      "user",
+		SenderID:  "u1",
+		Content:   "",
+		Images:    []ImageAttachment{{URL: "data:image/png;base64,AAA"}},
+		Timestamp: imgGapTS,
+	})
+
+	msgs := rb.ToLLMMessages()
+	require.Len(t, msgs, 6)
+
+	assert.Equal(t, "Alice: First", msgs[0].Content)
+	assert.Equal(t, "Alice: Within hour", msgs[1].Content)
+	assert.Equal(t, "Bot reply", msgs[2].Content)
+	assert.Equal(t, "["+time.Unix(userAfterGapTS, 0).UTC().Format(time.RFC3339)+"] Alice: Back again", msgs[3].Content)
+	assert.Equal(t, "["+time.Unix(userNoSenderTS, 0).UTC().Format(time.RFC3339)+"] Ping", msgs[4].Content)
+	require.Len(t, msgs[5].MultiContent, 2)
+	assert.Equal(t, "["+time.Unix(imgGapTS, 0).UTC().Format(time.RFC3339)+"]", msgs[5].MultiContent[0].Text)
+	assert.Equal(t, openai.ChatMessagePartTypeImageURL, msgs[5].MultiContent[1].Type)
+
+	// Assembler.Assemble applies the same timestamp injection and accounts for its byte cost.
+	res := NewAssembler().Assemble(AssemblyInput{
+		RecentEntries: rb.Entries(),
+	})
+	require.Len(t, res.Messages, 6)
+	assert.Equal(t, msgs[3].Content, res.Messages[3].Content)
+	assert.Equal(t, msgs[4].Content, res.Messages[4].Content)
+	assert.Equal(t, emittedMessagesBytes(res.Messages), res.Manifest.Usage.RecentTurns.Bytes)
+
+	t.Run("zero and backward timestamps and empty role", func(t *testing.T) {
+		rbEdge := NewRingBuffer(10)
+		rbEdge.Push(Entry{Role: "", SenderID: "u1", Content: "No ts 1", Timestamp: 0})
+		rbEdge.Push(Entry{Role: "", SenderID: "u1", Content: "Has ts", Timestamp: baseTS})
+		rbEdge.Push(Entry{Role: "", SenderID: "u1", Content: "Zero ts", Timestamp: 0})
+		rbEdge.Push(Entry{Role: "", SenderID: "u1", Content: "Backward ts", Timestamp: baseTS - 7200})
+
+		edgeMsgs := rbEdge.ToLLMMessages()
+		require.Len(t, edgeMsgs, 4)
+		assert.Equal(t, openai.ChatMessageRoleUser, edgeMsgs[0].Role)
+		assert.Equal(t, "No ts 1", edgeMsgs[0].Content)
+		assert.Equal(t, "Has ts", edgeMsgs[1].Content)
+		assert.Equal(t, "Zero ts", edgeMsgs[2].Content)
+		assert.Equal(t, "Backward ts", edgeMsgs[3].Content)
+	})
+
+	t.Run("dropped predecessor preserves timestamp and exact manifest bytes", func(t *testing.T) {
+		entries := []Entry{
+			{Role: "assistant", SenderID: "bot-1", Content: strings.Repeat("x", 100), Timestamp: baseTS},
+			{Role: "user", SenderID: "u1", Content: "Ping", Timestamp: baseTS + 7200},
+		}
+		resDropped := NewAssembler(SourceBudgets{RecentTurnsBytes: 40}).Assemble(AssemblyInput{
+			RecentEntries: entries,
+		})
+		require.Len(t, resDropped.Messages, 1)
+		expected := "[" + time.Unix(baseTS+7200, 0).UTC().Format(time.RFC3339) + "] Ping"
+		assert.Equal(t, expected, resDropped.Messages[0].Content)
+		assert.Equal(t, len(expected), resDropped.Manifest.Usage.RecentTurns.Bytes)
+		assert.Equal(t, 1, resDropped.Manifest.Usage.RecentTurns.OmittedCount)
+	})
+
+	t.Run("latest-turn truncation reserves timestamp overhead", func(t *testing.T) {
+		prev := Entry{Role: "assistant", SenderID: "bot-1", Content: "Old", Timestamp: baseTS}
+		longUser := Entry{
+			Role:       "user",
+			SenderID:   "u1",
+			SenderName: "Alice",
+			Content:    strings.Repeat("a", 100),
+			Timestamp:  baseTS + 7200,
+		}
+		res40 := NewAssembler(SourceBudgets{RecentTurnsBytes: 40}).Assemble(AssemblyInput{
+			RecentEntries: []Entry{prev, longUser},
+		})
+		require.Len(t, res40.Messages, 1)
+		assert.LessOrEqual(t, len(res40.Messages[0].Content), 40)
+		assert.Equal(t, len(res40.Messages[0].Content), res40.Manifest.Usage.RecentTurns.Bytes)
+		assert.True(t, strings.HasPrefix(res40.Messages[0].Content, "["+time.Unix(baseTS+7200, 0).UTC().Format(time.RFC3339)+"]"))
+
+		// UTF-8 multi-byte truncation with timestamp overhead
+		utf8User := Entry{
+			Role:      "user",
+			SenderID:  "u1",
+			Content:   strings.Repeat("é", 30),
+			Timestamp: baseTS + 7200,
+		}
+		resUTF8 := NewAssembler(SourceBudgets{RecentTurnsBytes: 30}).Assemble(AssemblyInput{
+			RecentEntries: []Entry{prev, utf8User},
+		})
+		require.Len(t, resUTF8.Messages, 1)
+		assert.LessOrEqual(t, len(resUTF8.Messages[0].Content), 30)
+		assert.Equal(t, len(resUTF8.Messages[0].Content), resUTF8.Manifest.Usage.RecentTurns.Bytes)
+
+		// Budget smaller than timestamp length (22 bytes) drops timestamp rather than exceeding budget
+		resTiny := NewAssembler(SourceBudgets{RecentTurnsBytes: 10}).Assemble(AssemblyInput{
+			RecentEntries: []Entry{prev, longUser},
+		})
+		require.Len(t, resTiny.Messages, 1)
+		assert.LessOrEqual(t, len(resTiny.Messages[0].Content), 10)
+		assert.Equal(t, len(resTiny.Messages[0].Content), resTiny.Manifest.Usage.RecentTurns.Bytes)
+	})
+}
+
+func emittedMessagesBytes(msgs []openai.ChatCompletionMessage) int {
+	total := 0
+	for _, m := range msgs {
+		if len(m.MultiContent) > 0 {
+			for _, p := range m.MultiContent {
+				total += len(p.Text)
+				if p.ImageURL != nil {
+					total += EstimatedImageBytes
+				}
+			}
+		} else {
+			total += len(m.Content)
+		}
+	}
+	return total
 }

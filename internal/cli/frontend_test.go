@@ -44,6 +44,7 @@ func TestFrontend_NetworkToolFiltering(t *testing.T) {
 		}
 		assert.Contains(t, names, "web_search")
 		assert.Contains(t, names, "web_fetch")
+		assert.Contains(t, names, "utc_now")
 		assert.NotContains(t, names, "execute")
 	})
 
@@ -78,6 +79,7 @@ func TestFrontend_NetworkToolFiltering(t *testing.T) {
 		}
 		assert.NotContains(t, names, "web_search")
 		assert.NotContains(t, names, "web_fetch")
+		assert.Contains(t, names, "utc_now")
 		assert.Contains(t, names, "execute")
 	})
 
@@ -95,6 +97,7 @@ func TestFrontend_NetworkToolFiltering(t *testing.T) {
 		}
 		assert.NotContains(t, names, "web_search")
 		assert.NotContains(t, names, "web_fetch")
+		assert.Contains(t, names, "utc_now")
 		assert.Contains(t, names, "execute")
 	})
 

@@ -49,6 +49,10 @@ func FormatProgressStep(toolCall openai.ToolCall) (title, desc string) {
 			desc = "Querying memory"
 		}
 
+	case UTCTimeToolName:
+		title = "Check UTC Time"
+		desc = "Checking current UTC time"
+
 	case RecallTaskHistoryToolName:
 		title = "Recall Task History"
 		if sid := parseStringArg(rawArgs, "step_id"); sid != "" {

@@ -27,7 +27,7 @@ func TestWebSearchToolDefinition(t *testing.T) {
 	registry := NewRegistry(nil, nil)
 	tools := registry.ToolDefinitions()
 
-	require.Len(t, tools, 3)
+	require.Len(t, tools, 4)
 	tool := tools[0]
 	assert.Equal(t, openai.ToolTypeFunction, tool.Type)
 	require.NotNil(t, tool.Function)
@@ -56,7 +56,7 @@ func TestWebFetchToolDefinition(t *testing.T) {
 	registry := NewRegistry(nil, nil)
 	tools := registry.ToolDefinitions()
 
-	require.Len(t, tools, 3)
+	require.Len(t, tools, 4)
 	tool := tools[1]
 	assert.Equal(t, openai.ToolTypeFunction, tool.Type)
 	require.NotNil(t, tool.Function)
@@ -85,7 +85,7 @@ func TestRecallMemoryToolDefinition(t *testing.T) {
 	registry := NewRegistry(nil, nil)
 	tools := registry.ToolDefinitions()
 
-	require.Len(t, tools, 3)
+	require.Len(t, tools, 4)
 	tool := tools[2]
 	assert.Equal(t, openai.ToolTypeFunction, tool.Type)
 	require.NotNil(t, tool.Function)
@@ -655,9 +655,9 @@ func TestSandboxToolDefinitionsScope(t *testing.T) {
 
 	reg := NewRegistry(nil, nil, sandboxMgr)
 
-	// Base ToolDefinitions (or Townhall session) has 3 tools (search, fetch, recall)
-	assert.Len(t, reg.ToolDefinitions(), 3)
-	assert.Len(t, reg.ToolDefinitionsForSession(ChatSessionContext{IsDM: false}), 3)
+	// Base ToolDefinitions (or Townhall session) has 4 tools (search, fetch, recall, utc_now)
+	assert.Len(t, reg.ToolDefinitions(), 4)
+	assert.Len(t, reg.ToolDefinitionsForSession(ChatSessionContext{IsDM: false}), 4)
 
 	thNames := make([]string, len(reg.ToolDefinitions()))
 	for i, tool := range reg.ToolDefinitions() {
@@ -676,9 +676,9 @@ func TestSandboxToolDefinitionsScope(t *testing.T) {
 	assert.NotContains(t, thNames, "discover_skills")
 	assert.NotContains(t, thNames, "load_skill")
 
-	// DM session has 15 tools (3 base + 3 scheduler + 3 sandbox + 6 knowledge) when no sandbox running
+	// DM session has 16 tools (4 base + 3 scheduler + 3 sandbox + 6 knowledge) when no sandbox running
 	dmTools := reg.ToolDefinitionsForSession(ChatSessionContext{IsDM: true})
-	assert.Len(t, dmTools, 15)
+	assert.Len(t, dmTools, 16)
 
 	names := make([]string, len(dmTools))
 	for i, tool := range dmTools {
@@ -1022,4 +1022,36 @@ func TestExecuteSandboxRequest_UINotifierAndFallback(t *testing.T) {
 	_, err = reg.Execute(fallbackCtx, "sandbox_request", `{"driver":"bwrap","network":"none","reason":"Retry fallback"}`)
 	require.NoError(t, err)
 	assert.Contains(t, fallbackText, "Sandbox Approval Requested")
+}
+
+func TestUTCNowTool(t *testing.T) {
+	reg := NewRegistry(nil, nil)
+
+	assert.True(t, IsReadOnlyTool(UTCTimeToolName))
+
+	before := time.Now().UTC().Truncate(time.Second)
+	out, err := reg.Execute(context.Background(), UTCTimeToolName, `{}`)
+	after := time.Now().UTC().Add(time.Second)
+	require.NoError(t, err)
+
+	var resp struct {
+		UTC     string `json:"utc"`
+		Unix    int64  `json:"unix"`
+		Weekday string `json:"weekday"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(out), &resp))
+
+	parsed, err := time.Parse(time.RFC3339, resp.UTC)
+	require.NoError(t, err)
+	assert.Equal(t, time.UTC, parsed.Location())
+	assert.False(t, parsed.Before(before), "parsed %v should not be before %v", parsed, before)
+	assert.False(t, parsed.After(after), "parsed %v should not be after %v", parsed, after)
+	assert.Equal(t, parsed.Unix(), resp.Unix)
+	assert.Equal(t, parsed.Weekday().String(), resp.Weekday)
+
+	title, desc := FormatProgressStep(openai.ToolCall{
+		Function: openai.FunctionCall{Name: UTCTimeToolName},
+	})
+	assert.Equal(t, "Check UTC Time", title)
+	assert.Equal(t, "Checking current UTC time", desc)
 }
