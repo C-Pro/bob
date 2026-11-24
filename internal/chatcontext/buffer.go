@@ -32,12 +32,19 @@ type Entry struct {
 // EvictionHook is a callback invoked with evicted entries when capacity is exceeded.
 type EvictionHook func(evicted []Entry)
 
+type pendingEntry struct {
+	token uint64
+	entry Entry
+}
+
 // RingBuffer is a thread-safe circular buffer holding up to `capacity` entries.
 type RingBuffer struct {
-	mu       sync.RWMutex
-	capacity int
-	entries  []Entry
-	onEvict  EvictionHook
+	mu               sync.RWMutex
+	capacity         int
+	entries          []Entry
+	pending          []pendingEntry
+	nextPendingToken uint64
+	onEvict          EvictionHook
 }
 
 // NewRingBuffer creates a new RingBuffer with the given maximum capacity.
@@ -90,12 +97,65 @@ func (rb *RingBuffer) Push(entry Entry) {
 	}
 }
 
+// RegisterPending records an outgoing assistant entry in the pre-send pending list
+// without modifying or evicting retained conversation entries, returning a unique token.
+func (rb *RingBuffer) RegisterPending(entry Entry) uint64 {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	rb.nextPendingToken++
+	token := rb.nextPendingToken
+	rb.pending = append(rb.pending, pendingEntry{token: token, entry: entry})
+	return token
+}
+
+// CommitPending promotes the pending entry identified by token into the ring buffer
+// after transport succeeds. If a concurrent echo already promoted it, CommitPending is a no-op.
+func (rb *RingBuffer) CommitPending(token uint64) {
+	rb.mu.Lock()
+	idx := -1
+	var entry Entry
+	for i := len(rb.pending) - 1; i >= 0; i-- {
+		if rb.pending[i].token == token {
+			idx = i
+			entry = rb.pending[i].entry
+			break
+		}
+	}
+	if idx < 0 {
+		rb.mu.Unlock()
+		return
+	}
+	rb.pending = append(rb.pending[:idx], rb.pending[idx+1:]...)
+	evicted, hook := rb.pushLocked(entry)
+	rb.mu.Unlock()
+
+	if hook != nil && len(evicted) > 0 {
+		hook(evicted)
+	}
+}
+
+// RemovePending removes the pre-send pending entry identified by token.
+// Used to roll back pre-send entries when transport fails without evicting retained history.
+func (rb *RingBuffer) RemovePending(token uint64) bool {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	for i := len(rb.pending) - 1; i >= 0; i-- {
+		if rb.pending[i].token == token {
+			rb.pending = append(rb.pending[:i], rb.pending[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
 // ReconcileAssistantEcho atomically reconciles an incoming assistant self-echo against existing
-// ring buffer entries:
+// ring buffer entries and pre-send pending entries:
 //  1. If entry.Seq > 0 matches an existing assistant entry, it is ignored as an exact duplicate.
-//  2. Otherwise, if a pending assistant entry (Seq == 0) has matching normalized content, its Seq
-//     is updated to entry.Seq (when > 0) without appending a duplicate.
-//  3. Otherwise, entry is appended to the ring buffer (evicting oldest entries if over capacity).
+//  2. Otherwise, if a committed pending assistant entry (Seq == 0) in entries has matching
+//     normalized content, its Seq is updated to entry.Seq (when > 0) without appending a duplicate.
+//  3. Otherwise, if a pre-send pending entry matches, it is promoted into the ring buffer with
+//     entry.Seq (when > 0) without appending a duplicate.
+//  4. Otherwise, entry is appended to the ring buffer (evicting oldest entries if over capacity).
 //
 // Returns true if a new entry was appended, false if it matched or reconciled an existing entry.
 func (rb *RingBuffer) ReconcileAssistantEcho(entry Entry) bool {
@@ -128,6 +188,31 @@ func (rb *RingBuffer) ReconcileAssistantEcho(entry Entry) bool {
 				}
 			}
 			rb.mu.Unlock()
+			return false
+		}
+	}
+
+	for i := 0; i < len(rb.pending); i++ {
+		p := rb.pending[i].entry
+		if p.Role != "assistant" {
+			continue
+		}
+		if p.SenderID != "" && entry.SenderID != "" && p.SenderID != entry.SenderID {
+			continue
+		}
+		if normalizeSpaces(p.Content) == normIncoming {
+			rb.pending = append(rb.pending[:i], rb.pending[i+1:]...)
+			if entry.Seq > 0 {
+				p.Seq = entry.Seq
+			}
+			if p.Timestamp == 0 && entry.Timestamp > 0 {
+				p.Timestamp = entry.Timestamp
+			}
+			evicted, hook := rb.pushLocked(p)
+			rb.mu.Unlock()
+			if hook != nil && len(evicted) > 0 {
+				hook(evicted)
+			}
 			return false
 		}
 	}
@@ -349,6 +434,21 @@ func (m *Manager) GetOrCreate(chatID string) *RingBuffer {
 func (m *Manager) Push(chatID string, entry Entry) {
 	rb := m.GetOrCreate(chatID)
 	rb.Push(entry)
+}
+
+// RegisterPending records a pre-send pending entry for chatID without evicting retained entries.
+func (m *Manager) RegisterPending(chatID string, entry Entry) uint64 {
+	return m.GetOrCreate(chatID).RegisterPending(entry)
+}
+
+// CommitPending promotes a pre-send pending entry for chatID into the ring buffer.
+func (m *Manager) CommitPending(chatID string, token uint64) {
+	m.GetOrCreate(chatID).CommitPending(token)
+}
+
+// RemovePending removes a pre-send pending entry for chatID by token.
+func (m *Manager) RemovePending(chatID string, token uint64) bool {
+	return m.GetOrCreate(chatID).RemovePending(token)
 }
 
 // GetLLMMessages returns the formatted LLM messages for the specified chatID.

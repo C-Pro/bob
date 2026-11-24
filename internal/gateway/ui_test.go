@@ -1341,3 +1341,164 @@ func TestHandleUIResponseAction_ApprovalsAndSecurity(t *testing.T) {
 	assert.Equal(t, 1, llmCalls, fmt.Sprintf("expected only 1 LLM call (for sandbox continuation), got %d", llmCalls))
 	llmMu.Unlock()
 }
+
+func TestDeliverAgentReply_PreSendPushReconcilesConcurrentEchoAndRollback(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	var gw *Gateway
+	echoDone := make(chan struct{}, 1)
+
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		require.NoError(t, err)
+		defer func() { _ = conn.Close() }()
+
+		for {
+			var out models.ClientMessage
+			if err := conn.ReadJSON(&out); err != nil {
+				return
+			}
+			if out.Type == models.ClientMessageTypeSend && out.Content != "" {
+				// Simulate an immediate concurrent WebSocket self-echo arriving while
+				// SendMessageWithAttachmentsAndUI has just written the frame.
+				require.NoError(t, gw.ProcessMessage(context.Background(), models.Message{
+					Seq:       42,
+					ChatID:    out.ChatID,
+					UserID:    "bot-1",
+					Content:   out.Content,
+					Timestamp: time.Now().Unix(),
+				}))
+				echoDone <- struct{}{}
+			}
+		}
+	}))
+	defer wsServer.Close()
+
+	cfg := &config.Config{
+		BotHandle:             "@bot",
+		BesedkaURL:            wsServer.URL,
+		TownhallMaxParagraphs: 4,
+		DMMaxParagraphs:       10,
+		MsgRingBufferSize:     50,
+	}
+	gw = NewGateway(cfg, nil)
+	gw.botUserID = "bot-1"
+	gw.botUser = models.User{ID: "bot-1", DisplayName: "Agent Bob", UserName: "bob"}
+	require.NoError(t, gw.DialWebSocket(context.Background()))
+
+	err := gw.deliverAgentReply(
+		context.Background(),
+		"townhall",
+		"alice",
+		"bot-1",
+		"Agent Bob",
+		false,
+		agentapi.RunDescriptor{},
+		"Hello from pre-send push!",
+		nil,
+		nil,
+		false,
+	)
+	require.NoError(t, err)
+	select {
+	case <-echoDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for concurrent echo")
+	}
+
+	entries := gw.contextManager.GetOrCreate("townhall").Entries()
+	require.Len(t, entries, 1, "concurrent self-echo must reconcile in place without creating a duplicate")
+	assert.Equal(t, int64(42), entries[0].Seq)
+	assert.Equal(t, "Hello from pre-send push!", entries[0].Content)
+
+	// Send failure rolls back the optimistic pending entry.
+	gw.mu.Lock()
+	if gw.conn != nil {
+		_ = gw.conn.Close()
+		gw.conn = nil
+	}
+	gw.mu.Unlock()
+
+	err = gw.deliverAgentReply(
+		context.Background(),
+		"townhall",
+		"alice",
+		"bot-1",
+		"Agent Bob",
+		false,
+		agentapi.RunDescriptor{},
+		"Should roll back",
+		nil,
+		nil,
+		false,
+	)
+	require.Error(t, err)
+	entries = gw.contextManager.GetOrCreate("townhall").Entries()
+	require.Len(t, entries, 1)
+	assert.Equal(t, int64(42), entries[0].Seq)
+}
+
+func TestPushPendingAndSend_DeterministicSyncEchoAndFullBufferRollback(t *testing.T) {
+	cfg := &config.Config{
+		BotHandle:         "@bot",
+		MsgRingBufferSize: 3,
+	}
+	gw := NewGateway(cfg, nil)
+	gw.botUserID = "bot-1"
+	gw.botUser = models.User{ID: "bot-1", DisplayName: "Agent Bob", UserName: "bob"}
+
+	// Fill buffer to capacity (3).
+	for i := int64(1); i <= 3; i++ {
+		gw.contextManager.Push("townhall", chatcontext.Entry{
+			Seq:       i,
+			Role:      "user",
+			SenderID:  "alice",
+			Content:   fmt.Sprintf("msg-%d", i),
+			Timestamp: 100 + i,
+		})
+	}
+
+	// 1. Failed send at full capacity must preserve all 3 existing entries.
+	failEntry := chatcontext.Entry{
+		Role:       "assistant",
+		SenderID:   "bot-1",
+		SenderName: "Agent Bob",
+		Content:    "will fail",
+		Timestamp:  200,
+	}
+	err := gw.pushPendingAndSend("townhall", failEntry, func() error {
+		return fmt.Errorf("ws write failed")
+	})
+	require.Error(t, err)
+	entries := gw.contextManager.GetOrCreate("townhall").Entries()
+	require.Len(t, entries, 3)
+	assert.Equal(t, int64(1), entries[0].Seq)
+	assert.Equal(t, int64(3), entries[2].Seq)
+
+	// 2. Synchronous self-echo inside sendFn before sendFn returns reconciles in place.
+	gw2 := NewGateway(&config.Config{BotHandle: "@bot", MsgRingBufferSize: 10}, nil)
+	gw2.botUserID = "bot-1"
+	gw2.botUser = models.User{ID: "bot-1", DisplayName: "Agent Bob", UserName: "bob"}
+
+	syncEntry := chatcontext.Entry{
+		Role:       "assistant",
+		SenderID:   "bot-1",
+		SenderName: "Agent Bob",
+		Content:    "sync echo reply",
+		Timestamp:  300,
+	}
+	err = gw2.pushPendingAndSend("townhall", syncEntry, func() error {
+		return gw2.ProcessMessage(context.Background(), models.Message{
+			Seq:       99,
+			ChatID:    "townhall",
+			UserID:    "bot-1",
+			Content:   "sync echo reply",
+			Timestamp: 300,
+		})
+	})
+	require.NoError(t, err)
+
+	entries2 := gw2.contextManager.GetOrCreate("townhall").Entries()
+	require.Len(t, entries2, 1)
+	assert.Equal(t, int64(99), entries2[0].Seq)
+	assert.Equal(t, "sync echo reply", entries2[0].Content)
+}

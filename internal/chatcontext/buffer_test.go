@@ -619,3 +619,63 @@ func emittedMessagesBytes(msgs []openai.ChatCompletionMessage) int {
 	}
 	return total
 }
+
+func TestRingBuffer_RegisterPending_NoEvictionOnRollback(t *testing.T) {
+	rb := NewRingBuffer(3)
+	evictCalls := 0
+	rb.SetOnEvict(func([]Entry) { evictCalls++ })
+
+	rb.Push(Entry{Seq: 1, Role: "user", SenderID: "u1", Content: "m1", Timestamp: 100})
+	rb.Push(Entry{Seq: 2, Role: "assistant", SenderID: "bot-1", Content: "m2", Timestamp: 101})
+	rb.Push(Entry{Seq: 3, Role: "user", SenderID: "u1", Content: "m3", Timestamp: 102})
+
+	pending := Entry{Role: "assistant", SenderID: "bot-1", Content: "m4", Timestamp: 103}
+	token := rb.RegisterPending(pending)
+	assert.Equal(t, 0, evictCalls, "RegisterPending must not evict retained history")
+	assert.Equal(t, 3, rb.Len())
+
+	assert.True(t, rb.RemovePending(token))
+	assert.Equal(t, 0, evictCalls, "rollback must not evict retained history")
+	entries := rb.Entries()
+	require.Len(t, entries, 3)
+	assert.Equal(t, []int64{1, 2, 3}, []int64{entries[0].Seq, entries[1].Seq, entries[2].Seq})
+}
+
+func TestRingBuffer_ReconcileDelayedEchoAndOverlappingIdenticalSends(t *testing.T) {
+	t.Run("delayed echo reconciles older committed entry before newer pending registration", func(t *testing.T) {
+		rb := NewRingBuffer(10)
+		tokenA := rb.RegisterPending(Entry{Role: "assistant", SenderID: "bot-1", Content: "Same", Timestamp: 100})
+		rb.CommitPending(tokenA) // A is now committed in entries with Seq == 0
+
+		tokenB := rb.RegisterPending(Entry{Role: "assistant", SenderID: "bot-1", Content: "Same", Timestamp: 100})
+		// Delayed echo for A arrives before B finishes sending
+		appended := rb.ReconcileAssistantEcho(Entry{Seq: 10, Role: "assistant", SenderID: "bot-1", Content: "Same", Timestamp: 100})
+		assert.False(t, appended)
+
+		// B fails and rolls back
+		assert.True(t, rb.RemovePending(tokenB))
+
+		entries := rb.Entries()
+		require.Len(t, entries, 1)
+		assert.Equal(t, int64(10), entries[0].Seq)
+	})
+
+	t.Run("overlapping identical sends use unique tokens", func(t *testing.T) {
+		rb := NewRingBuffer(10)
+		entry := Entry{Role: "assistant", SenderID: "bot-1", Content: "Same", Timestamp: 100}
+		tokenA := rb.RegisterPending(entry)
+		tokenB := rb.RegisterPending(entry)
+		assert.NotEqual(t, tokenA, tokenB)
+
+		// A's echo arrives and promotes A
+		assert.False(t, rb.ReconcileAssistantEcho(Entry{Seq: 21, Role: "assistant", SenderID: "bot-1", Content: "Same", Timestamp: 100}))
+		// CommitPending(tokenA) must be a no-op and NOT commit B
+		rb.CommitPending(tokenA)
+		// B fails and rolls back
+		assert.True(t, rb.RemovePending(tokenB))
+
+		entries := rb.Entries()
+		require.Len(t, entries, 1)
+		assert.Equal(t, int64(21), entries[0].Seq)
+	})
+}

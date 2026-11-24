@@ -214,6 +214,66 @@ class RunnerSystemOneTest(unittest.TestCase):
         self.assertEqual(batch["per_benchmark"]["swe-bench-lite"]["swe_patched"], 1)
         self.assertEqual(batch["system1_metrics"]["compaction_total_latency_ms"], 652)
 
+    def test_evaluate_swe_patch_docker_isolates_cwd(self):
+        from unittest import mock
+
+        observed_cwds = []
+
+        def fake_run(cmd, cwd=None, capture_output=True, text=True, timeout=None):
+            observed_cwds.append(Path(cwd))
+            run_id = cmd[cmd.index("-id") + 1]
+            inst_id = cmd[cmd.index("-i") + 1]
+            rep_dir = Path(cwd) / "logs" / "run_evaluation" / run_id / "bob" / inst_id
+            rep_dir.mkdir(parents=True, exist_ok=True)
+            (rep_dir / "report.json").write_text(json.dumps({
+                inst_id: {
+                    "resolved": True,
+                    "tests_status": {
+                        "FAIL_TO_PASS": {"success": ["test_a"], "failure": []},
+                        "PASS_TO_PASS": {"success": ["test_b"], "failure": []},
+                    },
+                }
+            }))
+            return mock.Mock(returncode=0)
+
+        with mock.patch("runner.resolve_swebench_python", return_value="python3"), \
+             mock.patch("runner.subprocess.run", side_effect=fake_run):
+            resolved, msg = runner.evaluate_swe_patch_docker("swe_django__django-12345", "diff --git a/x b/x")
+
+        self.assertTrue(resolved)
+        self.assertIn("Resolved", msg)
+        self.assertEqual(len(observed_cwds), 1)
+        self.assertFalse(observed_cwds[0].exists(), "temp swebench work_dir should be cleaned up")
+
+    def test_resolve_swebench_python_resolves_relative_override_preserving_symlink(self):
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            target_bin = tmp_path / "base_python"
+            target_bin.write_text("#!/bin/sh\n")
+            venv_bin = tmp_path / ".venv" / "bin"
+            venv_bin.mkdir(parents=True)
+            symlink_py = venv_bin / "python"
+            symlink_py.symlink_to(target_bin)
+
+            orig_cwd = os.getcwd()
+            try:
+                os.chdir(tmp_path)
+                with mock.patch.dict(os.environ, {"BOB_EVAL_SWEBENCH_PYTHON": ".venv/bin/python"}):
+                    resolved = runner.resolve_swebench_python()
+            finally:
+                os.chdir(orig_cwd)
+
+            self.assertTrue(os.path.isabs(resolved))
+            self.assertEqual(resolved, os.path.abspath(str(symlink_py)))
+            self.assertNotEqual(resolved, str(target_bin.resolve()))
+
+        with mock.patch.dict(os.environ, {"BOB_EVAL_SWEBENCH_PYTHON": "python3"}):
+            bare = runner.resolve_swebench_python()
+        self.assertEqual(bare, "python3")
+
 
 if __name__ == "__main__":
     unittest.main()

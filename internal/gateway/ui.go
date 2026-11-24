@@ -289,20 +289,34 @@ func buildDeliveryUIPlan(actions []agentapi.Action, suppressMain bool) (fallback
 	return "", nil, followUps
 }
 
+func (g *Gateway) pushPendingAndSend(chatID string, entry chatcontext.Entry, sendFn func() error) error {
+	token := g.contextManager.RegisterPending(chatID, entry)
+	if err := sendFn(); err != nil {
+		g.contextManager.RemovePending(chatID, token)
+		return err
+	}
+	g.contextManager.CommitPending(chatID, token)
+	return nil
+}
+
 func (g *Gateway) sendCommandReply(chatID, botID, botName, reply string, ui *models.UIData, recordAssistant bool) error {
+	sendFn := func() error {
+		if ui != nil {
+			return g.SendMessageWithUI(chatID, reply, ui)
+		}
+		return g.SendMessage(chatID, reply)
+	}
 	if recordAssistant {
-		g.contextManager.Push(chatID, chatcontext.Entry{
+		entry := chatcontext.Entry{
 			Role:       "assistant",
 			SenderID:   botID,
 			SenderName: botName,
 			Content:    FormatOutgoingMessageContent(reply, ui, ""),
 			Timestamp:  time.Now().Unix(),
-		})
+		}
+		return g.pushPendingAndSend(chatID, entry, sendFn)
 	}
-	if ui != nil {
-		return g.SendMessageWithUI(chatID, reply, ui)
-	}
-	return g.SendMessage(chatID, reply)
+	return sendFn()
 }
 
 func (g *Gateway) deliverAgentReply(
@@ -364,38 +378,41 @@ func (g *Gateway) deliverAgentReply(
 
 		if reply != "" || len(attachments) > 0 || mainUI != nil {
 			formattedReply := FormatResponse(reply, isDM, g.cfg.TownhallMaxParagraphs, g.cfg.DMMaxParagraphs)
-			if err := g.SendMessageWithAttachmentsAndUI(chatID, formattedReply, attachments, mainUI); err != nil {
-				return fmt.Errorf("failed to deliver reply to chat %s: %w", chatID, err)
-			}
-
 			extraText := ""
 			if len(attachments) > 0 {
 				extraText, _ = g.processAttachments(ctx, attachments)
 			}
-			g.contextManager.Push(chatID, chatcontext.Entry{
+			entry := chatcontext.Entry{
 				Role:       "assistant",
 				SenderID:   botID,
 				SenderName: botName,
 				Content:    FormatOutgoingMessageContent(formattedReply, mainUI, extraText),
 				Timestamp:  time.Now().Unix(),
-			})
+			}
+			if err := g.pushPendingAndSend(chatID, entry, func() error {
+				return g.SendMessageWithAttachmentsAndUI(chatID, formattedReply, attachments, mainUI)
+			}); err != nil {
+				return fmt.Errorf("failed to deliver reply to chat %s: %w", chatID, err)
+			}
 		}
 	}
 
 	var followUpErrs []error
 	for i, card := range followUps {
-		if err := g.SendMessageWithUI(chatID, card.Text, card.UI); err != nil {
-			slog.Warn("failed to send follow-up approval card", "chat_id", chatID, "card_index", i+1, "error", err)
-			followUpErrs = append(followUpErrs, fmt.Errorf("failed to deliver follow-up approval card %d to chat %s: %w", i+1, chatID, err))
-			continue
-		}
-		g.contextManager.Push(chatID, chatcontext.Entry{
+		entry := chatcontext.Entry{
 			Role:       "assistant",
 			SenderID:   botID,
 			SenderName: botName,
 			Content:    FormatOutgoingMessageContent(card.Text, card.UI, ""),
 			Timestamp:  time.Now().Unix(),
-		})
+		}
+		if err := g.pushPendingAndSend(chatID, entry, func() error {
+			return g.SendMessageWithUI(chatID, card.Text, card.UI)
+		}); err != nil {
+			slog.Warn("failed to send follow-up approval card", "chat_id", chatID, "card_index", i+1, "error", err)
+			followUpErrs = append(followUpErrs, fmt.Errorf("failed to deliver follow-up approval card %d to chat %s: %w", i+1, chatID, err))
+			continue
+		}
 	}
 
 	return errors.Join(followUpErrs...)
